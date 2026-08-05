@@ -24,6 +24,8 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+use crate::model::VolumeId;
+
 const FORMAT: &str = "ofs-volume-catalog";
 const VERSION: u32 = 1;
 
@@ -79,18 +81,18 @@ pub(crate) enum MetadataConfig {
 #[serde(tag = "model", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum VolumeDefinition {
     Direct {
-        id: String,
+        id: VolumeId,
         storage: StorageLocator,
     },
     Managed {
-        id: String,
+        id: VolumeId,
         storage: StorageLocator,
         metadata: MetadataConfig,
     },
 }
 
 impl VolumeDefinition {
-    pub(crate) fn id(&self) -> &str {
+    pub(crate) fn id(&self) -> &VolumeId {
         match self {
             Self::Direct { id, .. } | Self::Managed { id, .. } => id,
         }
@@ -110,7 +112,7 @@ impl VolumeDefinition {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.id().is_empty() {
+        if self.id().as_str().is_empty() {
             bail!("volume id is empty");
         }
         self.storage().validate()?;
@@ -178,7 +180,7 @@ impl Catalog {
             .with_context(|| format!("volume {name:?} is not defined"))
     }
 
-    pub(crate) fn get_by_id(&self, id: &str) -> Result<(&str, &VolumeDefinition)> {
+    pub(crate) fn get_by_id(&self, id: &VolumeId) -> Result<(&str, &VolumeDefinition)> {
         self.volumes
             .iter()
             .find(|(_, value)| value.id() == id)

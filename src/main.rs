@@ -21,6 +21,7 @@ use anyhow::bail;
 
 mod catalog;
 mod cli;
+mod model;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
