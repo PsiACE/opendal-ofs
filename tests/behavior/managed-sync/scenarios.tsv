@@ -1,0 +1,22 @@
+# id	source	observable behavior
+MS-BHV-001	RFC016:Managed	--storage alone selects colocated object metadata.
+MS-BHV-002	RFC016:Sync	A non-empty local tree publishes and an empty replica materializes it.
+MS-BHV-003	RFC016:Sync	An edit remains private until its replica explicitly syncs.
+MS-BHV-004	RFC016:publication	Whole-tree create, modify, delete, rename, and empty directory advance once.
+MS-BHV-005	RFC016:generation	A stale publisher cannot overwrite a newer head.
+MS-BHV-006	RFC016:conflict	A conflicting publication unit is blocked and both candidates remain available.
+MS-BHV-007	RFC017:reconciliation	--resolve publishes the selected local shape after generation revalidation.
+MS-BHV-008	RFC016:cold-recovery	An empty replica recovers from catalog, credentials, and remote stores.
+MS-BHV-009	RFC016:first-binding	Two non-empty trees without a common base fail closed.
+MS-BHV-010	RFC016:portable-semantics	A symlink is rejected before publication.
+MS-BHV-011	RFC017:reconciliation	Disjoint local and remote changes merge from the common base.
+MS-BHV-012	RFC016:conflict	Delete/edit, rename, collision, and type conflicts retain content.
+MS-BHV-013	RFC017:stable-input	A source change during preparation never publishes torn content.
+MS-BHV-014	RFC017:publication	An unknown result resolves by the original operation identity.
+MS-BHV-015	RFC017:materialization	Interrupted materialization resumes before common base advances.
+MS-BHV-016	RFC016:capabilities	Invalid names, collisions, hard links, types, and binding mismatch fail closed.
+MS-BHV-017	RFC016:status	Status is read-only and reports an unreachable authority as unknown.
+MS-BHV-018	RFC017:MetadataStore	D1 implements the same provider-neutral Metadata Store contract.
+MS-BHV-019	REQ:agent-workflow	Bub completes the public CLI workflow with ordinary directories.
+MS-BHV-020	RFC017:lifecycle	Replicas can be added, removed locally, cold rebuilt, and reused.
+MS-BHV-021	REQ:incremental-log	Sanitized agent trees converge by a fixed-target incremental change log.
