@@ -163,7 +163,7 @@ pub(crate) async fn sync_once(volume: &ManagedVolume, request: SyncRequest<'_>) 
     };
     state.publication = Some(pending);
     state.save(&paths)?;
-    upload_changes(volume, &paths, &remote, &target, request.transfers).await?;
+    upload_changes(volume, &paths, &changes, request.transfers).await?;
     if !publication_source_unchanged(&paths, &stable_local)? {
         state.publication = None;
         state.save(&paths)?;
@@ -231,14 +231,7 @@ async fn recover(
                         crate::replica::clear_staging(paths)?;
                         return Ok(());
                     }
-                    upload_changes(
-                        volume,
-                        paths,
-                        &Manifest::default(),
-                        &pending.target,
-                        NonZeroUsize::MIN,
-                    )
-                    .await?;
+                    upload_changes(volume, paths, &pending.changes, NonZeroUsize::MIN).await?;
                     let commit = CommitRecord::new(
                         state.volume_id.clone(),
                         pending.parent,
@@ -449,17 +442,21 @@ fn conflict_kind(base: Option<&Node>, local: Option<&Node>, remote: Option<&Node
 async fn upload_changes(
     volume: &ManagedVolume,
     paths: &ReplicaPaths,
-    remote: &Manifest,
-    target: &Manifest,
+    changes: &[NamespaceChange],
     concurrency: NonZeroUsize,
 ) -> Result<()> {
-    let files = target
-        .entries
+    let files = changes
         .iter()
-        .filter(|(path, node)| remote.entries.get(*path) != Some(*node))
-        .filter_map(|(_, node)| match &node.kind {
-            NodeKind::File { content, .. } => Some(content.clone()),
-            NodeKind::Directory => None,
+        .filter_map(|change| match change {
+            NamespaceChange::Put {
+                node:
+                    Node {
+                        kind: NodeKind::File { content, .. },
+                        ..
+                    },
+                ..
+            } => Some(content.clone()),
+            NamespaceChange::Put { .. } | NamespaceChange::Remove { .. } => None,
         })
         .collect::<Vec<_>>();
     stream::iter(files)
