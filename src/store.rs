@@ -213,28 +213,30 @@ impl MetadataStore for ObjectMetadataStore {
             Some(format) => format,
             None => {
                 if !self.operator.list("").await?.is_empty() {
-                    match self.read_format().await? {
-                        Some(format) => return self.initialize(format).await,
-                        None => bail!("storage root is not empty and has no Managed format"),
-                    }
-                }
-                match self
-                    .operator
-                    .write_with(FORMAT_KEY, serde_json::to_vec(&proposed)?)
-                    .if_not_exists(true)
-                    .await
-                {
-                    Ok(_) => proposed.clone(),
-                    Err(error) if precondition(&error) => self
-                        .read_format()
+                    self.read_format()
                         .await?
-                        .context("concurrent initializer did not leave a Managed format")?,
-                    Err(error) if error.is_temporary() || error.kind() == ErrorKind::Unexpected => {
-                        self.read_format()
+                        .context("storage root is not empty and has no Managed format")?
+                } else {
+                    match self
+                        .operator
+                        .write_with(FORMAT_KEY, serde_json::to_vec(&proposed)?)
+                        .if_not_exists(true)
+                        .await
+                    {
+                        Ok(_) => proposed.clone(),
+                        Err(error) if precondition(&error) => self
+                            .read_format()
                             .await?
-                            .context("Managed format initialization result is unknown")?
+                            .context("concurrent initializer did not leave a Managed format")?,
+                        Err(error)
+                            if error.is_temporary() || error.kind() == ErrorKind::Unexpected =>
+                        {
+                            self.read_format()
+                                .await?
+                                .context("Managed format initialization result is unknown")?
+                        }
+                        Err(error) => return Err(error).context("initialize Managed format"),
                     }
-                    Err(error) => return Err(error).context("initialize Managed format"),
                 }
             }
         };
@@ -325,10 +327,6 @@ impl MetadataStore for ObjectMetadataStore {
         commit.validate()?;
         if commit.volume_id != expected.format.volume_id || commit.parent != expected.head.cursor {
             bail!("publication does not match its observed authority position");
-        }
-        let current = self.observe_inner(&commit.volume_id).await?;
-        if current.head.cursor != expected.head.cursor || current.token != expected.token {
-            return Ok(PublicationOutcome::Conflict(current));
         }
         let checkpoint_cursor = if let Some(value) = checkpoint {
             if value.volume_id != commit.volume_id || value.cursor != commit.cursor {

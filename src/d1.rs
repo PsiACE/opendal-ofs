@@ -418,10 +418,6 @@ impl MetadataStore for D1MetadataStore {
         if commit.volume_id != expected.format.volume_id || commit.parent != expected.head.cursor {
             bail!("D1 publication does not match its observed authority position");
         }
-        let current = self.observe_inner(&commit.volume_id).await?;
-        if current.head.cursor != expected.head.cursor || current.token != expected.token {
-            return Ok(PublicationOutcome::Conflict(current));
-        }
         let checkpoint_cursor = checkpoint
             .as_ref()
             .map(|value| value.cursor.clone())
