@@ -55,16 +55,14 @@ pub(crate) struct D1Config {
 
 impl D1Config {
     pub(crate) fn resolve(locator: &StorageLocator, current: Option<&Url>) -> Result<Self> {
-        let environment = if current.is_none() {
-            std::env::var("OFS_METADATA_URL")
-                .ok()
-                .map(|value| Url::parse(&value))
-                .transpose()?
-        } else {
-            None
-        };
+        let environment = std::env::var("OFS_METADATA_URL")
+            .ok()
+            .map(|value| Url::parse(&value))
+            .transpose()?;
         let overlay = current
+            .filter(|url| url.query_pairs().any(|(key, _)| key == "token"))
             .or(environment.as_ref())
+            .or(current)
             .context("D1 metadata requires --metadata during create or OFS_METADATA_URL")?;
         if StorageLocator::parse(overlay)? != *locator {
             bail!("credential metadata URL does not match the catalog locator");
