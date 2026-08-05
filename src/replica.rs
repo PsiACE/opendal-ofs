@@ -27,11 +27,11 @@ use anyhow::{Context, Result, bail};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 use crate::model::{
     ContentRef, Cursor, Manifest, NamespaceChange, Node, NodeId, NodeKind, OperationId, VolumeId,
+    validate_name,
 };
 
 const STATE_FORMAT: &str = "ofs-sync-replica";
@@ -230,11 +230,38 @@ impl ReplicaState {
         if &self.volume_id != volume_id || self.local_root != paths.local {
             bail!("replica state binding does not match the volume or local directory");
         }
+        self.volume_id.validate()?;
         if let Some(common) = &self.common {
+            common.cursor.validate()?;
             common.manifest.validate()?;
         }
         if self.publication.is_some() && self.materialization.is_some() {
             bail!("replica cannot publish and materialize simultaneously");
+        }
+        if let Some(publication) = &self.publication {
+            publication.operation.validate()?;
+            publication.parent.validate()?;
+            publication.target.validate()?;
+            for change in &publication.changes {
+                change.validate()?;
+            }
+        }
+        if let Some(materialization) = &self.materialization {
+            materialization.target.validate()?;
+            materialization.manifest.validate()?;
+        }
+        for conflict in &self.conflicts {
+            crate::model::validate_path(&conflict.path)?;
+            conflict.remote_cursor.validate()?;
+            for node in [&conflict.base, &conflict.local, &conflict.remote]
+                .into_iter()
+                .flatten()
+            {
+                node.validate()?;
+            }
+        }
+        if self.publication.is_some() && !self.conflicts.is_empty() {
+            bail!("replica cannot publish while conflicts remain");
         }
         Ok(())
     }
@@ -446,53 +473,6 @@ fn same_file_shape(left: &Node, right: &Node) -> bool {
     matches!((&left.kind, &right.kind),
         (NodeKind::File { content: a, executable: x }, NodeKind::File { content: b, executable: y })
         if a.sha256 == b.sha256 && a.size == b.size && x == y)
-}
-
-fn validate_name(name: &str) -> Result<()> {
-    let normalized = name.nfc().collect::<String>();
-    let stem = name.split('.').next().unwrap_or(name);
-    if name.is_empty()
-        || name == "."
-        || name == ".."
-        || name.len() > 255
-        || name.ends_with([' ', '.'])
-        || normalized != name
-        || reserved_stem(stem)
-        || name
-            .chars()
-            .any(|value| value.is_control() || "<>:\"/\\|?*".contains(value))
-    {
-        bail!("name is outside the portable Managed Sync policy: {name:?}");
-    }
-    Ok(())
-}
-
-fn reserved_stem(stem: &str) -> bool {
-    matches!(
-        stem.to_ascii_uppercase().as_str(),
-        "CON"
-            | "PRN"
-            | "AUX"
-            | "NUL"
-            | "COM1"
-            | "COM2"
-            | "COM3"
-            | "COM4"
-            | "COM5"
-            | "COM6"
-            | "COM7"
-            | "COM8"
-            | "COM9"
-            | "LPT1"
-            | "LPT2"
-            | "LPT3"
-            | "LPT4"
-            | "LPT5"
-            | "LPT6"
-            | "LPT7"
-            | "LPT8"
-            | "LPT9"
-    )
 }
 
 fn new_node_id() -> Result<NodeId> {

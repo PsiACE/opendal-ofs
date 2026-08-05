@@ -17,11 +17,12 @@
 
 //! Provider-neutral Managed Volume records.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
+use unicode_normalization::UnicodeNormalization;
 
 const MANAGED_FORMAT: &str = "ofs-managed-volume";
 const RECORD_VERSION: u32 = 1;
@@ -39,7 +40,7 @@ macro_rules! identifier {
                 Ok(value)
             }
 
-            fn validate(&self) -> Result<()> {
+            pub(crate) fn validate(&self) -> Result<()> {
                 let value = self.as_str();
                 if value.is_empty()
                     || value.len() > 128
@@ -84,7 +85,7 @@ impl Cursor {
         }
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         self.operation.validate()?;
         if (self.generation == 0) != (self.operation.as_str() == "initial") {
             bail!("generation zero and the initial operation must identify the same cursor");
@@ -139,7 +140,7 @@ pub(crate) struct Node {
 }
 
 impl Node {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         self.id.validate()?;
         if let NodeKind::File { content, .. } = &self.kind {
             content.validate()?;
@@ -157,9 +158,24 @@ pub(crate) struct Manifest {
 
 impl Manifest {
     pub(crate) fn validate(&self) -> Result<()> {
+        let mut identities = BTreeSet::new();
         for (path, node) in &self.entries {
             validate_path(path)?;
             node.validate()?;
+            if !identities.insert(&node.id) {
+                bail!("Managed namespace contains a duplicate node identity");
+            }
+            let mut parent = path.as_str();
+            while let Some((value, _)) = parent.rsplit_once('/') {
+                if !self
+                    .entries
+                    .get(value)
+                    .is_some_and(|entry| matches!(entry.kind, NodeKind::Directory))
+                {
+                    bail!("Managed namespace path {path:?} has no directory parent");
+                }
+                parent = value;
+            }
         }
         Ok(())
     }
@@ -210,6 +226,29 @@ pub(crate) enum NamespaceChange {
     },
 }
 
+impl NamespaceChange {
+    pub(crate) fn validate(&self) -> Result<()> {
+        match self {
+            Self::Put {
+                path,
+                node,
+                replaces,
+            } => {
+                validate_path(path)?;
+                node.validate()?;
+                if let Some(id) = replaces {
+                    id.validate()?;
+                }
+            }
+            Self::Remove { path, removed } => {
+                validate_path(path)?;
+                removed.validate()?;
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct FormatRecord {
@@ -229,13 +268,15 @@ impl FormatRecord {
         if data_store_id.is_empty() {
             bail!("data store identity is empty");
         }
-        Ok(Self {
+        let value = Self {
             format: MANAGED_FORMAT.to_owned(),
             format_version: RECORD_VERSION,
             volume_id,
             placement,
             data_store_id,
-        })
+        };
+        value.validate()?;
+        Ok(value)
     }
 
     pub(crate) fn validate(&self) -> Result<()> {
@@ -326,7 +367,7 @@ impl CommitRecord {
             .generation
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("generation overflow"))?;
-        Ok(Self {
+        let value = Self {
             format: MANAGED_FORMAT.to_owned(),
             format_version: RECORD_VERSION,
             volume_id,
@@ -336,7 +377,9 @@ impl CommitRecord {
                 operation,
             },
             changes,
-        })
+        };
+        value.validate()?;
+        Ok(value)
     }
 
     pub(crate) fn validate(&self) -> Result<()> {
@@ -348,6 +391,9 @@ impl CommitRecord {
             || self.parent.generation.checked_add(1) != Some(self.cursor.generation)
         {
             bail!("invalid Managed change commit");
+        }
+        for change in &self.changes {
+            change.validate()?;
         }
         Ok(())
     }
@@ -390,17 +436,63 @@ fn validate_record(format: &str, version: u32) -> Result<()> {
     Ok(())
 }
 
-fn validate_path(path: &str) -> Result<()> {
+pub(crate) fn validate_path(path: &str) -> Result<()> {
     if path.is_empty()
+        || path.len() > 4096
         || path.starts_with('/')
         || path.ends_with('/')
-        || path
-            .split('/')
-            .any(|part| part.is_empty() || part == "." || part == "..")
+        || path.split('/').any(|part| validate_name(part).is_err())
     {
         bail!("invalid Managed namespace path {path:?}");
     }
     Ok(())
+}
+
+pub(crate) fn validate_name(name: &str) -> Result<()> {
+    let normalized = name.nfc().collect::<String>();
+    let stem = name.split('.').next().unwrap_or(name);
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.len() > 255
+        || name.ends_with([' ', '.'])
+        || normalized != name
+        || reserved_stem(stem)
+        || name
+            .chars()
+            .any(|value| value.is_control() || "<>:\"/\\|?*".contains(value))
+    {
+        bail!("name is outside the portable Managed Sync policy: {name:?}");
+    }
+    Ok(())
+}
+
+fn reserved_stem(stem: &str) -> bool {
+    matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
 }
 
 #[cfg(test)]

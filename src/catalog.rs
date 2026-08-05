@@ -137,9 +137,7 @@ impl VolumeDefinition {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.id().as_str().is_empty() {
-            bail!("volume id is empty");
-        }
+        self.id().validate()?;
         self.storage().validate()?;
         if let Some(MetadataConfig::External { locator }) = self.metadata() {
             locator.validate()?;
