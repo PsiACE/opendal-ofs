@@ -434,10 +434,18 @@ fn stage(
         bail!("stable input does not match its observed content");
     }
     match temporary.persist_noclobber(&target) {
-        Ok(_) => sync_directory(&directory),
+        Ok(_) => Ok(()),
         Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
         Err(error) => Err(error.error.into()),
     }
+}
+
+pub(crate) fn sync_staging(paths: &ReplicaPaths) -> Result<()> {
+    let directory = paths.state.join("staging");
+    if directory.exists() {
+        sync_directory(&directory)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn clear_staging(paths: &ReplicaPaths) -> Result<()> {

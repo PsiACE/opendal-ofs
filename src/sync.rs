@@ -161,6 +161,7 @@ pub(crate) async fn sync_once(volume: &ManagedVolume, request: SyncRequest<'_>) 
         target: target.clone(),
         changes: changes.clone(),
     };
+    crate::replica::sync_staging(&paths)?;
     state.publication = Some(pending);
     state.save(&paths)?;
     upload_changes(volume, &paths, &changes, request.transfers).await?;
