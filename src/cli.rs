@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::ffi::OsString;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
@@ -152,27 +151,6 @@ impl Invocation {
             DirectMountArgs::try_parse_from(args)
                 .map(Self::DirectMount)
                 .unwrap_or_else(|error| error.exit())
-        }
-    }
-
-    #[allow(dead_code)]
-    fn try_parse_from<I, T>(args: I) -> Result<Self, clap::Error>
-    where
-        I: IntoIterator<Item = T>,
-        T: Into<OsString> + Clone,
-    {
-        let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
-        let first = args.get(1).and_then(|value| value.to_str());
-        if args.len() == 1
-            || matches!(
-                first,
-                Some("volume" | "mount" | "sync" | "status" | "--config")
-            )
-            || first.is_some_and(|value| value.starts_with("--config="))
-        {
-            Cli::try_parse_from(args).map(Self::Command)
-        } else {
-            DirectMountArgs::try_parse_from(args).map(Self::DirectMount)
         }
     }
 }

@@ -522,7 +522,7 @@ mod tests {
         let encoded = r#"{
             "format":"ofs-managed-volume","format_version":1,
             "volume_id":"volume-1","cursor":{"generation":0,"operation":"initial"},
-            "checkpoint":{"generation":0,"operation":"initial"},"legacy":true
+            "checkpoint":{"generation":0,"operation":"initial"},"unexpected":true
         }"#;
         assert!(serde_json::from_str::<HeadRecord>(encoded).is_err());
     }

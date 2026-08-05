@@ -50,13 +50,27 @@ async fn execute_command(command: cli::Cli) -> Result<()> {
         cli::Command::Volume(args) => match args.command {
             cli::VolumeCommand::Create(args) => create_volume(command.config, args).await,
         },
-        cli::Command::Mount(args) => {
-            let _ = (command.config, args.volume, args.path);
-            bail!("volume-oriented mount is not implemented")
-        }
+        cli::Command::Mount(args) => mount_direct(command.config, args).await,
         cli::Command::Sync(args) => sync_managed(command.config, args).await,
         cli::Command::Status(args) => status_managed(command.config, args).await,
     }
+}
+
+async fn mount_direct(
+    requested_catalog: Option<std::path::PathBuf>,
+    args: cli::MountArgs,
+) -> Result<()> {
+    let path = catalog::catalog_path(requested_catalog)?;
+    let catalog = Catalog::load(&path)?;
+    let definition = catalog.get(&args.volume)?;
+    if definition.metadata().is_some() {
+        bail!("Managed Mount is not available");
+    }
+    execute_operator_mount(
+        store::assemble_operator(definition.storage(), None)?,
+        args.path,
+    )
+    .await
 }
 
 async fn status_managed(
@@ -205,10 +219,7 @@ fn new_id() -> Result<VolumeId> {
 
 #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
 async fn execute_direct_mount(cfg: cli::DirectMountArgs) -> Result<()> {
-    use fuse3::MountOptions;
-    use fuse3::path::Session;
     use opendal::Operator;
-    use std::env;
 
     if cfg.backend.has_host() {
         log::warn!("backend host will be ignored");
@@ -219,6 +230,18 @@ async fn execute_direct_mount(cfg: cli::DirectMountArgs) -> Result<()> {
 
     let backend = Operator::via_iter(scheme_str, op_args)
         .map_err(|err| anyhow!("invalid scheme or arguments for {scheme_str}: {err}"))?;
+
+    execute_operator_mount(backend, cfg.mount_path).await
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
+async fn execute_operator_mount(
+    backend: opendal::Operator,
+    mount_path: std::path::PathBuf,
+) -> Result<()> {
+    use fuse3::MountOptions;
+    use fuse3::path::Session;
+    use std::env;
 
     let mut mount_options = MountOptions::default();
     let mut gid = nix::unistd::getgid().into();
@@ -245,13 +268,11 @@ async fn execute_direct_mount(cfg: cli::DirectMountArgs) -> Result<()> {
         }
 
         let fs = fuse3_opendal::Filesystem::new(backend, uid, gid);
-        Session::new(mount_options)
-            .mount(fs, cfg.mount_path)
-            .await?
+        Session::new(mount_options).mount(fs, mount_path).await?
     } else {
         let fs = fuse3_opendal::Filesystem::new(backend, uid, gid);
         Session::new(mount_options)
-            .mount_with_unprivileged(fs, cfg.mount_path)
+            .mount_with_unprivileged(fs, mount_path)
             .await?
     };
 
