@@ -157,12 +157,19 @@ pub(crate) async fn sync_once(volume: &ManagedVolume, request: SyncRequest<'_>) 
     let pending = PendingPublication {
         operation: operation.clone(),
         parent: observed.head.cursor.clone(),
+        source: stable_local.clone(),
         target: target.clone(),
         changes: changes.clone(),
     };
     state.publication = Some(pending);
     state.save(&paths)?;
     upload_changes(volume, &paths, &remote, &target, request.transfers).await?;
+    if !publication_source_unchanged(&paths, &stable_local)? {
+        state.publication = None;
+        state.save(&paths)?;
+        crate::replica::clear_staging(&paths)?;
+        bail!("local tree changed while publication was prepared; rerun sync");
+    }
     let commit = CommitRecord::new(
         request.volume_id.clone(),
         observed.head.cursor.clone(),
@@ -173,6 +180,10 @@ pub(crate) async fn sync_once(volume: &ManagedVolume, request: SyncRequest<'_>) 
         PublicationOutcome::Committed(cursor) | PublicationOutcome::AlreadyCommitted(cursor) => {
             state.publication = None;
             state.save(&paths)?;
+            if !publication_source_unchanged(&paths, &stable_local)? {
+                crate::replica::clear_staging(&paths)?;
+                bail!("publication committed but the local tree changed; rerun sync");
+            }
             materialize(volume, &paths, &mut state, cursor, target).await?;
             Ok(state.common.as_ref().unwrap().cursor.generation)
         }
@@ -205,11 +216,21 @@ async fn recover(
             Some(cursor) => {
                 state.publication = None;
                 state.save(paths)?;
-                materialize(volume, paths, state, cursor, pending.target).await?;
+                if publication_source_unchanged(paths, &pending.source)? {
+                    materialize(volume, paths, state, cursor, pending.target).await?;
+                } else {
+                    crate::replica::clear_staging(paths)?;
+                }
             }
             None => {
                 let observed = volume.metadata.observe(&state.volume_id).await?;
                 if observed.head.cursor == pending.parent {
+                    if !publication_source_unchanged(paths, &pending.source)? {
+                        state.publication = None;
+                        state.save(paths)?;
+                        crate::replica::clear_staging(paths)?;
+                        return Ok(());
+                    }
                     upload_changes(
                         volume,
                         paths,
@@ -229,7 +250,11 @@ async fn recover(
                         | PublicationOutcome::AlreadyCommitted(cursor) => {
                             state.publication = None;
                             state.save(paths)?;
-                            materialize(volume, paths, state, cursor, pending.target).await?;
+                            if publication_source_unchanged(paths, &pending.source)? {
+                                materialize(volume, paths, state, cursor, pending.target).await?;
+                            } else {
+                                crate::replica::clear_staging(paths)?;
+                            }
                         }
                         PublicationOutcome::Unknown => {
                             bail!("recorded publication result remains unknown")
@@ -250,6 +275,10 @@ async fn recover(
         materialize(volume, paths, state, pending.target, pending.manifest).await?;
     }
     Ok(())
+}
+
+fn publication_source_unchanged(paths: &ReplicaPaths, source: &Manifest) -> Result<bool> {
+    Ok(crate::replica::scan(paths, Some(source), false)? == *source)
 }
 
 async fn remote_manifest(

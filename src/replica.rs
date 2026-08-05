@@ -128,6 +128,7 @@ pub(crate) struct CommonBase {
 pub(crate) struct PendingPublication {
     pub(crate) operation: OperationId,
     pub(crate) parent: Cursor,
+    pub(crate) source: Manifest,
     pub(crate) target: Manifest,
     pub(crate) changes: Vec<NamespaceChange>,
 }
@@ -241,6 +242,7 @@ impl ReplicaState {
         if let Some(publication) = &self.publication {
             publication.operation.validate()?;
             publication.parent.validate()?;
+            publication.source.validate()?;
             publication.target.validate()?;
             for change in &publication.changes {
                 change.validate()?;

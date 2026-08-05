@@ -130,6 +130,33 @@ assert_file "$tree_a/.bub/memory.md" 'remote memory'
 "$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_b" >/dev/null
 diff -ru "$tree_a" "$tree_b"
 
+# A file changing throughout preparation cannot advance the remote generation.
+status_json "$tree_b" >"$OFS_RUN_ROOT/status-before-unstable.json"
+before_unstable=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["base"]["generation"])' "$OFS_RUN_ROOT/status-before-unstable.json")
+dd if=/dev/zero of="$tree_a/.bub/unstable.bin" bs=1M count=32 status=none
+set +e
+"$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_a" \
+  >"$OFS_RUN_ROOT/unstable.log" 2>&1 & unstable_pid=$!
+(
+  update=0
+  while kill -0 "$unstable_pid" 2>/dev/null; do
+    printf '%08d' "$update" | dd of="$tree_a/.bub/unstable.bin" \
+      bs=8 count=1 conv=notrunc status=none
+    update=$((update + 1))
+  done
+) & modifier_pid=$!
+wait "$unstable_pid"; unstable_rc=$?
+wait "$modifier_pid"
+set -e
+if ((unstable_rc == 0)); then
+  printf 'continuously changing source unexpectedly published\n' >&2
+  exit 1
+fi
+status_json "$tree_b" >"$OFS_RUN_ROOT/status-after-unstable.json"
+assert_status "$OFS_RUN_ROOT/status-after-unstable.json" remote.generation "$before_unstable"
+rm "$tree_a/.bub/unstable.bin"
+"$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_a" >/dev/null
+
 # Competing edits retain a conflict; the selected local shape publishes later.
 printf 'candidate a\n' >"$tree_a/.bub/memory.md"
 printf 'winner b\n' >"$tree_b/.bub/memory.md"
