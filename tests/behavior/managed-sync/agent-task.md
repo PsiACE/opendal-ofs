@@ -10,6 +10,13 @@ Create the Managed volume with colocated metadata. Use the default replica
 state for every directory; do not inspect or edit sibling `.ofs-state`
 directories and do not inspect the provider's object layout.
 
+Create the volume by passing `--model managed` and
+`--storage "$OFS_STORAGE_URL"` to `ofs volume create`. Reference the environment
+variable in the command without printing, expanding, or copying its value.
+Do not use `env`, `printenv`, `set`, or another command that displays the
+storage variable. Omit `--state` from every sync and status command so each
+directory uses its default replica state.
+
 In sandbox A, create these one-line ordinary files:
 
 ```text

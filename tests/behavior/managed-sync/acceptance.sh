@@ -54,6 +54,10 @@ if [[ $actor == bub ]]; then
   timeout --signal=TERM --kill-after=15s "${BUB_TIMEOUT_SECONDS:-840}s" \
     bub --workspace "$OFS_RUN_ROOT" run --session-id "$OFS_VOLUME" "$task" \
     >"$OFS_RUN_ROOT/bub.log" 2>&1
+  if grep -Fq -- "$OFS_STORAGE_URL" "$OFS_RUN_ROOT/bub.log"; then
+    printf 'Bub log exposed the credentialed storage URL\n' >&2
+    exit 1
+  fi
   assert_file "$tree_a/memory/shared.md" 'shared memory from agent'
   assert_file "$tree_a/memory/private.md" 'private draft from agent'
   assert_file "$tree_b/skills/storage.txt" 'managed-sync'
