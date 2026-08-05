@@ -1,8 +1,8 @@
 # Managed Sync reference
 
 This reference describes the public Managed Sync commands, configuration,
-status vocabulary, supported filesystem surface, D1 requirements, and current
-behavior validation.
+status vocabulary, supported filesystem surface, storage layout, and D1
+requirements.
 
 ## Commands
 
@@ -136,7 +136,7 @@ head, immutable commits, and checkpoints are stored under the selected
 
 ### Growth and retention
 
-Current logical growth is approximately:
+Logical storage use grows as:
 
 ```text
 data bytes     = bytes in every unique content digest ever published
@@ -144,29 +144,15 @@ metadata bytes = fixed format/head + checkpoints + sum of commit records
 ```
 
 Failed or losing publications can also leave immutable commit or data objects
-that are not reachable from the head. No current command removes historical
-or unreachable objects.
+that are not reachable from the head. Managed Sync has no command that removes
+historical or unreachable objects.
 
-In a measured 1,000-file, 100-update tiny-file workload, G101 retained 1,800
-data objects and 101 commits. The 69,726-byte live tree occupied 130,526 bytes
-of content objects and 837,214 bytes of metadata: 1.87x, 12.01x, and 13.88x
-combined. G1 contributed a 420,499-byte full namespace commit; each later
-20-change commit averaged about 4,161 bytes. Thus routine publication was
-incremental, but retained history and namespace representation dominated the
-small live payload.
-
-Removing the derivable content-location string reduced the same workload's G1
-commit by exactly 85,000 bytes and G101 metadata by 153,000 bytes. Data object
-count and bytes did not change. This removes 85 bytes per file `put`; it does
-not address retained commit history, old content versions, or provider
-per-object overhead.
-
-A future compactor must publish a full checkpoint with a conditional head
-update before pruning earlier commits. Data collection must trace every
+Safe compaction requires a full checkpoint published with a conditional head
+update before earlier commits can be pruned. Data collection must trace every
 retained checkpoint and subsequent commit, preserve a retention window for
 offline replicas and idempotent recovery, and delay deletion of newly uploaded
-unreferenced blobs so it cannot race an in-flight publication. These retention
-and garbage-collection operations are not implemented.
+unreferenced blobs so it cannot race an in-flight publication. Managed Sync
+does not provide these retention and garbage-collection operations.
 
 ## D1 metadata locator
 
@@ -271,43 +257,3 @@ The D1 change-log reader performs one query per missed generation. Large
 generation gaps therefore increase foreground catch-up latency. There is no
 background daemon, periodic checkpoint, change-set merge, history browser,
 remote volume delete command, remote retention policy, or garbage collector.
-
-## Current behavior validation
-
-The checked-in acceptance assets exercise public commands and observable
-filesystem or status results. Current provider-backed validation covers the
-complete Managed Volume lifecycle with both colocated object metadata and a
-real D1 Metadata Store backed by MinIO content storage.
-
-- The full sanitized workspace contains 6,597 files and 662,007,352 logical
-  bytes. Initial publication, another replica, incremental sync, no-op sync,
-  and cold recovery converge to the same complete tree.
-- The long-history workload keeps 1,000 files converged through 1,000 explicit
-  publications, including stale readers and cold recovery.
-- Checked-in directory-churn regressions hand publication from A to B after a
-  complete catch-up and cover concurrent nested directory creation during
-  initialization, upgrade, and recreation. A separate provider-backed run
-  rotated 12 updates across four independent container volumes.
-- Provider-backed lifecycle, conflict, recovery, and credential-boundary
-  acceptance pass for their documented public behavior.
-
-Run the provider-backed behavior suites with:
-
-```console
-cargo build --locked --release --bin ofs
-
-OFS_BIN="$PWD/target/release/ofs" \
-  tests/behavior/managed-sync/minio.sh lifecycle
-OFS_BIN="$PWD/target/release/ofs" \
-  tests/behavior/managed-sync/minio.sh scripted
-OFS_BIN="$PWD/target/release/ofs" \
-  tests/behavior/managed-sync/minio.sh recovery
-
-set -a
-. ./.env
-set +a
-OFS_BIN="$PWD/target/release/ofs" \
-  tests/behavior/managed-sync/d1-minio.sh lifecycle
-OFS_BIN="$PWD/target/release/ofs" \
-  tests/behavior/managed-sync/d1-minio.sh scripted
-```

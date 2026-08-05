@@ -5,8 +5,8 @@ Managed Volume holds the published state. There is no background daemon. Local
 edits remain private until an agent explicitly runs `ofs sync`.
 
 This explanation shows how replicas share published generations, how one sync
-uses a common base and incremental changes, and where directory identity
-currently creates a conservative conflict.
+uses a common base and incremental changes, and how directory identity affects
+concurrent creation and rename conflicts.
 
 ## User-visible workflow
 
@@ -191,32 +191,17 @@ Different node types still report `incompatible_type_replacement`, and two
 different files created at the same child path still conflict. Coalescing a
 directory does not silently select between overlapping child edits.
 
-## Verified behavior
+## Replica state and local loss
 
-The directory-churn workflow was confirmed with four isolated Fedora agent
-containers and one MinIO container. Every agent container had its own named
-volume, catalog, home tree, replica state, and persistent container volume.
-All four used one authoritative MinIO bucket and root.
+The ordinary directory and its private replica state together form one
+replica. Removing the directory does not reset the common base stored in the
+replica state. If an empty directory is recreated with that old state, its
+missing paths are local deletions and the next sync can publish them.
 
-The initial tree contained 1,000 files and 968 directories under `.agents`,
-`.bub`, and `.codex`. The next 12 update publications rotated across A, B, C,
-and D. Before editing, each next publisher completely caught up; it then
-modified four files, deleted four files and their directories, and added four
-new directories and files. The run reached generation 13 without a
-materialization error. All four replicas converged, and a fifth empty replica
-cold-recovered the same 1,000-file digest.
+For cold recovery, remove both the lost directory and its replica state, or
+choose a fresh state path. Synchronizing the new empty directory then binds a
+new replica and materializes the latest published generation.
 
-The checked-in tests separately cover established empty replicas concurrently
-creating nested standard directories, an upgrade introducing a new public
-directory, deletion followed by concurrent recreation, and the conflicts that
-must not be coalesced.
-
-The cold-recovery step removed the lost replica's tree and established state
-before syncing an empty directory. An empty directory that still uses its old
-replica state is not a cold replica: its missing paths are local deletions and
-can be published as such.
-
-A separate MinIO check confirmed this distinction. After a generation 1 tree
-was removed and recreated empty while retaining its state, `ofs status`
-reported `local=changed` with the remote still `at_base`. Running sync then
-published the complete deletion as generation 2.
+If the local volume catalog is also lost, recreate the same named volume from
+the original Data Store and Metadata Store locators before synchronizing the
+new replica.

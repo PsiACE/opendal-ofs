@@ -23,7 +23,7 @@ Managed Sync separates local work from published state:
 5. Other agents receive the new generation on their next explicit sync.
 
 See [Managed Sync workflow](managed-sync-workflow.md) for diagrams of this
-publication flow, one reconciliation, and the current directory-identity
+publication flow, one reconciliation, and the directory-identity
 boundary.
 
 The operating model allows many readers at different generations and
@@ -81,10 +81,9 @@ snapshot. The initial checkpoint exists for first binding and cold recovery.
 This keeps routine publications proportional to the change set while retaining
 a complete recovery path when no replica state survives.
 
-A long-offline replica must still read every missed change record. With the D1
-adapter, this currently requires one authoritative query per missed generation,
-so catch-up latency grows with the generation gap even though transferred file
-content remains deduplicated.
+A long-offline replica must still read every missed change record. D1 catch-up
+uses one authoritative query per missed generation, so latency grows with the
+generation gap even though transferred file content remains deduplicated.
 
 ## Multiple agents
 
@@ -128,7 +127,7 @@ for the identity boundary and diagram.
 
 ## Why remote storage grows
 
-Managed Sync already publishes incrementally. The first non-empty publication
+Managed Sync publishes incrementally. The first non-empty publication
 describes the complete namespace because no earlier remote state exists. Each
 later commit contains only the namespace difference from the fixed remote head
 to the merged target. File content is addressed by SHA-256, so unchanged bytes
@@ -145,8 +144,8 @@ must first create a full checkpoint at a fixed head, conditionally move the
 head's checkpoint pointer, retain enough history for offline replicas and
 uncertain publications, and then mark data reachable from every retained
 checkpoint and commit before sweeping old blobs. Newly uploaded but not yet
-published data also needs a grace period. Managed Sync does not yet implement
-that checkpoint advancement, retention policy, or garbage collector.
+published data also needs a grace period. Managed Sync has no checkpoint
+advancement, retention policy, or garbage collector.
 
 ## Failure and recovery
 
