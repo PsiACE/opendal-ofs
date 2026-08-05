@@ -1,66 +1,130 @@
 # Apache OpenDAL™ ofs
 
-[![Build Status]][actions] [![Latest Version]][crates.io] [![Crate Downloads]][crates.io] [![chat]][discord]
+Apache OpenDAL™ ofs makes remote storage available through filesystem
+workflows. It supports two user-facing paths:
 
-[build status]: https://img.shields.io/github/actions/workflow/status/apache/opendal-ofs/ci.yml?branch=main
-[actions]: https://github.com/apache/opendal-ofs/actions?query=branch%3Amain
-[latest version]: https://img.shields.io/crates/v/ofs.svg
-[crates.io]: https://crates.io/crates/ofs
-[crate downloads]: https://img.shields.io/crates/d/ofs.svg
-[chat]: https://img.shields.io/discord/1081052318650339399
-[discord]: https://opendal.apache.org/discord
+- **Managed Sync** keeps agent memory, skills, history, and configuration in
+  ordinary local directories. Changes remain private until an explicit sync.
+- **Direct Mount** exposes an OpenDAL backend through FUSE on supported Unix
+  systems.
 
-`ofs` is a userspace filesystem backing by OpenDAL.
+Managed Sync is intended for short-lived servers and sandbox agents that need
+to recover a shared published state without using a storage SDK or running a
+background synchronization service.
 
-## Status
+## Build
 
-`ofs` is a work in progress. we only support `fs` and `s3` as backend on `Linux` currently.
-
-## How to use `ofs`
-
-### Install `FUSE` on Linux
-
-```shell
-sudo pacman -S fuse3 --noconfirm # archlinux
-sudo apt-get -y install fuse3    # debian/ubuntu
+```console
+cargo build --locked --release --bin ofs
+export PATH="$PWD/target/release:$PATH"
 ```
 
-### Load `FUSE` kernel module on FreeBSD
+## Create and synchronize a Managed Volume
 
-```shell
-kldload fuse
+Choose a catalog path and an OpenDAL storage URL. The catalog contains the
+volume definition but does not retain credentials.
+
+```console
+export OFS_CONFIG="$PWD/volumes.json"
+export OFS_STORAGE_URL='s3://?bucket=agent-state&root=home&endpoint=http://127.0.0.1:9000&region=us-east-1&access_key_id=ACCESS&secret_access_key=SECRET'
+
+ofs volume create agent-home \
+  --model managed \
+  --storage "$OFS_STORAGE_URL"
+
+mkdir agent-home
+printf 'remember this\n' >agent-home/memory.md
+ofs sync agent-home agent-home
 ```
 
-### Install `ofs`
+The first non-empty sync publishes the directory. Local edits after that point
+remain private until the same replica runs `ofs sync` again.
 
-`ofs` could be installed by `cargo`:
+A new agent starts from an empty directory:
 
-```shell
-cargo install ofs
+```console
+mkdir new-agent-home
+ofs sync agent-home new-agent-home
 ```
 
-> `cargo` is the Rust package manager. `cargo` could be installed by following the [Installation](https://www.rust-lang.org/tools/install) from Rust official website.
+The directory is materialized as ordinary files. The agent can use normal file
+tools and does not need an ofs process after the command exits.
 
-### Mount directory
+## Use D1 as the Metadata Store
 
-```shell
+D1 can hold the authoritative namespace while any supported OpenDAL service
+holds immutable file content. Keep the token in `OFS_METADATA_URL`; pass only
+the credential-free locator to `volume create`.
+
+```console
+export OFS_METADATA_URL='d1://ACCOUNT_ID/DATABASE_ID/agent-home?token=API_TOKEN'
+
+ofs volume create agent-home \
+  --model managed \
+  --storage "$OFS_STORAGE_URL" \
+  --metadata 'd1://ACCOUNT_ID/DATABASE_ID/agent-home'
+```
+
+All subsequent `sync` and `status` commands use the same public workflow. D1
+placement does not introduce a separate sync mode.
+
+## Inspect a replica
+
+```console
+ofs status agent-home
+ofs status agent-home --json
+```
+
+Status is read-only. If the authority cannot be reached, remote state is
+reported as unknown instead of returning a cached generation as current.
+
+## Recover after local loss
+
+Deleting a local directory, its sibling ofs state, or the local catalog does
+not delete the remote Managed Volume. Recreate the same named definition from
+the same storage and metadata locators, then sync into an empty directory:
+
+```console
+ofs volume create agent-home \
+  --model managed \
+  --storage "$OFS_STORAGE_URL" \
+  --metadata 'd1://ACCOUNT_ID/DATABASE_ID/agent-home'
+
+mkdir recovered-home
+ofs sync agent-home recovered-home
+```
+
+The volume identity and latest published generation are recovered from the
+Metadata Store.
+
+## Managed Sync scope
+
+Managed Sync supports complete directory synchronization for regular files,
+directories, empty directories, portable names, and executable bits on Unix.
+It supports multiple readers and fences stale publishers, while the normal
+workflow keeps one active publisher at a time.
+
+It does not provide background synchronization, path filters, symlinks, hard
+links, history browsing, timestamp restore, partial hydration, remote volume
+destruction, or remote garbage collection.
+
+See [Managed Sync explained](docs/managed-sync-explained.md) for the behavior
+and recovery model, and [Managed Sync reference](docs/managed-sync-reference.md)
+for commands, configuration, status, D1 requirements, and validation coverage.
+
+## Direct Mount
+
+Direct Mount requires FUSE and currently supports the `fs` and `s3` OpenDAL
+services on Linux.
+
+```console
 ofs <mount-point> 'fs://?root=<directory>'
+ofs <mount-point> 's3://?bucket=<bucket>&root=<path>&endpoint=<endpoint>&region=<region>'
 ```
 
-### Mount S3 bucket
+## License and trademarks
 
-```shell
-ofs <mount-point> 's3://?root=<path>&bucket=<bucket>&endpoint=<endpoint>&region=<region>&access_key_id=<access-key-id>&secret_access_key=<secret-access-key>'
-```
+Licensed under the Apache License, Version 2.0.
 
-## Branding
-
-The first and most prominent mentions must use the full form: **Apache OpenDAL™** of the name for any individual usage (webpage, handout, slides, etc.) Depending on the context and writing style, you should use the full form of the name sufficiently often to ensure that readers clearly understand the association of both the OpenDAL project and the OpenDAL software product to the ASF as the parent organization.
-
-For more details, see the [Apache Product Name Usage Guide](https://www.apache.org/foundation/marks/guide).
-
-## License and Trademarks
-
-Licensed under the Apache License, Version 2.0: http://www.apache.org/licenses/LICENSE-2.0
-
-Apache OpenDAL, OpenDAL, and Apache are either registered trademarks or trademarks of the Apache Software Foundation.
+Apache OpenDAL, OpenDAL, and Apache are either registered trademarks or
+trademarks of the Apache Software Foundation.
