@@ -148,6 +148,39 @@ assert_status "$OFS_RUN_ROOT/status-conflict.json" publication '"conflict"'
 "$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_b" >/dev/null
 diff -ru "$tree_a" "$tree_b"
 
+# Divergent renames retain one identity conflict and resolve to the local shape.
+mv "$tree_a/config.toml" "$tree_a/config-a.toml"
+mv "$tree_b/config.toml" "$tree_b/config-b.toml"
+"$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_b" >/dev/null
+if "$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_a" >/dev/null 2>&1; then
+  printf 'divergent rename unexpectedly published\n' >&2
+  exit 1
+fi
+test -f "$tree_a/config-a.toml"
+test ! -e "$tree_a/config-b.toml"
+status_json "$tree_a" >"$OFS_RUN_ROOT/status-rename-conflict.json"
+assert_status "$OFS_RUN_ROOT/status-rename-conflict.json" conflict_records.0.kind '"rename"'
+"$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_a" \
+  --resolve config.toml >/dev/null
+"$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_b" >/dev/null
+diff -ru "$tree_a" "$tree_b"
+
+# Delete-versus-modify retains local absence until it is explicitly selected.
+rm "$tree_a/.codex/history/new.jsonl"
+printf 'remote edit\n' >"$tree_b/.codex/history/new.jsonl"
+"$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_b" >/dev/null
+if "$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_a" >/dev/null 2>&1; then
+  printf 'delete-versus-modify unexpectedly published\n' >&2
+  exit 1
+fi
+test ! -e "$tree_a/.codex/history/new.jsonl"
+status_json "$tree_a" >"$OFS_RUN_ROOT/status-delete-conflict.json"
+assert_status "$OFS_RUN_ROOT/status-delete-conflict.json" conflict_records.0.kind '"delete_vs_modify"'
+"$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_a" \
+  --resolve .codex/history/new.jsonl >/dev/null
+"$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_b" >/dev/null
+diff -ru "$tree_a" "$tree_b"
+
 # Unsupported trees fail before a remote generation is changed.
 status_json "$tree_b" >"$OFS_RUN_ROOT/status-before-reject.json"
 before_reject=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["base"]["generation"])' "$OFS_RUN_ROOT/status-before-reject.json")
@@ -157,7 +190,7 @@ if "$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_b" >/dev/null 2>&1; 
   exit 1
 fi
 rm "$tree_b/unsupported-link"
-ln "$tree_b/config.toml" "$tree_b/hard-link"
+ln "$tree_b/config-a.toml" "$tree_b/hard-link"
 if "$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_b" >/dev/null 2>&1; then
   printf 'hard link unexpectedly synchronized\n' >&2
   exit 1

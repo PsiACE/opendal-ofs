@@ -317,6 +317,47 @@ fn merge(
     cursor: &Cursor,
     resolved: &BTreeSet<String>,
 ) -> (Manifest, Vec<Conflict>) {
+    let base_identities = identities(base);
+    let local_identities = identities(local);
+    let remote_identities = identities(remote);
+    let mut identity_choices = BTreeMap::<String, Option<Node>>::new();
+    let mut conflicts = Vec::new();
+    for (id, (base_path, base_node)) in &base_identities {
+        let local_value = local_identities.get(id);
+        let remote_value = remote_identities.get(id);
+        let local_path = local_value.map(|(path, _)| path.as_str());
+        let remote_path = remote_value.map(|(path, _)| path.as_str());
+        let local_relocated = local_path != Some(base_path.as_str());
+        let remote_relocated = remote_path != Some(base_path.as_str());
+        let divergent_location = local_relocated && remote_relocated && local_path != remote_path;
+        let rename_vs_edit = local_path.is_some()
+            && local_relocated
+            && remote_path == Some(base_path.as_str())
+            && remote_value.is_some_and(|(_, node)| node != base_node)
+            || remote_path.is_some()
+                && remote_relocated
+                && local_path == Some(base_path.as_str())
+                && local_value.is_some_and(|(_, node)| node != base_node);
+        if !divergent_location && !rename_vs_edit {
+            continue;
+        }
+        for path in [Some(base_path.as_str()), local_path, remote_path]
+            .into_iter()
+            .flatten()
+        {
+            identity_choices.insert(path.to_owned(), local.entries.get(path).cloned());
+        }
+        if !resolved.contains(base_path) {
+            conflicts.push(Conflict {
+                path: base_path.clone(),
+                kind: ConflictKind::Rename,
+                base: Some(base_node.clone()),
+                local: local_value.map(|(_, node)| node.clone()),
+                remote: remote_value.map(|(_, node)| node.clone()),
+                remote_cursor: cursor.clone(),
+            });
+        }
+    }
     let paths = base
         .entries
         .keys()
@@ -325,12 +366,13 @@ fn merge(
         .cloned()
         .collect::<BTreeSet<_>>();
     let mut entries = BTreeMap::new();
-    let mut conflicts = Vec::new();
     for path in paths {
         let base_node = base.entries.get(&path);
         let local_node = local.entries.get(&path);
         let remote_node = remote.entries.get(&path);
-        let selected = if resolved.contains(&path) {
+        let selected = if let Some(node) = identity_choices.get(&path) {
+            node.as_ref()
+        } else if resolved.contains(&path) {
             local_node
         } else if local_node == base_node {
             remote_node
@@ -352,6 +394,14 @@ fn merge(
         }
     }
     (Manifest { entries }, conflicts)
+}
+
+fn identities(manifest: &Manifest) -> BTreeMap<crate::model::NodeId, (String, Node)> {
+    manifest
+        .entries
+        .iter()
+        .map(|(path, node)| (node.id.clone(), (path.clone(), node.clone())))
+        .collect()
 }
 
 fn conflict_kind(base: Option<&Node>, local: Option<&Node>, remote: Option<&Node>) -> ConflictKind {
