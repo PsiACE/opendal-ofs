@@ -247,7 +247,7 @@ for line in (root / "minio-objects.jsonl").open(encoding="utf-8"):
     except json.JSONDecodeError: continue
     key, size = record.get("key", ""), int(record.get("size", 0))
     if "metadata/commits/" in key: kind = "change_commits"
-    elif "metadata/checkpoints/" in key: kind = "checkpoints"
+    elif "metadata/checkpoints/" in key or "metadata/snapshots/" in key: kind = "checkpoints"
     elif "data/sha256/" in key: kind = "immutable_data"
     else: kind = "authority"
     inventory[(kind, "objects")] += 1

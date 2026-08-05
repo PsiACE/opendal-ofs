@@ -68,6 +68,56 @@ if [[ $actor == bub ]]; then
   exit 0
 fi
 
+if [[ $actor == recovery ]]; then
+  source_tree=$tree_a
+  target_tree=$tree_b
+  "$OFS_BIN" --config "$catalog" volume create "$OFS_VOLUME" \
+    --model managed --storage "$OFS_STORAGE_URL"
+  mkdir "$source_tree/payload"
+  for index in $(seq 0 63); do
+    file="$source_tree/payload/file-$(printf '%02d' "$index").bin"
+    dd if=/dev/zero of="$file" bs=1M count=2 status=none
+    printf '%08d' "$index" | dd of="$file" bs=8 count=1 conv=notrunc status=none
+  done
+  "$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$source_tree" >/dev/null
+
+  "$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$target_tree" \
+    >"$OFS_RUN_ROOT/interrupted.log" 2>&1 & apply_pid=$!
+  partial=0
+  for _ in $(seq 1 2000); do
+    if [[ -d $target_tree/payload ]]; then
+      count=$(find "$target_tree/payload" -type f | wc -l)
+    else
+      count=0
+    fi
+    if ((count > 0 && count < 64)); then
+      partial=$count
+      kill -9 "$apply_pid"
+      break
+    fi
+    if ! kill -0 "$apply_pid" 2>/dev/null; then break; fi
+    sleep 0.005
+  done
+  set +e
+  wait "$apply_pid" 2>/dev/null
+  interrupted_rc=$?
+  set -e
+  if ((partial == 0 || interrupted_rc == 0)); then
+    printf 'materialization did not expose an interruptible partial tree\n' >&2
+    exit 1
+  fi
+
+  "$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$target_tree" >/dev/null
+  diff -ru "$source_tree" "$target_tree"
+  status_json "$target_tree" >"$OFS_RUN_ROOT/recovered.status.json"
+  assert_status "$OFS_RUN_ROOT/recovered.status.json" base.generation '1'
+  assert_status "$OFS_RUN_ROOT/recovered.status.json" publication '"idle"'
+  assert_status "$OFS_RUN_ROOT/recovered.status.json" materialize '"idle"'
+  assert_status "$OFS_RUN_ROOT/recovered.status.json" conflicts '0'
+  printf 'Managed Sync recovery acceptance passed\n'
+  exit 0
+fi
+
 # One sanitized agent workspace is published as one generation.
 mkdir -p "$tree_a/.agents/skills/storage" "$tree_a/.agents/empty" \
   "$tree_a/.bub" "$tree_a/.codex/history"
@@ -255,6 +305,17 @@ assert_status "$OFS_RUN_ROOT/status-after-reject.json" base.generation "$before_
 # A fresh tree and a locally removed replica both cold-rebuild exactly.
 "$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_c" >/dev/null
 diff -ru "$tree_a" "$tree_c"
+recovered_catalog="$OFS_RUN_ROOT/recovered-volumes.json"
+recovered_tree="$OFS_RUN_ROOT/recovered-agent"
+mkdir "$recovered_tree"
+"$OFS_BIN" --config "$recovered_catalog" volume create "$OFS_VOLUME" \
+  --model managed --storage "$OFS_STORAGE_URL"
+"$OFS_BIN" --config "$recovered_catalog" sync "$OFS_VOLUME" "$recovered_tree" >/dev/null
+diff -ru "$tree_a" "$recovered_tree"
+if grep -q 'ofs-acceptance-password' "$recovered_catalog"; then
+  printf 'recovered catalog persisted a storage credential\n' >&2
+  exit 1
+fi
 rm -rf "$tree_b" "$OFS_RUN_ROOT/.agent-b.ofs-state"
 mkdir "$tree_b"
 "$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_b" >/dev/null
