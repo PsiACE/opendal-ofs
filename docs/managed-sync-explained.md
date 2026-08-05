@@ -26,9 +26,10 @@ See [Managed Sync workflow](managed-sync-workflow.md) for diagrams of this
 publication flow, one reconciliation, and the current directory-identity
 boundary.
 
-The normal operating model allows many readers at different generations and
-one active publisher at a time. Conditional publication still protects the
-volume if two publishers overlap.
+The operating model allows many readers at different generations and
+publishers that take turns after catching up. Conditional publication protects
+the volume if two publishers overlap: one head update wins, and the other
+replica reconciles on a later explicit sync.
 
 ## Volume, authority, content, and replica
 
@@ -114,13 +115,38 @@ node metadata while published remote content remains in the Managed Volume.
 `--resolve`; resolution revalidates the remote generation before publishing.
 
 Two replicas that independently create the same directory path from a base
-where it was absent currently receive different directory identities. The
-merge conservatively reports that path as `divergent_rename`, even when their
-child-file edits are disjoint. Replicas that materialized an existing
-directory from the same published generation share its identity and do not
-conflict merely because they use the same directory name. See
+where it was absent receive different directory identities. When neither
+identity came from the base, the merge safely coalesces the new directory to
+the authority's identity and merges its children by path. This also works for
+multiple missing components created by `mkdir -p`.
+
+The rule does not coalesce a renamed base directory with an unrelated new
+directory, different node types, or different files created at the same child
+path. Those remain explicit conflicts. See
 [Managed Sync workflow](managed-sync-workflow.md#concurrent-creation-of-the-same-directory)
-for the observed behavior and operating implication.
+for the identity boundary and diagram.
+
+## Why remote storage grows
+
+Managed Sync already publishes incrementally. The first non-empty publication
+describes the complete namespace because no earlier remote state exists. Each
+later commit contains only the namespace difference from the fixed remote head
+to the merged target. File content is addressed by SHA-256, so unchanged bytes
+are not uploaded again and identical content shares one object.
+
+Storage still grows because commits and content versions are immutable. A file
+modification creates a new content object; deleting or superseding the file
+does not remove the old object or its historical commit. For trees containing
+many very small files, namespace JSON and per-object provider overhead can be
+much larger than live file bytes even though the write path is incremental.
+
+Reclaiming this history requires more than deleting old keys. A safe design
+must first create a full checkpoint at a fixed head, conditionally move the
+head's checkpoint pointer, retain enough history for offline replicas and
+uncertain publications, and then mark data reachable from every retained
+checkpoint and commit before sweeping old blobs. Newly uploaded but not yet
+published data also needs a grace period. Managed Sync does not yet implement
+that checkpoint advancement, retention policy, or garbage collector.
 
 ## Failure and recovery
 

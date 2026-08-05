@@ -263,7 +263,7 @@ Unsupported trees are rejected before a remote generation is advanced.
 | Local tree lost but established state retained | Use a fresh state path for cold recovery; reusing the old state treats missing paths as local deletions |
 | Local catalog lost | Recreate the same definition, then cold sync |
 | Same-path concurrent edits | Publication stops with a retained conflict |
-| Concurrent first creation of the same absent directory | Currently reports the directory as `divergent_rename`; explicit resolution is required |
+| Concurrent first creation of the same absent directory | Coalesces the two new directory identities and merges children by path; overlapping child changes can still conflict |
 | Authority unavailable during status | `remote.state` is `unknown` with no remote generation |
 | Publication result unknown | Next sync resolves the durable operation before retrying |
 
@@ -284,6 +284,10 @@ real D1 Metadata Store backed by MinIO content storage.
   and cold recovery converge to the same complete tree.
 - The long-history workload keeps 1,000 files converged through 1,000 explicit
   publications, including stale readers and cold recovery.
+- Checked-in directory-churn regressions hand publication from A to B after a
+  complete catch-up and cover concurrent nested directory creation during
+  initialization, upgrade, and recreation. A separate provider-backed run
+  rotated 12 updates across four independent container volumes.
 - Provider-backed lifecycle, conflict, recovery, and credential-boundary
   acceptance pass for their documented public behavior.
 
