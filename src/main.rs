@@ -29,6 +29,7 @@ mod catalog;
 mod cli;
 mod d1;
 mod model;
+mod reconcile;
 mod replica;
 mod status;
 mod store;
