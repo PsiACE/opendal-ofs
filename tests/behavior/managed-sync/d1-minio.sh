@@ -30,7 +30,9 @@ d1_execute() {
 import json
 import sys
 
-print(json.dumps({"sql": sys.argv[1], "params": [sys.argv[2]]}))
+sql = sys.argv[1]
+store_key = sys.argv[2]
+print(json.dumps({"sql": sql, "params": [store_key] * sql.count("?")}))
 PY
 )
   response=$(curl -fsS -X POST \
@@ -38,7 +40,19 @@ PY
     -H "Authorization: Bearer ${D1_KEY}" \
     -H 'Content-Type: application/json' \
     --data-binary "$body")
-  python3 -c 'import json,sys; value=json.load(sys.stdin); result=value.get("result", []); assert value.get("success") and len(result) == 1 and result[0].get("success") and result[0].get("meta", {}).get("served_by_primary") is True; assert sys.argv[1] != "empty" or result[0].get("results") == [{"retained": 0}]' "$mode" \
+  python3 -c '
+import json
+import sys
+
+response = json.load(sys.stdin)
+results = response.get("result", [])
+assert response.get("success") and len(results) == 1, response
+query = results[0]
+assert query.get("success"), query
+assert query.get("meta", {}).get("served_by_primary") is True, query
+if sys.argv[1] == "empty":
+    assert query.get("results") == [{"retained": 0}], query
+' "$mode" \
     <<<"$response"
 }
 
@@ -49,7 +63,13 @@ cleanup() {
       status=1
     fi
   done
-  if ! d1_execute "SELECT COUNT(*) AS retained FROM ofs_managed_formats WHERE store_key = ?" empty; then
+  retained_sql='SELECT
+    (SELECT COUNT(*) FROM ofs_managed_heads WHERE store_key = ?) +
+    (SELECT COUNT(*) FROM ofs_managed_commits WHERE store_key = ?) +
+    (SELECT COUNT(*) FROM ofs_managed_checkpoints WHERE store_key = ?) +
+    (SELECT COUNT(*) FROM ofs_managed_formats WHERE store_key = ?)
+    AS retained'
+  if ! d1_execute "$retained_sql" empty; then
     status=1
   fi
   if ! "$runtime" rm -f "$container" >/dev/null 2>&1; then
