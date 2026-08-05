@@ -14,6 +14,10 @@ tree_a="$OFS_RUN_ROOT/agent-a"
 tree_b="$OFS_RUN_ROOT/agent-b"
 tree_c="$OFS_RUN_ROOT/agent-c"
 mkdir "$tree_a" "$tree_b" "$tree_c"
+metadata_args=()
+if [[ -n ${OFS_METADATA_URL:-} ]]; then
+  metadata_args=(--metadata "${OFS_METADATA_LOCATOR:-$OFS_METADATA_URL}")
+fi
 
 status_json() {
   "$OFS_BIN" --config "$catalog" status "$1" --json
@@ -72,7 +76,7 @@ if [[ $actor == recovery ]]; then
   source_tree=$tree_a
   target_tree=$tree_b
   "$OFS_BIN" --config "$catalog" volume create "$OFS_VOLUME" \
-    --model managed --storage "$OFS_STORAGE_URL"
+    --model managed --storage "$OFS_STORAGE_URL" "${metadata_args[@]}"
   mkdir "$source_tree/payload"
   for index in $(seq 0 63); do
     file="$source_tree/payload/file-$(printf '%02d' "$index").bin"
@@ -173,9 +177,9 @@ printf 'shared memory\n' >"$tree_a/.bub/memory.md"
 printf '{"session":"a"}\n' >"$tree_a/.codex/history/session.jsonl"
 printf 'theme = "plain"\n' >"$tree_a/config.toml"
 "$OFS_BIN" --config "$catalog" volume create "$OFS_VOLUME" \
-  --model managed --storage "$OFS_STORAGE_URL"
+  --model managed --storage "$OFS_STORAGE_URL" "${metadata_args[@]}"
 "$OFS_BIN" --config "$catalog" volume create "$OFS_VOLUME" \
-  --model managed --storage "$OFS_STORAGE_URL"
+  --model managed --storage "$OFS_STORAGE_URL" "${metadata_args[@]}"
 if grep -q 'ofs-acceptance-password' "$catalog"; then
   printf 'catalog persisted a storage credential\n' >&2
   exit 1
@@ -357,7 +361,7 @@ recovered_catalog="$OFS_RUN_ROOT/recovered-volumes.json"
 recovered_tree="$OFS_RUN_ROOT/recovered-agent"
 mkdir "$recovered_tree"
 "$OFS_BIN" --config "$recovered_catalog" volume create "$OFS_VOLUME" \
-  --model managed --storage "$OFS_STORAGE_URL"
+  --model managed --storage "$OFS_STORAGE_URL" "${metadata_args[@]}"
 "$OFS_BIN" --config "$recovered_catalog" sync "$OFS_VOLUME" "$recovered_tree" >/dev/null
 diff -ru "$tree_a" "$recovered_tree"
 if grep -q 'ofs-acceptance-password' "$recovered_catalog"; then
@@ -375,7 +379,12 @@ before_status=$(sha256sum "$state_file" | cut -d' ' -f1)
 status_json "$tree_a" >"$OFS_RUN_ROOT/status-read-only.json"
 test "$before_status" = "$(sha256sum "$state_file" | cut -d' ' -f1)"
 credential_url=$OFS_STORAGE_URL
-export OFS_STORAGE_URL=${OFS_PUBLIC_STORAGE_URL:?}
+credential_metadata=${OFS_METADATA_URL:-}
+if ((${#metadata_args[@]})); then
+  unset OFS_METADATA_URL
+else
+  export OFS_STORAGE_URL=${OFS_PUBLIC_STORAGE_URL:?}
+fi
 status_json "$tree_a" >"$OFS_RUN_ROOT/status-offline.json"
 assert_status "$OFS_RUN_ROOT/status-offline.json" remote.state '"unknown"'
 python3 - "$OFS_RUN_ROOT/status-offline.json" <<'PY'
@@ -383,6 +392,9 @@ import json, sys
 assert "generation" not in json.load(open(sys.argv[1]))["remote"]
 PY
 export OFS_STORAGE_URL=$credential_url
+if [[ -n $credential_metadata ]]; then
+  export OFS_METADATA_URL=$credential_metadata
+fi
 
 # Independent publishers may race or serialize, but neither change is lost.
 printf 'agent a\n' >"$tree_a/.agents/a.txt"

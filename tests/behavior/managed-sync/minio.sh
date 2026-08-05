@@ -52,4 +52,8 @@ export OFS_PUBLIC_STORAGE_URL="s3://?bucket=ofs-managed-sync&root=${actor}&endpo
 export OFS_MINIO_ENDPOINT="http://127.0.0.1:${port}"
 export OFS_CONTAINER_RUNTIME="$runtime"
 
-"$workspace/tests/behavior/managed-sync/acceptance.sh" "$actor"
+if [[ $actor == lifecycle ]]; then
+  "$workspace/tests/behavior/managed-sync/lifecycle.sh"
+else
+  "$workspace/tests/behavior/managed-sync/acceptance.sh" "$actor"
+fi
