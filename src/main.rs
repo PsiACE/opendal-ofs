@@ -27,6 +27,7 @@ use store::MetadataStore;
 mod catalog;
 mod cli;
 mod model;
+mod replica;
 mod store;
 
 #[tokio::main(flavor = "multi_thread")]
