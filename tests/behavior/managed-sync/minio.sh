@@ -49,5 +49,7 @@ export OFS_RUN_ROOT="$run_root"
 export OFS_VOLUME=agent-home
 export OFS_STORAGE_URL="s3://?bucket=ofs-managed-sync&root=${actor}&endpoint=http://127.0.0.1:${port}&region=us-east-1&access_key_id=ofs-acceptance&secret_access_key=ofs-acceptance-password"
 export OFS_PUBLIC_STORAGE_URL="s3://?bucket=ofs-managed-sync&root=${actor}&endpoint=http://127.0.0.1:${port}&region=us-east-1"
+export OFS_MINIO_ENDPOINT="http://127.0.0.1:${port}"
+export OFS_CONTAINER_RUNTIME="$runtime"
 
 "$workspace/tests/behavior/managed-sync/acceptance.sh" "$actor"

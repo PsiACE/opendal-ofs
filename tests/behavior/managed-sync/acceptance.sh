@@ -114,6 +114,53 @@ if [[ $actor == recovery ]]; then
   assert_status "$OFS_RUN_ROOT/recovered.status.json" publication '"idle"'
   assert_status "$OFS_RUN_ROOT/recovered.status.json" materialize '"idle"'
   assert_status "$OFS_RUN_ROOT/recovered.status.json" conflicts '0'
+
+  # Kill after MinIO has committed the head but before the durable intent clears.
+  trace_container="ofs-recovery-trace-${PPID}-$$"
+  trace_file="$OFS_RUN_ROOT/minio-trace.jsonl"
+  trace_runtime=${OFS_CONTAINER_RUNTIME:?}
+  "$trace_runtime" run --rm --name "$trace_container" --network host --entrypoint /bin/sh \
+    quay.io/minio/mc:RELEASE.2024-09-16T17-43-14Z -c \
+    "mc alias set recovery ${OFS_MINIO_ENDPOINT:?} ofs-acceptance ofs-acceptance-password >/dev/null && mc admin trace --json recovery" \
+    >"$trace_file" 2>/dev/null & trace_pid=$!
+  sleep 0.3
+  printf 'changed\n' | dd of="$source_tree/payload/file-00.bin" \
+    bs=8 count=1 conv=notrunc status=none
+  "$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$source_tree" \
+    >"$OFS_RUN_ROOT/unknown.log" 2>&1 & publish_pid=$!
+  killed=false
+  for _ in $(seq 1 2000); do
+    if grep -F 's3.PutObject' "$trace_file" | grep -Eq 'metadata(%2F|/)head'; then
+      if kill -0 "$publish_pid" 2>/dev/null; then
+        kill -9 "$publish_pid"
+        killed=true
+      fi
+      break
+    fi
+    if ! kill -0 "$publish_pid" 2>/dev/null; then break; fi
+    sleep 0.005
+  done
+  "$trace_runtime" rm -f "$trace_container" >/dev/null 2>&1 || true
+  wait "$trace_pid" 2>/dev/null || true
+  set +e
+  wait "$publish_pid" 2>/dev/null
+  unknown_rc=$?
+  set -e
+  if ! $killed || ((unknown_rc == 0)); then
+    printf 'publication did not retain an interruptible unknown result\n' >&2
+    exit 1
+  fi
+  status_json "$source_tree" >"$OFS_RUN_ROOT/unknown.status.json"
+  assert_status "$OFS_RUN_ROOT/unknown.status.json" base.generation '1'
+  assert_status "$OFS_RUN_ROOT/unknown.status.json" remote.generation '2'
+  assert_status "$OFS_RUN_ROOT/unknown.status.json" publication '"pending"'
+
+  "$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$source_tree" >/dev/null
+  "$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$target_tree" >/dev/null
+  diff -ru "$source_tree" "$target_tree"
+  status_json "$source_tree" >"$OFS_RUN_ROOT/resolved-unknown.status.json"
+  assert_status "$OFS_RUN_ROOT/resolved-unknown.status.json" base.generation '2'
+  assert_status "$OFS_RUN_ROOT/resolved-unknown.status.json" publication '"idle"'
   printf 'Managed Sync recovery acceptance passed\n'
   exit 0
 fi

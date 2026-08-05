@@ -178,12 +178,11 @@ pub(crate) async fn sync_once(volume: &ManagedVolume, request: SyncRequest<'_>) 
     )?;
     match volume.metadata.publish(&observed, commit).await? {
         PublicationOutcome::Committed(cursor) | PublicationOutcome::AlreadyCommitted(cursor) => {
-            state.publication = None;
-            state.save(&paths)?;
             if !publication_source_unchanged(&paths, &stable_local)? {
-                crate::replica::clear_staging(&paths)?;
                 bail!("publication committed but the local tree changed; rerun sync");
             }
+            state.publication = None;
+            state.save(&paths)?;
             materialize(volume, &paths, &mut state, cursor, target).await?;
             Ok(state.common.as_ref().unwrap().cursor.generation)
         }
@@ -214,11 +213,13 @@ async fn recover(
             .await?
         {
             Some(cursor) => {
-                state.publication = None;
-                state.save(paths)?;
                 if publication_source_unchanged(paths, &pending.source)? {
+                    state.publication = None;
+                    state.save(paths)?;
                     materialize(volume, paths, state, cursor, pending.target).await?;
                 } else {
+                    state.publication = None;
+                    state.save(paths)?;
                     crate::replica::clear_staging(paths)?;
                 }
             }
@@ -241,11 +242,13 @@ async fn recover(
                     match volume.metadata.publish(&observed, commit).await? {
                         PublicationOutcome::Committed(cursor)
                         | PublicationOutcome::AlreadyCommitted(cursor) => {
-                            state.publication = None;
-                            state.save(paths)?;
                             if publication_source_unchanged(paths, &pending.source)? {
+                                state.publication = None;
+                                state.save(paths)?;
                                 materialize(volume, paths, state, cursor, pending.target).await?;
                             } else {
+                                state.publication = None;
+                                state.save(paths)?;
                                 crate::replica::clear_staging(paths)?;
                             }
                         }
