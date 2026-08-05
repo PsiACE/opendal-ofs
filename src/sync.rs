@@ -523,10 +523,10 @@ async fn upload_changes(
             if staged.exists() {
                 volume
                     .data
-                    .put_file(&staged, &content.sha256, content.size)
+                    .put_file(&staged, &content.sha256, content.size, concurrency)
                     .await?;
             } else {
-                volume.data.verify(&content).await?;
+                volume.data.verify(&content, concurrency).await?;
             }
             Ok(())
         })
@@ -670,7 +670,7 @@ async fn stage_materialization_files(
             crate::replica::discard_staged_content(paths, &content)?;
             volume
                 .data
-                .fetch(&content, &paths.staged(&content.sha256))
+                .fetch(&content, &paths.staged(&content.sha256), transfers)
                 .await
         })
         .await?;

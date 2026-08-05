@@ -18,12 +18,13 @@
 //! Provider adapters for a Managed Volume.
 
 use std::fmt::Write as _;
+use std::num::NonZeroUsize;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use futures::TryStreamExt;
-use opendal::layers::RetryLayer;
+use opendal::layers::{ConcurrentLimitLayer, RetryLayer};
 use opendal::{ErrorKind, Operator};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -43,6 +44,7 @@ const COMMIT_PREFIX: &str = "metadata/commits/";
 const CHECKPOINT_PREFIX: &str = "metadata/checkpoints/";
 const DATA_PREFIX: &str = "data/sha256/";
 const INITIAL_KEY: &str = "initial";
+const DATA_READ_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub(crate) struct Observation {
@@ -204,7 +206,7 @@ impl MetadataStore for ObjectMetadataStore {
         let format = match self.read_format().await? {
             Some(format) => format,
             None => {
-                if !self.operator.list("").await?.is_empty() {
+                if !self.operator.list_with("").limit(1).await?.is_empty() {
                     self.read_format()
                         .await?
                         .context("storage root is not empty and has no Managed format")?
@@ -373,6 +375,7 @@ impl DataStore {
         source: &Path,
         expected_sha256: &str,
         expected_size: u64,
+        concurrency: NonZeroUsize,
     ) -> Result<ContentRef> {
         let content = ContentRef {
             data_ref: format!("sha256:{expected_sha256}"),
@@ -381,15 +384,20 @@ impl DataStore {
         };
         content.validate()?;
         let key = data_key(&content)?;
-        let mut writer = match self.operator.writer_with(&key).if_not_exists(true).await {
-            Ok(writer) => Some(writer),
-            Err(error) if precondition(&error) => None,
+        let mut writer = match self
+            .operator
+            .writer_with(&key)
+            .if_not_exists(true)
+            .concurrent(concurrency.get())
+            .await
+        {
+            Ok(writer) => writer,
+            Err(error) if precondition(&error) => {
+                self.verify(&content, concurrency).await?;
+                return Ok(content);
+            }
             Err(error) => return Err(error).context("open immutable data writer"),
         };
-        if writer.is_none() {
-            self.verify(&content).await?;
-            return Ok(content);
-        }
         let mut file = tokio::fs::File::open(source).await?;
         let mut buffer = vec![0; 1024 * 1024];
         let mut hasher = Sha256::new();
@@ -401,31 +409,34 @@ impl DataStore {
             }
             hasher.update(&buffer[..read]);
             size += read as u64;
-            writer
-                .as_mut()
-                .unwrap()
-                .write(buffer[..read].to_vec())
-                .await?;
+            writer.write(buffer[..read].to_vec()).await?;
         }
         if size != expected_size || hex(hasher.finalize()) != expected_sha256 {
-            writer.as_mut().unwrap().abort().await?;
+            writer.abort().await?;
             bail!("staged content changed before immutable upload completed");
         }
-        match writer.as_mut().unwrap().close().await {
-            Ok(_) => self.verify(&content).await?,
+        let result = writer.close().await;
+        drop(writer);
+        match result {
+            Ok(_) => self.verify(&content, concurrency).await?,
             Err(error) if precondition(&error) || error.is_temporary() => {
-                self.verify(&content).await?
+                self.verify(&content, concurrency).await?
             }
             Err(error) => return Err(error).context("finish immutable data write"),
         }
         Ok(content)
     }
 
-    pub(crate) async fn fetch(&self, content: &ContentRef, target: &Path) -> Result<()> {
+    pub(crate) async fn fetch(
+        &self,
+        content: &ContentRef,
+        target: &Path,
+        concurrency: NonZeroUsize,
+    ) -> Result<()> {
         let parent = target.parent().context("staged content has no parent")?;
         let temporary = tempfile::NamedTempFile::new_in(parent)?;
         let mut file = tokio::fs::File::from_std(temporary.reopen()?);
-        self.read(content, Some(&mut file)).await?;
+        self.read(content, Some(&mut file), concurrency).await?;
         file.sync_all().await?;
         drop(file);
         temporary
@@ -434,17 +445,31 @@ impl DataStore {
         Ok(())
     }
 
-    pub(crate) async fn verify(&self, content: &ContentRef) -> Result<()> {
-        self.read(content, None).await.map(|_| ())
+    pub(crate) async fn verify(
+        &self,
+        content: &ContentRef,
+        concurrency: NonZeroUsize,
+    ) -> Result<()> {
+        self.read(content, None, concurrency).await.map(|_| ())
     }
 
     async fn read(
         &self,
         content: &ContentRef,
         mut target: Option<&mut tokio::fs::File>,
+        concurrency: NonZeroUsize,
     ) -> Result<u64> {
         content.validate()?;
-        let reader = self.operator.reader(&data_key(content)?).await?;
+        let key = data_key(content)?;
+        let reader = self.operator.reader_with(&key);
+        let reader = if content.size > DATA_READ_CHUNK_SIZE as u64 {
+            reader
+                .chunk(DATA_READ_CHUNK_SIZE)
+                .concurrent(concurrency.get())
+        } else {
+            reader
+        };
+        let reader = reader.await?;
         let mut stream = reader.into_stream(..).await?;
         let mut hasher = Sha256::new();
         let mut size = 0_u64;
@@ -467,6 +492,7 @@ impl DataStore {
 pub(crate) fn assemble_operator(
     locator: &StorageLocator,
     current: Option<&Url>,
+    concurrency: Option<NonZeroUsize>,
 ) -> Result<Operator> {
     let environment = if current.is_none() {
         std::env::var("OFS_STORAGE_URL")
@@ -499,9 +525,14 @@ pub(crate) fn assemble_operator(
             config.push((key.into_owned(), value.into_owned()));
         }
     }
-    Operator::via_iter(&locator.scheme, config)
+    let operator = Operator::via_iter(&locator.scheme, config)
         .map(|operator| operator.layer(RetryLayer::new().with_jitter().with_max_times(3)))
-        .context("assemble OpenDAL operator")
+        .context("assemble OpenDAL operator")?;
+    Ok(match concurrency {
+        Some(value) => operator
+            .layer(ConcurrentLimitLayer::new(value.get()).with_http_concurrent_limit(value.get())),
+        None => operator,
+    })
 }
 
 pub(crate) fn data_store_id(locator: &StorageLocator) -> Result<String> {

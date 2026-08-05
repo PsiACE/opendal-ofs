@@ -67,7 +67,7 @@ async fn mount_direct(
         bail!("Managed Mount is not available");
     }
     execute_operator_mount(
-        store::assemble_operator(definition.storage(), None)?,
+        store::assemble_operator(definition.storage(), None, None)?,
         args.path,
     )
     .await
@@ -93,7 +93,7 @@ async fn status_managed(
     let status_operator = if metadata.external_locator().is_some() {
         None
     } else {
-        store::assemble_operator(definition.storage(), None).ok()
+        store::assemble_operator(definition.storage(), None, None).ok()
     };
     let remote = match metadata_store(metadata, status_operator.as_ref(), None) {
         Ok(store) => store.observe(&state.volume_id).await.ok(),
@@ -122,7 +122,7 @@ async fn sync_managed(
         .metadata()
         .context("Direct Sync is not available")?;
     sync::admit(&args.require)?;
-    let operator = store::assemble_operator(definition.storage(), None)?;
+    let operator = store::assemble_operator(definition.storage(), None, Some(transfers))?;
     let volume = sync::ManagedVolume {
         metadata: metadata_store(metadata, Some(&operator), None)?,
         data: store::DataStore::new(operator)?,
@@ -167,14 +167,14 @@ async fn create_volume(
                 if existing.storage() != &storage || existing.metadata() != Some(&metadata) {
                     bail!("volume name already refers to a different definition");
                 }
-                let operator = store::assemble_operator(&storage, Some(&args.storage))?;
+                let operator = store::assemble_operator(&storage, Some(&args.storage), None)?;
                 store::DataStore::new(operator.clone())?;
                 let metadata_store =
                     metadata_store(&metadata, Some(&operator), args.metadata.as_ref())?;
                 metadata_store.observe(existing.id()).await?;
                 return Ok(());
             }
-            let operator = store::assemble_operator(&storage, Some(&args.storage))?;
+            let operator = store::assemble_operator(&storage, Some(&args.storage), None)?;
             store::DataStore::new(operator.clone())?;
             let metadata_store =
                 metadata_store(&metadata, Some(&operator), args.metadata.as_ref())?;
