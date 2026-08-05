@@ -193,27 +193,20 @@ remote volume delete command, remote retention policy, or garbage collector.
 
 ## Current behavior validation
 
-The checked-in acceptance assets exercise only public commands and observable
-filesystem or status results.
+The checked-in acceptance assets exercise public commands and observable
+filesystem or status results. Current provider-backed validation covers the
+complete Managed Volume lifecycle with both colocated object metadata and a
+real D1 Metadata Store backed by MinIO content storage.
 
-| Scenario | Current result |
-| --- | --- |
-| Colocated metadata with disposable MinIO | Scripted lifecycle and recovery pass |
-| External D1 metadata with disposable MinIO data | Full scripted behavior passes |
-| Rotating single-publisher agents | 12 handoffs, final generation 13, exact convergence |
-| Fresh and removed agents | Repeated cold materialization passes |
-| Lagged reader | Generation 1 to generation 13 incremental catch-up passes |
-| Lost catalog | Same volume definition reopens and cold-recovers |
-| Lost tree and state | Empty replica cold-recovers exactly |
-| Wrong D1/Data Store binding | Rejected before catalog or head mutation |
-| Large sanitized workspace | 6,597 files and 662,007,352 logical bytes converge |
-| Long change history | 1,000 files through 1,000 explicit publications converge |
+- The full sanitized workspace contains 6,597 files and 662,007,352 logical
+  bytes. Initial publication, another replica, incremental sync, no-op sync,
+  and cold recovery converge to the same complete tree.
+- The long-history workload keeps 1,000 files converged through 1,000 explicit
+  publications, including stale readers and cold recovery.
+- Provider-backed lifecycle, conflict, recovery, and credential-boundary
+  acceptance pass for their documented public behavior.
 
-The real D1 runs use a random store key in the configured database and remove
-all rows owned by that key after successful validation. Credentials, provider
-responses, private replica state, and generated evidence are not committed.
-
-Run the reproducible local and D1 behavior suites with:
+Run the provider-backed behavior suites with:
 
 ```console
 cargo build --locked --release --bin ofs
