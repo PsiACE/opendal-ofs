@@ -18,10 +18,16 @@
 use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
+use uuid::Uuid;
+
+use catalog::{Catalog, MetadataConfig, StorageLocator, VolumeDefinition};
+use model::{FormatRecord, MetadataPlacement, VolumeId};
+use store::MetadataStore;
 
 mod catalog;
 mod cli;
 mod model;
+mod store;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
@@ -37,16 +43,7 @@ async fn main() -> Result<()> {
 async fn execute_command(command: cli::Cli) -> Result<()> {
     match command.command {
         cli::Command::Volume(args) => match args.command {
-            cli::VolumeCommand::Create(args) => {
-                let _ = (
-                    command.config,
-                    args.name,
-                    args.model,
-                    args.storage,
-                    args.metadata,
-                );
-                bail!("named volume creation is not available in this commit")
-            }
+            cli::VolumeCommand::Create(args) => create_volume(command.config, args).await,
         },
         cli::Command::Mount(args) => {
             let _ = (command.config, args.volume, args.path);
@@ -68,6 +65,59 @@ async fn execute_command(command: cli::Cli) -> Result<()> {
             bail!("Managed Sync status is not available in this commit")
         }
     }
+}
+
+async fn create_volume(
+    requested_catalog: Option<std::path::PathBuf>,
+    args: cli::VolumeCreateArgs,
+) -> Result<()> {
+    let path = catalog::catalog_path(requested_catalog)?;
+    let mut catalog = Catalog::load(&path)?;
+    let storage = StorageLocator::parse(&args.storage)?;
+    match args.model {
+        cli::VolumeModel::Direct => {
+            if args.metadata.is_some() {
+                bail!("a Direct volume cannot use --metadata");
+            }
+            let definition = VolumeDefinition::direct(new_id()?, storage);
+            catalog.insert(args.name, definition)?;
+            catalog.save(&path)
+        }
+        cli::VolumeModel::Managed => {
+            if args.metadata.is_some() {
+                bail!("external Metadata Store support is not available in this commit");
+            }
+            let metadata = MetadataConfig::ColocatedObject;
+            if let Ok(existing) = catalog.get(&args.name) {
+                if existing.storage() != &storage || existing.metadata() != Some(&metadata) {
+                    bail!("volume name already refers to a different definition");
+                }
+                let operator = store::assemble_operator(&storage, Some(&args.storage))?;
+                store::DataStore::new(operator.clone())?;
+                let object = store::ObjectMetadataStore::new(operator)?;
+                object.observe(existing.id()).await?;
+                return Ok(());
+            }
+            let operator = store::assemble_operator(&storage, Some(&args.storage))?;
+            store::DataStore::new(operator.clone())?;
+            let object = store::ObjectMetadataStore::new(operator)?;
+            let proposed = FormatRecord::new(
+                new_id()?,
+                MetadataPlacement::ColocatedObject,
+                store::data_store_id(&storage)?,
+            )?;
+            let observed = object.initialize(proposed).await?;
+            catalog.insert(
+                args.name,
+                VolumeDefinition::managed(observed.format.volume_id, storage, metadata),
+            )?;
+            catalog.save(&path)
+        }
+    }
+}
+
+fn new_id() -> Result<VolumeId> {
+    VolumeId::parse(Uuid::new_v4().to_string())
 }
 
 #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]

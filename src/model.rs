@@ -28,7 +28,7 @@ const RECORD_VERSION: u32 = 1;
 
 macro_rules! identifier {
     ($name:ident) => {
-        #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+        #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
         #[serde(transparent)]
         pub(crate) struct $name(String);
 
@@ -233,13 +233,17 @@ impl FormatRecord {
         }
         Ok(())
     }
+
+    pub(crate) fn same_storage(&self, other: &Self) -> bool {
+        self.placement == other.placement && self.data_store_id == other.data_store_id
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct HeadRecord {
-    format: String,
-    format_version: u32,
+    pub(crate) format: String,
+    pub(crate) format_version: u32,
     pub(crate) volume_id: VolumeId,
     pub(crate) cursor: Cursor,
     pub(crate) checkpoint: Cursor,

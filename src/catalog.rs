@@ -77,6 +77,19 @@ pub(crate) enum MetadataConfig {
     External { locator: StorageLocator },
 }
 
+impl MetadataConfig {
+    pub(crate) fn external(locator: StorageLocator) -> Self {
+        Self::External { locator }
+    }
+
+    pub(crate) fn external_locator(&self) -> Option<&StorageLocator> {
+        match self {
+            Self::External { locator } => Some(locator),
+            Self::ColocatedObject => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "model", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum VolumeDefinition {
@@ -92,6 +105,18 @@ pub(crate) enum VolumeDefinition {
 }
 
 impl VolumeDefinition {
+    pub(crate) fn direct(id: VolumeId, storage: StorageLocator) -> Self {
+        Self::Direct { id, storage }
+    }
+
+    pub(crate) fn managed(id: VolumeId, storage: StorageLocator, metadata: MetadataConfig) -> Self {
+        Self::Managed {
+            id,
+            storage,
+            metadata,
+        }
+    }
+
     pub(crate) fn id(&self) -> &VolumeId {
         match self {
             Self::Direct { id, .. } | Self::Managed { id, .. } => id,
