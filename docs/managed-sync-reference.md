@@ -93,6 +93,81 @@ The selected service must support read, write, and create-only immutable
 writes. Colocated object metadata additionally requires list with limit,
 conditional write, and create-only write.
 
+### Colocated object layout
+
+All keys are relative to the configured storage root.
+
+| Key | Contents | Mutation rule |
+| --- | --- | --- |
+| `metadata/format` | Volume identity, metadata placement, and Data Store binding | Created once |
+| `metadata/head` | Current cursor and checkpoint cursor | Replaced with an ETag-conditional write |
+| `metadata/checkpoints/initial` | Full empty generation-0 manifest | Immutable |
+| `metadata/commits/OPERATION_ID` | Parent cursor, new cursor, and namespace changes | One immutable object per published generation |
+| `data/sha256/DIGEST` | Raw file bytes | Immutable and deduplicated by SHA-256 |
+
+The first non-empty commit contains one `put` for every directory and file.
+Later commits contain only `diff(remote, merged_target)`: creates, changes, and
+removals for affected paths. An unchanged file creates neither a new commit
+entry nor a new data object. `metadata/head` is overwritten in place, while
+commits and data versions accumulate.
+
+A file `put` stores one content reference containing the full SHA-256 digest
+and byte size. The Data Store key is derived from that digest; the metadata
+does not repeat a `data_ref` string.
+
+```text
+G0  format + head(G0) + checkpoints/initial(empty)
+ |
+ | first publication: full namespace commit + every unique live file digest
+ v
+G1  commits/O1(full) + data/sha256/... + head -> G1
+ |
+ | incremental publication: changed-path commit + only new file digests
+ v
+G2  commits/O2(delta) + additional data/sha256/... + head -> G2
+ |
+ v
+Gn  every earlier immutable commit and digest is still present
+```
+
+With external D1 metadata, S3 contains only `data/sha256/DIGEST`. The format,
+head, immutable commits, and checkpoints are stored under the selected
+`STORE_KEY` in the D1 tables listed below.
+
+### Growth and retention
+
+Current logical growth is approximately:
+
+```text
+data bytes     = bytes in every unique content digest ever published
+metadata bytes = fixed format/head + checkpoints + sum of commit records
+```
+
+Failed or losing publications can also leave immutable commit or data objects
+that are not reachable from the head. No current command removes historical
+or unreachable objects.
+
+In a measured 1,000-file, 100-update tiny-file workload, G101 retained 1,800
+data objects and 101 commits. The 69,726-byte live tree occupied 130,526 bytes
+of content objects and 837,214 bytes of metadata: 1.87x, 12.01x, and 13.88x
+combined. G1 contributed a 420,499-byte full namespace commit; each later
+20-change commit averaged about 4,161 bytes. Thus routine publication was
+incremental, but retained history and namespace representation dominated the
+small live payload.
+
+Removing the derivable content-location string reduced the same workload's G1
+commit by exactly 85,000 bytes and G101 metadata by 153,000 bytes. Data object
+count and bytes did not change. This removes 85 bytes per file `put`; it does
+not address retained commit history, old content versions, or provider
+per-object overhead.
+
+A future compactor must publish a full checkpoint with a conditional head
+update before pruning earlier commits. Data collection must trace every
+retained checkpoint and subsequent commit, preserve a retention window for
+offline replicas and idempotent recovery, and delay deletion of newly uploaded
+unreferenced blobs so it cannot race an in-flight publication. These retention
+and garbage-collection operations are not implemented.
+
 ## D1 metadata locator
 
 The credential-free catalog form is:

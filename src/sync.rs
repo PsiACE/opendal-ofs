@@ -838,11 +838,7 @@ mod tests {
         Node {
             id: NodeId::parse(id).unwrap(),
             kind: NodeKind::File {
-                content: ContentRef {
-                    data_ref: format!("data/{sha256}"),
-                    sha256,
-                    size: 1,
-                },
+                content: ContentRef { sha256, size: 1 },
                 executable: false,
             },
         }

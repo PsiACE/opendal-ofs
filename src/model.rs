@@ -104,18 +104,13 @@ pub(crate) enum MetadataPlacement {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ContentRef {
-    /// Opaque Data Store reference. Sync Access never interprets it.
-    pub(crate) data_ref: String,
     pub(crate) sha256: String,
     pub(crate) size: u64,
 }
 
 impl ContentRef {
     pub(crate) fn validate(&self) -> Result<()> {
-        if self.data_ref.is_empty()
-            || self.sha256.len() != 64
-            || !self.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
-        {
+        if self.sha256.len() != 64 || !self.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             bail!("invalid immutable content reference");
         }
         Ok(())

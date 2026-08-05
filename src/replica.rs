@@ -394,11 +394,7 @@ fn scan_directory(
                 Node {
                     id,
                     kind: NodeKind::File {
-                        content: ContentRef {
-                            data_ref: format!("sha256:{sha256}"),
-                            sha256,
-                            size,
-                        },
+                        content: ContentRef { sha256, size },
                         executable,
                     },
                 },

@@ -381,7 +381,6 @@ impl DataStore {
         concurrency: NonZeroUsize,
     ) -> Result<ContentRef> {
         let content = ContentRef {
-            data_ref: format!("sha256:{expected_sha256}"),
             sha256: expected_sha256.to_owned(),
             size: expected_size,
         };
