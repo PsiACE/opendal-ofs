@@ -18,6 +18,8 @@
 //! One foreground Managed Sync reconciliation.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
@@ -73,7 +75,7 @@ pub(crate) async fn sync_once(volume: &ManagedVolume, request: SyncRequest<'_>) 
     let paths = ReplicaPaths::resolve(request.local, request.state)?;
     let _lock = ReplicaLock::acquire(&paths)?;
     let mut state = ReplicaState::load_or_new(request.volume_id, &paths)?;
-    recover(volume, &paths, &mut state).await?;
+    recover(volume, &paths, &mut state, request.transfers).await?;
     if state.publication.is_none() {
         crate::replica::clear_staging(&paths)?;
     }
@@ -86,18 +88,22 @@ pub(crate) async fn sync_once(volume: &ManagedVolume, request: SyncRequest<'_>) 
         &observed.head.checkpoint,
     )
     .await?;
-    let local = crate::replica::scan(
-        &paths,
-        state.common.as_ref().map(|base| &base.manifest),
-        false,
-    )?;
 
     if state.common.is_none() {
+        let local = crate::replica::scan(&paths, None, false)?;
         if !local.entries.is_empty() && !remote.entries.is_empty() {
             bail!("local and remote trees are both non-empty without a common base");
         }
         if local.entries.is_empty() {
-            materialize(volume, &paths, &mut state, observed.head.cursor, remote).await?;
+            materialize(
+                volume,
+                &paths,
+                &mut state,
+                observed.head.cursor,
+                remote,
+                request.transfers,
+            )
+            .await?;
             return Ok(state.common.as_ref().unwrap().cursor.generation);
         }
     }
@@ -132,6 +138,15 @@ pub(crate) async fn sync_once(volume: &ManagedVolume, request: SyncRequest<'_>) 
     }
 
     let stable_local = crate::replica::scan(&paths, Some(&base), true)?;
+    if state.conflicts.is_empty()
+        && state
+            .common
+            .as_ref()
+            .is_some_and(|common| common.cursor == observed.head.cursor)
+        && stable_local == remote
+    {
+        return Ok(observed.head.cursor.generation);
+    }
     let (target, conflicts) = merge(
         &base,
         &stable_local,
@@ -148,7 +163,15 @@ pub(crate) async fn sync_once(volume: &ManagedVolume, request: SyncRequest<'_>) 
     state.conflicts.clear();
 
     if target == remote {
-        materialize(volume, &paths, &mut state, observed.head.cursor, target).await?;
+        materialize(
+            volume,
+            &paths,
+            &mut state,
+            observed.head.cursor,
+            target,
+            request.transfers,
+        )
+        .await?;
         return Ok(state.common.as_ref().unwrap().cursor.generation);
     }
 
@@ -184,7 +207,15 @@ pub(crate) async fn sync_once(volume: &ManagedVolume, request: SyncRequest<'_>) 
             }
             state.publication = None;
             state.save(&paths)?;
-            materialize(volume, &paths, &mut state, cursor, target).await?;
+            materialize(
+                volume,
+                &paths,
+                &mut state,
+                cursor,
+                target,
+                request.transfers,
+            )
+            .await?;
             Ok(state.common.as_ref().unwrap().cursor.generation)
         }
         PublicationOutcome::Conflict(actual) => {
@@ -206,6 +237,7 @@ async fn recover(
     volume: &ManagedVolume,
     paths: &ReplicaPaths,
     state: &mut ReplicaState,
+    transfers: NonZeroUsize,
 ) -> Result<()> {
     if let Some(pending) = state.publication.clone() {
         match volume
@@ -217,7 +249,7 @@ async fn recover(
                 if publication_source_unchanged(paths, &pending.source)? {
                     state.publication = None;
                     state.save(paths)?;
-                    materialize(volume, paths, state, cursor, pending.target).await?;
+                    materialize(volume, paths, state, cursor, pending.target, transfers).await?;
                 } else {
                     state.publication = None;
                     state.save(paths)?;
@@ -233,7 +265,7 @@ async fn recover(
                         crate::replica::clear_staging(paths)?;
                         return Ok(());
                     }
-                    upload_changes(volume, paths, &pending.changes, NonZeroUsize::MIN).await?;
+                    upload_changes(volume, paths, &pending.changes, transfers).await?;
                     let commit = CommitRecord::new(
                         state.volume_id.clone(),
                         pending.parent,
@@ -246,7 +278,15 @@ async fn recover(
                             if publication_source_unchanged(paths, &pending.source)? {
                                 state.publication = None;
                                 state.save(paths)?;
-                                materialize(volume, paths, state, cursor, pending.target).await?;
+                                materialize(
+                                    volume,
+                                    paths,
+                                    state,
+                                    cursor,
+                                    pending.target,
+                                    transfers,
+                                )
+                                .await?;
                             } else {
                                 state.publication = None;
                                 state.save(paths)?;
@@ -269,7 +309,15 @@ async fn recover(
         }
     }
     if let Some(pending) = state.materialization.clone() {
-        materialize(volume, paths, state, pending.target, pending.manifest).await?;
+        materialize(
+            volume,
+            paths,
+            state,
+            pending.target,
+            pending.manifest,
+            transfers,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -449,9 +497,9 @@ async fn upload_changes(
     changes: &[NamespaceChange],
     concurrency: NonZeroUsize,
 ) -> Result<()> {
-    let files = changes
-        .iter()
-        .filter_map(|change| match change {
+    let mut files = BTreeMap::new();
+    for change in changes {
+        let content = match change {
             NamespaceChange::Put {
                 node:
                     Node {
@@ -459,11 +507,16 @@ async fn upload_changes(
                         ..
                     },
                 ..
-            } => Some(content.clone()),
-            NamespaceChange::Put { .. } | NamespaceChange::Remove { .. } => None,
-        })
-        .collect::<Vec<_>>();
-    stream::iter(files)
+            } => content,
+            NamespaceChange::Put { .. } | NamespaceChange::Remove { .. } => continue,
+        };
+        if let Some(existing) = files.insert(content.sha256.clone(), content.clone())
+            && existing != *content
+        {
+            bail!("one content digest has inconsistent publication metadata");
+        }
+    }
+    stream::iter(files.into_values())
         .map(Ok::<_, anyhow::Error>)
         .try_for_each_concurrent(concurrency.get(), |content| async move {
             let staged = paths.staged(&content.sha256);
@@ -486,18 +539,23 @@ async fn materialize(
     state: &mut ReplicaState,
     cursor: Cursor,
     target: Manifest,
+    transfers: NonZeroUsize,
 ) -> Result<()> {
     let mut durable_directories = BTreeSet::new();
-    state.materialization = Some(PendingMaterialization {
-        target: cursor.clone(),
-        manifest: target.clone(),
-    });
-    state.save(paths)?;
-    let current = crate::replica::scan(
-        paths,
-        state.common.as_ref().map(|base| &base.manifest),
-        false,
-    )?;
+    let mut installs = Vec::new();
+    match &state.materialization {
+        Some(pending) if pending.target == cursor && pending.manifest == target => {}
+        Some(_) => bail!("materialization intent does not match its requested target"),
+        None => {
+            state.materialization = Some(PendingMaterialization {
+                target: cursor.clone(),
+                manifest: target.clone(),
+            });
+            state.save(paths)?;
+        }
+    }
+    let current = crate::replica::scan(paths, Some(&target), false)?;
+    stage_materialization_files(volume, paths, &current, &target, transfers).await?;
     let mut removals = current
         .entries
         .keys()
@@ -550,15 +608,15 @@ async fn materialize(
             .context("materialization path has no parent")?;
         std::fs::create_dir_all(parent)?;
         durable_directories.insert(parent.to_owned());
-        let name = path.file_name().unwrap().to_string_lossy();
-        let temporary = parent.join(format!(".{name}.ofs-apply-{}", content.sha256));
-        if temporary.exists() {
-            remove_path(&temporary)?;
-        }
-        volume.data.fetch(content, &temporary).await?;
-        set_executable(&temporary, *executable)?;
-        std::fs::rename(&temporary, &path)?;
+        let temporary = parent.join(format!(".ofs-apply-{}", node.id.as_str()));
+        installs.push(StagedInstall {
+            source: paths.staged(&content.sha256),
+            temporary,
+            target: path,
+            executable: *executable,
+        });
     }
+    install_staged_files(installs, transfers).await?;
     let mut durable_directories = durable_directories.into_iter().collect::<Vec<_>>();
     durable_directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
     for directory in durable_directories {
@@ -576,6 +634,95 @@ async fn materialize(
     state.conflicts.clear();
     crate::replica::clear_staging(paths)?;
     state.save(paths)
+}
+
+async fn stage_materialization_files(
+    volume: &ManagedVolume,
+    paths: &ReplicaPaths,
+    current: &Manifest,
+    target: &Manifest,
+    transfers: NonZeroUsize,
+) -> Result<()> {
+    let mut contents = BTreeMap::new();
+    for (relative, node) in &target.entries {
+        if current.entries.get(relative) == Some(node) {
+            continue;
+        }
+        let NodeKind::File { content, .. } = &node.kind else {
+            continue;
+        };
+        if let Some(existing) = contents.insert(content.sha256.clone(), content.clone())
+            && existing != *content
+        {
+            bail!("one content digest has inconsistent materialization metadata");
+        }
+    }
+    if contents.is_empty() {
+        return Ok(());
+    }
+    crate::replica::prepare_staging(paths)?;
+    stream::iter(contents.into_values())
+        .map(Ok::<_, anyhow::Error>)
+        .try_for_each_concurrent(transfers.get(), |content| async move {
+            if crate::replica::staged_content_matches(paths, &content)? {
+                return Ok(());
+            }
+            crate::replica::discard_staged_content(paths, &content)?;
+            volume
+                .data
+                .fetch(&content, &paths.staged(&content.sha256))
+                .await
+        })
+        .await?;
+    crate::replica::sync_staging(paths)
+}
+
+fn install_staged_file(
+    staged: &Path,
+    temporary: &Path,
+    target: &Path,
+    executable: bool,
+) -> Result<()> {
+    if temporary.exists() {
+        remove_path(temporary)?;
+    }
+    let mut input = File::open(staged)?;
+    let mut output = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(temporary)?;
+    std::io::copy(&mut input, &mut output)?;
+    output.flush()?;
+    output.sync_all()?;
+    drop(output);
+    set_executable(temporary, executable)?;
+    std::fs::rename(temporary, target)?;
+    Ok(())
+}
+
+struct StagedInstall {
+    source: PathBuf,
+    temporary: PathBuf,
+    target: PathBuf,
+    executable: bool,
+}
+
+async fn install_staged_files(installs: Vec<StagedInstall>, transfers: NonZeroUsize) -> Result<()> {
+    stream::iter(installs)
+        .map(Ok::<_, anyhow::Error>)
+        .try_for_each_concurrent(transfers.get(), |install| async move {
+            tokio::task::spawn_blocking(move || {
+                install_staged_file(
+                    &install.source,
+                    &install.temporary,
+                    &install.target,
+                    install.executable,
+                )
+            })
+            .await
+            .context("join staged file installation")?
+        })
+        .await
 }
 
 fn remove_path(path: &Path) -> Result<()> {

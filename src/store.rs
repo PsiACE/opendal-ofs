@@ -422,9 +422,15 @@ impl DataStore {
     }
 
     pub(crate) async fn fetch(&self, content: &ContentRef, target: &Path) -> Result<()> {
-        let mut file = tokio::fs::File::create(target).await?;
+        let parent = target.parent().context("staged content has no parent")?;
+        let temporary = tempfile::NamedTempFile::new_in(parent)?;
+        let mut file = tokio::fs::File::from_std(temporary.reopen()?);
         self.read(content, Some(&mut file)).await?;
         file.sync_all().await?;
+        drop(file);
+        temporary
+            .persist_noclobber(target)
+            .map_err(|error| error.error)?;
         Ok(())
     }
 

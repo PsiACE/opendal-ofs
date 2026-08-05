@@ -82,6 +82,36 @@ impl ReplicaPaths {
     }
 }
 
+pub(crate) fn prepare_staging(paths: &ReplicaPaths) -> Result<PathBuf> {
+    let directory = paths.state.join("staging");
+    std::fs::create_dir_all(&directory)?;
+    set_private_directory(&directory)?;
+    Ok(directory)
+}
+
+pub(crate) fn staged_content_matches(paths: &ReplicaPaths, content: &ContentRef) -> Result<bool> {
+    let path = paths.staged(&content.sha256);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_file() {
+        bail!("staged content path is not a regular file");
+    }
+    let (sha256, size) = fingerprint(&path, &metadata)?;
+    Ok(sha256 == content.sha256 && size == content.size)
+}
+
+pub(crate) fn discard_staged_content(paths: &ReplicaPaths, content: &ContentRef) -> Result<()> {
+    let path = paths.staged(&content.sha256);
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 pub(crate) struct ReplicaLock(File);
 
 impl ReplicaLock {
@@ -410,9 +440,7 @@ fn stage(
     size: u64,
     before: &std::fs::Metadata,
 ) -> Result<()> {
-    let directory = paths.state.join("staging");
-    std::fs::create_dir_all(&directory)?;
-    set_private_directory(&directory)?;
+    let directory = prepare_staging(paths)?;
     let target = directory.join(sha256);
     if target.exists() {
         let (actual, actual_size) = fingerprint(&target, &std::fs::metadata(&target)?)?;
