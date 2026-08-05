@@ -402,6 +402,7 @@ dependencies = [
  "quote",
  "syn",
 ]
+
 [[package]]
 name = "dlv-list"
 version = "0.5.2"
@@ -1315,10 +1316,13 @@ dependencies = [
  "logforth",
  "nix 0.30.1",
  "opendal",
+ "serde",
+ "serde_json",
  "tempfile",
  "test-context",
  "tokio",
  "url",
+ "uuid",
  "walkdir",
 ]
 

@@ -17,33 +17,60 @@
 
 use anyhow::Result;
 use anyhow::anyhow;
-use clap::Parser;
-use url::Url;
+use anyhow::bail;
 
-#[derive(Parser, Debug)]
-#[command(version, about)]
-struct Config {
-    /// fuse mount path
-    #[arg(env = "OFS_MOUNT_PATH", index = 1)]
-    mount_path: String,
-
-    /// location of opendal service
-    /// format: <scheme>://?<key>=<value>&<key>=<value>
-    /// example: fs://?root=/tmp
-    #[arg(env = "OFS_BACKEND", index = 2)]
-    backend: Url,
-}
+mod catalog;
+mod cli;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
-    let cfg = Config::parse();
+    let invocation = cli::Invocation::parse();
 
     logforth::starter_log::stderr().apply();
-    execute(cfg).await
+    match invocation {
+        cli::Invocation::Command(command) => execute_command(command).await,
+        cli::Invocation::DirectMount(args) => execute_direct_mount(args).await,
+    }
+}
+
+async fn execute_command(command: cli::Cli) -> Result<()> {
+    match command.command {
+        cli::Command::Volume(args) => match args.command {
+            cli::VolumeCommand::Create(args) => {
+                let _ = (
+                    command.config,
+                    args.name,
+                    args.model,
+                    args.storage,
+                    args.metadata,
+                );
+                bail!("named volume creation is not available in this commit")
+            }
+        },
+        cli::Command::Mount(args) => {
+            let _ = (command.config, args.volume, args.path);
+            bail!("volume-oriented mount is not implemented")
+        }
+        cli::Command::Sync(args) => {
+            let _ = (
+                command.config,
+                args.volume,
+                args.directory,
+                args.state,
+                args.resolve,
+                args.transfer_concurrency,
+            );
+            bail!("Managed Sync is not available in this commit")
+        }
+        cli::Command::Status(args) => {
+            let _ = (command.config, args.directory, args.state, args.json);
+            bail!("Managed Sync status is not available in this commit")
+        }
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
-async fn execute(cfg: Config) -> Result<()> {
+async fn execute_direct_mount(cfg: cli::DirectMountArgs) -> Result<()> {
     use fuse3::MountOptions;
     use fuse3::path::Session;
     use opendal::Operator;

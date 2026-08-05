@@ -35,6 +35,9 @@ clap = { version = "4.5.40", features = ["derive", "env"] }
 log = { version = "0.4.22" }
 logforth = { version = "0.28.1", features = ["starter-log"] }
 opendal = { version = "0.57.0" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3.23.0"
 tokio = { version = "1.47.0", features = [
   "fs",
   "macros",
@@ -43,6 +46,7 @@ tokio = { version = "1.47.0", features = [
   "signal",
 ] }
 url = { version = "2.5.4" }
+uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))'.dependencies]
 fuse3 = { version = "0.8.1", "features" = ["tokio-runtime", "unprivileged"] }
@@ -57,6 +61,5 @@ services-s3 = ["opendal/services-s3"]
 
 [dev-dependencies]
 opendal = { version = "0.57.0", features = ["tests"] }
-tempfile = "3.23.0"
 test-context = "0.4.1"
 walkdir = "2.5.0"
