@@ -88,6 +88,7 @@ impl ReplicaLock {
         std::fs::create_dir_all(&paths.state)?;
         let file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(paths.state.join(LOCK_FILE))?;

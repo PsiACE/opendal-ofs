@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
@@ -29,6 +30,7 @@ mod cli;
 mod model;
 mod replica;
 mod store;
+mod sync;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
@@ -50,22 +52,48 @@ async fn execute_command(command: cli::Cli) -> Result<()> {
             let _ = (command.config, args.volume, args.path);
             bail!("volume-oriented mount is not implemented")
         }
-        cli::Command::Sync(args) => {
-            let _ = (
-                command.config,
-                args.volume,
-                args.directory,
-                args.state,
-                args.resolve,
-                args.transfer_concurrency,
-            );
-            bail!("Managed Sync is not available in this commit")
-        }
+        cli::Command::Sync(args) => sync_managed(command.config, args).await,
         cli::Command::Status(args) => {
             let _ = (command.config, args.directory, args.state, args.json);
             bail!("Managed Sync status is not available in this commit")
         }
     }
+}
+
+async fn sync_managed(
+    requested_catalog: Option<std::path::PathBuf>,
+    args: cli::SyncArgs,
+) -> Result<()> {
+    let path = catalog::catalog_path(requested_catalog)?;
+    let catalog = Catalog::load(&path)?;
+    let transfers = args
+        .transfer_concurrency
+        .unwrap_or_else(|| catalog.transfer_concurrency());
+    let definition = catalog.get(&args.volume)?;
+    let metadata = definition
+        .metadata()
+        .context("Direct Sync is not available")?;
+    if metadata.external_locator().is_some() {
+        bail!("external Metadata Store support is not available in this commit");
+    }
+    let operator = store::assemble_operator(definition.storage(), None)?;
+    let volume = sync::ManagedVolume {
+        metadata: store::ObjectMetadataStore::new(operator.clone())?,
+        data: store::DataStore::new(operator)?,
+    };
+    let generation = sync::sync_once(
+        &volume,
+        sync::SyncRequest {
+            volume_id: definition.id(),
+            local: &args.directory,
+            state: args.state.as_deref(),
+            resolutions: &args.resolve,
+            transfers,
+        },
+    )
+    .await?;
+    println!("Managed Sync completed at generation {generation}");
+    Ok(())
 }
 
 async fn create_volume(

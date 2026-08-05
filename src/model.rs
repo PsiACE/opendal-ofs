@@ -34,7 +34,13 @@ macro_rules! identifier {
 
         impl $name {
             pub(crate) fn parse(value: impl Into<String>) -> Result<Self> {
-                let value = value.into();
+                let value = Self(value.into());
+                value.validate()?;
+                Ok(value)
+            }
+
+            fn validate(&self) -> Result<()> {
+                let value = self.as_str();
                 if value.is_empty()
                     || value.len() > 128
                     || !value
@@ -43,7 +49,7 @@ macro_rules! identifier {
                 {
                     bail!("invalid {}", stringify!($name));
                 }
-                Ok(Self(value))
+                Ok(())
             }
 
             pub(crate) fn as_str(&self) -> &str {
@@ -77,6 +83,14 @@ impl Cursor {
             operation: OperationId("initial".to_owned()),
         }
     }
+
+    fn validate(&self) -> Result<()> {
+        self.operation.validate()?;
+        if (self.generation == 0) != (self.operation.as_str() == "initial") {
+            bail!("generation zero and the initial operation must identify the same cursor");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -108,7 +122,7 @@ impl ContentRef {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum NodeKind {
     Directory,
     File {
@@ -121,12 +135,12 @@ pub(crate) enum NodeKind {
 #[serde(deny_unknown_fields)]
 pub(crate) struct Node {
     pub(crate) id: NodeId,
-    #[serde(flatten)]
     pub(crate) kind: NodeKind,
 }
 
 impl Node {
     fn validate(&self) -> Result<()> {
+        self.id.validate()?;
         if let NodeKind::File { content, .. } = &self.kind {
             content.validate()?;
         }
@@ -228,6 +242,7 @@ impl FormatRecord {
         if self.format != MANAGED_FORMAT || self.format_version != RECORD_VERSION {
             bail!("unsupported Managed Volume format or version");
         }
+        self.volume_id.validate()?;
         if self.data_store_id.is_empty() {
             bail!("data store identity is empty");
         }
@@ -262,10 +277,23 @@ impl HeadRecord {
 
     pub(crate) fn validate(&self) -> Result<()> {
         validate_record(&self.format, self.format_version)?;
+        self.volume_id.validate()?;
+        self.cursor.validate()?;
+        self.checkpoint.validate()?;
         if self.checkpoint.generation > self.cursor.generation {
             bail!("checkpoint is newer than the authority head");
         }
         Ok(())
+    }
+
+    pub(crate) fn advance(volume_id: VolumeId, cursor: Cursor, checkpoint: Cursor) -> Self {
+        Self {
+            format: MANAGED_FORMAT.to_owned(),
+            format_version: RECORD_VERSION,
+            volume_id,
+            cursor,
+            checkpoint,
+        }
     }
 }
 
@@ -309,7 +337,12 @@ impl CommitRecord {
 
     pub(crate) fn validate(&self) -> Result<()> {
         validate_record(&self.format, self.format_version)?;
-        if self.changes.is_empty() || self.cursor.generation != self.parent.generation + 1 {
+        self.volume_id.validate()?;
+        self.parent.validate()?;
+        self.cursor.validate()?;
+        if self.changes.is_empty()
+            || self.parent.generation.checked_add(1) != Some(self.cursor.generation)
+        {
             bail!("invalid Managed change commit");
         }
         Ok(())
@@ -340,6 +373,8 @@ impl CheckpointRecord {
 
     pub(crate) fn validate(&self) -> Result<()> {
         validate_record(&self.format, self.format_version)?;
+        self.volume_id.validate()?;
+        self.cursor.validate()?;
         self.manifest.validate()
     }
 }

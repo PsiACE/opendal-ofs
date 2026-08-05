@@ -78,10 +78,6 @@ pub(crate) enum MetadataConfig {
 }
 
 impl MetadataConfig {
-    pub(crate) fn external(locator: StorageLocator) -> Self {
-        Self::External { locator }
-    }
-
     pub(crate) fn external_locator(&self) -> Option<&StorageLocator> {
         match self {
             Self::External { locator } => Some(locator),
@@ -203,14 +199,6 @@ impl Catalog {
         self.volumes
             .get(name)
             .with_context(|| format!("volume {name:?} is not defined"))
-    }
-
-    pub(crate) fn get_by_id(&self, id: &VolumeId) -> Result<(&str, &VolumeDefinition)> {
-        self.volumes
-            .iter()
-            .find(|(_, value)| value.id() == id)
-            .map(|(name, value)| (name.as_str(), value))
-            .with_context(|| format!("volume id {id:?} is not defined"))
     }
 
     pub(crate) fn insert(&mut self, name: String, value: VolumeDefinition) -> Result<()> {

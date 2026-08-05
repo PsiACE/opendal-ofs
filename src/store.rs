@@ -326,12 +326,6 @@ impl MetadataStore for ObjectMetadataStore {
         if commit.volume_id != expected.format.volume_id || commit.parent != expected.head.cursor {
             bail!("publication does not match its observed authority position");
         }
-        if let Some(cursor) = self
-            .reachable(&commit.volume_id, &commit.cursor.operation)
-            .await?
-        {
-            return Ok(PublicationOutcome::AlreadyCommitted(cursor));
-        }
         let current = self.observe_inner(&commit.volume_id).await?;
         if current.head.cursor != expected.head.cursor || current.token != expected.token {
             return Ok(PublicationOutcome::Conflict(current));
@@ -348,13 +342,11 @@ impl MetadataStore for ObjectMetadataStore {
         };
         self.write_immutable(&commit_key(&commit.cursor.operation), &commit)
             .await?;
-        let head = HeadRecord {
-            format: "ofs-managed-volume".to_owned(),
-            format_version: 1,
-            volume_id: commit.volume_id.clone(),
-            cursor: commit.cursor.clone(),
-            checkpoint: checkpoint_cursor,
-        };
+        let head = HeadRecord::advance(
+            commit.volume_id.clone(),
+            commit.cursor.clone(),
+            checkpoint_cursor,
+        );
         match self
             .operator
             .write_with(HEAD_KEY, serde_json::to_vec(&head)?)
