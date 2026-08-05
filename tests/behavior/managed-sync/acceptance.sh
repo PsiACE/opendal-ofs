@@ -169,13 +169,8 @@ if [[ $actor == recovery ]]; then
   exit 0
 fi
 
-# One sanitized agent workspace is published as one generation.
-mkdir -p "$tree_a/.agents/skills/storage" "$tree_a/.agents/empty" \
-  "$tree_a/.bub" "$tree_a/.codex/history"
-printf 'managed-sync\n' >"$tree_a/.agents/skills/storage/SKILL.md"
-printf 'shared memory\n' >"$tree_a/.bub/memory.md"
-printf '{"session":"a"}\n' >"$tree_a/.codex/history/session.jsonl"
-printf 'theme = "plain"\n' >"$tree_a/config.toml"
+# Two empty replicas first establish G0, then independently initialize the same
+# standard agent directories before either one publishes.
 "$OFS_BIN" --config "$catalog" volume create "$OFS_VOLUME" \
   --model managed --storage "$OFS_STORAGE_URL" "${metadata_args[@]}"
 "$OFS_BIN" --config "$catalog" volume create "$OFS_VOLUME" \
@@ -192,9 +187,23 @@ fi
 test ! -e "$OFS_RUN_ROOT/.agent-c.ofs-state"
 "$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_a" >/dev/null
 "$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_b" >/dev/null
+mkdir -p "$tree_a/.agents/skills/storage" "$tree_a/.agents/empty" \
+  "$tree_a/.bub" "$tree_a/.codex/history"
+mkdir -p "$tree_b/.agents/skills/reviewer" "$tree_b/.agents/empty" \
+  "$tree_b/.bub" "$tree_b/.codex/history"
+printf 'managed-sync\n' >"$tree_a/.agents/skills/storage/SKILL.md"
+printf 'reviewer\n' >"$tree_b/.agents/skills/reviewer/SKILL.md"
+printf 'shared memory\n' >"$tree_a/.bub/memory.md"
+printf 'peer memory\n' >"$tree_b/.bub/peer.md"
+printf '{"session":"a"}\n' >"$tree_a/.codex/history/session.jsonl"
+printf '{"session":"b"}\n' >"$tree_b/.codex/history/peer.jsonl"
+printf 'theme = "plain"\n' >"$tree_a/config.toml"
+"$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_a" >/dev/null
+"$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_b" >/dev/null
+"$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_a" >/dev/null
 diff -ru "$tree_a" "$tree_b"
 status_json "$tree_a" >"$OFS_RUN_ROOT/status-a-1.json"
-assert_status "$OFS_RUN_ROOT/status-a-1.json" base.generation '1'
+assert_status "$OFS_RUN_ROOT/status-a-1.json" base.generation '2'
 assert_status "$OFS_RUN_ROOT/status-a-1.json" remote.state '"at_base"'
 
 # Two non-empty trees without a durable common base never guess an ancestor.
@@ -222,7 +231,7 @@ printf 'new session\n' >"$tree_b/.codex/history/new.jsonl"
 mkdir "$tree_b/.codex/cache"
 "$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_b" >/dev/null
 status_json "$tree_b" >"$OFS_RUN_ROOT/status-change-set.json"
-assert_status "$OFS_RUN_ROOT/status-change-set.json" base.generation '2'
+assert_status "$OFS_RUN_ROOT/status-change-set.json" base.generation '3'
 
 # Disjoint private and remote edits merge without losing either side.
 "$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_a" >/dev/null
