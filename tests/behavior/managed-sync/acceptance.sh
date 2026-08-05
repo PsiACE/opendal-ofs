@@ -283,9 +283,10 @@ fi
 test -f "$tree_a/config-a.toml"
 test ! -e "$tree_a/config-b.toml"
 status_json "$tree_a" >"$OFS_RUN_ROOT/status-rename-conflict.json"
-assert_status "$OFS_RUN_ROOT/status-rename-conflict.json" conflict_records.0.kind '"rename"'
+assert_status "$OFS_RUN_ROOT/status-rename-conflict.json" conflict_records.0.kind '"divergent_rename"'
+rename_conflict_path=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["conflict_records"][0]["path"])' "$OFS_RUN_ROOT/status-rename-conflict.json")
 "$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_a" \
-  --resolve config.toml >/dev/null
+  --resolve "$rename_conflict_path" >/dev/null
 "$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_b" >/dev/null
 diff -ru "$tree_a" "$tree_b"
 

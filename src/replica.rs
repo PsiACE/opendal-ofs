@@ -143,10 +143,10 @@ pub(crate) struct PendingMaterialization {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ConflictKind {
-    SamePathModified,
+    SameNodeModified,
     DeleteVsModify,
-    Rename,
-    TypeReplacement,
+    DivergentRename,
+    IncompatibleTypeReplacement,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

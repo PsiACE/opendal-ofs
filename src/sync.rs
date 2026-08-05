@@ -376,7 +376,7 @@ fn merge(
         if !resolved.contains(base_path) {
             conflicts.push(Conflict {
                 path: base_path.clone(),
-                kind: ConflictKind::Rename,
+                kind: ConflictKind::DivergentRename,
                 base: Some(base_node.clone()),
                 local: local_value.map(|(_, node)| node.clone()),
                 remote: remote_value.map(|(_, node)| node.clone()),
@@ -436,10 +436,10 @@ fn conflict_kind(base: Option<&Node>, local: Option<&Node>, remote: Option<&Node
         (_, Some(a), Some(b))
             if std::mem::discriminant(&a.kind) != std::mem::discriminant(&b.kind) =>
         {
-            ConflictKind::TypeReplacement
+            ConflictKind::IncompatibleTypeReplacement
         }
-        (_, Some(a), Some(b)) if a.id == b.id => ConflictKind::SamePathModified,
-        _ => ConflictKind::Rename,
+        (_, Some(a), Some(b)) if a.id == b.id => ConflictKind::SameNodeModified,
+        _ => ConflictKind::DivergentRename,
     }
 }
 
