@@ -92,6 +92,9 @@ pub(crate) struct SyncArgs {
     /// Publish the current local shape for a retained conflict path.
     #[arg(long, action = clap::ArgAction::Append)]
     pub(crate) resolve: Vec<PathBuf>,
+    /// Require a user-visible capability before reconciliation starts.
+    #[arg(long, action = clap::ArgAction::Append)]
+    pub(crate) require: Vec<String>,
     /// Maximum number of complete content transfer jobs.
     #[arg(long, env = "OFS_SYNC_TRANSFER_CONCURRENCY", value_name = "N")]
     pub(crate) transfer_concurrency: Option<NonZeroUsize>,

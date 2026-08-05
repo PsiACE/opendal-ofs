@@ -173,18 +173,7 @@ impl SyncStatus {
             conflicts: conflict_records.len(),
             conflict_records,
             metadata,
-            capabilities: vec![
-                "atomic-snapshot",
-                "change-feed",
-                "conditional-publication",
-                "conflict-retention",
-                "idempotent-publication",
-                "immutable-data",
-                "local-replica",
-                "offline-write",
-                "portable-names",
-                "stable-node-id",
-            ],
+            capabilities: crate::sync::CAPABILITIES.to_vec(),
         })
     }
 }

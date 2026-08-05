@@ -83,12 +83,28 @@ if grep -q 'ofs-acceptance-password' "$catalog"; then
   printf 'catalog persisted a storage credential\n' >&2
   exit 1
 fi
+if "$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_c" \
+  --require hard-link >/dev/null 2>&1; then
+  printf 'sync admitted an unavailable required capability\n' >&2
+  exit 1
+fi
+test ! -e "$OFS_RUN_ROOT/.agent-c.ofs-state"
 "$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_a" >/dev/null
 "$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_b" >/dev/null
 diff -ru "$tree_a" "$tree_b"
 status_json "$tree_a" >"$OFS_RUN_ROOT/status-a-1.json"
 assert_status "$OFS_RUN_ROOT/status-a-1.json" base.generation '1'
 assert_status "$OFS_RUN_ROOT/status-a-1.json" remote.state '"at_base"'
+
+# Two non-empty trees without a durable common base never guess an ancestor.
+tree_unbound="$OFS_RUN_ROOT/unbound"
+mkdir "$tree_unbound"
+printf 'unpublished candidate\n' >"$tree_unbound/local.txt"
+if "$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_unbound" >/dev/null 2>&1; then
+  printf 'unbound non-empty tree unexpectedly synchronized\n' >&2
+  exit 1
+fi
+assert_file "$tree_unbound/local.txt" 'unpublished candidate'
 
 # An ordinary local edit remains private until that replica explicitly syncs.
 printf 'private draft\n' >"$tree_a/.bub/private.md"
@@ -147,6 +163,32 @@ if "$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_b" >/dev/null 2>&1; 
   exit 1
 fi
 rm "$tree_b/hard-link"
+printf 'reserved\n' >"$tree_b/CON.txt"
+if "$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_b" >/dev/null 2>&1; then
+  printf 'reserved portable name unexpectedly synchronized\n' >&2
+  exit 1
+fi
+rm "$tree_b/CON.txt"
+mkdir "$tree_b/collision"
+printf 'upper\n' >"$tree_b/collision/Skill"
+printf 'lower\n' >"$tree_b/collision/skill"
+if "$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_b" >/dev/null 2>&1; then
+  printf 'portable case collision unexpectedly synchronized\n' >&2
+  exit 1
+fi
+rm -rf "$tree_b/collision"
+non_nfc=$'cafe\u0301'
+printf 'decomposed\n' >"$tree_b/$non_nfc"
+if "$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_b" >/dev/null 2>&1; then
+  printf 'non-NFC name unexpectedly synchronized\n' >&2
+  exit 1
+fi
+rm "$tree_b/$non_nfc"
+if "$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_b" \
+  --state "$OFS_RUN_ROOT/.agent-a.ofs-state" >/dev/null 2>&1; then
+  printf 'replica state binding mismatch unexpectedly synchronized\n' >&2
+  exit 1
+fi
 status_json "$tree_b" >"$OFS_RUN_ROOT/status-after-reject.json"
 assert_status "$OFS_RUN_ROOT/status-after-reject.json" base.generation "$before_reject"
 

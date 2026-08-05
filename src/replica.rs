@@ -27,6 +27,7 @@ use anyhow::{Context, Result, bail};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 use crate::model::{
@@ -426,10 +427,15 @@ fn same_file_shape(left: &Node, right: &Node) -> bool {
 }
 
 fn validate_name(name: &str) -> Result<()> {
+    let normalized = name.nfc().collect::<String>();
+    let stem = name.split('.').next().unwrap_or(name);
     if name.is_empty()
         || name == "."
         || name == ".."
+        || name.len() > 255
         || name.ends_with([' ', '.'])
+        || normalized != name
+        || reserved_stem(stem)
         || name
             .chars()
             .any(|value| value.is_control() || "<>:\"/\\|?*".contains(value))
@@ -437,6 +443,34 @@ fn validate_name(name: &str) -> Result<()> {
         bail!("name is outside the portable Managed Sync policy: {name:?}");
     }
     Ok(())
+}
+
+fn reserved_stem(stem: &str) -> bool {
+    matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
 }
 
 fn new_node_id() -> Result<NodeId> {

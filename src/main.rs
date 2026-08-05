@@ -107,6 +107,7 @@ async fn sync_managed(
     let metadata = definition
         .metadata()
         .context("Direct Sync is not available")?;
+    sync::admit(&args.require)?;
     let operator = store::assemble_operator(definition.storage(), None)?;
     let volume = sync::ManagedVolume {
         metadata: metadata_store(metadata, Some(&operator), None)?,

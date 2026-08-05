@@ -34,6 +34,28 @@ use crate::replica::{
 };
 use crate::store::{DataStore, MetadataStore, PublicationOutcome};
 
+pub(crate) const CAPABILITIES: &[&str] = &[
+    "atomic-snapshot",
+    "change-feed",
+    "conditional-publication",
+    "conflict-retention",
+    "idempotent-publication",
+    "immutable-data",
+    "local-replica",
+    "offline-write",
+    "portable-names",
+    "stable-node-id",
+];
+
+pub(crate) fn admit(required: &[String]) -> Result<()> {
+    for capability in required {
+        if !CAPABILITIES.contains(&capability.as_str()) {
+            bail!("required Managed Sync capability {capability:?} is unavailable");
+        }
+    }
+    Ok(())
+}
+
 pub(crate) struct ManagedVolume {
     pub(crate) metadata: Box<dyn MetadataStore>,
     pub(crate) data: DataStore,
