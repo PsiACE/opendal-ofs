@@ -267,17 +267,21 @@ sent = int(metric(after, "minio_s3_traffic_sent_bytes") - metric(before, "minio_
 (root / "traffic.tsv").write_text(f"direction\tbytes\nreceived\t{received}\nsent\t{sent}\n", encoding="utf-8")
 PY
 
-mean_and_max=$(awk -F '\t' 'NR > 1 {sum += $3; if ($3 > max) max = $3; n++}
-  END {printf "%.6f %.6f", sum/n, max}' "$output/generations.tsv")
-read -r mean_wall max_wall <<<"$mean_and_max"
+publication_summary=$(awk -F '\t' 'NR > 1 {sum += $3; if ($3 > max) max = $3; if ($6 > rss) rss = $6; n++}
+  END {printf "%d %.6f %.6f %.6f %d", n, sum, sum/n, max, rss}' "$output/generations.tsv")
+read -r publication_count total_wall mean_wall max_wall publication_rss <<<"$publication_summary"
 request_total=$(awk -F '\t' 'NR > 1 {sum += $2} END {print sum + 0}' "$output/requests.tsv")
 {
   printf 'managed-sync-minio-stress\nimplementation=%s\n' "$implementation"
   printf 'initial_files=%s\nupdate_generations=%s\nagents=%s\nchanges_per_generation=%s\n' \
     "$files" "$generations" "$agents" "$changes"
   printf 'final_generation=%s\nfinal_tree_digest=%s\n' "$final" "$final_digest"
-  printf 'publication_mean_wall_s=%s\npublication_max_wall_s=%s\nminio_s3_requests=%s\n' \
-    "$mean_wall" "$max_wall" "$request_total"
+  printf 'publication_count=%s\npublication_total_wall_s=%s\npublication_mean_wall_s=%s\n' \
+    "$publication_count" "$total_wall" "$mean_wall"
+  printf 'publication_max_wall_s=%s\npublication_max_rss_kib=%s\nminio_s3_requests=%s\n' \
+    "$max_wall" "$publication_rss" "$request_total"
+  awk -F '\t' '$1 == "initial-publication" {printf "initial_publication_wall_s=%s\ninitial_publication_max_rss_kib=%s\n", $2,$5}
+    $1 == "cold-rebuild" {printf "cold_rebuild_wall_s=%s\ncold_rebuild_max_rss_kib=%s\n", $2,$5}' "$output/phases.tsv"
   awk -F '\t' 'NR > 1 {printf "catchup_%s_generations_wall_s=%s\ncatchup_%s_generations_max_rss_kib=%s\n", $1,$3,$1,$4}' "$output/catchup.tsv"
   awk -F '\t' 'NR > 1 {printf "%s_objects=%s\n%s_bytes=%s\n%s_max_object_bytes=%s\n", $1,$2,$1,$3,$1,$4}' "$output/inventory.tsv"
   awk -F '\t' '$1 == "change_commits" && $2 > 1 {printf "incremental_commit_mean_bytes=%.2f\n", ($3-$4)/($2-1)}' "$output/inventory.tsv"
