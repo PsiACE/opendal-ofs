@@ -452,6 +452,16 @@ fn merge(
             remote_node
         } else if remote_node == base_node || local_node == remote_node {
             local_node
+        } else if independently_created_directories(
+            base_node,
+            local_node,
+            remote_node,
+            &base_identities,
+        ) {
+            // Directory identities are internal bookkeeping. When both replicas
+            // created the same previously absent path, retain the authority's
+            // identity and merge their children path by path.
+            remote_node
         } else {
             conflicts.push(Conflict {
                 path: path.clone(),
@@ -468,6 +478,23 @@ fn merge(
         }
     }
     (Manifest { entries }, conflicts)
+}
+
+fn independently_created_directories(
+    base: Option<&Node>,
+    local: Option<&Node>,
+    remote: Option<&Node>,
+    base_identities: &BTreeMap<crate::model::NodeId, (String, Node)>,
+) -> bool {
+    let (Some(local), Some(remote)) = (local, remote) else {
+        return false;
+    };
+    base.is_none()
+        && matches!(local.kind, NodeKind::Directory)
+        && matches!(remote.kind, NodeKind::Directory)
+        && local.id != remote.id
+        && !base_identities.contains_key(&local.id)
+        && !base_identities.contains_key(&remote.id)
 }
 
 fn identities(manifest: &Manifest) -> BTreeMap<crate::model::NodeId, (String, Node)> {
@@ -617,11 +644,7 @@ async fn materialize(
         });
     }
     install_staged_files(installs, transfers).await?;
-    let mut durable_directories = durable_directories.into_iter().collect::<Vec<_>>();
-    durable_directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
-    for directory in durable_directories {
-        crate::replica::sync_directory(&directory)?;
-    }
+    sync_durable_directories(durable_directories)?;
     let observed = crate::replica::scan(paths, Some(&target), false)?;
     if observed != target {
         bail!("materialized tree does not match its target manifest");
@@ -634,6 +657,31 @@ async fn materialize(
     state.conflicts.clear();
     crate::replica::clear_staging(paths)?;
     state.save(paths)
+}
+
+fn sync_durable_directories(directories: BTreeSet<PathBuf>) -> Result<()> {
+    let mut directories = directories.into_iter().collect::<Vec<_>>();
+    directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for directory in directories {
+        match std::fs::symlink_metadata(&directory) {
+            Ok(metadata) if metadata.is_dir() => crate::replica::sync_directory(&directory)?,
+            Ok(_) => bail!(
+                "materialization durability path is not a directory: {}",
+                directory.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // A deeper removal records both the removed directory and its
+                // surviving parent. The parent fsync makes the removal durable.
+            }
+            Err(error) => {
+                return Err(error).context(format!(
+                    "inspect materialization durability path {}",
+                    directory.display()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn stage_materialization_files(
@@ -771,4 +819,197 @@ fn resolution_paths(paths: &[PathBuf]) -> Result<BTreeSet<String>> {
             Ok(value)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{ContentRef, NodeId};
+
+    fn directory(id: &str) -> Node {
+        Node {
+            id: NodeId::parse(id).unwrap(),
+            kind: NodeKind::Directory,
+        }
+    }
+
+    fn file(id: &str, digest_byte: char) -> Node {
+        let sha256 = digest_byte.to_string().repeat(64);
+        Node {
+            id: NodeId::parse(id).unwrap(),
+            kind: NodeKind::File {
+                content: ContentRef {
+                    data_ref: format!("data/{sha256}"),
+                    sha256,
+                    size: 1,
+                },
+                executable: false,
+            },
+        }
+    }
+
+    fn manifest(entries: Vec<(&str, Node)>) -> Manifest {
+        Manifest {
+            entries: entries
+                .into_iter()
+                .map(|(path, node)| (path.to_owned(), node))
+                .collect(),
+        }
+    }
+
+    fn cursor() -> Cursor {
+        Cursor {
+            generation: 1,
+            operation: OperationId::parse("test-operation").unwrap(),
+        }
+    }
+
+    #[test]
+    fn established_empty_replicas_coalesce_nested_directory_creation() {
+        let base = Manifest::default();
+        let local = manifest(vec![
+            (".agents", directory("local-agents")),
+            (".agents/skills", directory("local-skills")),
+            (".agents/skills/a.md", file("local-file", 'a')),
+        ]);
+        let remote = manifest(vec![
+            (".agents", directory("remote-agents")),
+            (".agents/skills", directory("remote-skills")),
+            (".agents/skills/b.md", file("remote-file", 'b')),
+        ]);
+
+        let (target, conflicts) = merge(&base, &local, &remote, &cursor(), &BTreeSet::new());
+
+        assert!(conflicts.is_empty());
+        assert_eq!(target.entries[".agents"].id, remote.entries[".agents"].id);
+        assert_eq!(
+            target.entries[".agents/skills"].id,
+            remote.entries[".agents/skills"].id
+        );
+        assert!(target.entries.contains_key(".agents/skills/a.md"));
+        assert!(target.entries.contains_key(".agents/skills/b.md"));
+        target.validate().unwrap();
+        let changes = diff(&remote, &target);
+        assert_eq!(changes.len(), 1);
+        assert!(matches!(
+            &changes[0],
+            NamespaceChange::Put { path, replaces: None, .. }
+                if path == ".agents/skills/a.md"
+        ));
+    }
+
+    #[test]
+    fn upgrade_replicas_coalesce_one_new_public_directory() {
+        let agents = directory("shared-agents");
+        let base = manifest(vec![(".agents", agents.clone())]);
+        let local = manifest(vec![
+            (".agents", agents.clone()),
+            (".agents/memory", directory("local-memory")),
+            (".agents/memory/a.md", file("local-memory-file", 'a')),
+        ]);
+        let remote = manifest(vec![
+            (".agents", agents),
+            (".agents/memory", directory("remote-memory")),
+            (".agents/memory/b.md", file("remote-memory-file", 'b')),
+        ]);
+
+        let (target, conflicts) = merge(&base, &local, &remote, &cursor(), &BTreeSet::new());
+
+        assert!(conflicts.is_empty());
+        assert_eq!(
+            target.entries[".agents/memory"].id,
+            remote.entries[".agents/memory"].id
+        );
+        assert!(target.entries.contains_key(".agents/memory/a.md"));
+        assert!(target.entries.contains_key(".agents/memory/b.md"));
+        target.validate().unwrap();
+    }
+
+    #[test]
+    fn replicas_coalesce_a_public_directory_recreated_after_deletion() {
+        let agents = directory("shared-agents");
+        let skills = directory("shared-skills");
+        // Both replicas have already caught up to the generation where
+        // `.agents/skills/shared` was deleted.
+        let base = manifest(vec![
+            (".agents", agents.clone()),
+            (".agents/skills", skills.clone()),
+        ]);
+        let local = manifest(vec![
+            (".agents", agents.clone()),
+            (".agents/skills", skills.clone()),
+            (".agents/skills/shared", directory("local-recreated-shared")),
+            (
+                ".agents/skills/shared/a.md",
+                file("local-recreated-file", 'a'),
+            ),
+        ]);
+        let remote = manifest(vec![
+            (".agents", agents),
+            (".agents/skills", skills),
+            (
+                ".agents/skills/shared",
+                directory("remote-recreated-shared"),
+            ),
+            (
+                ".agents/skills/shared/b.md",
+                file("remote-recreated-file", 'b'),
+            ),
+        ]);
+
+        let (target, conflicts) = merge(&base, &local, &remote, &cursor(), &BTreeSet::new());
+
+        assert!(conflicts.is_empty());
+        assert_eq!(
+            target.entries[".agents/skills/shared"].id,
+            remote.entries[".agents/skills/shared"].id
+        );
+        assert!(target.entries.contains_key(".agents/skills/shared/a.md"));
+        assert!(target.entries.contains_key(".agents/skills/shared/b.md"));
+        target.validate().unwrap();
+    }
+
+    #[test]
+    fn a_rename_and_an_unrelated_new_directory_do_not_coalesce() {
+        let old = directory("existing-directory");
+        let base = manifest(vec![("old", old.clone())]);
+        let local = manifest(vec![("shared", old.clone())]);
+        let remote = manifest(vec![("old", old), ("shared", directory("new-directory"))]);
+
+        let (_, conflicts) = merge(&base, &local, &remote, &cursor(), &BTreeSet::new());
+
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].path, "shared");
+        assert_eq!(conflicts[0].kind, ConflictKind::DivergentRename);
+    }
+
+    #[test]
+    fn coalesced_directories_do_not_hide_same_file_conflicts() {
+        let base = Manifest::default();
+        let local = manifest(vec![
+            (".agents", directory("local-agents")),
+            (".agents/config.toml", file("local-config", 'a')),
+        ]);
+        let remote = manifest(vec![
+            (".agents", directory("remote-agents")),
+            (".agents/config.toml", file("remote-config", 'b')),
+        ]);
+
+        let (_, conflicts) = merge(&base, &local, &remote, &cursor(), &BTreeSet::new());
+
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].path, ".agents/config.toml");
+        assert_eq!(conflicts[0].kind, ConflictKind::DivergentRename);
+    }
+
+    #[test]
+    fn durability_skips_a_directory_removed_during_materialization() {
+        let root = tempfile::tempdir().unwrap();
+        let removed = root.path().join("removed");
+        std::fs::create_dir(&removed).unwrap();
+        std::fs::remove_dir(&removed).unwrap();
+        let directories = [root.path().to_owned(), removed].into_iter().collect();
+
+        sync_durable_directories(directories).unwrap();
+    }
 }

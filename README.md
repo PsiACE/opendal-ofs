@@ -108,8 +108,8 @@ recreating the definition.
 
 Managed Sync supports complete directory synchronization for regular files,
 directories, empty directories, portable names, and executable bits on Unix.
-It supports multiple readers and fences stale publishers, while the normal
-workflow keeps one active publisher at a time.
+It supports multiple readers, publishers that take turns after catching up,
+and conditional fencing when publications overlap.
 
 It does not provide background synchronization, path filters, symlinks, hard
 links, history browsing, timestamp restore, partial hydration, remote volume

@@ -418,6 +418,54 @@ fi
 test -f "$tree_a/.agents/a.txt" -a -f "$tree_a/.agents/b.txt"
 diff -ru "$tree_a" "$tree_b"
 
+# A replica can materialize directory removals and then publish the next
+# generation's directory delete/add set after a complete catch-up.
+mkdir -p "$tree_a/.agents/handoff/remove-a"
+printf 'first publisher\n' >"$tree_a/.agents/handoff/remove-a/value.txt"
+"$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_a" >/dev/null
+"$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_b" >/dev/null
+rm -rf "$tree_a/.agents/handoff/remove-a"
+mkdir -p "$tree_a/.agents/handoff/add-a"
+printf 'published by a\n' >"$tree_a/.agents/handoff/add-a/value.txt"
+"$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_a" >/dev/null
+"$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_b" >/dev/null
+rm -rf "$tree_b/.agents/handoff/add-a"
+mkdir -p "$tree_b/.agents/handoff/add-b"
+printf 'published by b\n' >"$tree_b/.agents/handoff/add-b/value.txt"
+"$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_b" >/dev/null
+"$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_a" >/dev/null
+diff -ru "$tree_a" "$tree_b"
+
+# An upgrade may make independent replicas create the same missing nested
+# public directories. Their directory identities coalesce and disjoint files
+# are both retained.
+mkdir -p "$tree_a/.agents/concurrent-upgrade/skills"
+mkdir -p "$tree_b/.agents/concurrent-upgrade/skills"
+printf 'from a\n' >"$tree_a/.agents/concurrent-upgrade/skills/a.md"
+printf 'from b\n' >"$tree_b/.agents/concurrent-upgrade/skills/b.md"
+"$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_a" >/dev/null
+"$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_b" >/dev/null
+"$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_a" >/dev/null
+test -f "$tree_a/.agents/concurrent-upgrade/skills/a.md"
+test -f "$tree_a/.agents/concurrent-upgrade/skills/b.md"
+diff -ru "$tree_a" "$tree_b"
+
+# The same rule applies after all replicas catch up to deletion of a public
+# directory and independently recreate it.
+rm -rf "$tree_a/.agents/concurrent-upgrade"
+"$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_a" >/dev/null
+"$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_b" >/dev/null
+mkdir -p "$tree_a/.agents/concurrent-upgrade/skills"
+mkdir -p "$tree_b/.agents/concurrent-upgrade/skills"
+printf 'recreated by a\n' >"$tree_a/.agents/concurrent-upgrade/skills/a.md"
+printf 'recreated by b\n' >"$tree_b/.agents/concurrent-upgrade/skills/b.md"
+"$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_a" >/dev/null
+"$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_b" >/dev/null
+"$OFS_BIN" --config "$catalog" sync "$OFS_VOLUME" "$tree_a" >/dev/null
+test -f "$tree_a/.agents/concurrent-upgrade/skills/a.md"
+test -f "$tree_a/.agents/concurrent-upgrade/skills/b.md"
+diff -ru "$tree_a" "$tree_b"
+
 status_json "$tree_a" >"$OFS_RUN_ROOT/status-final.json"
 assert_status "$OFS_RUN_ROOT/status-final.json" local '"clean"'
 assert_status "$OFS_RUN_ROOT/status-final.json" publication '"idle"'

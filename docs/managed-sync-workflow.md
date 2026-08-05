@@ -141,9 +141,10 @@ add .agents/a.md         add .agents/b.md
           both child files are retained
 ```
 
-Agents may remain at older generations until they choose to sync. The expected
-operating model has many readers and one active publisher, while conditional
-publication prevents a stale writer from overwriting a newer head.
+Agents may remain at older generations until they choose to sync. Publishers
+can take turns after catching up. If two publications race from the same head,
+conditional publication allows only one to advance it; the loser reconciles
+again on a later explicit sync.
 
 ## Concurrent creation of the same directory
 
@@ -167,53 +168,48 @@ Remote: .agents/a.md                         Local:  directory ID B
                                              Remote: directory ID A
                                                         |
                                                         v
-                                              current identity conflict
+                                           coalesce new directory
+                                           to remote NodeId=A
+                                                        |
+                                                        v
+                                           retain a.md and b.md
+                                           publish only B's delta
 ```
 
-The current merge treats the two directory nodes as different identities and
-reports the directory path as `divergent_rename`. This is a conservative
-current behavior, not a claim that the child-file edits are semantically
-overlapping. It applies only when the directory is independently created from
-a base where it did not exist; agents that materialized the directory from a
-published generation share its NodeId and do not conflict merely because they
-use the same directory name.
+The merge coalesces the two directory identities only when the path is absent
+from the common base, both sides contain a directory there, and neither
+directory identity belonged to any node in the base. It keeps the authority's
+directory identity, then merges children by their own paths. The rule applies
+independently at each missing component, so concurrent
+`mkdir -p .agents/skills/...` can coalesce both `.agents` and
+`.agents/skills`.
 
-An explicit `--resolve PATH` selects the local directory identity after
-revalidating the remote cursor. In the observed disjoint-child case, the next
-merge retained both children. Coalescing two genuinely new directory
-identities automatically would require a narrower rule that does not also
-merge a renamed existing directory with an unrelated new directory.
-
-Until that behavior is refined, publish common top-level agent directories
-before multiple agents begin editing them, or resolve a concurrent first
-creation explicitly.
+The base-identity check is the important safety boundary. A directory renamed
+from another base path is not treated as a new directory, so a rename into the
+same path as an unrelated new directory still reports `divergent_rename`.
+Different node types still report `incompatible_type_replacement`, and two
+different files created at the same child path still conflict. Coalescing a
+directory does not silently select between overlapping child edits.
 
 ## Verified behavior
 
-The workflow was confirmed with four isolated Fedora agent containers and one
-MinIO container. Every agent container had its own catalog, named local volume
-definition, ordinary tree, and replica state. All four definitions recovered
-the same remote VolumeId from one MinIO bucket and root.
+The directory-churn workflow was confirmed with four isolated Fedora agent
+containers and one MinIO container. Every agent container had its own named
+volume, catalog, home tree, replica state, and persistent container volume.
+All four used one authoritative MinIO bucket and root.
 
-The run observed these results:
+The initial tree contained 1,000 files and 968 directories under `.agents`,
+`.bub`, and `.codex`. The next 12 update publications rotated across A, B, C,
+and D. Before editing, each next publisher completely caught up; it then
+modified four files, deleted four files and their directories, and added four
+new directories and files. The run reached generation 13 without a
+materialization error. All four replicas converged, and a fifth empty replica
+cold-recovered the same 1,000-file digest.
 
-- initial publication and multiple readers converged at generation 1;
-- an unpublished local edit remained absent from two other replicas;
-- alternating publishers and a lagging reader converged at generation 3;
-- a new fourth agent cold-recovered the same tree;
-- concurrent disjoint edits below established directories were both retained,
-  and all replicas converged at generation 5;
-- concurrent first creation of one absent directory produced one
-  `divergent_rename` conflict at that directory;
-- explicit resolution retained both child files and converged at generation 7;
-- deleting one agent's catalog, tree, and replica state still allowed exact
-  cold recovery to generation 7.
-
-At the end, all four trees were identical. Every replica reported `clean`,
-`at_base`, idle publication and materialization state, and zero conflicts.
-The concurrent disjoint publications happened to serialize successfully in
-this run; this observation proves convergence without lost content, but does
-not by itself demonstrate a forced compare-and-swap loser.
+The checked-in tests separately cover established empty replicas concurrently
+creating nested standard directories, an upgrade introducing a new public
+directory, deletion followed by concurrent recreation, and the conflicts that
+must not be coalesced.
 
 The cold-recovery step removed the lost replica's tree and established state
 before syncing an empty directory. An empty directory that still uses its old
