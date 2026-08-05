@@ -45,6 +45,10 @@ synchronized tree.
 may be repeated. `--require` fails before scan or mutation when a requested
 public capability is unavailable.
 
+An empty directory is a fresh replica only when it has no established replica
+state. Recreating an empty directory while reusing its previous state presents
+the missing paths as local deletions from the common base.
+
 `--transfer-concurrency` is a positive integer. The catalog default is four.
 It bounds complete content transfer and local installation jobs; OpenDAL owns
 provider request limits, retry behavior, and object-level read/write options.
@@ -178,11 +182,13 @@ Unsupported trees are rejected before a remote generation is advanced.
 | Situation | Result |
 | --- | --- |
 | Local edit without sync | Remains private to that replica |
-| Fresh empty directory | Materializes the latest published generation |
+| Empty directory with no established replica state | Materializes the latest published generation |
 | Replica behind several generations | Replays every consecutive change record to a fixed target |
 | Local tree and replica state lost | Cold recovery from Metadata Store and Data Store |
+| Local tree lost but established state retained | Use a fresh state path for cold recovery; reusing the old state treats missing paths as local deletions |
 | Local catalog lost | Recreate the same definition, then cold sync |
 | Same-path concurrent edits | Publication stops with a retained conflict |
+| Concurrent first creation of the same absent directory | Currently reports the directory as `divergent_rename`; explicit resolution is required |
 | Authority unavailable during status | `remote.state` is `unknown` with no remote generation |
 | Publication result unknown | Next sync resolves the durable operation before retrying |
 

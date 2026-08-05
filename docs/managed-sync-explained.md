@@ -22,6 +22,10 @@ Managed Sync separates local work from published state:
    directory change.
 5. Other agents receive the new generation on their next explicit sync.
 
+See [Managed Sync workflow](managed-sync-workflow.md) for diagrams of this
+publication flow, one reconciliation, and the current directory-identity
+boundary.
+
 The normal operating model allows many readers at different generations and
 one active publisher at a time. Conditional publication still protects the
 volume if two publishers overlap.
@@ -93,9 +97,9 @@ Older readers remain on their existing local generation until they choose to
 catch up.
 
 If two publishers start from the same authority position, only one conditional
-head update can win. The other publisher re-observes the volume and reconciles
-its local work with the winner. A stale writer cannot overwrite a newer
-generation.
+head update can win. A stale invocation returns an error without overwriting
+the newer generation. On the next explicit sync, that replica re-observes the
+volume and reconciles its local work with the winner.
 
 ## Conflicts
 
@@ -104,9 +108,19 @@ guess when both sides modify the same logical node, when one side deletes what
 the other modifies, or when the same node is renamed differently.
 
 Such a conflict blocks the complete publication unit. The local shape remains
-in the directory, the remote candidate is recorded outside it, and `ofs
-status` reports the conflict. The user chooses retained local paths with
+in the directory. Private replica state records the base, local, and remote
+node metadata while published remote content remains in the Managed Volume.
+`ofs status` reports the conflict. The user chooses retained local paths with
 `--resolve`; resolution revalidates the remote generation before publishing.
+
+Two replicas that independently create the same directory path from a base
+where it was absent currently receive different directory identities. The
+merge conservatively reports that path as `divergent_rename`, even when their
+child-file edits are disjoint. Replicas that materialized an existing
+directory from the same published generation share its identity and do not
+conflict merely because they use the same directory name. See
+[Managed Sync workflow](managed-sync-workflow.md#concurrent-creation-of-the-same-directory)
+for the observed behavior and operating implication.
 
 ## Failure and recovery
 
@@ -121,9 +135,13 @@ while the visible directory is partial.
 
 Three forms of local loss have different meanings:
 
-- Losing only the directory allows reconstruction from its retained replica
-  state or a cold sync.
-- Losing the directory and replica state creates a new cold replica.
+- Losing only the directory while retaining its established replica state does
+  not create a cold replica. If an empty directory is recreated at the same
+  path, the missing entries are local deletions relative to the common base and
+  the next sync can publish those deletions. Use a fresh state path for cold
+  recovery instead of reusing the old state.
+- Losing the directory and replica state allows an empty directory to bind as
+  a new cold replica.
 - Losing the local catalog requires recreating the same named definition from
   the same Data Store and Metadata Store locators before cold sync.
 

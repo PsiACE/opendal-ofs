@@ -80,9 +80,15 @@ reported as unknown instead of returning a cached generation as current.
 
 ## Recover after local loss
 
-Deleting a local directory, its sibling ofs state, or the local catalog does
-not delete the remote Managed Volume. Recreate the same named definition from
-the same storage and metadata locators, then sync into an empty directory:
+Losing local files, replica state, or the local catalog does not by itself
+delete the remote Managed Volume. Cold recovery requires an empty directory
+with no established replica state. If the original directory was lost but its
+sibling ofs state remains, do not reuse that state with a recreated empty
+directory: the missing files are treated as local deletions and a sync can
+publish an empty tree. Use a new directory or a fresh `--state` path instead.
+
+If the catalog was also lost, recreate the same named definition from the same
+storage and metadata locators. For the D1 example above:
 
 ```console
 ofs volume create agent-home \
@@ -95,7 +101,8 @@ ofs sync agent-home recovered-home
 ```
 
 The volume identity and latest published generation are recovered from the
-Metadata Store.
+Metadata Store. For colocated object metadata, omit `--metadata` when
+recreating the definition.
 
 ## Managed Sync scope
 
@@ -108,9 +115,11 @@ It does not provide background synchronization, path filters, symlinks, hard
 links, history browsing, timestamp restore, partial hydration, remote volume
 destruction, or remote garbage collection.
 
-See [Managed Sync explained](docs/managed-sync-explained.md) for the behavior
-and recovery model, and [Managed Sync reference](docs/managed-sync-reference.md)
-for commands, configuration, status, D1 requirements, and validation coverage.
+See [Managed Sync workflow](docs/managed-sync-workflow.md) for diagrams of
+publication, reconciliation, and multiple agents; [Managed Sync
+explained](docs/managed-sync-explained.md) for the behavior and recovery model;
+and [Managed Sync reference](docs/managed-sync-reference.md) for commands,
+configuration, status, D1 requirements, and validation coverage.
 
 ## Direct Mount
 
