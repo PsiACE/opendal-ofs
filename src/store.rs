@@ -91,10 +91,13 @@ impl ObjectMetadataStore {
         if !cap.read
             || !cap.write
             || !cap.list
+            || !cap.list_with_limit
             || !cap.write_with_if_match
             || !cap.write_with_if_not_exists
         {
-            bail!("Managed object metadata requires read, list, If-Match, and create-only write");
+            bail!(
+                "Managed object metadata requires read, limited list, If-Match, and create-only write"
+            );
         }
         Ok(Self { operator })
     }
