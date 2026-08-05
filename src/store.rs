@@ -50,7 +50,7 @@ const MAX_ANCESTRY: usize = 1_000_000;
 pub(crate) struct Observation {
     pub(crate) format: FormatRecord,
     pub(crate) head: HeadRecord,
-    token: String,
+    pub(crate) token: String,
 }
 
 #[derive(Debug)]

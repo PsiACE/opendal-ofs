@@ -27,6 +27,7 @@ use store::MetadataStore;
 
 mod catalog;
 mod cli;
+mod d1;
 mod model;
 mod replica;
 mod status;
@@ -75,9 +76,12 @@ async fn status_managed(
     } else {
         "colocated-object"
     };
-    let remote = match store::assemble_operator(definition.storage(), None)
-        .and_then(store::ObjectMetadataStore::new)
-    {
+    let status_operator = if metadata.external_locator().is_some() {
+        None
+    } else {
+        store::assemble_operator(definition.storage(), None).ok()
+    };
+    let remote = match metadata_store(metadata, status_operator.as_ref(), None) {
         Ok(store) => store.observe(&state.volume_id).await.ok(),
         Err(_) => None,
     };
@@ -103,12 +107,9 @@ async fn sync_managed(
     let metadata = definition
         .metadata()
         .context("Direct Sync is not available")?;
-    if metadata.external_locator().is_some() {
-        bail!("external Metadata Store support is not available in this commit");
-    }
     let operator = store::assemble_operator(definition.storage(), None)?;
     let volume = sync::ManagedVolume {
-        metadata: store::ObjectMetadataStore::new(operator.clone())?,
+        metadata: metadata_store(metadata, Some(&operator), None)?,
         data: store::DataStore::new(operator)?,
     };
     let generation = sync::sync_once(
@@ -143,35 +144,57 @@ async fn create_volume(
             catalog.save(&path)
         }
         cli::VolumeModel::Managed => {
-            if args.metadata.is_some() {
-                bail!("external Metadata Store support is not available in this commit");
-            }
-            let metadata = MetadataConfig::ColocatedObject;
+            let metadata = match args.metadata.as_ref() {
+                Some(url) => MetadataConfig::external(StorageLocator::parse(url)?),
+                None => MetadataConfig::ColocatedObject,
+            };
             if let Ok(existing) = catalog.get(&args.name) {
                 if existing.storage() != &storage || existing.metadata() != Some(&metadata) {
                     bail!("volume name already refers to a different definition");
                 }
                 let operator = store::assemble_operator(&storage, Some(&args.storage))?;
                 store::DataStore::new(operator.clone())?;
-                let object = store::ObjectMetadataStore::new(operator)?;
-                object.observe(existing.id()).await?;
+                let metadata_store =
+                    metadata_store(&metadata, Some(&operator), args.metadata.as_ref())?;
+                metadata_store.observe(existing.id()).await?;
                 return Ok(());
             }
             let operator = store::assemble_operator(&storage, Some(&args.storage))?;
             store::DataStore::new(operator.clone())?;
-            let object = store::ObjectMetadataStore::new(operator)?;
-            let proposed = FormatRecord::new(
-                new_id()?,
-                MetadataPlacement::ColocatedObject,
-                store::data_store_id(&storage)?,
-            )?;
-            let observed = object.initialize(proposed).await?;
+            let metadata_store =
+                metadata_store(&metadata, Some(&operator), args.metadata.as_ref())?;
+            let placement = if metadata.external_locator().is_some() {
+                MetadataPlacement::ExternalD1
+            } else {
+                MetadataPlacement::ColocatedObject
+            };
+            let proposed =
+                FormatRecord::new(new_id()?, placement, store::data_store_id(&storage)?)?;
+            let observed = metadata_store.initialize(proposed).await?;
             catalog.insert(
                 args.name,
                 VolumeDefinition::managed(observed.format.volume_id, storage, metadata),
             )?;
             catalog.save(&path)
         }
+    }
+}
+
+fn metadata_store(
+    config: &MetadataConfig,
+    operator: Option<&opendal::Operator>,
+    current_url: Option<&url::Url>,
+) -> Result<Box<dyn MetadataStore>> {
+    match config.external_locator() {
+        Some(locator) => Ok(Box::new(d1::D1MetadataStore::new(d1::D1Config::resolve(
+            locator,
+            current_url,
+        )?)?)),
+        None => Ok(Box::new(store::ObjectMetadataStore::new(
+            operator
+                .context("colocated metadata requires the Data Store operator")?
+                .clone(),
+        )?)),
     }
 }
 

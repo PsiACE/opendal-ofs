@@ -32,10 +32,10 @@ use crate::replica::{
     CommonBase, Conflict, ConflictKind, PendingMaterialization, PendingPublication, ReplicaLock,
     ReplicaPaths, ReplicaState,
 };
-use crate::store::{DataStore, MetadataStore, ObjectMetadataStore, PublicationOutcome};
+use crate::store::{DataStore, MetadataStore, PublicationOutcome};
 
 pub(crate) struct ManagedVolume {
-    pub(crate) metadata: ObjectMetadataStore,
+    pub(crate) metadata: Box<dyn MetadataStore>,
     pub(crate) data: DataStore,
 }
 

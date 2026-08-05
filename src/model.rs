@@ -252,6 +252,10 @@ impl FormatRecord {
     pub(crate) fn same_storage(&self, other: &Self) -> bool {
         self.placement == other.placement && self.data_store_id == other.data_store_id
     }
+
+    pub(crate) fn placement(&self) -> MetadataPlacement {
+        self.placement
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

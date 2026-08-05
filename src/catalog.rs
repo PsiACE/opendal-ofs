@@ -78,6 +78,10 @@ pub(crate) enum MetadataConfig {
 }
 
 impl MetadataConfig {
+    pub(crate) fn external(locator: StorageLocator) -> Self {
+        Self::External { locator }
+    }
+
     pub(crate) fn external_locator(&self) -> Option<&StorageLocator> {
         match self {
             Self::External { locator } => Some(locator),
