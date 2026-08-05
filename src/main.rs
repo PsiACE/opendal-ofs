@@ -29,6 +29,7 @@ mod catalog;
 mod cli;
 mod model;
 mod replica;
+mod status;
 mod store;
 mod sync;
 
@@ -53,11 +54,40 @@ async fn execute_command(command: cli::Cli) -> Result<()> {
             bail!("volume-oriented mount is not implemented")
         }
         cli::Command::Sync(args) => sync_managed(command.config, args).await,
-        cli::Command::Status(args) => {
-            let _ = (command.config, args.directory, args.state, args.json);
-            bail!("Managed Sync status is not available in this commit")
-        }
+        cli::Command::Status(args) => status_managed(command.config, args).await,
     }
+}
+
+async fn status_managed(
+    requested_catalog: Option<std::path::PathBuf>,
+    args: cli::StatusArgs,
+) -> Result<()> {
+    let paths = replica::ReplicaPaths::resolve(&args.directory, args.state.as_deref())?;
+    let state = replica::ReplicaState::load(&paths)?;
+    let path = catalog::catalog_path(requested_catalog)?;
+    let catalog = Catalog::load(&path)?;
+    let (name, definition) = catalog.get_by_id(&state.volume_id)?;
+    let metadata = definition
+        .metadata()
+        .context("replica is not bound to a Managed volume")?;
+    let placement = if metadata.external_locator().is_some() {
+        "external-d1"
+    } else {
+        "colocated-object"
+    };
+    let remote = match store::assemble_operator(definition.storage(), None)
+        .and_then(store::ObjectMetadataStore::new)
+    {
+        Ok(store) => store.observe(&state.volume_id).await.ok(),
+        Err(_) => None,
+    };
+    let status = status::SyncStatus::inspect(name, placement, &paths, &state, remote.as_ref())?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&status)?);
+    } else {
+        println!("{status}");
+    }
+    Ok(())
 }
 
 async fn sync_managed(

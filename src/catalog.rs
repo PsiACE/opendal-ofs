@@ -201,6 +201,14 @@ impl Catalog {
             .with_context(|| format!("volume {name:?} is not defined"))
     }
 
+    pub(crate) fn get_by_id(&self, id: &VolumeId) -> Result<(&str, &VolumeDefinition)> {
+        self.volumes
+            .iter()
+            .find(|(_, value)| value.id() == id)
+            .map(|(name, value)| (name.as_str(), value))
+            .with_context(|| format!("volume id {id:?} is not defined"))
+    }
+
     pub(crate) fn insert(&mut self, name: String, value: VolumeDefinition) -> Result<()> {
         if name.is_empty() || self.volumes.contains_key(&name) {
             bail!("volume {name:?} already exists or has an empty name");

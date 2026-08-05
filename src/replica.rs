@@ -188,6 +188,14 @@ impl ReplicaState {
         Ok(state)
     }
 
+    pub(crate) fn load(paths: &ReplicaPaths) -> Result<Self> {
+        let bytes = std::fs::read(paths.state.join(STATE_FILE)).context("read replica state")?;
+        let state: Self = serde_json::from_slice(&bytes).context("decode replica state")?;
+        let volume_id = state.volume_id.clone();
+        state.validate(&volume_id, paths)?;
+        Ok(state)
+    }
+
     pub(crate) fn save(&self, paths: &ReplicaPaths) -> Result<()> {
         self.validate(&self.volume_id, paths)?;
         std::fs::create_dir_all(&paths.state)?;
