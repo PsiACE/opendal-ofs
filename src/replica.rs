@@ -86,13 +86,24 @@ pub(crate) struct ReplicaLock(File);
 
 impl ReplicaLock {
     pub(crate) fn acquire(paths: &ReplicaPaths) -> Result<Self> {
+        let new_state_directory = !paths.state.exists();
         std::fs::create_dir_all(&paths.state)?;
+        set_private_directory(&paths.state)?;
+        if new_state_directory {
+            sync_directory(
+                paths
+                    .state
+                    .parent()
+                    .context("replica state has no parent directory")?,
+            )?;
+        }
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
             .open(paths.state.join(LOCK_FILE))?;
+        set_private_file(&file)?;
         file.try_lock_exclusive()
             .context("another sync owns this local replica")?;
         Ok(Self(file))
@@ -200,6 +211,7 @@ impl ReplicaState {
     pub(crate) fn save(&self, paths: &ReplicaPaths) -> Result<()> {
         self.validate(&self.volume_id, paths)?;
         std::fs::create_dir_all(&paths.state)?;
+        set_private_directory(&paths.state)?;
         let mut temporary = tempfile::NamedTempFile::new_in(&paths.state)?;
         serde_json::to_writer(temporary.as_file_mut(), self)?;
         temporary.write_all(b"\n")?;
@@ -207,6 +219,7 @@ impl ReplicaState {
         temporary
             .persist(paths.state.join(STATE_FILE))
             .map_err(|error| error.error)?;
+        sync_directory(&paths.state)?;
         Ok(())
     }
 
@@ -370,6 +383,7 @@ fn stage(
 ) -> Result<()> {
     let directory = paths.state.join("staging");
     std::fs::create_dir_all(&directory)?;
+    set_private_directory(&directory)?;
     let target = directory.join(sha256);
     if target.exists() {
         let (actual, actual_size) = fingerprint(&target, &std::fs::metadata(&target)?)?;
@@ -391,9 +405,17 @@ fn stage(
         bail!("stable input does not match its observed content");
     }
     match temporary.persist_noclobber(&target) {
-        Ok(_) => Ok(()),
+        Ok(_) => sync_directory(&directory),
         Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
         Err(error) => Err(error.error.into()),
+    }
+}
+
+pub(crate) fn clear_staging(paths: &ReplicaPaths) -> Result<()> {
+    match std::fs::remove_dir_all(paths.state.join("staging")) {
+        Ok(()) => sync_directory(&paths.state),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -538,6 +560,41 @@ fn same_file(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
     left.len() == right.len()
         && left.modified().ok() == right.modified().ok()
         && file_identity(left) == file_identity(right)
+}
+
+#[cfg(unix)]
+pub(crate) fn sync_directory(path: &Path) -> Result<()> {
+    File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn sync_directory(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_directory(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_private_directory(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_file(file: &File) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_private_file(_file: &File) -> Result<()> {
+    Ok(())
 }
 
 fn hex(bytes: impl AsRef<[u8]>) -> String {

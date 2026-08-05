@@ -74,6 +74,9 @@ pub(crate) async fn sync_once(volume: &ManagedVolume, request: SyncRequest<'_>) 
     let _lock = ReplicaLock::acquire(&paths)?;
     let mut state = ReplicaState::load_or_new(request.volume_id, &paths)?;
     recover(volume, &paths, &mut state).await?;
+    if state.publication.is_none() {
+        crate::replica::clear_staging(&paths)?;
+    }
 
     let observed = volume.metadata.observe(request.volume_id).await?;
     let remote = remote_manifest(
@@ -139,6 +142,7 @@ pub(crate) async fn sync_once(volume: &ManagedVolume, request: SyncRequest<'_>) 
     if !conflicts.is_empty() {
         state.conflicts = conflicts;
         state.save(&paths)?;
+        crate::replica::clear_staging(&paths)?;
         bail!("Managed Sync conflict; inspect status and rerun with --resolve PATH");
     }
     state.conflicts.clear();
@@ -175,6 +179,7 @@ pub(crate) async fn sync_once(volume: &ManagedVolume, request: SyncRequest<'_>) 
         PublicationOutcome::Conflict(actual) => {
             state.publication = None;
             state.save(&paths)?;
+            crate::replica::clear_staging(&paths)?;
             bail!(
                 "publication was stale at generation {}; rerun sync to reconcile",
                 actual.head.cursor.generation
@@ -402,6 +407,7 @@ async fn materialize(
     cursor: Cursor,
     target: Manifest,
 ) -> Result<()> {
+    let mut durable_directories = BTreeSet::new();
     state.materialization = Some(PendingMaterialization {
         target: cursor.clone(),
         manifest: target.clone(),
@@ -420,7 +426,11 @@ async fn materialize(
         .collect::<Vec<_>>();
     removals.sort_by_key(|path| std::cmp::Reverse(path.matches('/').count()));
     for relative in removals {
-        remove_path(&paths.local.join(relative))?;
+        let path = paths.local.join(relative);
+        if let Some(parent) = path.parent() {
+            durable_directories.insert(parent.to_owned());
+        }
+        remove_path(&path)?;
     }
     let mut directories = target
         .entries
@@ -432,6 +442,11 @@ async fn materialize(
         let path = paths.local.join(relative);
         if path.exists() && !path.is_dir() {
             remove_path(&path)?;
+        }
+        if !path.exists() {
+            if let Some(parent) = path.parent() {
+                durable_directories.insert(parent.to_owned());
+            }
         }
         std::fs::create_dir_all(path)?;
     }
@@ -454,6 +469,7 @@ async fn materialize(
             .parent()
             .context("materialization path has no parent")?;
         std::fs::create_dir_all(parent)?;
+        durable_directories.insert(parent.to_owned());
         let name = path.file_name().unwrap().to_string_lossy();
         let temporary = parent.join(format!(".{name}.ofs-apply-{}", content.sha256));
         if temporary.exists() {
@@ -462,6 +478,11 @@ async fn materialize(
         volume.data.fetch(content, &temporary).await?;
         set_executable(&temporary, *executable)?;
         std::fs::rename(&temporary, &path)?;
+    }
+    let mut durable_directories = durable_directories.into_iter().collect::<Vec<_>>();
+    durable_directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for directory in durable_directories {
+        crate::replica::sync_directory(&directory)?;
     }
     let observed = crate::replica::scan(paths, Some(&target), false)?;
     if observed != target {
@@ -473,6 +494,7 @@ async fn materialize(
     });
     state.materialization = None;
     state.conflicts.clear();
+    crate::replica::clear_staging(paths)?;
     state.save(paths)
 }
 

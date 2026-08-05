@@ -240,7 +240,8 @@ impl Catalog {
         temporary.write_all(b"\n")?;
         temporary.as_file_mut().sync_all()?;
         temporary.persist(path).map_err(|error| error.error)?;
-        set_private(path)
+        set_private(path)?;
+        crate::replica::sync_directory(parent)
     }
 
     fn validate(&self) -> Result<()> {
