@@ -176,7 +176,7 @@ pub(crate) async fn sync_once(volume: &ManagedVolume, request: SyncRequest<'_>) 
         operation,
         changes,
     )?;
-    match volume.metadata.publish(&observed, commit, None).await? {
+    match volume.metadata.publish(&observed, commit).await? {
         PublicationOutcome::Committed(cursor) | PublicationOutcome::AlreadyCommitted(cursor) => {
             state.publication = None;
             state.save(&paths)?;
@@ -238,7 +238,7 @@ async fn recover(
                         pending.operation,
                         pending.changes,
                     )?;
-                    match volume.metadata.publish(&observed, commit, None).await? {
+                    match volume.metadata.publish(&observed, commit).await? {
                         PublicationOutcome::Committed(cursor)
                         | PublicationOutcome::AlreadyCommitted(cursor) => {
                             state.publication = None;

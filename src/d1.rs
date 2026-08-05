@@ -405,27 +405,16 @@ impl MetadataStore for D1MetadataStore {
         &self,
         expected: &Observation,
         commit: CommitRecord,
-        checkpoint: Option<CheckpointRecord>,
     ) -> Result<PublicationOutcome> {
         commit.validate()?;
         if commit.volume_id != expected.format.volume_id || commit.parent != expected.head.cursor {
             bail!("D1 publication does not match its observed authority position");
         }
-        let checkpoint_cursor = checkpoint
-            .as_ref()
-            .map(|value| value.cursor.clone())
-            .unwrap_or_else(|| expected.head.checkpoint.clone());
-        if let Some(value) = checkpoint {
-            if value.volume_id != commit.volume_id || value.cursor != commit.cursor {
-                bail!("D1 publication checkpoint does not match its commit");
-            }
-            self.write_checkpoint(&value).await?;
-        }
         let hash = self.write_commit(&commit).await?;
         let next = HeadRecord::advance(
             commit.volume_id.clone(),
             commit.cursor.clone(),
-            checkpoint_cursor,
+            expected.head.checkpoint.clone(),
         );
         let result = self
             .transport

@@ -74,7 +74,6 @@ pub(crate) trait MetadataStore: Send + Sync {
         &self,
         expected: &Observation,
         commit: CommitRecord,
-        checkpoint: Option<CheckpointRecord>,
     ) -> Result<PublicationOutcome>;
     async fn resolve(&self, volume: &VolumeId, operation: &OperationId) -> Result<Option<Cursor>>;
 }
@@ -315,28 +314,17 @@ impl MetadataStore for ObjectMetadataStore {
         &self,
         expected: &Observation,
         commit: CommitRecord,
-        checkpoint: Option<CheckpointRecord>,
     ) -> Result<PublicationOutcome> {
         commit.validate()?;
         if commit.volume_id != expected.format.volume_id || commit.parent != expected.head.cursor {
             bail!("publication does not match its observed authority position");
         }
-        let checkpoint_cursor = if let Some(value) = checkpoint {
-            if value.volume_id != commit.volume_id || value.cursor != commit.cursor {
-                bail!("publication checkpoint does not match its commit");
-            }
-            self.write_immutable(&checkpoint_key(&value.cursor), &value)
-                .await?;
-            value.cursor
-        } else {
-            expected.head.checkpoint.clone()
-        };
         self.write_immutable(&commit_key(&commit.cursor.operation), &commit)
             .await?;
         let head = HeadRecord::advance(
             commit.volume_id.clone(),
             commit.cursor.clone(),
-            checkpoint_cursor,
+            expected.head.checkpoint.clone(),
         );
         match self
             .operator
