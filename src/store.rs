@@ -17,7 +17,6 @@
 
 //! Provider adapters for a Managed Volume.
 
-use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::path::Path;
 
@@ -44,7 +43,6 @@ const COMMIT_PREFIX: &str = "metadata/commits/";
 const CHECKPOINT_PREFIX: &str = "metadata/checkpoints/";
 const DATA_PREFIX: &str = "data/sha256/";
 const INITIAL_KEY: &str = "initial";
-const MAX_ANCESTRY: usize = 1_000_000;
 
 #[derive(Clone, Debug)]
 pub(crate) struct Observation {
@@ -188,20 +186,15 @@ impl ObjectMetadataStore {
     async fn reachable(&self, volume: &VolumeId, target: &OperationId) -> Result<Option<Cursor>> {
         let observed = self.observe_inner(volume).await?;
         let mut cursor = observed.head.cursor;
-        let mut seen = HashSet::new();
-        for _ in 0..MAX_ANCESTRY {
+        loop {
             if &cursor.operation == target {
                 return Ok(Some(cursor));
             }
             if cursor.generation == 0 {
                 return Ok(None);
             }
-            if !seen.insert(cursor.operation.clone()) {
-                bail!("Managed change ancestry contains a cycle");
-            }
             cursor = self.read_commit(&cursor).await?.parent;
         }
-        bail!("Managed change ancestry exceeds its safety bound")
     }
 }
 
@@ -304,7 +297,7 @@ impl MetadataStore for ObjectMetadataStore {
         let mut cursor = through.clone();
         let mut commits = Vec::new();
         while cursor != *after {
-            if commits.len() == MAX_ANCESTRY || cursor.generation <= after.generation {
+            if cursor.generation <= after.generation {
                 bail!("change cursor is not in the target ancestry");
             }
             let commit = self.read_commit(&cursor).await?;

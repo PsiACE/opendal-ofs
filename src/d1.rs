@@ -17,7 +17,6 @@
 
 //! Cloudflare D1 adapter for the provider-neutral Metadata Store contract.
 
-use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
 
@@ -41,7 +40,6 @@ use crate::store::{MetadataStore, Observation, PublicationOutcome};
 
 const API_BASE: &str = "https://api.cloudflare.com/client/v4";
 const SCHEMA_VERSION: u32 = 1;
-const MAX_ANCESTRY: usize = 1_000_000;
 const CREATE_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS ofs_managed_schema (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), schema_version INTEGER NOT NULL)";
 const CREATE_FORMATS: &str = "CREATE TABLE IF NOT EXISTS ofs_managed_formats (store_key TEXT PRIMARY KEY, record_json TEXT NOT NULL, digest TEXT NOT NULL)";
 const CREATE_HEADS: &str = "CREATE TABLE IF NOT EXISTS ofs_managed_heads (store_key TEXT PRIMARY KEY, volume_id TEXT NOT NULL, generation TEXT NOT NULL, operation_id TEXT NOT NULL, token TEXT NOT NULL, head_json TEXT NOT NULL)";
@@ -317,16 +315,12 @@ impl D1MetadataStore {
             bail!("D1 head belongs to another Managed Volume");
         }
         let mut cursor = head.cursor;
-        let mut seen = HashSet::new();
-        for _ in 0..MAX_ANCESTRY {
+        loop {
             if &cursor.operation == operation {
                 return Ok(Some(cursor));
             }
             if cursor.generation == 0 {
                 return Ok(None);
-            }
-            if !seen.insert(cursor.operation.clone()) {
-                bail!("D1 commit ancestry contains a cycle");
             }
             let commit = self.read_commit(&cursor.operation).await?;
             if commit.cursor != cursor || &commit.volume_id != volume {
@@ -334,7 +328,6 @@ impl D1MetadataStore {
             }
             cursor = commit.parent;
         }
-        bail!("D1 commit ancestry exceeds its safety bound")
     }
 }
 
@@ -394,7 +387,7 @@ impl MetadataStore for D1MetadataStore {
         let mut cursor = through.clone();
         let mut changes = Vec::new();
         while cursor != *after {
-            if changes.len() == MAX_ANCESTRY || cursor.generation <= after.generation {
+            if cursor.generation <= after.generation {
                 bail!("D1 change cursor is not in the target ancestry");
             }
             let commit = self.read_commit(&cursor.operation).await?;
