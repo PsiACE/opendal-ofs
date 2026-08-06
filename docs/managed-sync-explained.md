@@ -81,9 +81,11 @@ snapshot. The initial checkpoint exists for first binding and cold recovery.
 This keeps routine publications proportional to the change set while retaining
 a complete recovery path when no replica state survives.
 
-A long-offline replica must still read every missed change record. D1 catch-up
-uses one authoritative query per missed generation, so latency grows with the
-generation gap even though transferred file content remains deduplicated.
+A long-offline replica must still read every missed change record. D1 fetches
+the fixed generation interval with one authoritative range query and validates
+the parent-cursor chain locally. Payload and replay work grow with the gap, but
+D1 request latency no longer grows by one round trip per generation; file
+content remains deduplicated.
 
 ## Multiple agents
 

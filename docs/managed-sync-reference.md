@@ -72,8 +72,18 @@ does not reconcile, publish, materialize, or change local or remote state.
 | `OFS_SYNC_TRANSFER_CONCURRENCY` | Default override for one sync invocation |
 | `XDG_CONFIG_HOME`, `HOME` | Default catalog location when `--config` and `OFS_CONFIG` are absent |
 
-Command-line values take precedence over catalog defaults. `--config` is a
-global option and appears before the subcommand.
+For settings that have all four forms, resolution is command line, then
+environment, then catalog, then the built-in default. In particular,
+`--transfer-concurrency` overrides `OFS_SYNC_TRANSFER_CONCURRENCY`, which
+overrides `sync.transfer_concurrency` in the catalog; a newly created catalog
+uses four. `--config` overrides `OFS_CONFIG`, followed by the XDG/HOME default
+location. `--config` is global and appears before the subcommand.
+
+During `volume create`, credential query values in `--storage` and `--metadata`
+override values in the corresponding environment URL. Later commands use the
+credential-free locator from the catalog with credentials from the environment.
+Every credential-bearing URL must resolve to the same credential-free locator;
+an environment variable cannot redirect a named volume to another root.
 
 The catalog stores storage and metadata locators, volume IDs, and transfer
 defaults. Query credentials whose names contain token, secret, password,
@@ -108,8 +118,9 @@ All keys are relative to the configured storage root.
 The first non-empty commit contains one `put` for every directory and file.
 Later commits contain only `diff(remote, merged_target)`: creates, changes, and
 removals for affected paths. An unchanged file creates neither a new commit
-entry nor a new data object. `metadata/head` is overwritten in place, while
-commits and data versions accumulate.
+entry nor a new data object. `metadata/head` is overwritten in place. Its ETag
+is the CAS authority token, and a successful conditional write returns the
+token for the new observation. Commits and data versions accumulate.
 
 A file `put` stores one content reference containing the full SHA-256 digest
 and byte size. The Data Store key is derived from that digest; the metadata
@@ -176,16 +187,25 @@ The token must allow D1 Query API access. Initialization executes idempotent
 schema creation and requires `CREATE TABLE`, `SELECT`, `INSERT`, and `UPDATE`
 on the selected database. The five shared tables are:
 
-- `ofs_managed_schema`
-- `ofs_managed_formats`
-- `ofs_managed_heads`
-- `ofs_managed_commits`
-- `ofs_managed_checkpoints`
+- `ofs_managed_v1_schema`
+- `ofs_managed_v1_formats`
+- `ofs_managed_v1_heads`
+- `ofs_managed_v1_commits`
+- `ofs_managed_v1_checkpoints`
 
 `STORE_KEY` isolates one Managed Volume within those tables. Reusing a store
 key with a different Data Store binding is rejected. D1 query results must
 report `served_by_primary=true`; ofs does not treat an unproven replica result
 as an authoritative observation.
+
+D1 uses the head row's integer revision as the same CAS authority boundary as
+an object ETag. A successful conditional update increments and returns the
+replacement revision; it does not duplicate the namespace generation as a
+second authority mechanism.
+Read and idempotent statements retry transient transport, rate-limit, service,
+and non-authoritative responses with bounded jittered backoff. The publication
+statement is never retried blindly because a lost response can leave its result
+unknown.
 
 D1 is the Metadata Store only. File bytes remain in the configured OpenDAL
 Data Store.
@@ -198,9 +218,11 @@ Data Store.
 | `volume.name`, `volume.id`, `volume.model` | Bound named Managed Volume |
 | `access` | `sync` |
 | `local` | `clean` or `changed` |
+| `local_error` | Stable error kind and diagnostic message when local inspection fails |
 | `base.generation` | Durable common generation, or absent before binding |
 | `remote.state` | `at_base`, `ahead`, `behind`, `diverged`, or `unknown` |
 | `remote.generation` | Present only after a successful live authority observation |
+| `remote.error` | Stable error kind and diagnostic message when live observation fails |
 | `publication` | `idle`, `pending`, or `conflict` |
 | `materialize` | `idle` or `pending` |
 | `conflicts` | Number of retained conflicts |
@@ -253,7 +275,9 @@ Unsupported trees are rejected before a remote generation is advanced.
 | Authority unavailable during status | `remote.state` is `unknown` with no remote generation |
 | Publication result unknown | Next sync resolves the durable operation before retrying |
 
-The D1 change-log reader performs one query per missed generation. Large
-generation gaps therefore increase foreground catch-up latency. There is no
+The D1 change-log reader fetches the fixed generation interval in one ordered
+query, then verifies the parent-cursor ancestry in memory. Payload size still
+grows with the number and size of missed changes, but network round trips do
+not grow once per generation. There is no
 background daemon, periodic checkpoint, change-set merge, history browser,
 remote volume delete command, remote retention policy, or garbage collector.
