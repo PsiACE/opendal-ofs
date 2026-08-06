@@ -55,7 +55,7 @@ contract. Placement changes configuration, not user behavior.
 One `ofs sync` invocation performs a complete foreground reconciliation and
 then exits.
 
-It first recovers any interrupted publication or materialization recorded in
+It first resumes any interrupted publication or materialization recorded in
 the replica state. It then observes one fixed authority position, reconstructs
 the remote target, scans a stable local tree, and compares both sides with the
 replica's durable common base.
@@ -76,10 +76,11 @@ operation identity. To catch up, a replica consumes consecutive namespace
 change records from its common cursor to the authority position observed at
 the start of sync.
 
-Each regular change record contains changed paths, not a full directory
-snapshot. The initial checkpoint exists for first binding and cold recovery.
-This keeps routine publications proportional to the change set while retaining
-a complete recovery path when no replica state survives.
+Each change record contains changed paths, not a full directory snapshot.
+Generation zero is the defined empty namespace. A new replica starts there and
+replays the consecutive change log to the fixed authority cursor. This keeps
+routine publications proportional to the change set while retaining a complete
+cold recovery path when no replica state survives.
 
 A long-offline replica must still read every missed change record. D1 fetches
 the fixed generation interval with one authoritative range query and validates
@@ -141,15 +142,11 @@ does not remove the old object or its historical commit. For trees containing
 many very small files, namespace JSON and per-object provider overhead can be
 much larger than live file bytes even though the write path is incremental.
 
-Reclaiming this history requires more than deleting old keys. A safe design
-must first create a full checkpoint at a fixed head, conditionally move the
-head's checkpoint pointer, retain enough history for offline replicas and
-uncertain publications, and then mark data reachable from every retained
-checkpoint and commit before sweeping old blobs. Newly uploaded but not yet
-published data also needs a grace period. Managed Sync has no checkpoint
-advancement, retention policy, or garbage collector.
+Managed Sync does not compact the change log or collect old content. Operators
+must account for all published content versions and change records, not only
+the current live tree.
 
-## Failure and recovery
+## Failure handling and cold recovery
 
 Publication is ordered data before metadata. A durable operation identity is
 recorded before the authority can advance. If a process or network failure

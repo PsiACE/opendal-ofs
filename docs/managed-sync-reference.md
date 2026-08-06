@@ -32,8 +32,8 @@ ofs [--config CATALOG] sync NAME DIRECTORY \
   [--transfer-concurrency N]
 ```
 
-The command performs one recovery and reconciliation pass, prints the final
-generation, and exits. `DIRECTORY` may be non-empty only for the first
+The command resumes recorded local work, performs one reconciliation, prints
+the final generation, and exits. `DIRECTORY` may be non-empty only for the first
 publication to an empty volume or when it already has a matching durable
 replica state.
 
@@ -110,25 +110,23 @@ All keys are relative to the configured storage root.
 | Key | Contents | Mutation rule |
 | --- | --- | --- |
 | `metadata/format` | Volume identity, metadata placement, and Data Store binding | Created once |
-| `metadata/head` | Current cursor and checkpoint cursor | Replaced with an ETag-conditional write |
-| `metadata/checkpoints/initial` | Full empty generation-0 manifest | Immutable |
+| `metadata/head` | Current cursor | Replaced with an ETag-conditional write |
 | `metadata/commits/OPERATION_ID` | Parent cursor, new cursor, and namespace changes | One immutable object per published generation |
 | `data/sha256/DIGEST` | Raw file bytes | Immutable and deduplicated by SHA-256 |
 
 The first non-empty commit contains one `put` for every directory and file.
 Later commits contain only `diff(remote, merged_target)`: creates, changes, and
 removals for affected paths. An unchanged file creates neither a new commit
-entry nor a new data object. `metadata/head` is overwritten in place. Its ETag
-is the CAS authority token, and a successful conditional write must return a
-new ETag even though the current single-publication workflow does not retain
-it. Commits and data versions accumulate.
+entry nor a new data object. `metadata/head` is overwritten in place. The ETag
+observed with the head is the precondition for the next conditional write.
+Commits and data versions accumulate.
 
 A file `put` stores one content reference containing the full SHA-256 digest
 and byte size. The Data Store key is derived from that digest; the metadata
 does not repeat a `data_ref` string.
 
 ```text
-G0  format + head(G0) + checkpoints/initial(empty)
+G0  format + head(G0), with an implicit empty namespace
  |
  | first publication: full namespace commit + every unique live file digest
  v
@@ -143,28 +141,21 @@ Gn  every earlier immutable commit and digest is still present
 ```
 
 With external D1 metadata, S3 contains only `data/sha256/DIGEST`. The format,
-head, immutable commits, and checkpoints are stored under the selected
-`STORE_KEY` in the D1 tables listed below.
+head, and immutable commits are stored under the selected `STORE_KEY` in the
+D1 tables listed below.
 
-### Growth and retention
+### Storage growth
 
 Logical storage use grows as:
 
 ```text
 data bytes     = bytes in every unique content digest ever published
-metadata bytes = fixed format/head + checkpoints + sum of commit records
+metadata bytes = fixed format/head + sum of commit records
 ```
 
 Failed or losing publications can also leave immutable commit or data objects
-that are not reachable from the head. Managed Sync has no command that removes
-historical or unreachable objects.
-
-Safe compaction requires a full checkpoint published with a conditional head
-update before earlier commits can be pruned. Data collection must trace every
-retained checkpoint and subsequent commit, preserve a retention window for
-offline replicas and idempotent recovery, and delay deletion of newly uploaded
-unreferenced blobs so it cannot race an in-flight publication. Managed Sync
-does not provide these retention and garbage-collection operations.
+that are not reachable from the head. Managed Sync does not compact the change
+log or remove historical and unreachable objects.
 
 ## D1 metadata locator
 
@@ -186,23 +177,21 @@ key. A mismatch fails before a D1 statement is executed.
 
 The token must allow D1 Query API access. Initialization executes idempotent
 schema creation and requires `CREATE TABLE`, `SELECT`, `INSERT`, and `UPDATE`
-on the selected database. The five shared tables are:
+on the selected database. The four shared tables are:
 
 - `ofs_managed_v1_schema`
 - `ofs_managed_v1_formats`
 - `ofs_managed_v1_heads`
 - `ofs_managed_v1_commits`
-- `ofs_managed_v1_checkpoints`
 
 `STORE_KEY` isolates one Managed Volume within those tables. Reusing a store
 key with a different Data Store binding is rejected. D1 query results must
 report `served_by_primary=true`; ofs does not treat an unproven replica result
 as an authoritative observation.
 
-D1 uses the head row's integer revision as the same CAS authority boundary as
-an object ETag. A successful conditional update increments and returns the
-replacement revision; it does not duplicate the namespace generation as a
-second authority mechanism.
+D1 uses the observed head row revision as the precondition for its conditional
+update. A successful publication increments that revision. The namespace
+generation remains part of the same predicate and head record.
 Read and idempotent statements retry transient transport, rate-limit, service,
 and non-authoritative responses with bounded jittered backoff. The publication
 statement is never retried blindly because a lost response can leave its result
@@ -238,7 +227,7 @@ Conflict kinds are `same_node_modified`, `delete_vs_modify`,
 
 Managed Sync reports these public capabilities:
 
-- `atomic-snapshot`
+- `atomic-publication`
 - `change-feed`
 - `conditional-publication`
 - `conflict-retention`
@@ -279,6 +268,5 @@ Unsupported trees are rejected before a remote generation is advanced.
 The D1 change-log reader fetches the fixed generation interval in one ordered
 query, then verifies the parent-cursor ancestry in memory. Payload size still
 grows with the number and size of missed changes, but network round trips do
-not grow once per generation. There is no
-background daemon, periodic checkpoint, change-set merge, history browser,
-remote volume delete command, remote retention policy, or garbage collector.
+not grow once per generation. There is no background daemon, history browser,
+remote volume delete command, log compaction, or garbage collector.
