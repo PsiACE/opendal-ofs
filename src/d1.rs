@@ -34,8 +34,7 @@ use url::Url;
 
 use crate::catalog::StorageLocator;
 use crate::model::{
-    CheckpointRecord, CommitRecord, Cursor, FormatRecord, HeadRecord, MetadataPlacement,
-    OperationId, VolumeId,
+    CommitRecord, Cursor, FormatRecord, HeadRecord, MetadataPlacement, OperationId, VolumeId,
 };
 use crate::store::{AuthorityToken, MetadataStore, Observation, PublicationOutcome};
 
@@ -46,7 +45,6 @@ const CREATE_FORMATS: &str = "CREATE TABLE IF NOT EXISTS ofs_managed_v1_formats 
 const CREATE_HEADS: &str = "CREATE TABLE IF NOT EXISTS ofs_managed_v1_heads (store_key TEXT PRIMARY KEY, volume_id TEXT NOT NULL, generation INTEGER NOT NULL, operation_id TEXT NOT NULL, revision INTEGER NOT NULL, head_json TEXT NOT NULL)";
 const CREATE_COMMITS: &str = "CREATE TABLE IF NOT EXISTS ofs_managed_v1_commits (store_key TEXT NOT NULL, operation_id TEXT NOT NULL, volume_id TEXT NOT NULL, generation INTEGER NOT NULL, parent_generation INTEGER NOT NULL, parent_operation_id TEXT NOT NULL, record_json TEXT NOT NULL, digest TEXT NOT NULL, PRIMARY KEY (store_key, operation_id))";
 const CREATE_COMMIT_GENERATION_INDEX: &str = "CREATE INDEX IF NOT EXISTS ofs_managed_v1_commits_by_generation ON ofs_managed_v1_commits (store_key, generation)";
-const CREATE_CHECKPOINTS: &str = "CREATE TABLE IF NOT EXISTS ofs_managed_v1_checkpoints (store_key TEXT NOT NULL, operation_id TEXT NOT NULL, volume_id TEXT NOT NULL, generation INTEGER NOT NULL, record_json TEXT NOT NULL, digest TEXT NOT NULL, PRIMARY KEY (store_key, operation_id))";
 
 pub(crate) struct D1Config {
     account: String,
@@ -128,7 +126,6 @@ impl D1MetadataStore {
             CREATE_HEADS,
             CREATE_COMMITS,
             CREATE_COMMIT_GENERATION_INDEX,
-            CREATE_CHECKPOINTS,
         ] {
             self.transport
                 .execute(sql, Vec::new(), Semantics::Idempotent)
@@ -211,45 +208,6 @@ impl D1MetadataStore {
             )
             .await?;
         Ok(())
-    }
-
-    async fn write_checkpoint(&self, value: &CheckpointRecord) -> Result<()> {
-        value.validate()?;
-        let json = serde_json::to_string(value)?;
-        let hash = digest(&json);
-        self.transport
-            .execute(
-                "INSERT OR IGNORE INTO ofs_managed_v1_checkpoints (store_key, operation_id, volume_id, generation, record_json, digest) VALUES (?, ?, ?, ?, ?, ?)",
-                vec![
-                    self.store_key.clone().into(),
-                    value.cursor.operation.as_str().into(),
-                    value.volume_id.as_str().into(),
-                    value.cursor.generation.into(),
-                    json.into(),
-                    hash.clone().into(),
-                ],
-                Semantics::Idempotent,
-            )
-            .await?;
-        let stored = self.read_checkpoint(&value.cursor.operation).await?;
-        if &stored != value {
-            bail!("immutable D1 checkpoint key was reused with different content");
-        }
-        Ok(())
-    }
-
-    async fn read_checkpoint(&self, operation: &OperationId) -> Result<CheckpointRecord> {
-        let rows = self
-            .transport
-            .execute(
-                "SELECT record_json, digest FROM ofs_managed_v1_checkpoints WHERE store_key = ? AND operation_id = ?",
-                vec![self.store_key.clone().into(), operation.as_str().into()],
-                Semantics::Read,
-            )
-            .await?;
-        let value: CheckpointRecord = record(one(&rows, "D1 checkpoint")?)?;
-        value.validate()?;
-        Ok(value)
     }
 
     async fn write_commit(&self, value: &CommitRecord) -> Result<String> {
@@ -356,12 +314,6 @@ impl MetadataStore for D1MetadataStore {
         if !format.same_storage(&proposed) {
             bail!("D1 scope has a different metadata placement or Data Store binding");
         }
-        let checkpoint = CheckpointRecord::new(
-            format.volume_id.clone(),
-            Cursor::initial(),
-            Default::default(),
-        )?;
-        self.write_checkpoint(&checkpoint).await?;
         let head = HeadRecord::initial(format.volume_id.clone());
         self.transport
             .execute(
@@ -379,14 +331,6 @@ impl MetadataStore for D1MetadataStore {
 
     async fn observe(&self, volume: &VolumeId) -> Result<Observation> {
         self.observe_inner(volume).await
-    }
-
-    async fn checkpoint(&self, volume: &VolumeId, at: &Cursor) -> Result<CheckpointRecord> {
-        let value = self.read_checkpoint(&at.operation).await?;
-        if &value.volume_id != volume || value.cursor != *at {
-            bail!("D1 checkpoint does not match the requested cursor");
-        }
-        Ok(value)
     }
 
     async fn changes(
@@ -456,11 +400,7 @@ impl MetadataStore for D1MetadataStore {
             bail!("D1 publication does not match its observed authority position");
         }
         let hash = self.write_commit(&commit).await?;
-        let next = HeadRecord::advance(
-            commit.volume_id.clone(),
-            commit.cursor.clone(),
-            expected.head.checkpoint.clone(),
-        );
+        let next = HeadRecord::advance(commit.volume_id.clone(), commit.cursor.clone());
         let expected_revision = match &expected.authority {
             AuthorityToken::D1Revision(value) => *value,
             AuthorityToken::ObjectEtag(_) => bail!("D1 metadata received an object ETag"),
@@ -468,7 +408,7 @@ impl MetadataStore for D1MetadataStore {
         let result = self
             .transport
             .execute(
-                "UPDATE ofs_managed_v1_heads SET generation = ?, operation_id = ?, revision = revision + 1, head_json = ? WHERE store_key = ? AND volume_id = ? AND generation = ? AND operation_id = ? AND revision = ? AND EXISTS (SELECT 1 FROM ofs_managed_v1_commits c WHERE c.store_key = ofs_managed_v1_heads.store_key AND c.operation_id = ? AND c.generation = ? AND c.digest = ?) RETURNING revision",
+                "UPDATE ofs_managed_v1_heads SET generation = ?, operation_id = ?, revision = revision + 1, head_json = ? WHERE store_key = ? AND volume_id = ? AND generation = ? AND operation_id = ? AND revision = ? AND EXISTS (SELECT 1 FROM ofs_managed_v1_commits c WHERE c.store_key = ofs_managed_v1_heads.store_key AND c.operation_id = ? AND c.generation = ? AND c.digest = ?) RETURNING generation",
                 vec![
                     commit.cursor.generation.into(),
                     commit.cursor.operation.as_str().into(),
@@ -486,14 +426,8 @@ impl MetadataStore for D1MetadataStore {
             )
             .await;
         match result {
-            Ok(rows) if !rows.is_empty() => {
-                let next_revision = required_u64(one(&rows, "D1 publication")?, "revision")?;
-                if Some(next_revision) != expected_revision.checked_add(1) {
-                    bail!("D1 publication returned an invalid authority revision");
-                }
-                Ok(PublicationOutcome::Committed(commit.cursor))
-            }
-            Ok(_) => match self
+            Ok(rows) if rows.len() == 1 => Ok(PublicationOutcome::Committed(commit.cursor)),
+            Ok(rows) if rows.is_empty() => match self
                 .reachable(&commit.volume_id, &commit.cursor.operation)
                 .await?
             {
@@ -502,6 +436,7 @@ impl MetadataStore for D1MetadataStore {
                     self.observe_inner(&commit.volume_id).await?,
                 )),
             },
+            Ok(_) => bail!("D1 returned duplicate publication rows"),
             Err(error) if error.unknown => Ok(PublicationOutcome::Unknown),
             Err(error) => Err(error.into()),
         }

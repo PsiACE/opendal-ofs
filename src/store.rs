@@ -25,7 +25,6 @@ use async_trait::async_trait;
 use futures::TryStreamExt;
 use opendal::layers::RetryLayer;
 use opendal::{ErrorKind, Operator};
-use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -33,16 +32,13 @@ use url::Url;
 
 use crate::catalog::StorageLocator;
 use crate::model::{
-    CheckpointRecord, CommitRecord, ContentRef, Cursor, FormatRecord, HeadRecord, OperationId,
-    VolumeId,
+    CommitRecord, ContentRef, Cursor, FormatRecord, HeadRecord, OperationId, VolumeId,
 };
 
 const FORMAT_KEY: &str = "metadata/format";
 const HEAD_KEY: &str = "metadata/head";
 const COMMIT_PREFIX: &str = "metadata/commits/";
-const CHECKPOINT_PREFIX: &str = "metadata/checkpoints/";
 const DATA_PREFIX: &str = "data/sha256/";
-const INITIAL_KEY: &str = "initial";
 
 #[derive(Clone, Debug)]
 pub(crate) struct Observation {
@@ -69,7 +65,6 @@ pub(crate) enum PublicationOutcome {
 pub(crate) trait MetadataStore: Send + Sync {
     async fn initialize(&self, proposed: FormatRecord) -> Result<Observation>;
     async fn observe(&self, volume: &VolumeId) -> Result<Observation>;
-    async fn checkpoint(&self, volume: &VolumeId, at: &Cursor) -> Result<CheckpointRecord>;
     async fn changes(
         &self,
         volume: &VolumeId,
@@ -154,24 +149,25 @@ impl ObjectMetadataStore {
         decode(&bytes.to_vec(), what)
     }
 
-    async fn write_immutable<T: Serialize>(&self, key: &str, value: &T) -> Result<()> {
+    async fn write_commit(&self, value: &CommitRecord) -> Result<()> {
+        let key = commit_key(&value.cursor.operation);
         let bytes = serde_json::to_vec(value)?;
         match self
             .operator
-            .write_with(key, bytes.clone())
+            .write_with(&key, bytes.clone())
             .if_not_exists(true)
             .await
         {
             Ok(_) => Ok(()),
             Err(error) if precondition(&error) => {
-                let existing = self.operator.read(key).await?;
+                let existing = self.operator.read(&key).await?;
                 if existing.to_vec() == bytes {
                     Ok(())
                 } else {
-                    bail!("immutable metadata key was reused with different content")
+                    bail!("immutable commit key was reused with different content")
                 }
             }
-            Err(error) => Err(error).context("write immutable Managed metadata"),
+            Err(error) => Err(error).context("write immutable Managed commit"),
         }
     }
 
@@ -251,13 +247,6 @@ impl MetadataStore for ObjectMetadataStore {
                     .downcast_ref::<opendal::Error>()
                     .is_some_and(|source| source.kind() == ErrorKind::NotFound) =>
             {
-                let checkpoint = CheckpointRecord::new(
-                    format.volume_id.clone(),
-                    Cursor::initial(),
-                    Default::default(),
-                )?;
-                self.write_immutable(&checkpoint_key(&Cursor::initial()), &checkpoint)
-                    .await?;
                 let head = HeadRecord::initial(format.volume_id.clone());
                 match self
                     .operator
@@ -280,17 +269,6 @@ impl MetadataStore for ObjectMetadataStore {
 
     async fn observe(&self, volume: &VolumeId) -> Result<Observation> {
         self.observe_inner(volume).await
-    }
-
-    async fn checkpoint(&self, volume: &VolumeId, at: &Cursor) -> Result<CheckpointRecord> {
-        let value: CheckpointRecord = self
-            .read_json(&checkpoint_key(at), "Managed checkpoint")
-            .await?;
-        value.validate()?;
-        if &value.volume_id != volume || value.cursor != *at {
-            bail!("checkpoint does not match the requested volume cursor");
-        }
-        Ok(value)
     }
 
     async fn changes(
@@ -328,13 +306,8 @@ impl MetadataStore for ObjectMetadataStore {
         if commit.volume_id != expected.format.volume_id || commit.parent != expected.head.cursor {
             bail!("publication does not match its observed authority position");
         }
-        self.write_immutable(&commit_key(&commit.cursor.operation), &commit)
-            .await?;
-        let head = HeadRecord::advance(
-            commit.volume_id.clone(),
-            commit.cursor.clone(),
-            expected.head.checkpoint.clone(),
-        );
+        self.write_commit(&commit).await?;
+        let head = HeadRecord::advance(commit.volume_id.clone(), commit.cursor.clone());
         let etag = match &expected.authority {
             AuthorityToken::ObjectEtag(value) => value,
             AuthorityToken::D1Revision(_) => {
@@ -347,12 +320,7 @@ impl MetadataStore for ObjectMetadataStore {
             .if_match(etag)
             .await
         {
-            Ok(metadata) => {
-                metadata
-                    .etag()
-                    .context("Metadata Store write did not return the head ETag")?;
-                Ok(PublicationOutcome::Committed(commit.cursor))
-            }
+            Ok(_) => Ok(PublicationOutcome::Committed(commit.cursor)),
             Err(error) if precondition(&error) => match self
                 .reachable(&commit.volume_id, &commit.cursor.operation)
                 .await?
@@ -544,15 +512,6 @@ fn publication_result_unknown(error: &opendal::Error) -> bool {
 
 fn commit_key(operation: &OperationId) -> String {
     format!("{COMMIT_PREFIX}{}", operation.as_str())
-}
-
-fn checkpoint_key(cursor: &Cursor) -> String {
-    let suffix = if cursor.generation == 0 {
-        INITIAL_KEY
-    } else {
-        cursor.operation.as_str()
-    };
-    format!("{CHECKPOINT_PREFIX}{suffix}")
 }
 
 fn data_key(content: &ContentRef) -> Result<String> {

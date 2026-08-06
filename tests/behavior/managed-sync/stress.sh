@@ -247,7 +247,6 @@ for line in (root / "minio-objects.jsonl").open(encoding="utf-8"):
     except json.JSONDecodeError: continue
     key, size = record.get("key", ""), int(record.get("size", 0))
     if "metadata/commits/" in key: kind = "change_commits"
-    elif "metadata/checkpoints/" in key or "metadata/snapshots/" in key: kind = "checkpoints"
     elif "data/sha256/" in key: kind = "immutable_data"
     else: kind = "authority"
     inventory[(kind, "objects")] += 1
@@ -255,7 +254,7 @@ for line in (root / "minio-objects.jsonl").open(encoding="utf-8"):
     inventory[(kind, "max")] = max(inventory[(kind, "max")], size)
 with (root / "inventory.tsv").open("w", encoding="utf-8") as out:
     out.write("kind\tobjects\tbytes\tmax_object_bytes\n")
-    for kind in ("change_commits", "checkpoints", "immutable_data", "authority"):
+    for kind in ("change_commits", "immutable_data", "authority"):
         out.write(f"{kind}\t{inventory[kind, 'objects']}\t{inventory[kind, 'bytes']}\t{inventory[kind, 'max']}\n")
 
 def metric(path, name):

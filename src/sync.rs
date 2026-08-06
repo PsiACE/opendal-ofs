@@ -36,7 +36,7 @@ use crate::replica::{
 use crate::store::{DataStore, MetadataStore, PublicationOutcome};
 
 pub(crate) const CAPABILITIES: &[&str] = &[
-    "atomic-snapshot",
+    "atomic-publication",
     "change-feed",
     "conditional-publication",
     "conflict-retention",
@@ -74,19 +74,13 @@ pub(crate) async fn sync_once(volume: &ManagedVolume, request: SyncRequest<'_>) 
     let paths = ReplicaPaths::resolve(request.local, request.state)?;
     let _lock = ReplicaLock::acquire(&paths)?;
     let mut state = ReplicaState::load_or_new(request.volume_id, &paths)?;
-    recover(volume, &paths, &mut state, request.transfers).await?;
+    resume_pending_work(volume, &paths, &mut state, request.transfers).await?;
     if state.publication.is_none() {
         crate::replica::clear_staging(&paths)?;
     }
 
     let observed = volume.metadata.observe(request.volume_id).await?;
-    let remote = remote_manifest(
-        volume,
-        &state,
-        &observed.head.cursor,
-        &observed.head.checkpoint,
-    )
-    .await?;
+    let remote = remote_manifest(volume, &state, &observed.head.cursor).await?;
 
     if state.common.is_none() {
         let local = crate::replica::scan(&paths, None, false)?;
@@ -232,7 +226,7 @@ pub(crate) async fn sync_once(volume: &ManagedVolume, request: SyncRequest<'_>) 
     Ok(state.common.as_ref().unwrap().cursor.generation)
 }
 
-async fn recover(
+async fn resume_pending_work(
     volume: &ManagedVolume,
     paths: &ReplicaPaths,
     state: &mut ReplicaState,
@@ -322,19 +316,12 @@ async fn remote_manifest(
     volume: &ManagedVolume,
     state: &ReplicaState,
     target: &Cursor,
-    checkpoint: &Cursor,
 ) -> Result<Manifest> {
     let (mut cursor, mut manifest) = match &state.common {
         Some(common) if common.cursor.generation <= target.generation => {
             (common.cursor.clone(), common.manifest.clone())
         }
-        _ => {
-            let value = volume
-                .metadata
-                .checkpoint(&state.volume_id, checkpoint)
-                .await?;
-            (value.cursor, value.manifest)
-        }
+        _ => (Cursor::initial(), Manifest::default()),
     };
     for commit in volume
         .metadata

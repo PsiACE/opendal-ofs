@@ -301,7 +301,6 @@ pub(crate) struct HeadRecord {
     pub(crate) format_version: u32,
     pub(crate) volume_id: VolumeId,
     pub(crate) cursor: Cursor,
-    pub(crate) checkpoint: Cursor,
 }
 
 impl HeadRecord {
@@ -311,7 +310,6 @@ impl HeadRecord {
             format_version: RECORD_VERSION,
             volume_id,
             cursor: Cursor::initial(),
-            checkpoint: Cursor::initial(),
         }
     }
 
@@ -319,20 +317,15 @@ impl HeadRecord {
         validate_record(&self.format, self.format_version)?;
         self.volume_id.validate()?;
         self.cursor.validate()?;
-        self.checkpoint.validate()?;
-        if self.checkpoint.generation > self.cursor.generation {
-            bail!("checkpoint is newer than the authority head");
-        }
         Ok(())
     }
 
-    pub(crate) fn advance(volume_id: VolumeId, cursor: Cursor, checkpoint: Cursor) -> Self {
+    pub(crate) fn advance(volume_id: VolumeId, cursor: Cursor) -> Self {
         Self {
             format: MANAGED_FORMAT.to_owned(),
             format_version: RECORD_VERSION,
             volume_id,
             cursor,
-            checkpoint,
         }
     }
 }
@@ -391,36 +384,6 @@ impl CommitRecord {
             change.validate()?;
         }
         Ok(())
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct CheckpointRecord {
-    format: String,
-    format_version: u32,
-    pub(crate) volume_id: VolumeId,
-    pub(crate) cursor: Cursor,
-    pub(crate) manifest: Manifest,
-}
-
-impl CheckpointRecord {
-    pub(crate) fn new(volume_id: VolumeId, cursor: Cursor, manifest: Manifest) -> Result<Self> {
-        manifest.validate()?;
-        Ok(Self {
-            format: MANAGED_FORMAT.to_owned(),
-            format_version: RECORD_VERSION,
-            volume_id,
-            cursor,
-            manifest,
-        })
-    }
-
-    pub(crate) fn validate(&self) -> Result<()> {
-        validate_record(&self.format, self.format_version)?;
-        self.volume_id.validate()?;
-        self.cursor.validate()?;
-        self.manifest.validate()
     }
 }
 
@@ -517,7 +480,7 @@ mod tests {
         let encoded = r#"{
             "format":"ofs-managed-volume","format_version":1,
             "volume_id":"volume-1","cursor":{"generation":0,"operation":"initial"},
-            "checkpoint":{"generation":0,"operation":"initial"},"unexpected":true
+            "unexpected":true
         }"#;
         assert!(serde_json::from_str::<HeadRecord>(encoded).is_err());
     }
