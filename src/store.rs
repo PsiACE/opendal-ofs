@@ -496,17 +496,18 @@ pub(crate) fn assemble_operator(
     current: Option<&Url>,
     concurrency: Option<NonZeroUsize>,
 ) -> Result<Operator> {
-    let environment = if current.is_none() {
-        std::env::var("OFS_STORAGE_URL")
-            .ok()
-            .map(|value| Url::parse(&value))
-            .transpose()?
-    } else {
-        None
-    };
-    let overlay = current.or(environment.as_ref());
-    if overlay.is_some_and(|url| StorageLocator::parse(url).as_ref().ok() != Some(locator)) {
-        bail!("credential storage URL does not match the volume catalog locator");
+    let environment = std::env::var("OFS_STORAGE_URL")
+        .ok()
+        .map(|value| Url::parse(&value))
+        .transpose()?;
+    let overlays = [environment.as_ref(), current]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    for overlay in &overlays {
+        if StorageLocator::parse(overlay)? != *locator {
+            bail!("credential storage URL does not match the volume catalog locator");
+        }
     }
     let mut config = locator
         .options
@@ -521,7 +522,7 @@ pub(crate) fn assemble_operator(
     if !locator.path.is_empty() && locator.path != "/" {
         config.push(("root".to_owned(), locator.path.clone()));
     }
-    if let Some(url) = overlay {
+    for url in overlays {
         for (key, value) in url.query_pairs() {
             config.retain(|(existing, _)| existing != key.as_ref());
             config.push((key.into_owned(), value.into_owned()));

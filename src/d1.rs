@@ -59,14 +59,15 @@ impl D1Config {
             .ok()
             .map(|value| Url::parse(&value))
             .transpose()?;
+        for overlay in [environment.as_ref(), current].into_iter().flatten() {
+            if StorageLocator::parse(overlay)? != *locator {
+                bail!("credential metadata URL does not match the catalog locator");
+            }
+        }
         let overlay = current
             .filter(|url| url.query_pairs().any(|(key, _)| key == "token"))
             .or(environment.as_ref())
-            .or(current)
-            .context("D1 metadata requires --metadata during create or OFS_METADATA_URL")?;
-        if StorageLocator::parse(overlay)? != *locator {
-            bail!("credential metadata URL does not match the catalog locator");
-        }
+            .context("D1 metadata requires --metadata with a token or OFS_METADATA_URL")?;
         if locator.scheme != "d1" || locator.port.is_some() || !locator.options.is_empty() {
             bail!("D1 URL must be d1://ACCOUNT/DATABASE/STORE?token=...");
         }

@@ -265,9 +265,6 @@ pub(crate) fn catalog_path(requested: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(path) = requested {
         return Ok(path);
     }
-    if let Some(path) = std::env::var_os("OFS_CONFIG").filter(|value| !value.is_empty()) {
-        return Ok(path.into());
-    }
     if let Some(path) = std::env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty()) {
         let path = PathBuf::from(path);
         if path.is_absolute() {

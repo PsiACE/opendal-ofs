@@ -127,8 +127,12 @@ Direct Mount requires FUSE and currently supports the `fs` and `s3` OpenDAL
 services on Linux.
 
 ```console
-ofs <mount-point> 'fs://?root=<directory>'
-ofs <mount-point> 's3://?bucket=<bucket>&root=<path>&endpoint=<endpoint>&region=<region>'
+ofs volume create local --model direct --storage 'fs://?root=<directory>'
+ofs mount local <mount-point>
+
+ofs volume create remote --model direct \
+  --storage 's3://?bucket=<bucket>&root=<path>&endpoint=<endpoint>&region=<region>'
+ofs mount remote <mount-point>
 ```
 
 ## License and trademarks

@@ -17,8 +17,8 @@
 
 use anyhow::Context;
 use anyhow::Result;
-use anyhow::anyhow;
 use anyhow::bail;
+use clap::Parser;
 use uuid::Uuid;
 
 use catalog::{Catalog, MetadataConfig, StorageLocator, VolumeDefinition};
@@ -37,13 +37,10 @@ mod sync;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
-    let invocation = cli::Invocation::parse();
+    let command = cli::Cli::parse();
 
     logforth::starter_log::stderr().apply();
-    match invocation {
-        cli::Invocation::Command(command) => execute_command(command).await,
-        cli::Invocation::DirectMount(args) => execute_direct_mount(args).await,
-    }
+    execute_command(command).await
 }
 
 async fn execute_command(command: cli::Cli) -> Result<()> {
@@ -216,23 +213,6 @@ fn metadata_store(
 
 fn new_id() -> Result<VolumeId> {
     VolumeId::parse(Uuid::new_v4().to_string())
-}
-
-#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
-async fn execute_direct_mount(cfg: cli::DirectMountArgs) -> Result<()> {
-    use opendal::Operator;
-
-    if cfg.backend.has_host() {
-        log::warn!("backend host will be ignored");
-    }
-
-    let scheme_str = cfg.backend.scheme();
-    let op_args = cfg.backend.query_pairs().into_owned();
-
-    let backend = Operator::via_iter(scheme_str, op_args)
-        .map_err(|err| anyhow!("invalid scheme or arguments for {scheme_str}: {err}"))?;
-
-    execute_operator_mount(backend, cfg.mount_path).await
 }
 
 #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
