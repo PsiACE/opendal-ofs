@@ -13,7 +13,7 @@ anyhow@1.0.98		X								X
 async-notify@0.3.0										X
 async-trait@0.1.88		X								X
 autocfg@1.4.0		X								X
-backon@1.5.0		X
+backon@1.6.0		X
 backtrace@0.3.75		X								X
 base64@0.22.1		X								X
 bincode@1.3.3										X

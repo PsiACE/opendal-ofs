@@ -402,7 +402,10 @@ status_json "$tree_a" >"$OFS_RUN_ROOT/status-offline.json"
 assert_status "$OFS_RUN_ROOT/status-offline.json" remote.state '"unknown"'
 python3 - "$OFS_RUN_ROOT/status-offline.json" <<'PY'
 import json, sys
-assert "generation" not in json.load(open(sys.argv[1]))["remote"]
+remote = json.load(open(sys.argv[1]))["remote"]
+assert "generation" not in remote
+assert remote["error"]["kind"]
+assert remote["error"]["message"]
 PY
 export OFS_STORAGE_URL=$credential_url
 if [[ -n $credential_metadata ]]; then

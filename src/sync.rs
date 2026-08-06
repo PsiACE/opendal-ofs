@@ -199,24 +199,9 @@ pub(crate) async fn sync_once(volume: &ManagedVolume, request: SyncRequest<'_>) 
         operation,
         changes,
     )?;
-    match volume.metadata.publish(&observed, commit).await? {
-        PublicationOutcome::Committed(cursor) | PublicationOutcome::AlreadyCommitted(cursor) => {
-            if !publication_source_unchanged(&paths, &stable_local)? {
-                bail!("publication committed but the local tree changed; rerun sync");
-            }
-            state.publication = None;
-            state.save(&paths)?;
-            materialize(
-                volume,
-                &paths,
-                &mut state,
-                cursor,
-                target,
-                request.transfers,
-            )
-            .await?;
-            Ok(state.common.as_ref().unwrap().cursor.generation)
-        }
+    let cursor = match volume.metadata.publish(&observed, commit).await? {
+        PublicationOutcome::Committed(observed) => observed.head.cursor,
+        PublicationOutcome::AlreadyCommitted(cursor) => cursor,
         PublicationOutcome::Conflict(actual) => {
             state.publication = None;
             state.save(&paths)?;
@@ -229,7 +214,22 @@ pub(crate) async fn sync_once(volume: &ManagedVolume, request: SyncRequest<'_>) 
         PublicationOutcome::Unknown => {
             bail!("publication result is unknown; rerun sync to resolve the recorded operation")
         }
+    };
+    if !publication_source_unchanged(&paths, &stable_local)? {
+        bail!("publication committed but the local tree changed; rerun sync");
     }
+    state.publication = None;
+    state.save(&paths)?;
+    materialize(
+        volume,
+        &paths,
+        &mut state,
+        cursor,
+        target,
+        request.transfers,
+    )
+    .await?;
+    Ok(state.common.as_ref().unwrap().cursor.generation)
 }
 
 async fn recover(
@@ -271,34 +271,27 @@ async fn recover(
                         pending.operation,
                         pending.changes,
                     )?;
-                    match volume.metadata.publish(&observed, commit).await? {
-                        PublicationOutcome::Committed(cursor)
-                        | PublicationOutcome::AlreadyCommitted(cursor) => {
-                            if publication_source_unchanged(paths, &pending.source)? {
-                                state.publication = None;
-                                state.save(paths)?;
-                                materialize(
-                                    volume,
-                                    paths,
-                                    state,
-                                    cursor,
-                                    pending.target,
-                                    transfers,
-                                )
-                                .await?;
-                            } else {
-                                state.publication = None;
-                                state.save(paths)?;
-                                crate::replica::clear_staging(paths)?;
-                            }
-                        }
+                    let cursor = match volume.metadata.publish(&observed, commit).await? {
+                        PublicationOutcome::Committed(observed) => observed.head.cursor,
+                        PublicationOutcome::AlreadyCommitted(cursor) => cursor,
                         PublicationOutcome::Unknown => {
                             bail!("recorded publication result remains unknown")
                         }
                         PublicationOutcome::Conflict(_) => {
                             state.publication = None;
                             state.save(paths)?;
+                            return Ok(());
                         }
+                    };
+                    if publication_source_unchanged(paths, &pending.source)? {
+                        state.publication = None;
+                        state.save(paths)?;
+                        materialize(volume, paths, state, cursor, pending.target, transfers)
+                            .await?;
+                    } else {
+                        state.publication = None;
+                        state.save(paths)?;
+                        crate::replica::clear_staging(paths)?;
                     }
                 } else {
                     state.publication = None;
@@ -392,10 +385,10 @@ async fn upload_changes(
             if staged.exists() {
                 volume
                     .data
-                    .put_file(&staged, &content.sha256, content.size, concurrency)
+                    .put_file(&staged, &content.sha256, content.size)
                     .await?;
             } else {
-                volume.data.verify(&content, concurrency).await?;
+                volume.data.verify(&content).await?;
             }
             Ok(())
         })
@@ -560,7 +553,7 @@ async fn stage_materialization_files(
             crate::replica::discard_staged_content(paths, &content)?;
             volume
                 .data
-                .fetch(&content, &paths.staged(&content.sha256), transfers)
+                .fetch(&content, &paths.staged(&content.sha256))
                 .await
         })
         .await?;

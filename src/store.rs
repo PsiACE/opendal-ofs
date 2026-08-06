@@ -18,13 +18,12 @@
 //! Provider adapters for a Managed Volume.
 
 use std::fmt::Write as _;
-use std::num::NonZeroUsize;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use futures::TryStreamExt;
-use opendal::layers::{ConcurrentLimitLayer, RetryLayer};
+use opendal::layers::RetryLayer;
 use opendal::{ErrorKind, Operator};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -44,18 +43,23 @@ const COMMIT_PREFIX: &str = "metadata/commits/";
 const CHECKPOINT_PREFIX: &str = "metadata/checkpoints/";
 const DATA_PREFIX: &str = "data/sha256/";
 const INITIAL_KEY: &str = "initial";
-const DATA_READ_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub(crate) struct Observation {
     pub(crate) format: FormatRecord,
     pub(crate) head: HeadRecord,
-    pub(crate) token: String,
+    pub(crate) authority: AuthorityToken,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum AuthorityToken {
+    ObjectEtag(String),
+    D1Revision(u64),
 }
 
 #[derive(Debug)]
 pub(crate) enum PublicationOutcome {
-    Committed(Cursor),
+    Committed(Box<Observation>),
     AlreadyCommitted(Cursor),
     Conflict(Observation),
     Unknown,
@@ -183,7 +187,7 @@ impl ObjectMetadataStore {
         Ok(Observation {
             format,
             head,
-            token,
+            authority: AuthorityToken::ObjectEtag(token),
         })
     }
 
@@ -331,13 +335,29 @@ impl MetadataStore for ObjectMetadataStore {
             commit.cursor.clone(),
             expected.head.checkpoint.clone(),
         );
+        let etag = match &expected.authority {
+            AuthorityToken::ObjectEtag(value) => value,
+            AuthorityToken::D1Revision(_) => {
+                bail!("object metadata received a D1 authority revision")
+            }
+        };
         match self
             .operator
             .write_with(HEAD_KEY, serde_json::to_vec(&head)?)
-            .if_match(&expected.token)
+            .if_match(etag)
             .await
         {
-            Ok(_) => Ok(PublicationOutcome::Committed(commit.cursor)),
+            Ok(metadata) => {
+                let token = metadata
+                    .etag()
+                    .context("Metadata Store write did not return the head ETag")?
+                    .to_owned();
+                Ok(PublicationOutcome::Committed(Box::new(Observation {
+                    format: expected.format.clone(),
+                    head,
+                    authority: AuthorityToken::ObjectEtag(token),
+                })))
+            }
             Err(error) if precondition(&error) => match self
                 .reachable(&commit.volume_id, &commit.cursor.operation)
                 .await?
@@ -347,9 +367,7 @@ impl MetadataStore for ObjectMetadataStore {
                     self.observe_inner(&commit.volume_id).await?,
                 )),
             },
-            Err(error) if error.is_temporary() || error.kind() == ErrorKind::Unexpected => {
-                Ok(PublicationOutcome::Unknown)
-            }
+            Err(error) if publication_result_unknown(&error) => Ok(PublicationOutcome::Unknown),
             Err(error) => Err(error).context("publish Managed head"),
         }
     }
@@ -378,7 +396,6 @@ impl DataStore {
         source: &Path,
         expected_sha256: &str,
         expected_size: u64,
-        concurrency: NonZeroUsize,
     ) -> Result<ContentRef> {
         let content = ContentRef {
             sha256: expected_sha256.to_owned(),
@@ -386,16 +403,10 @@ impl DataStore {
         };
         content.validate()?;
         let key = data_key(&content)?;
-        let mut writer = match self
-            .operator
-            .writer_with(&key)
-            .if_not_exists(true)
-            .concurrent(concurrency.get())
-            .await
-        {
+        let mut writer = match self.operator.writer_with(&key).if_not_exists(true).await {
             Ok(writer) => writer,
             Err(error) if precondition(&error) => {
-                self.verify(&content, concurrency).await?;
+                self.verify(&content).await?;
                 return Ok(content);
             }
             Err(error) => return Err(error).context("open immutable data writer"),
@@ -420,25 +431,20 @@ impl DataStore {
         let result = writer.close().await;
         drop(writer);
         match result {
-            Ok(_) => self.verify(&content, concurrency).await?,
+            Ok(_) => self.verify(&content).await?,
             Err(error) if precondition(&error) || error.is_temporary() => {
-                self.verify(&content, concurrency).await?
+                self.verify(&content).await?
             }
             Err(error) => return Err(error).context("finish immutable data write"),
         }
         Ok(content)
     }
 
-    pub(crate) async fn fetch(
-        &self,
-        content: &ContentRef,
-        target: &Path,
-        concurrency: NonZeroUsize,
-    ) -> Result<()> {
+    pub(crate) async fn fetch(&self, content: &ContentRef, target: &Path) -> Result<()> {
         let parent = target.parent().context("staged content has no parent")?;
         let temporary = tempfile::NamedTempFile::new_in(parent)?;
         let mut file = tokio::fs::File::from_std(temporary.reopen()?);
-        self.read(content, Some(&mut file), concurrency).await?;
+        self.read(content, Some(&mut file)).await?;
         file.sync_all().await?;
         drop(file);
         temporary
@@ -447,31 +453,18 @@ impl DataStore {
         Ok(())
     }
 
-    pub(crate) async fn verify(
-        &self,
-        content: &ContentRef,
-        concurrency: NonZeroUsize,
-    ) -> Result<()> {
-        self.read(content, None, concurrency).await.map(|_| ())
+    pub(crate) async fn verify(&self, content: &ContentRef) -> Result<()> {
+        self.read(content, None).await.map(|_| ())
     }
 
     async fn read(
         &self,
         content: &ContentRef,
         mut target: Option<&mut tokio::fs::File>,
-        concurrency: NonZeroUsize,
     ) -> Result<u64> {
         content.validate()?;
         let key = data_key(content)?;
-        let reader = self.operator.reader_with(&key);
-        let reader = if content.size > DATA_READ_CHUNK_SIZE as u64 {
-            reader
-                .chunk(DATA_READ_CHUNK_SIZE)
-                .concurrent(concurrency.get())
-        } else {
-            reader
-        };
-        let reader = reader.await?;
+        let reader = self.operator.reader(&key).await?;
         let mut stream = reader.into_stream(..).await?;
         let mut hasher = Sha256::new();
         let mut size = 0_u64;
@@ -494,7 +487,6 @@ impl DataStore {
 pub(crate) fn assemble_operator(
     locator: &StorageLocator,
     current: Option<&Url>,
-    concurrency: Option<NonZeroUsize>,
 ) -> Result<Operator> {
     let environment = std::env::var("OFS_STORAGE_URL")
         .ok()
@@ -528,14 +520,9 @@ pub(crate) fn assemble_operator(
             config.push((key.into_owned(), value.into_owned()));
         }
     }
-    let operator = Operator::via_iter(&locator.scheme, config)
+    Operator::via_iter(&locator.scheme, config)
         .map(|operator| operator.layer(RetryLayer::new().with_jitter().with_max_times(3)))
-        .context("assemble OpenDAL operator")?;
-    Ok(match concurrency {
-        Some(value) => operator
-            .layer(ConcurrentLimitLayer::new(value.get()).with_http_concurrent_limit(value.get())),
-        None => operator,
-    })
+        .context("assemble OpenDAL operator")
 }
 
 pub(crate) fn data_store_id(locator: &StorageLocator) -> Result<String> {
@@ -554,6 +541,10 @@ fn precondition(error: &opendal::Error) -> bool {
         error.kind(),
         ErrorKind::ConditionNotMatch | ErrorKind::AlreadyExists
     )
+}
+
+fn publication_result_unknown(error: &opendal::Error) -> bool {
+    error.is_temporary() || error.kind() == ErrorKind::Unexpected
 }
 
 fn commit_key(operation: &OperationId) -> String {

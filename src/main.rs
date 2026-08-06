@@ -28,6 +28,7 @@ use store::MetadataStore;
 mod catalog;
 mod cli;
 mod d1;
+mod error;
 mod model;
 mod reconcile;
 mod replica;
@@ -65,7 +66,7 @@ async fn mount_direct(
         bail!("Managed Mount is not available");
     }
     execute_operator_mount(
-        store::assemble_operator(definition.storage(), None, None)?,
+        store::assemble_operator(definition.storage(), None)?,
         args.path,
     )
     .await
@@ -88,15 +89,20 @@ async fn status_managed(
     } else {
         "colocated-object"
     };
-    let status_operator = if metadata.external_locator().is_some() {
-        None
-    } else {
-        store::assemble_operator(definition.storage(), None, None).ok()
+    let remote = match metadata.external_locator() {
+        Some(_) => match metadata_store(metadata, None, None) {
+            Ok(store) => store.observe(&state.volume_id).await,
+            Err(error) => Err(error),
+        },
+        None => match store::assemble_operator(definition.storage(), None) {
+            Ok(operator) => match metadata_store(metadata, Some(&operator), None) {
+                Ok(store) => store.observe(&state.volume_id).await,
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        },
     };
-    let remote = match metadata_store(metadata, status_operator.as_ref(), None) {
-        Ok(store) => store.observe(&state.volume_id).await.ok(),
-        Err(_) => None,
-    };
+    let remote = remote.map_err(|error| error::ErrorSummary::from_error(&error));
     let status = status::SyncStatus::inspect(name, placement, &paths, &state, remote.as_ref())?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&status)?);
@@ -120,7 +126,7 @@ async fn sync_managed(
         .metadata()
         .context("Direct Sync is not available")?;
     sync::admit(&args.require)?;
-    let operator = store::assemble_operator(definition.storage(), None, Some(transfers))?;
+    let operator = store::assemble_operator(definition.storage(), None)?;
     let volume = sync::ManagedVolume {
         metadata: metadata_store(metadata, Some(&operator), None)?,
         data: store::DataStore::new(operator)?,
@@ -165,14 +171,14 @@ async fn create_volume(
                 if existing.storage() != &storage || existing.metadata() != Some(&metadata) {
                     bail!("volume name already refers to a different definition");
                 }
-                let operator = store::assemble_operator(&storage, Some(&args.storage), None)?;
+                let operator = store::assemble_operator(&storage, Some(&args.storage))?;
                 store::DataStore::new(operator.clone())?;
                 let metadata_store =
                     metadata_store(&metadata, Some(&operator), args.metadata.as_ref())?;
                 metadata_store.observe(existing.id()).await?;
                 return Ok(());
             }
-            let operator = store::assemble_operator(&storage, Some(&args.storage), None)?;
+            let operator = store::assemble_operator(&storage, Some(&args.storage))?;
             store::DataStore::new(operator.clone())?;
             let metadata_store =
                 metadata_store(&metadata, Some(&operator), args.metadata.as_ref())?;

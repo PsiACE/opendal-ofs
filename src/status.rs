@@ -20,6 +20,7 @@ use std::fmt;
 use anyhow::Result;
 use serde::Serialize;
 
+use crate::error::ErrorSummary;
 use crate::model::VolumeId;
 use crate::replica::{ConflictKind, ReplicaPaths, ReplicaState};
 use crate::store::Observation;
@@ -30,6 +31,8 @@ pub(crate) struct SyncStatus {
     volume: StatusVolume,
     access: &'static str,
     local: LocalState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    local_error: Option<ErrorSummary>,
     base: Option<BaseState>,
     remote: RemoteState,
     publication: WorkState,
@@ -65,6 +68,8 @@ struct RemoteState {
     state: RemotePosition,
     #[serde(skip_serializing_if = "Option::is_none")]
     generation: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<ErrorSummary>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -98,9 +103,9 @@ impl SyncStatus {
         metadata: &'static str,
         paths: &ReplicaPaths,
         state: &ReplicaState,
-        remote: Option<&Observation>,
+        remote: Result<&Observation, &ErrorSummary>,
     ) -> Result<Self> {
-        let local = match crate::replica::scan(
+        let (local, local_error) = match crate::replica::scan(
             paths,
             state.common.as_ref().map(|base| &base.manifest),
             false,
@@ -111,16 +116,16 @@ impl SyncStatus {
                     .as_ref()
                     .is_some_and(|base| base.manifest == manifest) =>
             {
-                LocalState::Clean
+                (LocalState::Clean, None)
             }
-            Ok(_) => LocalState::Changed,
-            Err(_) => LocalState::Unknown,
+            Ok(_) => (LocalState::Changed, None),
+            Err(error) => (LocalState::Unknown, Some(ErrorSummary::from_error(&error))),
         };
         let base = state.common.as_ref().map(|value| BaseState {
             generation: value.cursor.generation,
         });
         let remote = match remote {
-            Some(observation) => {
+            Ok(observation) => {
                 let generation = observation.head.cursor.generation;
                 let position = match &state.common {
                     Some(base) if base.cursor == observation.head.cursor => RemotePosition::AtBase,
@@ -130,11 +135,13 @@ impl SyncStatus {
                 RemoteState {
                     state: position,
                     generation: Some(generation),
+                    error: None,
                 }
             }
-            None => RemoteState {
+            Err(error) => RemoteState {
                 state: RemotePosition::Unknown,
                 generation: None,
+                error: Some(error.clone()),
             },
         };
         let conflict_records = state
@@ -156,6 +163,7 @@ impl SyncStatus {
             },
             access: "sync",
             local,
+            local_error,
             base,
             remote,
             publication: if state.publication.is_some() {

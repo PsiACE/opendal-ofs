@@ -1330,6 +1330,7 @@ version = "0.0.24"
 dependencies = [
  "anyhow",
  "async-trait",
+ "backon",
  "clap",
  "fs2",
  "fuse3",

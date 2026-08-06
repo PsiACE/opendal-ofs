@@ -58,16 +58,16 @@ if sys.argv[1] == "empty":
 
 cleanup() {
   status=$?
-  for table in ofs_managed_heads ofs_managed_commits ofs_managed_checkpoints ofs_managed_formats; do
+  for table in ofs_managed_v1_heads ofs_managed_v1_commits ofs_managed_v1_checkpoints ofs_managed_v1_formats; do
     if ! d1_execute "DELETE FROM ${table} WHERE store_key = ?"; then
       status=1
     fi
   done
   retained_sql='SELECT
-    (SELECT COUNT(*) FROM ofs_managed_heads WHERE store_key = ?) +
-    (SELECT COUNT(*) FROM ofs_managed_commits WHERE store_key = ?) +
-    (SELECT COUNT(*) FROM ofs_managed_checkpoints WHERE store_key = ?) +
-    (SELECT COUNT(*) FROM ofs_managed_formats WHERE store_key = ?)
+    (SELECT COUNT(*) FROM ofs_managed_v1_heads WHERE store_key = ?) +
+    (SELECT COUNT(*) FROM ofs_managed_v1_commits WHERE store_key = ?) +
+    (SELECT COUNT(*) FROM ofs_managed_v1_checkpoints WHERE store_key = ?) +
+    (SELECT COUNT(*) FROM ofs_managed_v1_formats WHERE store_key = ?)
     AS retained'
   if ! d1_execute "$retained_sql" empty; then
     status=1

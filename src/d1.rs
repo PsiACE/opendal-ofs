@@ -17,11 +17,13 @@
 
 //! Cloudflare D1 adapter for the provider-neutral Metadata Store contract.
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use backon::{ExponentialBuilder, Retryable};
 use http::{Request, StatusCode, header};
 use opendal::Buffer;
 use opendal::raw::{HttpClient, format_authorization_by_bearer};
@@ -29,22 +31,22 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use url::Url;
-use uuid::Uuid;
 
 use crate::catalog::StorageLocator;
 use crate::model::{
     CheckpointRecord, CommitRecord, Cursor, FormatRecord, HeadRecord, MetadataPlacement,
     OperationId, VolumeId,
 };
-use crate::store::{MetadataStore, Observation, PublicationOutcome};
+use crate::store::{AuthorityToken, MetadataStore, Observation, PublicationOutcome};
 
 const API_BASE: &str = "https://api.cloudflare.com/client/v4";
 const SCHEMA_VERSION: u32 = 1;
-const CREATE_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS ofs_managed_schema (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), schema_version INTEGER NOT NULL)";
-const CREATE_FORMATS: &str = "CREATE TABLE IF NOT EXISTS ofs_managed_formats (store_key TEXT PRIMARY KEY, record_json TEXT NOT NULL, digest TEXT NOT NULL)";
-const CREATE_HEADS: &str = "CREATE TABLE IF NOT EXISTS ofs_managed_heads (store_key TEXT PRIMARY KEY, volume_id TEXT NOT NULL, generation TEXT NOT NULL, operation_id TEXT NOT NULL, token TEXT NOT NULL, head_json TEXT NOT NULL)";
-const CREATE_COMMITS: &str = "CREATE TABLE IF NOT EXISTS ofs_managed_commits (store_key TEXT NOT NULL, operation_id TEXT NOT NULL, volume_id TEXT NOT NULL, generation TEXT NOT NULL, parent_generation TEXT NOT NULL, parent_operation_id TEXT NOT NULL, record_json TEXT NOT NULL, digest TEXT NOT NULL, PRIMARY KEY (store_key, operation_id))";
-const CREATE_CHECKPOINTS: &str = "CREATE TABLE IF NOT EXISTS ofs_managed_checkpoints (store_key TEXT NOT NULL, operation_id TEXT NOT NULL, volume_id TEXT NOT NULL, generation TEXT NOT NULL, record_json TEXT NOT NULL, digest TEXT NOT NULL, PRIMARY KEY (store_key, operation_id))";
+const CREATE_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS ofs_managed_v1_schema (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), schema_version INTEGER NOT NULL)";
+const CREATE_FORMATS: &str = "CREATE TABLE IF NOT EXISTS ofs_managed_v1_formats (store_key TEXT PRIMARY KEY, record_json TEXT NOT NULL, digest TEXT NOT NULL)";
+const CREATE_HEADS: &str = "CREATE TABLE IF NOT EXISTS ofs_managed_v1_heads (store_key TEXT PRIMARY KEY, volume_id TEXT NOT NULL, generation INTEGER NOT NULL, operation_id TEXT NOT NULL, revision INTEGER NOT NULL, head_json TEXT NOT NULL)";
+const CREATE_COMMITS: &str = "CREATE TABLE IF NOT EXISTS ofs_managed_v1_commits (store_key TEXT NOT NULL, operation_id TEXT NOT NULL, volume_id TEXT NOT NULL, generation INTEGER NOT NULL, parent_generation INTEGER NOT NULL, parent_operation_id TEXT NOT NULL, record_json TEXT NOT NULL, digest TEXT NOT NULL, PRIMARY KEY (store_key, operation_id))";
+const CREATE_COMMIT_GENERATION_INDEX: &str = "CREATE INDEX IF NOT EXISTS ofs_managed_v1_commits_by_generation ON ofs_managed_v1_commits (store_key, generation)";
+const CREATE_CHECKPOINTS: &str = "CREATE TABLE IF NOT EXISTS ofs_managed_v1_checkpoints (store_key TEXT NOT NULL, operation_id TEXT NOT NULL, volume_id TEXT NOT NULL, generation INTEGER NOT NULL, record_json TEXT NOT NULL, digest TEXT NOT NULL, PRIMARY KEY (store_key, operation_id))";
 
 pub(crate) struct D1Config {
     account: String,
@@ -125,6 +127,7 @@ impl D1MetadataStore {
             CREATE_FORMATS,
             CREATE_HEADS,
             CREATE_COMMITS,
+            CREATE_COMMIT_GENERATION_INDEX,
             CREATE_CHECKPOINTS,
         ] {
             self.transport
@@ -133,7 +136,7 @@ impl D1MetadataStore {
         }
         self.transport
             .execute(
-                "INSERT OR IGNORE INTO ofs_managed_schema (singleton, schema_version) VALUES (1, ?)",
+                "INSERT OR IGNORE INTO ofs_managed_v1_schema (singleton, schema_version) VALUES (1, ?)",
                 vec![SCHEMA_VERSION.into()],
                 Semantics::Idempotent,
             )
@@ -141,7 +144,7 @@ impl D1MetadataStore {
         let rows = self
             .transport
             .execute(
-                "SELECT schema_version FROM ofs_managed_schema WHERE singleton = 1",
+                "SELECT schema_version FROM ofs_managed_v1_schema WHERE singleton = 1",
                 Vec::new(),
                 Semantics::Read,
             )
@@ -160,7 +163,7 @@ impl D1MetadataStore {
         let rows = self
             .transport
             .execute(
-                "SELECT record_json, digest FROM ofs_managed_formats WHERE store_key = ?",
+                "SELECT record_json, digest FROM ofs_managed_v1_formats WHERE store_key = ?",
                 vec![self.store_key.clone().into()],
                 Semantics::Read,
             )
@@ -170,11 +173,11 @@ impl D1MetadataStore {
         Ok(value)
     }
 
-    async fn read_head(&self) -> Result<(HeadRecord, String)> {
+    async fn read_head(&self) -> Result<(HeadRecord, u64)> {
         let rows = self
             .transport
             .execute(
-                "SELECT token, head_json FROM ofs_managed_heads WHERE store_key = ?",
+                "SELECT revision, head_json FROM ofs_managed_v1_heads WHERE store_key = ?",
                 vec![self.store_key.clone().into()],
                 Semantics::Read,
             )
@@ -182,19 +185,19 @@ impl D1MetadataStore {
         let row = one(&rows, "D1 head")?;
         let head: HeadRecord = serde_json::from_str(required(row, "head_json")?)?;
         head.validate()?;
-        Ok((head, required(row, "token")?.to_owned()))
+        Ok((head, required_u64(row, "revision")?))
     }
 
     async fn observe_inner(&self, volume: &VolumeId) -> Result<Observation> {
         let format = self.read_format().await?;
-        let (head, token) = self.read_head().await?;
+        let (head, revision) = self.read_head().await?;
         if &format.volume_id != volume || &head.volume_id != volume {
             bail!("D1 metadata scope belongs to another Managed Volume");
         }
         Ok(Observation {
             format,
             head,
-            token,
+            authority: AuthorityToken::D1Revision(revision),
         })
     }
 
@@ -202,7 +205,7 @@ impl D1MetadataStore {
         let json = serde_json::to_string(value)?;
         self.transport
             .execute(
-                "INSERT OR IGNORE INTO ofs_managed_formats (store_key, record_json, digest) VALUES (?, ?, ?)",
+                "INSERT OR IGNORE INTO ofs_managed_v1_formats (store_key, record_json, digest) VALUES (?, ?, ?)",
                 vec![self.store_key.clone().into(), json.clone().into(), digest(&json).into()],
                 Semantics::Idempotent,
             )
@@ -216,12 +219,12 @@ impl D1MetadataStore {
         let hash = digest(&json);
         self.transport
             .execute(
-                "INSERT OR IGNORE INTO ofs_managed_checkpoints (store_key, operation_id, volume_id, generation, record_json, digest) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT OR IGNORE INTO ofs_managed_v1_checkpoints (store_key, operation_id, volume_id, generation, record_json, digest) VALUES (?, ?, ?, ?, ?, ?)",
                 vec![
                     self.store_key.clone().into(),
                     value.cursor.operation.as_str().into(),
                     value.volume_id.as_str().into(),
-                    value.cursor.generation.to_string().into(),
+                    value.cursor.generation.into(),
                     json.into(),
                     hash.clone().into(),
                 ],
@@ -239,7 +242,7 @@ impl D1MetadataStore {
         let rows = self
             .transport
             .execute(
-                "SELECT record_json, digest FROM ofs_managed_checkpoints WHERE store_key = ? AND operation_id = ?",
+                "SELECT record_json, digest FROM ofs_managed_v1_checkpoints WHERE store_key = ? AND operation_id = ?",
                 vec![self.store_key.clone().into(), operation.as_str().into()],
                 Semantics::Read,
             )
@@ -253,15 +256,16 @@ impl D1MetadataStore {
         value.validate()?;
         let json = serde_json::to_string(value)?;
         let hash = digest(&json);
-        self.transport
+        let rows = self
+            .transport
             .execute(
-                "INSERT OR IGNORE INTO ofs_managed_commits (store_key, operation_id, volume_id, generation, parent_generation, parent_operation_id, record_json, digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT OR IGNORE INTO ofs_managed_v1_commits (store_key, operation_id, volume_id, generation, parent_generation, parent_operation_id, record_json, digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING record_json, digest",
                 vec![
                     self.store_key.clone().into(),
                     value.cursor.operation.as_str().into(),
                     value.volume_id.as_str().into(),
-                    value.cursor.generation.to_string().into(),
-                    value.parent.generation.to_string().into(),
+                    value.cursor.generation.into(),
+                    value.parent.generation.into(),
                     value.parent.operation.as_str().into(),
                     json.into(),
                     hash.clone().into(),
@@ -269,7 +273,16 @@ impl D1MetadataStore {
                 Semantics::Idempotent,
             )
             .await?;
-        if self.read_commit(&value.cursor.operation).await? != *value {
+        let stored = match rows.as_slice() {
+            [row] => {
+                let stored: CommitRecord = record(row)?;
+                stored.validate()?;
+                stored
+            }
+            [] => self.read_commit(&value.cursor.operation).await?,
+            _ => bail!("D1 returned duplicate commit rows"),
+        };
+        if stored != *value {
             bail!("immutable D1 commit key was reused with different content");
         }
         Ok(hash)
@@ -279,7 +292,7 @@ impl D1MetadataStore {
         let rows = self
             .transport
             .execute(
-                "SELECT record_json, digest FROM ofs_managed_commits WHERE store_key = ? AND operation_id = ?",
+                "SELECT record_json, digest FROM ofs_managed_v1_commits WHERE store_key = ? AND operation_id = ?",
                 vec![self.store_key.clone().into(), operation.as_str().into()],
                 Semantics::Read,
             )
@@ -352,11 +365,10 @@ impl MetadataStore for D1MetadataStore {
         let head = HeadRecord::initial(format.volume_id.clone());
         self.transport
             .execute(
-                "INSERT OR IGNORE INTO ofs_managed_heads (store_key, volume_id, generation, operation_id, token, head_json) VALUES (?, ?, '0', 'initial', ?, ?)",
+                "INSERT OR IGNORE INTO ofs_managed_v1_heads (store_key, volume_id, generation, operation_id, revision, head_json) VALUES (?, ?, 0, 'initial', 0, ?)",
                 vec![
                     self.store_key.clone().into(),
                     format.volume_id.as_str().into(),
-                    Uuid::new_v4().to_string().into(),
                     serde_json::to_string(&head)?.into(),
                 ],
                 Semantics::Idempotent,
@@ -383,13 +395,44 @@ impl MetadataStore for D1MetadataStore {
         after: &Cursor,
         through: &Cursor,
     ) -> Result<Vec<CommitRecord>> {
+        if after.generation > through.generation {
+            bail!("D1 change range is reversed");
+        }
+        let rows = self
+            .transport
+            .execute(
+                "SELECT record_json, digest FROM ofs_managed_v1_commits WHERE store_key = ? AND generation > ? AND generation <= ? ORDER BY generation ASC",
+                vec![
+                    self.store_key.clone().into(),
+                    after.generation.into(),
+                    through.generation.into(),
+                ],
+                Semantics::Read,
+            )
+            .await?;
+        let mut candidates = BTreeMap::new();
+        for row in &rows {
+            let commit: CommitRecord = record(row)?;
+            commit.validate()?;
+            if &commit.volume_id != volume {
+                bail!("D1 change belongs to another Managed Volume");
+            }
+            if candidates
+                .insert(commit.cursor.operation.clone(), commit)
+                .is_some()
+            {
+                bail!("D1 returned duplicate change rows");
+            }
+        }
         let mut cursor = through.clone();
         let mut changes = Vec::new();
         while cursor != *after {
             if cursor.generation <= after.generation {
                 bail!("D1 change cursor is not in the target ancestry");
             }
-            let commit = self.read_commit(&cursor.operation).await?;
+            let commit = candidates
+                .remove(&cursor.operation)
+                .context("required D1 change commit is missing")?;
             if commit.cursor != cursor || &commit.volume_id != volume {
                 bail!("D1 change ancestry is corrupt");
             }
@@ -415,28 +458,39 @@ impl MetadataStore for D1MetadataStore {
             commit.cursor.clone(),
             expected.head.checkpoint.clone(),
         );
+        let revision = match &expected.authority {
+            AuthorityToken::D1Revision(value) => *value,
+            AuthorityToken::ObjectEtag(_) => bail!("D1 metadata received an object ETag"),
+        };
         let result = self
             .transport
             .execute(
-                "UPDATE ofs_managed_heads SET generation = ?, operation_id = ?, token = ?, head_json = ? WHERE store_key = ? AND volume_id = ? AND generation = ? AND operation_id = ? AND token = ? AND EXISTS (SELECT 1 FROM ofs_managed_commits c WHERE c.store_key = ofs_managed_heads.store_key AND c.operation_id = ? AND c.digest = ?) RETURNING generation",
+                "UPDATE ofs_managed_v1_heads SET generation = ?, operation_id = ?, revision = revision + 1, head_json = ? WHERE store_key = ? AND volume_id = ? AND generation = ? AND operation_id = ? AND revision = ? AND EXISTS (SELECT 1 FROM ofs_managed_v1_commits c WHERE c.store_key = ofs_managed_v1_heads.store_key AND c.operation_id = ? AND c.generation = ? AND c.digest = ?) RETURNING revision",
                 vec![
-                    commit.cursor.generation.to_string().into(),
+                    commit.cursor.generation.into(),
                     commit.cursor.operation.as_str().into(),
-                    Uuid::new_v4().to_string().into(),
                     serde_json::to_string(&next)?.into(),
                     self.store_key.clone().into(),
                     commit.volume_id.as_str().into(),
-                    commit.parent.generation.to_string().into(),
+                    commit.parent.generation.into(),
                     commit.parent.operation.as_str().into(),
-                    expected.token.clone().into(),
+                    revision.into(),
                     commit.cursor.operation.as_str().into(),
+                    commit.cursor.generation.into(),
                     hash.into(),
                 ],
                 Semantics::Publication,
             )
             .await;
         match result {
-            Ok(rows) if !rows.is_empty() => Ok(PublicationOutcome::Committed(commit.cursor)),
+            Ok(rows) if !rows.is_empty() => {
+                let revision = required_u64(one(&rows, "D1 publication")?, "revision")?;
+                Ok(PublicationOutcome::Committed(Box::new(Observation {
+                    format: expected.format.clone(),
+                    head: next,
+                    authority: AuthorityToken::D1Revision(revision),
+                })))
+            }
             Ok(_) => match self
                 .reachable(&commit.volume_id, &commit.cursor.operation)
                 .await?
@@ -471,40 +525,102 @@ impl Transport {
         semantics: Semantics,
     ) -> std::result::Result<Vec<Map<String, Value>>, QueryFailure> {
         let body = serde_json::to_vec(&QueryRequest { sql, params })
-            .map_err(|_| QueryFailure::new(false, "encode D1 query"))?;
+            .map(Buffer::from)
+            .map_err(|error| QueryFailure::local("encode D1 query", error))?;
+        if semantics == Semantics::Publication {
+            return self.execute_once(body, semantics).await;
+        }
+        (|| self.execute_once(body.clone(), semantics))
+            .retry(
+                ExponentialBuilder::default()
+                    .with_jitter()
+                    .with_max_times(3),
+            )
+            .when(|error| error.retryable)
+            .await
+    }
+
+    async fn execute_once(
+        &self,
+        body: Buffer,
+        semantics: Semantics,
+    ) -> std::result::Result<Vec<Map<String, Value>>, QueryFailure> {
         let request = Request::post(&self.endpoint)
             .header(header::AUTHORIZATION, self.authorization.clone())
             .header(header::CONTENT_TYPE, "application/json")
-            .body(Buffer::from(body))
-            .map_err(|_| QueryFailure::new(false, "build D1 query"))?;
-        let response =
-            self.client.send(request).await.map_err(|_| {
-                QueryFailure::new(semantics == Semantics::Publication, "send D1 query")
-            })?;
+            .body(body)
+            .map_err(|error| QueryFailure::local("build D1 query", error))?;
+        let response = self.client.send(request).await.map_err(|error| {
+            QueryFailure::new(
+                QueryFailureKind::Transport,
+                true,
+                semantics == Semantics::Publication,
+                format!("send D1 query: {error}"),
+            )
+        })?;
         let status = response.status();
+        let response_body = response.into_body().to_vec();
         if !status.is_success() {
             let unknown = semantics == Semantics::Publication && status.is_server_error();
+            let kind = if status == StatusCode::TOO_MANY_REQUESTS {
+                QueryFailureKind::RateLimited
+            } else if status == StatusCode::BAD_REQUEST {
+                QueryFailureKind::InvalidRequest
+            } else if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+                QueryFailureKind::PermissionDenied
+            } else if status == StatusCode::NOT_FOUND {
+                QueryFailureKind::NotFound
+            } else if status == StatusCode::CONFLICT {
+                QueryFailureKind::Conflict
+            } else if status.is_server_error() {
+                QueryFailureKind::Service
+            } else {
+                QueryFailureKind::Rejected
+            };
             return Err(QueryFailure::new(
+                kind,
+                status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error(),
                 unknown,
-                if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
-                    "D1 temporarily rejected the query"
-                } else {
-                    "D1 rejected the query"
-                },
+                format!(
+                    "D1 query returned HTTP {status}: {}",
+                    response_detail(&response_body)
+                ),
             ));
         }
-        let response: QueryResponse = serde_json::from_slice(&response.into_body().to_vec())
-            .map_err(|_| {
-                QueryFailure::new(semantics == Semantics::Publication, "decode D1 response")
-            })?;
+        let response: QueryResponse = serde_json::from_slice(&response_body).map_err(|error| {
+            QueryFailure::new(
+                QueryFailureKind::InvalidResponse,
+                false,
+                semantics == Semantics::Publication,
+                format!("decode D1 response: {error}"),
+            )
+        })?;
         if !response.success || response.result.len() != 1 || !response.errors.is_empty() {
-            return Err(QueryFailure::new(false, "D1 statement failed"));
+            return Err(QueryFailure::new(
+                QueryFailureKind::Statement,
+                false,
+                false,
+                format!(
+                    "D1 statement failed: {}",
+                    response_detail(&serde_json::to_vec(&response.errors).unwrap_or_default())
+                ),
+            ));
         }
         let result = response.result.into_iter().next().unwrap();
-        if !result.success || result.meta.served_by_primary != Some(true) {
+        if !result.success {
             return Err(QueryFailure::new(
+                QueryFailureKind::Statement,
                 false,
-                "D1 did not prove an authoritative primary result",
+                false,
+                "D1 statement result was unsuccessful".to_owned(),
+            ));
+        }
+        if result.meta.served_by_primary != Some(true) {
+            return Err(QueryFailure::new(
+                QueryFailureKind::NotAuthoritative,
+                true,
+                semantics == Semantics::Publication,
+                "D1 did not prove an authoritative primary result".to_owned(),
             ));
         }
         Ok(result.results)
@@ -519,24 +635,56 @@ enum Semantics {
 }
 
 #[derive(Debug)]
-struct QueryFailure {
-    unknown: bool,
-    message: &'static str,
+pub(crate) struct QueryFailure {
+    pub(crate) kind: QueryFailureKind,
+    retryable: bool,
+    pub(crate) unknown: bool,
+    message: String,
 }
 
 impl QueryFailure {
-    fn new(unknown: bool, message: &'static str) -> Self {
-        Self { unknown, message }
+    fn new(kind: QueryFailureKind, retryable: bool, unknown: bool, message: String) -> Self {
+        Self {
+            kind,
+            retryable,
+            unknown,
+            message,
+        }
+    }
+
+    fn local(what: &str, error: impl fmt::Display) -> Self {
+        Self::new(
+            QueryFailureKind::Local,
+            false,
+            false,
+            format!("{what}: {error}"),
+        )
     }
 }
 
 impl fmt::Display for QueryFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.message)
+        formatter.write_str(&self.message)
     }
 }
 
 impl Error for QueryFailure {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum QueryFailureKind {
+    Local,
+    Transport,
+    RateLimited,
+    InvalidRequest,
+    NotFound,
+    PermissionDenied,
+    Conflict,
+    Service,
+    Rejected,
+    InvalidResponse,
+    Statement,
+    NotAuthoritative,
+}
 
 #[derive(Serialize)]
 struct QueryRequest {
@@ -581,6 +729,12 @@ fn required<'a>(row: &'a Map<String, Value>, field: &str) -> Result<&'a str> {
         .with_context(|| format!("D1 field {field:?} is missing or invalid"))
 }
 
+fn required_u64(row: &Map<String, Value>, field: &str) -> Result<u64> {
+    row.get(field)
+        .and_then(Value::as_u64)
+        .with_context(|| format!("D1 field {field:?} is missing or invalid"))
+}
+
 fn record<T: for<'de> Deserialize<'de>>(row: &Map<String, Value>) -> Result<T> {
     let json = required(row, "record_json")?;
     if digest(json) != required(row, "digest")? {
@@ -601,6 +755,18 @@ fn digest(value: &str) -> String {
 
 fn segment(value: &str) -> String {
     url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
+}
+
+fn response_detail(body: &[u8]) -> String {
+    let text = String::from_utf8_lossy(body);
+    if text.len() <= 1024 {
+        return text.into_owned();
+    }
+    let mut end = 1024;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
 }
 
 #[cfg(test)]
