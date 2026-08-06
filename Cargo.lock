@@ -1338,7 +1338,6 @@ dependencies = [
  "futures",
  "http",
  "libc",
- "log",
  "logforth",
  "nix 0.30.1",
  "opendal",

@@ -17,7 +17,6 @@
 
 use std::fmt;
 
-use anyhow::Result;
 use serde::Serialize;
 
 use crate::error::ErrorSummary;
@@ -104,7 +103,7 @@ impl SyncStatus {
         paths: &ReplicaPaths,
         state: &ReplicaState,
         remote: Result<&Observation, &ErrorSummary>,
-    ) -> Result<Self> {
+    ) -> Self {
         let (local, local_error) = match crate::replica::scan(
             paths,
             state.common.as_ref().map(|base| &base.manifest),
@@ -154,7 +153,7 @@ impl SyncStatus {
                 resolution: "unresolved",
             })
             .collect::<Vec<_>>();
-        Ok(Self {
+        Self {
             format_version: 1,
             volume: StatusVolume {
                 name: volume_name.to_owned(),
@@ -182,7 +181,7 @@ impl SyncStatus {
             conflict_records,
             metadata,
             capabilities: crate::sync::CAPABILITIES.to_vec(),
-        })
+        }
     }
 }
 

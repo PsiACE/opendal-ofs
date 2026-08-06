@@ -103,7 +103,7 @@ async fn status_managed(
         },
     };
     let remote = remote.map_err(|error| error::ErrorSummary::from_error(&error));
-    let status = status::SyncStatus::inspect(name, placement, &paths, &state, remote.as_ref())?;
+    let status = status::SyncStatus::inspect(name, placement, &paths, &state, remote.as_ref());
     if args.json {
         println!("{}", serde_json::to_string_pretty(&status)?);
     } else {
