@@ -217,10 +217,10 @@ Data Store.
 | `format_version` | `1` |
 | `volume.name`, `volume.id`, `volume.model` | Bound named Managed Volume |
 | `access` | `sync` |
-| `local` | `clean` or `changed` |
+| `local` | `clean`, `changed`, or `unknown` |
 | `local_error` | Stable error kind and diagnostic message when local inspection fails |
 | `base.generation` | Durable common generation, or absent before binding |
-| `remote.state` | `at_base`, `ahead`, `behind`, `diverged`, or `unknown` |
+| `remote.state` | `at_base`, `ahead`, `observed`, or `unknown` |
 | `remote.generation` | Present only after a successful live authority observation |
 | `remote.error` | Stable error kind and diagnostic message when live observation fails |
 | `publication` | `idle`, `pending`, or `conflict` |

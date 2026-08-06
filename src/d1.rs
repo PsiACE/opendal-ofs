@@ -398,6 +398,9 @@ impl MetadataStore for D1MetadataStore {
         if after.generation > through.generation {
             bail!("D1 change range is reversed");
         }
+        if after == through {
+            return Ok(Vec::new());
+        }
         let rows = self
             .transport
             .execute(
