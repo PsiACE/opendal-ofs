@@ -200,7 +200,7 @@ pub(crate) async fn sync_once(volume: &ManagedVolume, request: SyncRequest<'_>) 
         changes,
     )?;
     let cursor = match volume.metadata.publish(&observed, commit).await? {
-        PublicationOutcome::Committed(observed) => observed.head.cursor,
+        PublicationOutcome::Committed(cursor) => cursor,
         PublicationOutcome::AlreadyCommitted(cursor) => cursor,
         PublicationOutcome::Conflict(actual) => {
             state.publication = None;
@@ -272,7 +272,7 @@ async fn recover(
                         pending.changes,
                     )?;
                     let cursor = match volume.metadata.publish(&observed, commit).await? {
-                        PublicationOutcome::Committed(observed) => observed.head.cursor,
+                        PublicationOutcome::Committed(cursor) => cursor,
                         PublicationOutcome::AlreadyCommitted(cursor) => cursor,
                         PublicationOutcome::Unknown => {
                             bail!("recorded publication result remains unknown")

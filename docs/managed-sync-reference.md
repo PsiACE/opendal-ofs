@@ -119,8 +119,9 @@ The first non-empty commit contains one `put` for every directory and file.
 Later commits contain only `diff(remote, merged_target)`: creates, changes, and
 removals for affected paths. An unchanged file creates neither a new commit
 entry nor a new data object. `metadata/head` is overwritten in place. Its ETag
-is the CAS authority token, and a successful conditional write returns the
-token for the new observation. Commits and data versions accumulate.
+is the CAS authority token, and a successful conditional write must return a
+new ETag even though the current single-publication workflow does not retain
+it. Commits and data versions accumulate.
 
 A file `put` stores one content reference containing the full SHA-256 digest
 and byte size. The Data Store key is derived from that digest; the metadata

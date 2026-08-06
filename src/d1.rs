@@ -461,7 +461,7 @@ impl MetadataStore for D1MetadataStore {
             commit.cursor.clone(),
             expected.head.checkpoint.clone(),
         );
-        let revision = match &expected.authority {
+        let expected_revision = match &expected.authority {
             AuthorityToken::D1Revision(value) => *value,
             AuthorityToken::ObjectEtag(_) => bail!("D1 metadata received an object ETag"),
         };
@@ -477,7 +477,7 @@ impl MetadataStore for D1MetadataStore {
                     commit.volume_id.as_str().into(),
                     commit.parent.generation.into(),
                     commit.parent.operation.as_str().into(),
-                    revision.into(),
+                    expected_revision.into(),
                     commit.cursor.operation.as_str().into(),
                     commit.cursor.generation.into(),
                     hash.into(),
@@ -487,12 +487,11 @@ impl MetadataStore for D1MetadataStore {
             .await;
         match result {
             Ok(rows) if !rows.is_empty() => {
-                let revision = required_u64(one(&rows, "D1 publication")?, "revision")?;
-                Ok(PublicationOutcome::Committed(Box::new(Observation {
-                    format: expected.format.clone(),
-                    head: next,
-                    authority: AuthorityToken::D1Revision(revision),
-                })))
+                let next_revision = required_u64(one(&rows, "D1 publication")?, "revision")?;
+                if Some(next_revision) != expected_revision.checked_add(1) {
+                    bail!("D1 publication returned an invalid authority revision");
+                }
+                Ok(PublicationOutcome::Committed(commit.cursor))
             }
             Ok(_) => match self
                 .reachable(&commit.volume_id, &commit.cursor.operation)

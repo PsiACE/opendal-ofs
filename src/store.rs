@@ -59,7 +59,7 @@ pub(crate) enum AuthorityToken {
 
 #[derive(Debug)]
 pub(crate) enum PublicationOutcome {
-    Committed(Box<Observation>),
+    Committed(Cursor),
     AlreadyCommitted(Cursor),
     Conflict(Observation),
     Unknown,
@@ -348,15 +348,10 @@ impl MetadataStore for ObjectMetadataStore {
             .await
         {
             Ok(metadata) => {
-                let token = metadata
+                metadata
                     .etag()
-                    .context("Metadata Store write did not return the head ETag")?
-                    .to_owned();
-                Ok(PublicationOutcome::Committed(Box::new(Observation {
-                    format: expected.format.clone(),
-                    head,
-                    authority: AuthorityToken::ObjectEtag(token),
-                })))
+                    .context("Metadata Store write did not return the head ETag")?;
+                Ok(PublicationOutcome::Committed(commit.cursor))
             }
             Err(error) if precondition(&error) => match self
                 .reachable(&commit.volume_id, &commit.cursor.operation)
