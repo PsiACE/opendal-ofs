@@ -236,7 +236,6 @@ async fn execute_operator_mount(
     let mut uid = nix::unistd::getuid().into();
     mount_options.uid(uid);
 
-    #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
     let mut mount_handle = if nix::unistd::getuid().is_root() {
         if let Some(sudo_gid) = env::var("SUDO_GID")
             .ok()
@@ -250,8 +249,8 @@ async fn execute_operator_mount(
             .ok()
             .and_then(|gid_str| gid_str.parse::<u32>().ok())
         {
-            mount_options.uid(uid);
             uid = sudo_uid;
+            mount_options.uid(uid);
         }
 
         let fs = fuse3_opendal::Filesystem::new(backend, uid, gid);
