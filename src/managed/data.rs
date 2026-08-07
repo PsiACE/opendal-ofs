@@ -21,8 +21,7 @@ use opendal::{ErrorKind, Operator, Writer};
 use sha2::{Digest as _, Sha256};
 
 use super::{ManagedError, ManagedErrorKind};
-use crate::filesystem::FileVersionId;
-use crate::managed::namespace::{ContentRef, FileVersionRecord};
+use crate::managed::namespace::{ContentRef, FileVersionLayout, FileVersionRecord};
 
 const READ_WINDOW: u64 = 4 * 1024 * 1024;
 const LOOSE_ROOT: &str = "data/v1/loose/sha256";
@@ -88,7 +87,10 @@ impl ManagedData {
         if size == 0 {
             return Ok(version);
         }
-        let key = loose_key(&version.content);
+        let FileVersionLayout::Whole { content } = &version.layout else {
+            unreachable!("whole-file sealing created another layout")
+        };
+        let key = loose_key(content);
 
         match self.operator.writer_with(&key).if_not_exists(true).await {
             Err(error) if already_exists(&error) => {}
@@ -129,7 +131,7 @@ impl ManagedData {
         target: &Operator,
         target_path: &str,
     ) -> Result<(), ManagedError> {
-        self.verify_metadata(version).await?;
+        let content = self.verify_metadata(version).await?;
         if version.logical_size == 0 {
             target
                 .write(target_path, Vec::<u8>::new())
@@ -137,7 +139,7 @@ impl ManagedData {
                 .map_err(|_| unavailable("create materialized file"))?;
             return Ok(());
         }
-        let key = loose_key(&version.content);
+        let key = loose_key(&content);
         let mut writer = target
             .writer(target_path)
             .await
@@ -156,7 +158,7 @@ impl ManagedData {
                 return Err(unavailable("read loose data"));
             }
         };
-        if digest.as_bytes() != &version.content.digest {
+        if digest.as_bytes() != &content.digest {
             let _ = writer.abort().await;
             return Err(corrupt("read loose data", "content digest does not match"));
         }
@@ -168,12 +170,15 @@ impl ManagedData {
     }
 
     async fn verify(&self, version: &FileVersionRecord) -> Result<(), ManagedError> {
-        self.verify_metadata(version).await?;
-        let key = loose_key(&version.content);
+        let content = self.verify_metadata(version).await?;
+        if content.logical_length == 0 {
+            return Ok(());
+        }
+        let key = loose_key(&content);
         let digest = digest_and_copy(&self.operator, &key, version.logical_size, None)
             .await
             .map_err(|_| unavailable("verify loose data"))?;
-        if digest.as_bytes() != &version.content.digest {
+        if digest.as_bytes() != &content.digest {
             return Err(corrupt(
                 "verify loose data",
                 "content digest does not match its key",
@@ -182,32 +187,37 @@ impl ManagedData {
         Ok(())
     }
 
-    async fn verify_metadata(&self, version: &FileVersionRecord) -> Result<(), ManagedError> {
-        let canonical = whole_file_version(
-            version.logical_size,
-            Digest::from_bytes(version.logical_digest),
-        );
-        if version != &canonical || version.content.digest != version.logical_digest {
+    async fn verify_metadata(
+        &self,
+        version: &FileVersionRecord,
+    ) -> Result<ContentRef, ManagedError> {
+        if !version.is_valid() {
             return Err(corrupt(
                 "read loose data",
-                "whole-file manifest identity is invalid",
+                "file manifest identity is invalid",
             ));
         }
-        if version.logical_size == 0 {
-            return Ok(());
+        let FileVersionLayout::Whole { content } = &version.layout else {
+            return Err(invalid(
+                "read loose data",
+                "file layout is not supported by the whole-file reader",
+            ));
+        };
+        if content.logical_length == 0 {
+            return Ok(*content);
         }
         let metadata = self
             .operator
-            .stat(&loose_key(&version.content))
+            .stat(&loose_key(content))
             .await
             .map_err(|_| unavailable("stat loose data"))?;
-        if !metadata.is_file() || metadata.content_length() != version.logical_size {
+        if !metadata.is_file() || metadata.content_length() != content.logical_length {
             return Err(corrupt(
                 "stat loose data",
                 "stored size does not match the file version",
             ));
         }
-        Ok(())
+        Ok(*content)
     }
 }
 
@@ -241,19 +251,7 @@ async fn digest_and_copy(
 }
 
 fn whole_file_version(size: u64, digest: Digest) -> FileVersionRecord {
-    let mut hash = Sha256::new();
-    hash.update(b"ofs-managed-whole-file-v1\0");
-    hash.update(size.to_be_bytes());
-    hash.update(digest.as_bytes());
-    FileVersionRecord {
-        id: FileVersionId::from_bytes(hash.finalize().into()),
-        logical_size: size,
-        logical_digest: *digest.as_bytes(),
-        content: ContentRef {
-            digest: *digest.as_bytes(),
-            logical_length: size,
-        },
-    }
+    FileVersionRecord::whole(size, *digest.as_bytes())
 }
 
 fn loose_key(content: &ContentRef) -> String {

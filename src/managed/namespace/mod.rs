@@ -25,7 +25,8 @@ mod validation;
 pub(crate) use d1::{D1Namespace, D1NamespaceObservation};
 pub use object::{NamespaceObservation, ObjectNamespace};
 pub use records::{
-    ContentRef, DirectoryPrecondition, DirectoryRecord, FileVersionRecord, NamespacePublication,
+    ChunkSpan, ChunkingAlgorithm, ChunkingSpec, ContentRef, DataExtent, DirectoryPrecondition,
+    DirectoryRecord, FileExtent, FileVersionLayout, FileVersionRecord, NamespacePublication,
     NamespaceSnapshot, NodePrecondition, NodeRecord,
 };
 pub(crate) use records::{managed_generation, managed_generation_number, next_managed_generation};

@@ -125,10 +125,7 @@ pub(super) fn validate_snapshot(snapshot: &NamespaceSnapshot) -> Result<(), Mana
         }
     }
     for (id, version) in &snapshot.file_versions {
-        if *id != version.id
-            || version.logical_size != version.content.logical_length
-            || version.logical_digest != version.content.digest
-        {
+        if *id != version.id || !version.is_valid() {
             return Err(invalid("read Managed namespace", "file version is invalid"));
         }
     }

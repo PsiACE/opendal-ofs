@@ -205,9 +205,7 @@ fn validate_prepared(
     for (path, entry) in local.entries() {
         match (entry.kind, prepared.get(path)) {
             (LocalKind::File, Some(version))
-                if version.logical_size == entry.size
-                    && version.logical_size == version.content.logical_length
-                    && version.logical_digest == version.content.digest => {}
+                if version.logical_size == entry.size && version.is_valid() => {}
             (LocalKind::File, Some(_)) => {
                 bail!("prepared file version for {path:?} does not match the local file")
             }

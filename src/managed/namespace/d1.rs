@@ -23,8 +23,9 @@ use serde_json::Value;
 
 use super::validation::{validate_publication, validate_snapshot};
 use super::{
-    ContentRef, DirectoryPrecondition, DirectoryRecord, FileVersionRecord, NamespacePublication,
-    NamespaceSnapshot, NodePrecondition, NodeRecord, managed_generation, managed_generation_number,
+    DirectoryPrecondition, DirectoryRecord, FileVersionLayout, FileVersionRecord,
+    NamespacePublication, NamespaceSnapshot, NodePrecondition, NodeRecord, managed_generation,
+    managed_generation_number,
 };
 use crate::filesystem::{
     ChangeCursor, CommitOutcome, DirectoryEntry, FileVersionId, NodeAttributes, NodeId, NodeKind,
@@ -665,12 +666,12 @@ impl From<StoredNodeAttributes> for NodeAttributes {
 }
 
 #[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct StoredFileVersion {
     id: [u8; 32],
     logical_size: u64,
     logical_digest: [u8; 32],
-    content_digest: [u8; 32],
-    content_length: u64,
+    layout: FileVersionLayout,
 }
 
 impl From<&FileVersionRecord> for StoredFileVersion {
@@ -679,8 +680,7 @@ impl From<&FileVersionRecord> for StoredFileVersion {
             id: *version.id.as_bytes(),
             logical_size: version.logical_size,
             logical_digest: version.logical_digest,
-            content_digest: version.content.digest,
-            content_length: version.content.logical_length,
+            layout: version.layout.clone(),
         }
     }
 }
@@ -691,10 +691,7 @@ impl StoredFileVersion {
             id: FileVersionId::from_bytes(self.id),
             logical_size: self.logical_size,
             logical_digest: self.logical_digest,
-            content: ContentRef {
-                digest: self.content_digest,
-                logical_length: self.content_length,
-            },
+            layout: self.layout,
         }
     }
 }
