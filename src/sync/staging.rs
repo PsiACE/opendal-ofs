@@ -22,6 +22,7 @@ use super::local::{
     set_executable,
 };
 
+const COPY_CHUNK: usize = 1024 * 1024;
 const COPY_CONCURRENCY: usize = 8;
 const MANIFEST_FORMAT: &str = "ofs-staged-tree";
 const MANIFEST_MAJOR: u16 = 1;
@@ -394,7 +395,8 @@ async fn stage_file(
     require_same_file_attributes(path, expected, &before_attributes)?;
 
     let reader = source
-        .reader(path)
+        .reader_with(path)
+        .chunk(COPY_CHUNK)
         .await
         .with_context(|| format!("open source file {path:?}"))?;
     let mut input = reader
