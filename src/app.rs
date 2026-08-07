@@ -12,7 +12,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 use ofs::catalog::{Catalog, VolumeDefinition};
-use ofs::filesystem::{AccessModel, VolumeId, VolumeModel};
+use ofs::filesystem::{AccessModel, Capabilities, VolumeId, VolumeModel};
 use ofs::managed::{
     D1Config, D1Metadata, ManagedDataFormat, ManagedError, ManagedErrorKind, ManagedFormat,
     Metadata, MetadataPlacement, ObjectMetadata,
@@ -193,6 +193,25 @@ fn status(config: Option<&Path>, args: StatusArgs) -> Result<()> {
     if definition.model != VolumeModel::Managed {
         bail!("replica state is not bound to a Managed volume");
     }
+    let capabilities = Capabilities::managed_sync_v1();
+    let guarantees = capabilities
+        .guarantees()
+        .map(|capability| {
+            serde_json::json!({
+                "name": capability.name.as_str(),
+                "guarantee": capability.guarantee,
+            })
+        })
+        .collect::<Vec<_>>();
+    let limitations = capabilities
+        .limitations()
+        .map(|limitation| {
+            serde_json::json!({
+                "name": limitation.name.as_str(),
+                "reason": limitation.reason,
+            })
+        })
+        .collect::<Vec<_>>();
     let value = serde_json::json!({
         "volume": alias,
         "volume_model": model_name(definition.model),
@@ -201,6 +220,8 @@ fn status(config: Option<&Path>, args: StatusArgs) -> Result<()> {
         "common_sequence": state.common.sequence(),
         "pending": state.pending.is_some(),
         "conflicts": state.conflicts.len(),
+        "capabilities": guarantees,
+        "limitations": limitations,
     });
     if args.json {
         println!("{}", serde_json::to_string(&value)?);
@@ -211,6 +232,19 @@ fn status(config: Option<&Path>, args: StatusArgs) -> Result<()> {
             state.common.sequence(),
             usize::from(state.pending.is_some()),
             state.conflicts.len()
+        );
+        println!(
+            "guarantees: {}; limitations: {}",
+            capabilities
+                .guarantees()
+                .map(|capability| capability.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            capabilities
+                .limitations()
+                .map(|limitation| limitation.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
     Ok(())

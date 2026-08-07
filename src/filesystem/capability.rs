@@ -15,43 +15,113 @@
 // specific language governing permissions and limitations
 // under the License.
 
-/// One effective filesystem capability reported to a user.
-///
-/// The scopes are product vocabulary, not provider capability names. Missing
-/// guarantees carry the error returned when the caller starts an access mode
-/// that requires them.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Capability {
-    Supported {
-        name: String,
-        atomicity_scope: String,
-        durability_boundary: String,
-        multi_client_visibility: String,
-    },
-    Unsupported {
-        name: String,
-        access_start_error: String,
-    },
+/// A stable RFC 016 guarantee exposed by a volume and access combination.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CapabilityName {
+    StableNodeIdentity,
+    ObjectScopedGenerations,
+    AtomicNamespacePublication,
+    DurableCommonBase,
+    ExplicitConflictRetention,
 }
 
-impl Capability {
-    pub fn name(&self) -> &str {
+impl CapabilityName {
+    pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Supported { name, .. } | Self::Unsupported { name, .. } => name,
+            Self::StableNodeIdentity => "stable_node_identity",
+            Self::ObjectScopedGenerations => "object_scoped_generations",
+            Self::AtomicNamespacePublication => "atomic_namespace_publication",
+            Self::DurableCommonBase => "durable_common_base",
+            Self::ExplicitConflictRetention => "explicit_conflict_retention",
         }
     }
 }
 
-/// Effective capabilities for one selected volume and access combination.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct Capabilities(Vec<Capability>);
+/// A filesystem operation that the selected combination does not implement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LimitationName {
+    HardLinks,
+    SymbolicLinks,
+    RandomWrite,
+}
+
+impl LimitationName {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HardLinks => "hard_links",
+            Self::SymbolicLinks => "symbolic_links",
+            Self::RandomWrite => "random_write",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CapabilityGuarantee {
+    pub name: CapabilityName,
+    pub guarantee: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CapabilityLimitation {
+    pub name: LimitationName,
+    pub reason: &'static str,
+}
+
+/// Effective RFC 016 semantics for one selected volume and access model.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Capabilities {
+    guarantees: &'static [CapabilityGuarantee],
+    limitations: &'static [CapabilityLimitation],
+}
 
 impl Capabilities {
-    pub fn new(capabilities: Vec<Capability>) -> Self {
-        Self(capabilities)
+    /// Semantics currently provided by Managed volumes through Sync access.
+    pub const fn managed_sync_v1() -> Self {
+        Self {
+            guarantees: &[
+                CapabilityGuarantee {
+                    name: CapabilityName::StableNodeIdentity,
+                    guarantee: "NodeId is preserved when a known node is renamed.",
+                },
+                CapabilityGuarantee {
+                    name: CapabilityName::ObjectScopedGenerations,
+                    guarantee: "nodes and directories carry independent opaque generations",
+                },
+                CapabilityGuarantee {
+                    name: CapabilityName::AtomicNamespacePublication,
+                    guarantee: "one complete namespace publication becomes authoritative atomically",
+                },
+                CapabilityGuarantee {
+                    name: CapabilityName::DurableCommonBase,
+                    guarantee: "each replica durably records its last common change cursor",
+                },
+                CapabilityGuarantee {
+                    name: CapabilityName::ExplicitConflictRetention,
+                    guarantee: "concurrent local and remote candidates remain retained until explicit resolution",
+                },
+            ],
+            limitations: &[
+                CapabilityLimitation {
+                    name: LimitationName::HardLinks,
+                    reason: "hard-link identity is not represented; use independent regular files",
+                },
+                CapabilityLimitation {
+                    name: LimitationName::SymbolicLinks,
+                    reason: "symbolic links are rejected at the Sync boundary",
+                },
+                CapabilityLimitation {
+                    name: LimitationName::RandomWrite,
+                    reason: "Sync publishes complete immutable file versions, not range updates",
+                },
+            ],
+        }
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &Capability> {
-        self.0.iter()
+    pub fn guarantees(self) -> impl Iterator<Item = &'static CapabilityGuarantee> {
+        self.guarantees.iter()
+    }
+
+    pub fn limitations(self) -> impl Iterator<Item = &'static CapabilityLimitation> {
+        self.limitations.iter()
     }
 }

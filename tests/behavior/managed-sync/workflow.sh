@@ -178,6 +178,17 @@ grep -Eq '"access_model"[[:space:]]*:[[:space:]]*"sync"' <<<"$status_json" || \
   fail 'status did not report access_model=sync'
 grep -Eq '"conflicts"[[:space:]]*:[[:space:]]*0' <<<"$status_json" || \
   fail 'status still reports conflicts after explicit resolution'
+for capability in stable_node_identity object_scoped_generations \
+  atomic_namespace_publication durable_common_base explicit_conflict_retention; do
+  grep -Fq -- "\"name\":\"$capability\"" <<<"$status_json" || \
+    fail "status did not report capability: $capability"
+done
+grep -Fq -- '"guarantee":' <<<"$status_json" || fail 'status omitted capability guarantees'
+for limitation in hard_links symbolic_links random_write; do
+  grep -Fq -- "\"name\":\"$limitation\"" <<<"$status_json" || \
+    fail "status did not report limitation: $limitation"
+done
+grep -Fq -- '"reason":' <<<"$status_json" || fail 'status omitted limitation reasons'
 
 for name in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN OFS_D1_TOKEN; do
   secret=${!name:-}
