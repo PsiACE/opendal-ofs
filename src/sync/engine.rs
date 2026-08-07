@@ -13,6 +13,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use futures::{StreamExt as _, stream};
 use opendal::{Operator, services};
 
 use super::local::{NativeIdentity, fs_operator, set_executable};
@@ -135,7 +136,7 @@ impl SyncEngine {
         } else {
             None
         };
-        let observed = self.volume.observe().await?;
+        let observed = self.volume.observe_from(state.authority.as_ref()).await?;
         let remote = observed.as_ref().map(|value| value.snapshot());
         if remote.is_none() && state.common != ChangeCursor::Genesis {
             bail!("authoritative namespace disappeared after this replica was initialized");
@@ -185,6 +186,7 @@ impl SyncEngine {
                 create_remote_directories(&target, remote).await?;
             }
             local_renames = plan.local_renames;
+            let mut installs = Vec::new();
             for action in plan.actions {
                 match action {
                     ReconcileAction::KeepLocal { .. } => {}
@@ -199,10 +201,9 @@ impl SyncEngine {
                         let file = remote
                             .file_versions
                             .get(&version)
-                            .context("reconciliation references a missing remote file version")?;
-                        self.volume.materialize(file, &target, &path).await?;
-                        known_digests.insert(path, digest);
-                        install_remote = true;
+                            .context("reconciliation references a missing remote file version")?
+                            .clone();
+                        installs.push((path, file, digest));
                     }
                     ReconcileAction::DeleteLocal { path } => {
                         target.delete(&path).await?;
@@ -218,6 +219,23 @@ impl SyncEngine {
                         bail!("cannot reconcile {path:?}: {reason}")
                     }
                 }
+            }
+            let installed = stream::iter(installs)
+                .map(|(path, file, digest)| {
+                    let volume = self.volume.clone();
+                    let target = target.clone();
+                    async move {
+                        volume.materialize(&file, &target, &path).await?;
+                        Ok::<_, crate::managed::ManagedError>((path, digest))
+                    }
+                })
+                .buffer_unordered(4)
+                .collect::<Vec<_>>()
+                .await;
+            for installed in installed {
+                let (path, digest) = installed?;
+                known_digests.insert(path, digest);
+                install_remote = true;
             }
             if merge_remote_directories {
                 delete_absent_directories(&target, &local, remote).await?;
@@ -615,6 +633,7 @@ async fn state_from_snapshot(snapshot: &NamespaceSnapshot, replica: &Path) -> Re
     let local = LocalTree::scan(replica).await?;
     let mut state = ReplicaState::empty(snapshot.volume_id);
     state.common = snapshot.cursor;
+    state.authority = Some(snapshot.clone());
     for (path, node) in snapshot_paths(snapshot)? {
         let record = &snapshot.nodes[&node];
         let digest = record

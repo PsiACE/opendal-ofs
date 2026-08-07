@@ -116,6 +116,23 @@ impl ManagedVolume {
         }
     }
 
+    /// Observe the authority, reusing an already verified Sync common base when it is current.
+    pub async fn observe_from(
+        &self,
+        base: Option<&NamespaceSnapshot>,
+    ) -> Result<Option<ManagedObservation>, ManagedError> {
+        match (&self.namespace, base) {
+            (NamespaceAuthority::Object(namespace), Some(base)) => {
+                namespace.observe_from(base).await.map(|observed| {
+                    observed.map(|observed| ManagedObservation {
+                        authority: AuthorityObservation::Object(observed),
+                    })
+                })
+            }
+            _ => self.observe().await,
+        }
+    }
+
     pub async fn seal_whole_file(
         &self,
         frozen: &Operator,

@@ -31,3 +31,4 @@ pub use records::{
     NamespacePublication, NamespaceSnapshot, NodePrecondition, NodeRecord,
 };
 pub(crate) use records::{managed_generation, managed_generation_number, next_managed_generation};
+pub(crate) use validation::validate_snapshot;

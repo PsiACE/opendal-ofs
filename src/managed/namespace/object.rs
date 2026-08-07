@@ -47,7 +47,7 @@ const CHECKPOINT_MAGIC: &[u8] = b"OFS1CHK\0";
 const RESULT_MAGIC: &[u8] = b"OFS1RES\0";
 const HEAD_MAGIC: &str = "ofs-managed-sync-head";
 const FORMAT_MAJOR: u16 = 1;
-const MAX_TAIL_TRANSACTIONS: u16 = 4;
+const MAX_TAIL_TRANSACTIONS: u16 = 32;
 
 #[derive(Clone, Debug)]
 pub struct NamespaceObservation {
@@ -69,6 +69,7 @@ impl NamespaceObservation {
 struct ObservationAuthority {
     head: StoredHead,
     committed: BTreeSet<[u8; 16]>,
+    committed_complete: bool,
 }
 
 #[derive(Clone)]
@@ -101,15 +102,48 @@ impl ObjectNamespace {
             return Ok(None);
         };
         let head = decode_head(&bytes)?;
+        self.recover_observation(head, revision).await.map(Some)
+    }
+
+    pub async fn observe_from(
+        &self,
+        base: &NamespaceSnapshot,
+    ) -> Result<Option<NamespaceObservation>, ManagedError> {
+        let Some((bytes, revision)) = self.read_head().await? else {
+            return Ok(None);
+        };
+        let head = decode_head(&bytes)?;
+        head.validate(self.volume_id)?;
+        if base.volume_id == self.volume_id && base.cursor == head.cursor.into_cursor()? {
+            validate_snapshot(base)?;
+            return Ok(Some(NamespaceObservation {
+                snapshot: base.clone(),
+                revision,
+                authority: Box::new(ObservationAuthority {
+                    head,
+                    committed: BTreeSet::new(),
+                    committed_complete: false,
+                }),
+            }));
+        }
+        self.recover_observation(head, revision).await.map(Some)
+    }
+
+    async fn recover_observation(
+        &self,
+        head: StoredHead,
+        revision: String,
+    ) -> Result<NamespaceObservation, ManagedError> {
         let recovered = self.recover(&head).await?;
-        Ok(Some(NamespaceObservation {
+        Ok(NamespaceObservation {
             snapshot: recovered.snapshot,
             revision,
             authority: Box::new(ObservationAuthority {
                 head,
                 committed: recovered.committed,
+                committed_complete: true,
             }),
-        }))
+        })
     }
 
     pub async fn publish(
@@ -147,14 +181,18 @@ impl ObjectNamespace {
         let transaction_sha256 = sha256(&bytes);
         self.ensure_transaction(publication.operation, &bytes)
             .await?;
-        let mut committed = observed
-            .map(|value| value.authority.committed.clone())
-            .unwrap_or_default();
-        committed.insert(*publication.operation.as_bytes());
         let checkpoint_due = observed.is_none()
             || observed.is_some_and(|value| {
                 value.authority.head.tail_transactions + 1 >= MAX_TAIL_TRANSACTIONS
             });
+        let mut committed = match observed {
+            Some(observed) if checkpoint_due && !observed.authority.committed_complete => {
+                self.recover(&observed.authority.head).await?.committed
+            }
+            Some(observed) => observed.authority.committed.clone(),
+            None => BTreeSet::new(),
+        };
+        committed.insert(*publication.operation.as_bytes());
         let (checkpoint, checkpoint_cursor, tail_transactions) = if checkpoint_due {
             let checkpoint = StoredCheckpoint {
                 major: FORMAT_MAJOR,
@@ -196,9 +234,8 @@ impl ObjectNamespace {
         match replaced {
             Ok(true) => {
                 let outcome = CommitOutcome::Committed(publication.target.cursor);
-                let _ = self
-                    .ensure_result(publication.operation, transaction_sha256, &outcome)
-                    .await;
+                self.ensure_result(publication.operation, transaction_sha256, &outcome)
+                    .await?;
                 Ok(outcome)
             }
             Ok(false) => self.outcome_after_race(publication.operation).await,
@@ -327,6 +364,12 @@ impl ObjectNamespace {
         let head = decode_head(&bytes)?;
         let recovered = self.recover(&head).await?;
         if recovered.committed.contains(operation.as_bytes()) {
+            self.ensure_result(
+                operation,
+                transaction_sha256,
+                &CommitOutcome::Committed(target.cursor.into_cursor()?),
+            )
+            .await?;
             return Ok(CommitOutcome::Committed(target.cursor.into_cursor()?));
         }
         let parent = target.parent.into_cursor()?;

@@ -69,7 +69,7 @@ pub(super) fn validate_publication(
     Ok(true)
 }
 
-pub(super) fn validate_snapshot(snapshot: &NamespaceSnapshot) -> Result<(), ManagedError> {
+pub(crate) fn validate_snapshot(snapshot: &NamespaceSnapshot) -> Result<(), ManagedError> {
     let root = snapshot
         .nodes
         .get(&snapshot.root)
