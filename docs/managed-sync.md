@@ -199,6 +199,12 @@ ofs volume pack workspace
 Running the same command again is safe. Content that already has a verified
 pack location is not packed again.
 
+A cold full-tree materialization downloads and verifies each selected pack
+once, then writes all of its files from that verified body. Incremental Sync
+keeps range reads because downloading a whole pack for one changed file would
+amplify data transfer. The choice belongs to the materialization operation and
+does not change the pack format or index.
+
 Use the optional maintenance controls when you intend to replace packs with
 dead entries or remove redundant loose copies:
 

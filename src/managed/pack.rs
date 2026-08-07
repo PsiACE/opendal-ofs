@@ -71,6 +71,21 @@ pub struct SealedPack {
     pub locations: BTreeMap<ContentRef, PackLocation>,
 }
 
+/// One completely downloaded pack whose envelope and entries have been verified.
+#[derive(Debug)]
+pub(crate) struct VerifiedPack {
+    pack: SealedPack,
+    bytes: Vec<u8>,
+}
+
+impl VerifiedPack {
+    pub(crate) fn content(&self, content: ContentRef) -> Option<&[u8]> {
+        let location = self.pack.locations.get(&content)?;
+        self.bytes
+            .get(location.offset as usize..(location.offset + location.stored_length) as usize)
+    }
+}
+
 type CachedPack = Arc<OnceCell<Result<Arc<SealedPack>, ManagedError>>>;
 
 /// Pack locations fixed for one materialization operation.
@@ -93,18 +108,31 @@ impl PackReadSession {
         })
     }
 
-    /// Read one packed location. `None` means the fixed index has no location.
-    pub(crate) async fn read(&self, content: ContentRef) -> Result<Option<Vec<u8>>, ManagedError> {
+    /// Return locations from the pack index fixed for this operation.
+    pub(crate) async fn locations(
+        &self,
+        content: ContentRef,
+    ) -> Result<Vec<PackLocation>, ManagedError> {
         let operator = self.operator.clone();
         let index = self
             .index
             .get_or_init(|| async move { PackIndex::open(operator).await })
             .await;
-        let locations = match index {
-            Ok(Some(index)) => index.locations(content).to_vec(),
-            Ok(None) => return Ok(None),
-            Err(error) => return Err(error.clone()),
-        };
+        match index {
+            Ok(Some(index)) => Ok(index.locations(content).to_vec()),
+            Ok(None) => Ok(Vec::new()),
+            Err(error) => Err(error.clone()),
+        }
+    }
+
+    /// Download a complete pack without retaining it in this session.
+    pub(crate) async fn read_full(&self, id: PackId) -> Result<VerifiedPack, ManagedError> {
+        self.store.read_complete(id).await
+    }
+
+    /// Read one packed location. `None` means the fixed index has no location.
+    pub(crate) async fn read(&self, content: ContentRef) -> Result<Option<Vec<u8>>, ManagedError> {
+        let locations = self.locations(content).await?;
         if locations.is_empty() {
             return Ok(None);
         }
@@ -124,6 +152,7 @@ impl PackReadSession {
                     store
                         .inspect_inner(location.pack, false)
                         .await
+                        .map(|(pack, _)| pack)
                         .map(Arc::new)
                 })
                 .await;
@@ -227,14 +256,23 @@ impl PackStore {
 
     /// Verify the complete pack and return its footer-derived locations.
     pub async fn inspect(&self, id: PackId) -> Result<SealedPack, ManagedError> {
-        self.inspect_inner(id, true).await
+        self.read_complete(id).await.map(|verified| verified.pack)
+    }
+
+    /// Download and verify a complete pack for reading several entries.
+    pub(crate) async fn read_complete(&self, id: PackId) -> Result<VerifiedPack, ManagedError> {
+        let (pack, bytes) = self.inspect_inner(id, true).await?;
+        Ok(VerifiedPack {
+            pack,
+            bytes: bytes.expect("complete inspection retains the downloaded pack"),
+        })
     }
 
     async fn inspect_inner(
         &self,
         id: PackId,
         verify_checksum: bool,
-    ) -> Result<SealedPack, ManagedError> {
+    ) -> Result<(SealedPack, Option<Vec<u8>>), ManagedError> {
         let key = pack_key(id);
         let complete = if verify_checksum {
             Some(
@@ -358,7 +396,7 @@ impl PackStore {
                 },
             );
         }
-        Ok(SealedPack { id, locations })
+        Ok((SealedPack { id, locations }, complete))
     }
 
     /// Read and validate one indexed content range.
@@ -367,7 +405,7 @@ impl PackStore {
         content: ContentRef,
         location: PackLocation,
     ) -> Result<Vec<u8>, ManagedError> {
-        let pack = self.inspect_inner(location.pack, false).await?;
+        let (pack, _) = self.inspect_inner(location.pack, false).await?;
         self.read_verified(content, location, &pack).await
     }
 
@@ -377,18 +415,7 @@ impl PackStore {
         location: PackLocation,
         pack: &SealedPack,
     ) -> Result<Vec<u8>, ManagedError> {
-        if location.logical_length != content.logical_length {
-            return Err(corrupt(
-                "read pack content",
-                "index length disagrees with content",
-            ));
-        }
-        if pack.locations.get(&content) != Some(&location) {
-            return Err(corrupt(
-                "read pack content",
-                "index range disagrees with pack footer",
-            ));
-        }
+        validate_location(content, location, pack)?;
         let bytes = self
             .operator
             .read_with(&pack_key(pack.id))
@@ -447,6 +474,26 @@ impl PackStore {
             .await
             .map_err(|_| unavailable("delete retired pack", "retired pack cannot be deleted"))
     }
+}
+
+fn validate_location(
+    content: ContentRef,
+    location: PackLocation,
+    pack: &SealedPack,
+) -> Result<(), ManagedError> {
+    if location.logical_length != content.logical_length {
+        return Err(corrupt(
+            "read pack content",
+            "index length disagrees with content",
+        ));
+    }
+    if pack.locations.get(&content) != Some(&location) {
+        return Err(corrupt(
+            "read pack content",
+            "index range disagrees with pack footer",
+        ));
+    }
+    Ok(())
 }
 
 /// Rebuildable mapping from logical content identities to pack ranges.
@@ -1038,6 +1085,9 @@ mod tests {
             .await
             .unwrap();
         let content = content_ref(b"on disk");
+        let complete = store.read_complete(sealed.id).await.unwrap();
+        assert_eq!(complete.content(content), Some(b"on disk".as_slice()));
+        assert_eq!(complete.content(content_ref(b"missing")), None);
         assert_eq!(
             store
                 .read(content, sealed.locations[&content])

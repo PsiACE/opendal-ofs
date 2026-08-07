@@ -20,15 +20,15 @@
 use opendal::Operator;
 
 use super::namespace::{
-    D1Namespace, D1NamespaceObservation, FileVersionRecord, NamespaceGcSweep, NamespaceObservation,
-    NamespacePublication, NamespaceSnapshot, ObjectNamespace,
+    ContentRef, D1Namespace, D1NamespaceObservation, FileVersionRecord, NamespaceGcSweep,
+    NamespaceObservation, NamespacePublication, NamespaceSnapshot, ObjectNamespace,
 };
 use super::{
     AuthorityKnownContent, D1Metadata, FileLayoutPolicy, LooseGcMaintenance, ManagedData,
     ManagedError, ManagedErrorKind, PackMaintenance, PackRetirement, SparseExtent,
 };
 use crate::filesystem::{CommitOutcome, OperationId, VolumeId};
-use crate::managed::pack::PackReadSession;
+use crate::managed::pack::{PackId, PackLocation, PackReadSession, VerifiedPack};
 
 #[derive(Clone)]
 pub struct ManagedVolume {
@@ -64,6 +64,17 @@ impl ManagedMaterializer {
         self.data
             .read_to_with(version, target, path, &self.packs)
             .await
+    }
+
+    pub(crate) async fn pack_locations(
+        &self,
+        content: ContentRef,
+    ) -> Result<Vec<PackLocation>, ManagedError> {
+        self.packs.locations(content).await
+    }
+
+    pub(crate) async fn read_full_pack(&self, id: PackId) -> Result<VerifiedPack, ManagedError> {
+        self.packs.read_full(id).await
     }
 }
 

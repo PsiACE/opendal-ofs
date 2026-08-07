@@ -25,8 +25,13 @@ use super::{
 use crate::filesystem::{
     ChangeCursor, NodeId, NodeKind, OperationId, PublicationProgress, VolumeId,
 };
-use crate::managed::namespace::{FileVersionRecord, NamespaceSnapshot};
-use crate::managed::{AuthorityKnownContent, D1Metadata, FileLayoutPolicy, ManagedVolume};
+use crate::managed::namespace::{
+    ContentRef, FileVersionLayout, FileVersionRecord, NamespaceSnapshot,
+};
+use crate::managed::pack::PackId;
+use crate::managed::{
+    AuthorityKnownContent, D1Metadata, FileLayoutPolicy, ManagedMaterializer, ManagedVolume,
+};
 
 #[derive(Clone, Debug)]
 pub struct SyncResult {
@@ -190,6 +195,7 @@ impl SyncEngine {
             .collect::<BTreeMap<_, _>>();
         let mut publish = remote.is_none() && !local.entries().is_empty();
         let mut install_remote = false;
+        let mut staged_full_tree = false;
         let mut conflicts = Vec::new();
         let mut local_renames = BTreeMap::new();
         let requested = resolve_paths.iter().cloned().collect::<BTreeSet<_>>();
@@ -256,21 +262,19 @@ impl SyncEngine {
                 }
             }
             let materializer = self.volume.materializer()?;
-            let installed = stream::iter(installs)
-                .map(|(path, file, digest, executable)| {
-                    let materializer = materializer.clone();
-                    let target = target.clone();
-                    async move {
-                        materializer.materialize(&file, &target, &path).await?;
-                        Ok::<_, crate::managed::ManagedError>((path, digest, executable))
-                    }
-                })
-                .buffer_unordered(self.transfer_concurrency.get())
-                .collect::<Vec<_>>()
-                .await;
+            let full_tree = state.base.is_empty() && local.entries().is_empty();
+            staged_full_tree = full_tree;
+            let installed = materialize_files(
+                &materializer,
+                &target,
+                staged.root(),
+                installs,
+                full_tree,
+                self.transfer_concurrency,
+            )
+            .await?;
             for installed in installed {
-                let (path, digest, executable) = installed?;
-                set_executable(&staged.root().join(&path), executable)?;
+                let (path, digest, _) = installed;
                 staged
                     .record_materialized_file(path.clone(), digest)
                     .await?;
@@ -298,7 +302,12 @@ impl SyncEngine {
             if let Some(remote) = remote {
                 if install_remote {
                     if matches_frozen(replica_path, &frozen_input).await? {
-                        install_staged_changes(replica_path, &staged, &frozen_input)?;
+                        if staged_full_tree {
+                            StagedTree::remove_manifest(&staging_path)?;
+                            install_tree(replica_path, &staging_path)?;
+                        } else {
+                            install_staged_changes(replica_path, &staged, &frozen_input)?;
+                        }
                     } else {
                         install_remote = false;
                     }
@@ -808,6 +817,99 @@ fn install_staged_changes(replica: &Path, staged: &StagedTree, before: &FrozenTr
     Ok(())
 }
 
+async fn materialize_files(
+    materializer: &ManagedMaterializer,
+    target: &Operator,
+    root: &Path,
+    files: Vec<(String, FileVersionRecord, [u8; 32], bool)>,
+    full_tree: bool,
+    transfer_concurrency: NonZeroUsize,
+) -> Result<Vec<(String, [u8; 32], bool)>> {
+    let mut packed =
+        BTreeMap::<PackId, Vec<(String, FileVersionRecord, [u8; 32], bool, ContentRef)>>::new();
+    let mut unpacked = Vec::new();
+    for (path, version, digest, executable) in files {
+        let content = match &version.layout {
+            FileVersionLayout::Whole { content } if full_tree && content.logical_length > 0 => {
+                Some(*content)
+            }
+            _ => None,
+        };
+        let location = match content {
+            Some(content) => materializer
+                .pack_locations(content)
+                .await
+                .ok()
+                .and_then(|locations| locations.into_iter().next()),
+            None => None,
+        };
+        match (content, location) {
+            (Some(content), Some(location)) => packed
+                .entry(location.pack)
+                .or_default()
+                .push((path, version, digest, executable, content)),
+            _ => unpacked.push((path, version, digest, executable)),
+        }
+    }
+    let packed_results = stream::iter(packed)
+        .map(|(id, files)| {
+            let materializer = materializer.clone();
+            let target = target.clone();
+            let root = root.to_owned();
+            async move {
+                let pack = materializer.read_full_pack(id).await;
+                let mut installed = Vec::with_capacity(files.len());
+                if let Ok(pack) = &pack
+                    && files
+                        .iter()
+                        .all(|(_, _, _, _, content)| pack.content(*content).is_some())
+                {
+                    for (path, _, digest, executable, content) in files {
+                        let bytes = pack
+                            .content(content)
+                            .expect("all selected pack entries were checked");
+                        target.write(&path, bytes.to_vec()).await?;
+                        set_executable(&root.join(&path), executable)?;
+                        installed.push((path, digest, executable));
+                    }
+                } else {
+                    for (path, version, digest, executable, _) in files {
+                        materializer.materialize(&version, &target, &path).await?;
+                        set_executable(&root.join(&path), executable)?;
+                        installed.push((path, digest, executable));
+                    }
+                }
+                Ok::<_, anyhow::Error>(installed)
+            }
+        })
+        .buffer_unordered(transfer_concurrency.get())
+        .collect::<Vec<_>>()
+        .await;
+    let mut installed = Vec::new();
+    for group in packed_results {
+        installed.extend(group?);
+    }
+
+    let unpacked_results = stream::iter(unpacked)
+        .map(|(path, version, digest, executable)| {
+            let materializer = materializer.clone();
+            let target = target.clone();
+            let root = root.to_owned();
+            async move {
+                materializer.materialize(&version, &target, &path).await?;
+                set_executable(&root.join(&path), executable)?;
+                Ok::<_, anyhow::Error>((path, digest, executable))
+            }
+        })
+        .buffer_unordered(transfer_concurrency.get())
+        .collect::<Vec<_>>()
+        .await;
+    for file in unpacked_results {
+        installed.push(file?);
+    }
+    Ok(installed)
+}
+
 async fn materialize_tree(
     volume: &ManagedVolume,
     replica: &Path,
@@ -840,23 +942,21 @@ async fn materialize_tree(
                 }
             }
         }
-        let installed = stream::iter(files)
-            .map(|(path, version, executable)| {
-                let materializer = materializer.clone();
-                let target = target.clone();
-                let staging = staging.clone();
-                async move {
-                    materializer.materialize(&version, &target, &path).await?;
-                    set_executable(&staging.join(&path), executable)?;
-                    Ok::<_, anyhow::Error>(())
-                }
-            })
-            .buffer_unordered(transfer_concurrency.get())
-            .collect::<Vec<_>>()
-            .await;
-        for installed in installed {
-            installed?;
-        }
+        materialize_files(
+            &materializer,
+            &target,
+            &staging,
+            files
+                .into_iter()
+                .map(|(path, version, executable)| {
+                    let digest = version.logical_digest;
+                    (path, version, digest, executable)
+                })
+                .collect(),
+            true,
+            transfer_concurrency,
+        )
+        .await?;
         Ok::<_, anyhow::Error>(())
     }
     .await;
