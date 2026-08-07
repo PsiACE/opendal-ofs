@@ -15,17 +15,22 @@ use anyhow::{Context, Result, anyhow, bail};
 use ofs::catalog::{Catalog, VolumeDefinition};
 use ofs::filesystem::{AccessModel, Capabilities, OperationId, VolumeId, VolumeModel};
 use ofs::managed::{
-    D1Config, D1Metadata, ManagedDataFormat, ManagedError, ManagedErrorKind, ManagedFormat,
-    ManagedVolume, Metadata, MetadataPlacement, ObjectMetadata,
+    D1Config, D1Metadata, FileLayoutPolicy, ManagedDataFormat, ManagedError, ManagedErrorKind,
+    ManagedFormat, ManagedVolume, Metadata, MetadataPlacement, ObjectMetadata,
 };
 use ofs::sync::{ReplicaState, SyncEngine};
 use opendal::Operator;
 use url::Url;
 
 use crate::cli::{
-    Cli, Command, StatusArgs, SyncArgs, VolumeCommand, VolumeCreateArgs, VolumeGcArgs,
-    VolumePackArgs,
+    Cli, Command, FileLayoutArg, StatusArgs, SyncArgs, VolumeCommand, VolumeCreateArgs,
+    VolumeGcArgs, VolumePackArgs,
 };
+
+const DEFAULT_FASTCDC_MINIMUM_FILE_SIZE: u64 = 1024 * 1024;
+const DEFAULT_FASTCDC_MINIMUM_CHUNK_SIZE: u32 = 64 * 1024;
+const DEFAULT_FASTCDC_TARGET_CHUNK_SIZE: u32 = 256 * 1024;
+const DEFAULT_FASTCDC_MAXIMUM_CHUNK_SIZE: u32 = 1024 * 1024;
 
 pub(crate) async fn run(cli: Cli) -> Result<()> {
     match (cli.command, cli.mount_path, cli.backend) {
@@ -186,6 +191,10 @@ async fn create_volume(config: Option<&Path>, args: VolumeCreateArgs) -> Result<
     .context("cannot open the volume catalog; set --config or OFS_CONFIG to a writable path")?;
 
     let configured = catalog.get(&args.alias).cloned();
+    let file_layout = requested_file_layout(
+        &args,
+        configured.as_ref().map(|definition| definition.file_layout),
+    )?;
     let provisional_id = configured
         .as_ref()
         .map(|definition| definition.volume_id)
@@ -197,10 +206,11 @@ async fn create_volume(config: Option<&Path>, args: VolumeCreateArgs) -> Result<
         args.metadata.clone(),
         1,
     )
+    .and_then(|definition| definition.with_file_layout(file_layout))
     .context("volume URLs must be credential-free; supply credentials through provider environment variables")?;
     if configured
         .as_ref()
-        .is_some_and(|current| current != &provisional)
+        .is_some_and(|current| !current.has_same_binding(&provisional))
     {
         bail!(
             "volume alias {:?} conflicts with its existing configuration",
@@ -238,8 +248,14 @@ async fn create_volume(config: Option<&Path>, args: VolumeCreateArgs) -> Result<
         args.storage,
         args.metadata,
         1,
-    )?;
-    let created = catalog.create(&args.alias, definition)?;
+    )?
+    .with_file_layout(file_layout)?;
+    let created = if configured.is_some() {
+        catalog.configure_file_layout(&args.alias, file_layout)?;
+        false
+    } else {
+        catalog.create(&args.alias, definition)?
+    };
 
     catalog
         .save()
@@ -248,6 +264,50 @@ async fn create_volume(config: Option<&Path>, args: VolumeCreateArgs) -> Result<
     let action = if created { "created" } else { "opened" };
     println!("{action} managed volume {:?} with format v1", args.alias);
     Ok(())
+}
+
+fn requested_file_layout(
+    args: &VolumeCreateArgs,
+    configured: Option<FileLayoutPolicy>,
+) -> Result<FileLayoutPolicy> {
+    let has_fastcdc_sizes = args.fastcdc_minimum_file_size.is_some()
+        || args.fastcdc_minimum_chunk_size.is_some()
+        || args.fastcdc_target_chunk_size.is_some()
+        || args.fastcdc_maximum_chunk_size.is_some();
+    if args.file_layout.is_none() && !has_fastcdc_sizes {
+        return Ok(configured.unwrap_or_default());
+    }
+    if matches!(args.file_layout, Some(FileLayoutArg::Whole)) {
+        if has_fastcdc_sizes {
+            bail!("FastCDC size options require --file-layout fastcdc");
+        }
+        return Ok(FileLayoutPolicy::Whole);
+    }
+
+    let base = match configured {
+        Some(FileLayoutPolicy::FastCdcV2020 {
+            minimum_file_size,
+            minimum_size,
+            target_size,
+            maximum_size,
+        }) => (minimum_file_size, minimum_size, target_size, maximum_size),
+        _ => (
+            DEFAULT_FASTCDC_MINIMUM_FILE_SIZE,
+            DEFAULT_FASTCDC_MINIMUM_CHUNK_SIZE,
+            DEFAULT_FASTCDC_TARGET_CHUNK_SIZE,
+            DEFAULT_FASTCDC_MAXIMUM_CHUNK_SIZE,
+        ),
+    };
+    let policy = FileLayoutPolicy::FastCdcV2020 {
+        minimum_file_size: args.fastcdc_minimum_file_size.unwrap_or(base.0),
+        minimum_size: args.fastcdc_minimum_chunk_size.unwrap_or(base.1),
+        target_size: args.fastcdc_target_chunk_size.unwrap_or(base.2),
+        maximum_size: args.fastcdc_maximum_chunk_size.unwrap_or(base.3),
+    };
+    policy
+        .validate()
+        .context("invalid FastCDC file layout configuration")?;
+    Ok(policy)
 }
 
 fn open_metadata(data: Operator, metadata: Option<&Url>) -> Result<Metadata> {
@@ -288,7 +348,8 @@ async fn sync_volume(config: Option<&Path>, args: SyncArgs) -> Result<()> {
     let engine = match metadata {
         Metadata::Object(_) => SyncEngine::object(definition.volume_id, data)?,
         Metadata::D1(metadata) => SyncEngine::d1(definition.volume_id, data, metadata)?,
-    };
+    }
+    .with_file_layout(definition.file_layout)?;
     let resolutions = args.resolve.into_iter().collect::<Vec<_>>();
     let result = engine
         .sync(&args.replica, &args.state, &resolutions)
@@ -347,6 +408,25 @@ fn status(config: Option<&Path>, args: StatusArgs) -> Result<()> {
             })
         })
         .collect::<Vec<_>>();
+    let layout_settings = match definition.file_layout {
+        FileLayoutPolicy::Whole => serde_json::Value::Null,
+        FileLayoutPolicy::Fixed { chunk_size } => serde_json::json!({
+            "algorithm": "fixed",
+            "chunk_size": chunk_size,
+        }),
+        FileLayoutPolicy::FastCdcV2020 {
+            minimum_file_size,
+            minimum_size,
+            target_size,
+            maximum_size,
+        } => serde_json::json!({
+            "algorithm": "fastcdc_v2020",
+            "minimum_file_size": minimum_file_size,
+            "minimum_chunk_size": minimum_size,
+            "target_chunk_size": target_size,
+            "maximum_chunk_size": maximum_size,
+        }),
+    };
     let value = serde_json::json!({
         "volume": alias,
         "volume_model": model_name(definition.model),
@@ -371,7 +451,8 @@ fn status(config: Option<&Path>, args: StatusArgs) -> Result<()> {
             "managed_data_major": 1,
         },
         "data_policy": {
-            "foreground_layout": "whole",
+            "foreground_layout": definition.file_layout.name(),
+            "layout_settings": layout_settings,
             "foreground_placement": "loose",
             "pack_maintenance": "explicit",
         },

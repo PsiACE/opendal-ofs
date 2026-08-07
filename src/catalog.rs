@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::filesystem::{VolumeId, VolumeModel};
+use crate::managed::FileLayoutPolicy;
 
 const SCHEMA_MAJOR: u16 = 1;
 
@@ -37,6 +38,7 @@ pub struct VolumeDefinition {
     pub model: VolumeModel,
     pub storage: Url,
     pub metadata: Option<Url>,
+    pub file_layout: FileLayoutPolicy,
     pub format_major: u16,
 }
 
@@ -57,8 +59,23 @@ impl VolumeDefinition {
             model,
             storage,
             metadata,
+            file_layout: FileLayoutPolicy::Whole,
             format_major,
         })
+    }
+
+    pub fn with_file_layout(mut self, file_layout: FileLayoutPolicy) -> Result<Self> {
+        file_layout.validate()?;
+        self.file_layout = file_layout;
+        Ok(self)
+    }
+
+    pub fn has_same_binding(&self, other: &Self) -> bool {
+        self.volume_id == other.volume_id
+            && self.model == other.model
+            && self.storage == other.storage
+            && self.metadata == other.metadata
+            && self.format_major == other.format_major
     }
 }
 
@@ -132,6 +149,20 @@ impl Catalog {
         }
     }
 
+    pub fn configure_file_layout(
+        &mut self,
+        alias: &str,
+        file_layout: FileLayoutPolicy,
+    ) -> Result<()> {
+        file_layout.validate()?;
+        let definition = self
+            .volumes
+            .get_mut(alias)
+            .with_context(|| format!("volume alias {alias:?} is not in the catalog"))?;
+        definition.file_layout = file_layout;
+        Ok(())
+    }
+
     pub fn save(&self) -> Result<()> {
         let stored = StoredCatalog::from(self);
         let mut bytes = serde_json::to_vec_pretty(&stored)?;
@@ -186,6 +217,8 @@ struct StoredVolume {
     model: String,
     storage: String,
     metadata: Option<String>,
+    #[serde(default)]
+    file_layout: FileLayoutPolicy,
     format_major: u16,
 }
 
@@ -214,6 +247,7 @@ impl From<&VolumeDefinition> for StoredVolume {
             .into(),
             storage: volume.storage.to_string(),
             metadata: volume.metadata.as_ref().map(ToString::to_string),
+            file_layout: volume.file_layout,
             format_major: volume.format_major,
         }
     }
@@ -234,7 +268,8 @@ impl TryFrom<StoredVolume> for VolumeDefinition {
             .metadata
             .map(|value| Url::parse(&value).context("invalid metadata URL in catalog"))
             .transpose()?;
-        Self::new(volume_id, model, storage, metadata, volume.format_major)
+        Self::new(volume_id, model, storage, metadata, volume.format_major)?
+            .with_file_layout(volume.file_layout)
     }
 }
 
@@ -253,4 +288,55 @@ fn require_credential_free(kind: &str, url: &Url) -> Result<()> {
         bail!("{kind} URL must not contain credentials");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_catalog_defaults_to_whole_and_accepts_layout_updates() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("volumes.json");
+        fs::write(
+            &path,
+            r#"{
+  "schema_major": 1,
+  "volumes": {
+    "workspace": {
+      "volume_id": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+      "model": "managed",
+      "storage": "memory:///workspace",
+      "metadata": null,
+      "format_major": 1
+    }
+  }
+}
+"#,
+        )
+        .unwrap();
+
+        let mut catalog = Catalog::load(&path).unwrap();
+        let current = catalog.get("workspace").unwrap().clone();
+        assert_eq!(current.file_layout, FileLayoutPolicy::Whole);
+
+        let configured = current
+            .with_file_layout(FileLayoutPolicy::FastCdcV2020 {
+                minimum_file_size: 1024 * 1024,
+                minimum_size: 64 * 1024,
+                target_size: 256 * 1024,
+                maximum_size: 1024 * 1024,
+            })
+            .unwrap();
+        catalog
+            .configure_file_layout("workspace", configured.file_layout)
+            .unwrap();
+        catalog.save().unwrap();
+
+        let reopened = Catalog::load(path).unwrap();
+        assert!(matches!(
+            reopened.get("workspace").unwrap().file_layout,
+            FileLayoutPolicy::FastCdcV2020 { .. }
+        ));
+    }
 }

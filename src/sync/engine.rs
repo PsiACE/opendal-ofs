@@ -25,7 +25,7 @@ use crate::filesystem::{
     ChangeCursor, NodeId, NodeKind, OperationId, PublicationProgress, VolumeId,
 };
 use crate::managed::namespace::{FileVersionRecord, NamespaceSnapshot};
-use crate::managed::{D1Metadata, ManagedVolume};
+use crate::managed::{D1Metadata, FileLayoutPolicy, ManagedVolume};
 
 #[derive(Clone, Debug)]
 pub struct SyncResult {
@@ -56,6 +56,11 @@ impl SyncEngine {
             volume_id,
             volume: ManagedVolume::d1(volume_id, data_operator, metadata)?,
         })
+    }
+
+    pub fn with_file_layout(mut self, policy: FileLayoutPolicy) -> Result<Self> {
+        self.volume = self.volume.with_file_layout(policy)?;
+        Ok(self)
     }
 
     pub async fn sync(

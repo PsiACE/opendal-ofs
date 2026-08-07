@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use ofs::filesystem::VolumeModel;
 use url::Url;
 
@@ -93,6 +93,33 @@ pub(crate) struct VolumeCreateArgs {
     /// Credential-free D1 metadata URL. Set its token with OFS_D1_TOKEN.
     #[arg(long, env = "OFS_METADATA_URL", value_name = "URL")]
     pub metadata: Option<Url>,
+
+    /// Foreground file layout. Existing volumes keep their configured value when omitted.
+    #[arg(long, env = "OFS_FILE_LAYOUT", value_enum, value_name = "LAYOUT")]
+    pub file_layout: Option<FileLayoutArg>,
+
+    /// Smallest file written with FastCDC.
+    #[arg(long, env = "OFS_FASTCDC_MINIMUM_FILE_SIZE", value_name = "BYTES")]
+    pub fastcdc_minimum_file_size: Option<u64>,
+
+    /// Minimum FastCDC chunk size.
+    #[arg(long, env = "OFS_FASTCDC_MINIMUM_CHUNK_SIZE", value_name = "BYTES")]
+    pub fastcdc_minimum_chunk_size: Option<u32>,
+
+    /// Target FastCDC chunk size.
+    #[arg(long, env = "OFS_FASTCDC_TARGET_CHUNK_SIZE", value_name = "BYTES")]
+    pub fastcdc_target_chunk_size: Option<u32>,
+
+    /// Maximum FastCDC chunk size.
+    #[arg(long, env = "OFS_FASTCDC_MAXIMUM_CHUNK_SIZE", value_name = "BYTES")]
+    pub fastcdc_maximum_chunk_size: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(crate) enum FileLayoutArg {
+    Whole,
+    #[value(name = "fastcdc")]
+    FastCdc,
 }
 
 #[derive(Debug, Args)]

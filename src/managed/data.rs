@@ -26,6 +26,7 @@ use fastcdc::v2020::{
 };
 use futures::StreamExt;
 use opendal::{ErrorKind, Operator, Writer};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::{ManagedError, ManagedErrorKind};
@@ -88,18 +89,35 @@ impl PackRetirement {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum FileLayoutPolicy {
     #[default]
     Whole,
     Fixed {
         chunk_size: u32,
     },
+    #[serde(rename = "fastcdc_v2020")]
     FastCdcV2020 {
+        minimum_file_size: u64,
         minimum_size: u32,
         target_size: u32,
         maximum_size: u32,
     },
+}
+
+impl FileLayoutPolicy {
+    pub fn validate(self) -> Result<(), ManagedError> {
+        validate_policy(self)
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Whole => "whole",
+            Self::Fixed { .. } => "fixed",
+            Self::FastCdcV2020 { .. } => "fastcdc_v2020",
+        }
+    }
 }
 
 /// Ordered ranges discovered from one frozen sparse file.
@@ -154,7 +172,7 @@ impl ManagedData {
     }
 
     pub(crate) fn set_policy(&mut self, policy: FileLayoutPolicy) -> Result<(), ManagedError> {
-        validate_policy(policy)?;
+        policy.validate()?;
         self.policy = policy;
         Ok(())
     }
@@ -170,12 +188,17 @@ impl ManagedData {
                 self.seal_fixed(local, frozen_path, chunk_size).await
             }
             FileLayoutPolicy::FastCdcV2020 {
+                minimum_file_size,
                 minimum_size,
                 target_size,
                 maximum_size,
             } => {
-                self.seal_fastcdc(local, frozen_path, minimum_size, target_size, maximum_size)
-                    .await
+                if frozen_size(local, frozen_path).await? < minimum_file_size {
+                    self.seal_whole_file(local, frozen_path).await
+                } else {
+                    self.seal_fastcdc(local, frozen_path, minimum_size, target_size, maximum_size)
+                        .await
+                }
             }
         }
     }
@@ -775,15 +798,21 @@ impl ManagedData {
             return Ok(content);
         }
         let key = loose_key(&content);
-        match self
-            .operator
-            .write_with(&key, bytes.to_vec())
-            .if_not_exists(true)
-            .await
-        {
+        match self.operator.stat(&key).await {
             Ok(_) => {}
-            Err(error) if already_exists(&error) => {}
-            Err(_) => return Err(unavailable("write loose data")),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                match self
+                    .operator
+                    .write_with(&key, bytes.to_vec())
+                    .if_not_exists(true)
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(error) if already_exists(&error) => {}
+                    Err(_) => return Err(unavailable("write loose data")),
+                }
+            }
+            Err(_) => return Err(unavailable("inspect loose data")),
         }
         let mut digest = Sha256::new();
         let mut pack_index = None;
@@ -1154,6 +1183,7 @@ fn validate_policy(policy: FileLayoutPolicy) -> Result<(), ManagedError> {
             "fixed chunk size must be positive",
         )),
         FileLayoutPolicy::FastCdcV2020 {
+            minimum_file_size: _,
             minimum_size,
             target_size,
             maximum_size,
@@ -1453,12 +1483,27 @@ mod tests {
         assert_eq!(target.read("fixed").await.unwrap().to_bytes(), bytes);
 
         data.set_policy(FileLayoutPolicy::FastCdcV2020 {
+            minimum_file_size: bytes.len() as u64 + 1,
+            minimum_size: 64,
+            target_size: 256,
+            maximum_size: 1024,
+        })
+        .unwrap();
+        let below_threshold = data.seal_file(&source, "input").await.unwrap();
+        assert!(matches!(
+            below_threshold.layout,
+            FileVersionLayout::Whole { .. }
+        ));
+
+        data.set_policy(FileLayoutPolicy::FastCdcV2020 {
+            minimum_file_size: 0,
             minimum_size: 64,
             target_size: 256,
             maximum_size: 1024,
         })
         .unwrap();
         let cdc = data.seal_file(&source, "input").await.unwrap();
+        assert!(matches!(cdc.layout, FileVersionLayout::Chunked { .. }));
         data.read_to(&cdc, &target, "cdc").await.unwrap();
         assert_eq!(target.read("cdc").await.unwrap().to_bytes(), bytes);
 
