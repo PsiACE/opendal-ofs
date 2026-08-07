@@ -51,6 +51,7 @@ impl LocalTree {
             .await
             .context("scan local replica through OpenDAL fs")?;
         let mut entries = BTreeMap::new();
+        let mut file_identities = BTreeMap::new();
         for entry in listed {
             let path = entry.path().trim_end_matches('/');
             if path.is_empty() {
@@ -68,6 +69,27 @@ impl LocalTree {
                 .last_modified()
                 .context("local filesystem did not report modification time")?
                 .to_string();
+            let native_identity = native_identity_at(root, path, kind)?;
+            if kind == LocalKind::File {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt as _;
+                    let metadata = fs::symlink_metadata(root.join(path))
+                        .with_context(|| format!("inspect local links for {path:?}"))?;
+                    if metadata.nlink() > 1 {
+                        bail!(
+                            "local path {path:?} is a hard link; Managed Sync does not publish hard-linked files"
+                        );
+                    }
+                }
+                if let Some(identity) = native_identity
+                    && let Some(other) = file_identities.insert(identity, path.to_owned())
+                {
+                    bail!(
+                        "local paths {other:?} and {path:?} are hard links; Managed Sync does not publish hard-linked files"
+                    );
+                }
+            }
             entries.insert(
                 path.to_owned(),
                 LocalEntry {
@@ -75,7 +97,7 @@ impl LocalTree {
                     size: metadata.content_length(),
                     modified,
                     executable: executable_at(root, path, kind)?,
-                    native_identity: native_identity_at(root, path, kind)?,
+                    native_identity,
                 },
             );
         }

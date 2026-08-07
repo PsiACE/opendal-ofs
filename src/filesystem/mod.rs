@@ -32,4 +32,4 @@ pub use capability::{
 pub use identity::{ChangeCursor, FileVersionId, Generation, NodeId, OperationId, VolumeId};
 pub use model::{AccessModel, VolumeModel};
 pub use namespace::{DirectoryEntry, NodeAttributes, NodeKind};
-pub use publication::CommitOutcome;
+pub use publication::{CommitOutcome, PublicationProgress};

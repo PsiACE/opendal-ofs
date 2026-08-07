@@ -20,7 +20,9 @@ use super::{
     BaseEntry, ConflictRecord, LocalKind, LocalTree, PendingIntent, ReconcileAction, ReplicaState,
     StagedTree, build_publication, reconcile,
 };
-use crate::filesystem::{ChangeCursor, CommitOutcome, NodeId, NodeKind, OperationId, VolumeId};
+use crate::filesystem::{
+    ChangeCursor, NodeId, NodeKind, OperationId, PublicationProgress, VolumeId,
+};
 use crate::managed::namespace::{FileVersionRecord, NamespaceSnapshot};
 use crate::managed::{D1Metadata, ManagedVolume};
 
@@ -72,15 +74,19 @@ impl SyncEngine {
             bail!("replica state belongs to another volume");
         }
 
-        let prior_staging = if let Some(pending) = &state.pending {
-            match self.volume.resolve(pending.operation).await? {
-                CommitOutcome::Committed(_) => {
+        let prior_staging = if let Some(pending) = state.pending.clone() {
+            let progress = PublicationProgress::prepared(pending.base)
+                .record_outcome(self.volume.resolve(pending.operation).await?)
+                .context("resolve prepared publication")?;
+            match progress {
+                PublicationProgress::Published { committed } => {
                     let observed = self
                         .volume
                         .observe()
                         .await?
                         .context("committed publication has no authoritative namespace")?;
-                    let target_is_live = pending.staging.is_dir()
+                    let target_is_live = observed.snapshot().cursor == committed
+                        && pending.staging.is_dir()
                         && same_tree(replica_path, &pending.staging, state_path).await?;
                     let safe_to_install = target_is_live
                         || committed_tree_is_safe(
@@ -90,7 +96,10 @@ impl SyncEngine {
                             state_path,
                         )
                         .await?;
-                    let materialized = safe_to_install && !target_is_live;
+                    if !target_is_live && !safe_to_install {
+                        return Ok(result(&state, false, false));
+                    }
+                    let materialized = !target_is_live;
                     if materialized {
                         if pending.staging.is_dir() {
                             apply_snapshot_attributes(&pending.staging, observed.snapshot())?;
@@ -100,17 +109,28 @@ impl SyncEngine {
                                 .await?;
                         }
                     }
-                    state = state_from_snapshot(observed.snapshot(), replica_path).await?;
-                    state.install(state_path)?;
+                    let progress = progress
+                        .record_install(observed.snapshot().cursor)
+                        .context("record installed publication")?;
+                    state = advance_common_base(
+                        progress,
+                        observed.snapshot(),
+                        replica_path,
+                        state_path,
+                    )
+                    .await?;
                     return Ok(result(&state, true, materialized));
                 }
-                CommitOutcome::Unknown => return Ok(result(&state, false, false)),
-                CommitOutcome::Absent | CommitOutcome::Conflict { .. } => {
+                PublicationProgress::Unknown { .. } => {
+                    return Ok(result(&state, false, false));
+                }
+                PublicationProgress::Retry { .. } => {
                     if !pending.staging.is_dir() {
                         bail!("pending publication staging is missing; restore it before recovery");
                     }
-                    Some(pending.staging.clone())
+                    Some(pending.staging)
                 }
+                _ => bail!("resolved publication entered an invalid state"),
             }
         } else {
             None
@@ -305,16 +325,26 @@ impl SyncEngine {
             &merged,
             &prepared,
         )?;
-        match self.volume.publish(observed.as_ref(), &publication).await? {
-            CommitOutcome::Committed(_) => {
+        let progress = PublicationProgress::prepared(publication.parent)
+            .record_outcome(self.volume.publish(observed.as_ref(), &publication).await?)
+            .context("record publication outcome")?;
+        match progress {
+            PublicationProgress::Published { .. } => {
                 let unchanged = matches_frozen(replica_path, &frozen_input).await?;
-                let materialized = requires_materialization && unchanged;
+                if !unchanged {
+                    return Ok(result(&state, false, false));
+                }
+                let materialized = requires_materialization;
                 if materialized {
                     apply_snapshot_attributes(staged.root(), &publication.target)?;
                     install_tree(replica_path, &staging_path)?;
                 }
-                state = state_from_snapshot(&publication.target, replica_path).await?;
-                state.install(state_path)?;
+                let progress = progress
+                    .record_install(publication.target.cursor)
+                    .context("record installed publication")?;
+                state =
+                    advance_common_base(progress, &publication.target, replica_path, state_path)
+                        .await?;
                 if let Some(old) = prior_staging {
                     remove_tree(&old)?;
                 }
@@ -323,11 +353,29 @@ impl SyncEngine {
                 }
                 Ok(result(&state, true, materialized))
             }
-            CommitOutcome::Absent | CommitOutcome::Conflict { .. } | CommitOutcome::Unknown => {
+            PublicationProgress::Retry { .. } | PublicationProgress::Unknown { .. } => {
                 Ok(result(&state, false, false))
             }
+            _ => bail!("publication entered an invalid state"),
         }
     }
+}
+
+async fn advance_common_base(
+    progress: PublicationProgress,
+    snapshot: &NamespaceSnapshot,
+    replica: &Path,
+    state_path: &Path,
+) -> Result<ReplicaState> {
+    let state = state_from_snapshot(snapshot, replica).await?;
+    let progress = progress
+        .record_common_base(state.common)
+        .context("advance publication common base")?;
+    let _complete = progress
+        .record_intent_clear()
+        .context("clear completed publication intent")?;
+    state.install(state_path)?;
+    Ok(state)
 }
 
 fn result(state: &ReplicaState, published: bool, materialized: bool) -> SyncResult {

@@ -29,3 +29,60 @@ pub enum CommitOutcome {
     /// The caller must retain its intent and resolve the original operation.
     Unknown,
 }
+
+/// Runtime-independent progress of one durable publication intent.
+///
+/// Sync implementations reconstruct this progress from the durable intent,
+/// the authoritative outcome, and the installed replica. The common base and
+/// intent are committed together only after the published tree is installed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PublicationProgress {
+    Prepared { base: ChangeCursor },
+    Published { committed: ChangeCursor },
+    Installed { common: ChangeCursor },
+    CommonBaseAdvanced { common: ChangeCursor },
+    IntentCleared { common: ChangeCursor },
+    Retry { observed: ChangeCursor },
+    Unknown { base: ChangeCursor },
+}
+
+impl PublicationProgress {
+    pub const fn prepared(base: ChangeCursor) -> Self {
+        Self::Prepared { base }
+    }
+
+    pub fn record_outcome(self, outcome: CommitOutcome) -> Option<Self> {
+        let Self::Prepared { base } = self else {
+            return None;
+        };
+        Some(match outcome {
+            CommitOutcome::Committed(committed) => Self::Published { committed },
+            CommitOutcome::Absent => Self::Retry { observed: base },
+            CommitOutcome::Conflict { observed } => Self::Retry { observed },
+            CommitOutcome::Unknown => Self::Unknown { base },
+        })
+    }
+
+    pub fn record_install(self, common: ChangeCursor) -> Option<Self> {
+        let Self::Published { committed } = self else {
+            return None;
+        };
+        (common.sequence() >= committed.sequence()).then_some(Self::Installed { common })
+    }
+
+    pub fn record_common_base(self, common: ChangeCursor) -> Option<Self> {
+        match self {
+            Self::Installed { common: installed } if installed == common => {
+                Some(Self::CommonBaseAdvanced { common })
+            }
+            _ => None,
+        }
+    }
+
+    pub fn record_intent_clear(self) -> Option<Self> {
+        match self {
+            Self::CommonBaseAdvanced { common } => Some(Self::IntentCleared { common }),
+            _ => None,
+        }
+    }
+}

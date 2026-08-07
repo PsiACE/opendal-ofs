@@ -77,6 +77,20 @@ OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a"
 OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_b" --state "$state_b"
 cmp "$replica_a/first.txt" "$replica_b/first.txt" || fail 'empty replica did not materialize first.txt'
 
+printf '%s\n' 'acceptance: reject hard links before publication'
+printf '%s\n' 'must remain local' >"$replica_a/hard-link-source.txt"
+if ln "$replica_a/hard-link-source.txt" "$replica_a/hard-link-alias.txt" 2>/dev/null; then
+  before_hard_link=$(OFS_CONFIG="$config" "$OFS_BIN" status "$replica_a" --state "$state_a" --json)
+  if hard_link_error=$(OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a" 2>&1); then
+    fail 'hard-linked files were published'
+  fi
+  grep -Fq 'hard link' <<<"$hard_link_error" || fail 'hard-link rejection was not explicit'
+  after_hard_link=$(OFS_CONFIG="$config" "$OFS_BIN" status "$replica_a" --state "$state_a" --json)
+  [[ "$before_hard_link" == "$after_hard_link" ]] || fail 'hard-link rejection changed replica state'
+  rm "$replica_a/hard-link-alias.txt"
+fi
+rm "$replica_a/hard-link-source.txt"
+
 printf '%s\n' 'acceptance: publish nested, empty, executable, and large files'
 mkdir -p "$replica_a/nested/level" "$replica_a/tools"
 printf '%s\n' 'created in a nested directory' >"$replica_a/nested/level/entry.txt"
@@ -156,6 +170,51 @@ printf '%s\n' 'acceptance: resolve explicitly with the retained local candidate'
 OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_b" --state "$state_b" --resolve shared.txt
 OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a"
 grep -Fxq 'candidate from replica b' "$replica_a/shared.txt" || fail 'resolved content was not published'
+
+printf '%s\n' 'acceptance: recover a durable publication intent after process death'
+mkdir "$replica_a/crash-recovery"
+for index in $(seq -w 1 128); do
+  {
+    printf 'crash recovery file %s\n' "$index"
+    head -c 65536 /dev/zero
+  } >"$replica_a/crash-recovery/$index.bin"
+done
+OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a" &
+crash_pid=$!
+intent_observed=false
+for _ in $(seq 1 200); do
+  if ! kill -0 "$crash_pid" 2>/dev/null; then
+    break
+  fi
+  recovery_status=$(OFS_CONFIG="$config" "$OFS_BIN" status "$replica_a" --state "$state_a" --json 2>/dev/null || true)
+  if grep -Eq '"pending"[[:space:]]*:[[:space:]]*true' <<<"$recovery_status"; then
+    if kill -KILL "$crash_pid" 2>/dev/null; then
+      intent_observed=true
+    fi
+    break
+  fi
+  sleep 0.01
+done
+wait "$crash_pid" 2>/dev/null || true
+[[ "$intent_observed" == true ]] || fail 'could not interrupt sync after its intent became durable'
+recovery_status=$(OFS_CONFIG="$config" "$OFS_BIN" status "$replica_a" --state "$state_a" --json)
+grep -Eq '"pending"[[:space:]]*:[[:space:]]*true' <<<"$recovery_status" || \
+  fail 'process death lost the durable publication intent'
+recovered=false
+for _ in $(seq 1 5); do
+  if OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a"; then
+    recovered=true
+    break
+  fi
+  sleep 0.05
+done
+[[ "$recovered" == true ]] || fail 'repeated sync could not resolve the durable publication intent'
+recovery_status=$(OFS_CONFIG="$config" "$OFS_BIN" status "$replica_a" --state "$state_a" --json)
+grep -Eq '"pending"[[:space:]]*:[[:space:]]*false' <<<"$recovery_status" || \
+  fail 'recovered publication did not clear its completed intent'
+OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_b" --state "$state_b"
+cmp "$replica_a/crash-recovery/128.bin" "$replica_b/crash-recovery/128.bin" || \
+  fail 'recovered publication did not materialize on another replica'
 
 printf '%s\n' 'acceptance: rebuild a cold client from remote authority'
 OFS_CONFIG="$cold_config" "$OFS_BIN" "${volume_create[@]}"
