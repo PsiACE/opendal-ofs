@@ -313,6 +313,38 @@ additional semantics.
 Managed storage is an internal format. Direct writes to its data prefix are
 corruption, not concurrent filesystem changes.
 
+### Managed durable format v1
+
+Managed format v1 is the durable realization of the Managed volume contract.
+It is independent of the Access Model: Mount and Sync consume the same
+authoritative namespace, immutable `FileVersion` records, object-scoped
+generations, and ordered `ChangeCursor` history.
+
+The format keeps logical identity separate from physical placement:
+
+- metadata owns `NodeId`, directory entries, node and directory generations,
+  `FileVersion`, and the change log;
+- each `FileVersion` describes whole, chunked, or sparse logical content using
+  durable content references;
+- OpenDAL stores immutable loose content and pack objects;
+- loose and packed locations are replaceable physical representations and do
+  not change `FileVersion`, generations, or the change cursor; and
+- metadata adapters may use object records or a transactional database, but
+  both apply the same logical changes and recovery rules.
+
+Every durable owner has its own strict v1 envelope. Unknown major versions or
+required features fail before mutation. Data is written and verified before a
+metadata transaction can reference it. Recovery starts from a validated
+checkpoint, replays a bounded consecutive change tail to a fixed target, and
+uses the original operation ID to distinguish committed, absent, conflicting,
+and still-unknown publications.
+
+This format definition does not make synchronization concepts part of the
+Managed volume. Intent logs, common bases, three-way merge, retained conflicts,
+and local materialization belong to Sync. Handles, writeback, invalidation,
+and remote `fsync` acknowledgement belong to Mount. Both Access Models use the
+same Managed identities and publication contract.
+
 ## Mount contract
 
 A Mount frontend presents the remote volume as the authority. Local data is an
@@ -377,9 +409,8 @@ The existing two-positional-argument CLI remains a compatibility form of a
 Direct Mount while the volume-oriented CLI is introduced. Existing object
 layouts and OpenDAL URLs keep their current interpretation.
 
-The current FUSE implementation becomes one Mount frontend; this RFC does not
-require an immediate implementation change. New frontends must implement the
-same core contract rather than fork Direct or Managed behavior.
+FUSE is one possible Mount frontend. Every frontend implements the same core
+contract rather than defining separate Direct or Managed behavior.
 
 A volume's model is fixed when it is created. Direct-to-Managed conversion is
 an explicit import that assigns stable identities and initial generations.
