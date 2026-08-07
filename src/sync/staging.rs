@@ -13,13 +13,13 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use futures::{StreamExt as _, TryStreamExt as _, stream};
-use opendal::Operator;
+use opendal::{Operator, raw::Timestamp};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::local::{
-    LocalEntry, LocalKind, LocalTree, NativeIdentity, entry_at, executable_at, fs_operator,
-    native_identity_at, set_executable,
+    LocalEntry, LocalKind, LocalTree, NativeIdentity, entry_at, fs_operator, native_identity_at,
+    set_executable,
 };
 
 const COPY_CHUNK: u64 = 1024 * 1024;
@@ -365,68 +365,84 @@ async fn stage_file(
     expected: &LocalEntry,
     known_digest: Option<[u8; 32]>,
 ) -> Result<StagedFile> {
+    if let Some(digest) = known_digest {
+        let metadata = fs::symlink_metadata(source_root.join(path))
+            .with_context(|| format!("inspect unchanged source file {path:?}"))?;
+        require_same_file_attributes(path, expected, &metadata)?;
+        let modified = Timestamp::try_from(
+            metadata
+                .modified()
+                .with_context(|| format!("read unchanged source file mtime for {path:?}"))?,
+        )
+        .with_context(|| format!("normalize unchanged source file mtime for {path:?}"))?;
+        if metadata.len() != expected.size || modified.to_string() != expected.modified {
+            bail!("source file {path:?} changed while preparing publication; retry sync");
+        }
+        return Ok(StagedFile {
+            size: expected.size,
+            source_modified: expected.modified.clone(),
+            digest,
+        });
+    }
+
     let before = source
         .stat(path)
         .await
         .with_context(|| format!("inspect source file {path:?} before staging"))?;
     require_same(path, expected.size, &expected.modified, &before)?;
-    require_same_executable(source_root, path, expected.executable)?;
-    require_same_identity(source_root, path, LocalKind::File, expected.native_identity)?;
+    let before_attributes = fs::symlink_metadata(source_root.join(path))
+        .with_context(|| format!("inspect source file attributes for {path:?} before staging"))?;
+    require_same_file_attributes(path, expected, &before_attributes)?;
 
-    let digest = if let Some(digest) = known_digest {
-        digest
-    } else {
-        let reader = source
-            .reader(path)
+    let reader = source
+        .reader(path)
+        .await
+        .with_context(|| format!("open source file {path:?}"))?;
+    let mut writer = staged
+        .writer(path)
+        .await
+        .with_context(|| format!("open staging file {path:?}"))?;
+    let mut digest = Sha256::new();
+    let mut offset = 0;
+    while offset < expected.size {
+        let end = expected.size.min(offset + COPY_CHUNK);
+        let buffer = reader
+            .read(offset..end)
             .await
-            .with_context(|| format!("open source file {path:?}"))?;
-        let mut writer = staged
-            .writer(path)
-            .await
-            .with_context(|| format!("open staging file {path:?}"))?;
-        let mut digest = Sha256::new();
-        let mut offset = 0;
-        while offset < expected.size {
-            let end = expected.size.min(offset + COPY_CHUNK);
-            let buffer = reader
-                .read(offset..end)
-                .await
-                .with_context(|| format!("read stable source file {path:?}"))?;
-            let bytes = buffer.to_bytes();
-            if bytes.len() as u64 != end - offset {
-                bail!("source file {path:?} returned a short read; retry sync");
-            }
-            digest.update(&bytes);
-            writer
-                .write(bytes)
-                .await
-                .with_context(|| format!("write staging file {path:?}"))?;
-            offset = end;
+            .with_context(|| format!("read stable source file {path:?}"))?;
+        let bytes = buffer.to_bytes();
+        if bytes.len() as u64 != end - offset {
+            bail!("source file {path:?} returned a short read; retry sync");
         }
+        digest.update(&bytes);
         writer
-            .close()
+            .write(bytes)
             .await
-            .with_context(|| format!("finish staging file {path:?}"))?;
-        digest.finalize().into()
-    };
+            .with_context(|| format!("write staging file {path:?}"))?;
+        offset = end;
+    }
+    writer
+        .close()
+        .await
+        .with_context(|| format!("finish staging file {path:?}"))?;
+    let digest = digest.finalize().into();
 
     let after = source
         .stat(path)
         .await
         .with_context(|| format!("inspect source file {path:?} after staging"))?;
     require_same(path, expected.size, &expected.modified, &after)?;
-    require_same_executable(source_root, path, expected.executable)?;
-    require_same_identity(source_root, path, LocalKind::File, expected.native_identity)?;
-    if known_digest.is_none() {
-        set_executable(&staging_root.join(path), expected.executable)
-            .with_context(|| format!("preserve executable bit for {path:?}"))?;
-        let staged_metadata = staged
-            .stat(path)
-            .await
-            .with_context(|| format!("verify staging file {path:?}"))?;
-        if staged_metadata.content_length() != expected.size {
-            bail!("staging file {path:?} is incomplete; retry sync");
-        }
+    let after_attributes = fs::symlink_metadata(source_root.join(path))
+        .with_context(|| format!("inspect source file attributes for {path:?} after staging"))?;
+    require_same_file_attributes(path, expected, &after_attributes)?;
+    set_executable(&staging_root.join(path), expected.executable)
+        .with_context(|| format!("preserve executable bit for {path:?}"))?;
+    let staged_metadata = staged
+        .stat(path)
+        .await
+        .with_context(|| format!("verify staging file {path:?}"))?;
+    if staged_metadata.content_length() != expected.size {
+        bail!("staging file {path:?} is incomplete; retry sync");
     }
     Ok(StagedFile {
         size: expected.size,
@@ -457,8 +473,34 @@ fn require_same_identity(
     Ok(())
 }
 
-fn require_same_executable(root: &Path, path: &str, expected: bool) -> Result<()> {
-    if executable_at(root, path, LocalKind::File)? != expected {
+fn require_same_file_attributes(
+    path: &str,
+    expected: &LocalEntry,
+    metadata: &fs::Metadata,
+) -> Result<()> {
+    if !metadata.file_type().is_file() {
+        bail!("source file {path:?} changed kind while preparing publication; retry sync");
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let identity = Some(NativeIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        });
+        if identity != expected.native_identity {
+            bail!("source path {path:?} was replaced while preparing publication; retry sync");
+        }
+        if (metadata.permissions().mode() & 0o111 != 0) != expected.executable {
+            bail!(
+                "source file {path:?} changed permissions while preparing publication; retry sync"
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    if expected.native_identity.is_some() || expected.executable {
         bail!("source file {path:?} changed permissions while preparing publication; retry sync");
     }
     Ok(())
