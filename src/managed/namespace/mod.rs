@@ -17,8 +17,11 @@
 
 //! Managed namespace records and authoritative snapshot publication.
 
+mod object;
 mod records;
+mod validation;
 
+pub use object::{NamespaceObservation, ObjectNamespace};
 pub use records::{
     ContentRef, DirectoryEntry, DirectoryPrecondition, DirectoryRecord, FileVersionRecord,
     NamespacePublication, NamespaceSnapshot, NodeAttributes, NodeKind, NodePrecondition,
