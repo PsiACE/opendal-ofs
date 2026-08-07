@@ -166,7 +166,8 @@ fn run_workflow(metadata: &str) -> Result<(), String> {
     let case_root = run_root.join("case");
     let binary = workspace_root().join("target/debug/ofs");
     let endpoint = format!("http%3A%2F%2F127.0.0.1%3A{}", minio_port());
-    let storage = format!("s3://managed-sync/acceptance?endpoint={endpoint}&region=us-east-1");
+    let case_id = run_root.file_name().unwrap().to_string_lossy();
+    let storage = format!("s3://managed-sync/{case_id}?endpoint={endpoint}&region=us-east-1");
 
     let mut workflow = Command::new("bash");
     workflow
