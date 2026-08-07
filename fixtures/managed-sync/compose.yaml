@@ -1,0 +1,54 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements. See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership. The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.
+
+services:
+  minio:
+    image: quay.io/minio/minio:RELEASE.2024-09-22T00-33-43Z
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "127.0.0.1:${OFS_MANAGED_SYNC_MINIO_PORT:-19000}:9000"
+    volumes:
+      - minio-data:/data
+
+  minio-client:
+    image: quay.io/minio/mc:RELEASE.2024-09-16T17-43-14Z
+    depends_on:
+      - minio
+    environment:
+      NO_PROXY: minio,localhost,127.0.0.1
+      no_proxy: minio,localhost,127.0.0.1
+    entrypoint: ["/bin/sh", "-ec"]
+
+  d1:
+    image: python:3.13.7-alpine3.22
+    command:
+      - python
+      - /fixture/d1-query-api.py
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --database-root
+      - /data
+      - --token
+      - local-d1-token
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+    ports:
+      - "127.0.0.1:${OFS_MANAGED_SYNC_D1_PORT:-19001}:8080"
+    stop_grace_period: 1s
+    volumes:
+      - ./d1-query-api.py:/fixture/d1-query-api.py:ro,Z
+      - d1-data:/data
+
+volumes:
+  minio-data:
+  d1-data:
