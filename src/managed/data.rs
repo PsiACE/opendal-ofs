@@ -589,7 +589,6 @@ impl ManagedData {
         let store = PackStore::new(self.operator.clone())?;
         let mut retired = BTreeSet::new();
         let mut protected = BTreeSet::new();
-        let mut verified_packs = BTreeMap::new();
         for id in index.pack_ids() {
             let pack = store.inspect(id).await?;
             index.validate_pack(&pack)?;
@@ -603,12 +602,16 @@ impl ManagedData {
                 retired.insert(id);
                 protected.extend(pack_live);
             }
-            verified_packs.insert(id, pack);
         }
         if retired.is_empty() {
             return Ok(None);
         }
         index.require_update()?;
+
+        let mut retiring_bodies = BTreeMap::new();
+        for id in &retired {
+            retiring_bodies.insert(*id, store.read_complete(*id).await?);
+        }
 
         let mut batch = Vec::new();
         let mut batch_bytes = 0_u64;
@@ -620,25 +623,16 @@ impl ManagedData {
                 replacements.push(replacement.id);
                 batch_bytes = 0;
             }
-            let mut bytes = None;
-            let mut failure = None;
-            for location in index.locations(*content) {
-                let Some(pack) = verified_packs.get(&location.pack) else {
-                    continue;
-                };
-                match store.read_verified(*content, *location, pack).await {
-                    Ok(value) => {
-                        bytes = Some(value);
-                        break;
-                    }
-                    Err(error) => failure = Some(error),
-                }
-            }
-            batch.push(bytes.ok_or_else(|| {
-                failure.unwrap_or_else(|| {
-                    corrupt("repack content", "live pack content cannot be resolved")
+            let bytes = index
+                .locations(*content)
+                .iter()
+                .find_map(|location| {
+                    retiring_bodies
+                        .get(&location.pack)
+                        .and_then(|pack| pack.content(*content))
                 })
-            })?);
+                .ok_or_else(|| corrupt("repack content", "live pack content cannot be resolved"))?;
+            batch.push(bytes.to_vec());
             batch_bytes += content.logical_length;
         }
         if !batch.is_empty() {
@@ -899,21 +893,15 @@ impl ManagedData {
             return Ok(content);
         }
         let key = loose_key(&content);
-        match self.operator.stat(&key).await {
+        match self
+            .operator
+            .write_with(&key, bytes.to_vec())
+            .if_not_exists(true)
+            .await
+        {
             Ok(_) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                match self
-                    .operator
-                    .write_with(&key, bytes.to_vec())
-                    .if_not_exists(true)
-                    .await
-                {
-                    Ok(_) => {}
-                    Err(error) if already_exists(&error) => {}
-                    Err(_) => return Err(unavailable("write loose data")),
-                }
-            }
-            Err(_) => return Err(unavailable("inspect loose data")),
+            Err(error) if already_exists(&error) => {}
+            Err(_) => return Err(unavailable("write loose data")),
         }
         let mut digest = Sha256::new();
         self.copy_content(&content, 0..content.logical_length, None, &mut digest, None)
