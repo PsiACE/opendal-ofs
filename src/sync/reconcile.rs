@@ -348,7 +348,11 @@ fn validate_subtree_renames(
     renames: &BTreeMap<String, String>,
 ) -> Result<()> {
     for (from, path) in renames {
-        if replica.base[from].digest.is_some() {
+        let base = replica
+            .base
+            .get(from)
+            .with_context(|| format!("remembered rename source {from:?} is not in the base"))?;
+        if base.digest.is_some() {
             continue;
         }
         let source_prefix = format!("{from}/");
