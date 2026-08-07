@@ -133,6 +133,22 @@ impl FileVersionRecord {
         }
     }
 
+    pub(crate) fn from_layout(
+        logical_size: u64,
+        logical_digest: [u8; 32],
+        layout: FileVersionLayout,
+    ) -> Option<Self> {
+        if !layout_valid(logical_size, &logical_digest, &layout) {
+            return None;
+        }
+        Some(Self {
+            id: canonical_file_version_id(logical_size, &logical_digest, &layout)?,
+            logical_size,
+            logical_digest,
+            layout,
+        })
+    }
+
     pub(crate) fn is_valid(&self) -> bool {
         layout_valid(self.logical_size, &self.logical_digest, &self.layout)
             && canonical_file_version_id(self.logical_size, &self.logical_digest, &self.layout)

@@ -25,7 +25,7 @@ use crate::filesystem::{VolumeId, VolumeModel};
 const MAGIC: &str = "ofs-managed-volume";
 const MAJOR: u16 = 1;
 const MINOR: u16 = 0;
-const SUPPORTED_FEATURES: &[&str] = &["whole-file-v1"];
+const SUPPORTED_FEATURES: &[&str] = &["file-version-layouts-v1"];
 
 /// Naming rules fixed by the Managed volume format.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -62,8 +62,8 @@ impl ManagedFormat {
             metadata_placement,
             data_root_binding: data_root_binding.into(),
             naming_policy: NamingPolicy::PortableUtf8,
-            required_reader_features: BTreeSet::from(["whole-file-v1".to_owned()]),
-            required_writer_features: BTreeSet::from(["whole-file-v1".to_owned()]),
+            required_reader_features: BTreeSet::from(["file-version-layouts-v1".to_owned()]),
+            required_writer_features: BTreeSet::from(["file-version-layouts-v1".to_owned()]),
         };
         format.validate_for_write()?;
         Ok(format)

@@ -23,7 +23,9 @@ use super::namespace::{
     D1Namespace, D1NamespaceObservation, FileVersionRecord, NamespaceObservation,
     NamespacePublication, NamespaceSnapshot, ObjectNamespace,
 };
-use super::{D1Metadata, ManagedData, ManagedError, ManagedErrorKind};
+use super::{
+    D1Metadata, FileLayoutPolicy, ManagedData, ManagedError, ManagedErrorKind, SparseExtent,
+};
 use crate::filesystem::{CommitOutcome, OperationId, VolumeId};
 
 #[derive(Clone)]
@@ -80,6 +82,11 @@ impl ManagedVolume {
         })
     }
 
+    pub fn with_file_layout(mut self, policy: FileLayoutPolicy) -> Result<Self, ManagedError> {
+        self.data.set_policy(policy)?;
+        Ok(self)
+    }
+
     pub async fn observe(&self) -> Result<Option<ManagedObservation>, ManagedError> {
         match &self.namespace {
             NamespaceAuthority::Object(namespace) => {
@@ -107,6 +114,23 @@ impl ManagedVolume {
         path: &str,
     ) -> Result<FileVersionRecord, ManagedError> {
         self.data.seal_whole_file(frozen, path).await
+    }
+
+    pub async fn seal_file(
+        &self,
+        frozen: &Operator,
+        path: &str,
+    ) -> Result<FileVersionRecord, ManagedError> {
+        self.data.seal_file(frozen, path).await
+    }
+
+    pub async fn seal_extents(
+        &self,
+        frozen: &Operator,
+        path: &str,
+        extents: &[SparseExtent],
+    ) -> Result<FileVersionRecord, ManagedError> {
+        self.data.seal_extents(frozen, path, extents).await
     }
 
     pub async fn publish(

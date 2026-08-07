@@ -16,7 +16,7 @@ use super::{ManagedError, ManagedErrorKind};
 const FORMAT_KEY: &str = "data/v1/format.json";
 const MAGIC: &str = "ofs-managed-data";
 const MAJOR: u16 = 1;
-const SUPPORTED_FEATURES: &[&str] = &["whole-file-v1"];
+const SUPPORTED_FEATURES: &[&str] = &["loose-sha256-v1"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DigestAlgorithm {
@@ -35,8 +35,8 @@ impl ManagedDataFormat {
     pub fn v1() -> Self {
         Self {
             digest_algorithm: DigestAlgorithm::Sha256,
-            required_reader_features: BTreeSet::from(["whole-file-v1".to_owned()]),
-            required_writer_features: BTreeSet::from(["whole-file-v1".to_owned()]),
+            required_reader_features: BTreeSet::from(["loose-sha256-v1".to_owned()]),
+            required_writer_features: BTreeSet::from(["loose-sha256-v1".to_owned()]),
         }
     }
 
