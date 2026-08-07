@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use ofs::catalog::{Catalog, VolumeDefinition};
@@ -90,12 +91,39 @@ async fn pack_volume(config: Option<&Path>, args: VolumePackArgs) -> Result<()> 
     let packed = volume
         .pack_reachable_content(&observed, OperationId::generate())
         .await?;
+    let mut retired = 0;
+    let mut replacements = 0;
+    if let Some(grace_seconds) = args.repack_grace_seconds {
+        let fixed = volume
+            .observe()
+            .await?
+            .context("Managed volume has no namespace recovery root for repack")?;
+        if let Some(retirement) = volume
+            .repack_reachable_content(&fixed, OperationId::generate())
+            .await?
+        {
+            replacements = retirement.replacement_packs().len();
+            if grace_seconds > 0 {
+                std::thread::sleep(Duration::from_secs(grace_seconds));
+            }
+            let current = volume
+                .observe()
+                .await?
+                .context("Managed namespace disappeared during pack retirement")?;
+            retired = volume
+                .finalize_pack_retirement(&current, retirement)
+                .await?
+                .len();
+        }
+    }
     println!(
-        "packed {:?}: packs={} content={} logical_bytes={}",
+        "packed {:?}: packs={} content={} logical_bytes={} replacements={} retired={}",
         args.alias,
         packed.packs.len(),
         packed.reclaimable_loose.len(),
-        packed.logical_bytes
+        packed.logical_bytes,
+        replacements,
+        retired,
     );
     Ok(())
 }

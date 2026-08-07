@@ -56,6 +56,10 @@ pub(crate) enum VolumeCommand {
 pub(crate) struct VolumePackArgs {
     /// Named Managed volume from the local catalog.
     pub alias: String,
+
+    /// Repack dead entries, then wait this process-local grace period before retiring old packs.
+    #[arg(long, env = "OFS_PACK_GRACE_SECONDS", value_name = "SECONDS")]
+    pub repack_grace_seconds: Option<u64>,
 }
 
 #[derive(Debug, Args)]

@@ -231,6 +231,9 @@ done
 OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_b" --state "$state_b"
 grep -Fxq 'history change 60' "$replica_b/checkpoint.txt" || \
   fail 'replica did not recover the fixed target after a long change history'
+repack=$(OFS_CONFIG="$config" "$OFS_BIN" volume pack workspace --repack-grace-seconds 0)
+grep -Eq 'retired=[1-9][0-9]*' <<<"$repack" || \
+  fail 'repack did not retire packs containing dead entries'
 
 printf '%s\n' 'acceptance: rebuild a cold client from remote authority'
 OFS_CONFIG="$cold_config" "$OFS_BIN" "${volume_create[@]}"
