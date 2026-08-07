@@ -4,8 +4,8 @@ Managed Sync reconciles an ordinary local directory with a Managed volume. The
 local directory stays usable while disconnected. Remote publication happens
 only when you run `ofs sync`.
 
-This guide covers the Managed Sync implementation and its local acceptance
-environment. The filesystem concepts it uses come from
+This guide explains the Managed Sync contract and its local acceptance
+environment. The filesystem concepts come from
 [RFC 016](../rfcs/0016_filesystem_architecture.md) and are not specific to
 Sync.
 
@@ -25,10 +25,20 @@ whether it is opened through Mount or Sync. Direct volumes use the same
 vocabulary where it applies, with storage object versions and paths supplying
 their weaker identity model.
 
-This repository currently implements the Managed and Sync intersection. Sync
-adds durable local intent, a common base, three-way reconciliation, retained
-conflicts, and local materialization. Those concerns do not belong to the
-Managed volume format.
+The named-volume commands in this guide assemble a Managed volume with Sync
+access. Sync adds durable local intent, a common base, three-way reconciliation,
+retained conflicts, and local materialization. Those concerns do not belong to
+the Managed volume format.
+
+## Runtime storage concurrency
+
+`--transfer-concurrency N` and `OFS_TRANSFER_CONCURRENCY` set the shared OFS
+storage concurrency value. The default is four, and the value must be greater
+than zero. Each assembled OpenDAL storage operator uses it as its operation
+limit. Sync uses the same value to bound publication and materialization work.
+Direct Mount, Managed Sync, and Managed maintenance therefore use one setting.
+This is runtime configuration, not part of a Volume Model, Access Model, or
+durable format.
 
 ## Managed format v1
 
@@ -37,12 +47,12 @@ placement. Metadata owns stable nodes, directory entries, object-scoped
 generations, immutable `FileVersion` manifests, and the ordered change log.
 Apache OpenDAL™ stores immutable content.
 
-The foreground write path stores loose content and uses the configured file
-layout. Whole-file manifests are the default. FastCDC is available for large
-files, while files below its threshold remain whole. A `FileVersion` can also
-describe fixed chunks or sparse extents. Packing changes only the physical
-location of a `ContentRef`; it does not change a file manifest, node generation,
-or change cursor.
+The foreground write path stores loose content. The CLI exposes `whole` and
+`fastcdc` writer policies, with whole-file manifests as the default. FastCDC
+applies at or above its configured file-size threshold, so smaller files remain
+whole. Format v1 also defines fixed-chunk and sparse/extents manifest records.
+Packing changes only the physical location of a `ContentRef`; it does not change
+a file manifest, node generation, or change cursor.
 
 Metadata can be colocated with data as immutable objects plus a compare-and-swap
 head, or stored in D1 as normalized rows and transactions. Both adapters apply
@@ -148,13 +158,6 @@ ofs status worktree --state state/worktree.json
 ofs status worktree --state state/worktree.json --json
 ```
 
-OFS runs at most four storage transfer jobs at a time by default. Set
-`--transfer-concurrency N` or `OFS_TRANSFER_CONCURRENCY` to change the limit.
-The option is global, so Direct Mount, Managed Sync, and Managed maintenance
-use the same setting. The value must be greater than zero. OpenDAL applies it
-to each assembled storage operator; it is OFS runtime configuration and is not
-part of a volume model, access model, or Managed format v1.
-
 A sync freezes a stable view of local input, records its publication intent,
 writes and verifies data, then publishes one metadata transaction. The common
 base advances only after the committed target has been installed locally. If a
@@ -189,8 +192,10 @@ file before running the command. Sync never chooses a last writer silently.
 
 ## Pack and reclaim data
 
-Packing is explicit maintenance. It groups reachable small whole-file content into an
-immutable pack, verifies its footer, and publishes a derived pack index.
+Packing is explicit maintenance over a fixed namespace snapshot. It selects
+reachable, non-empty whole-file content no larger than 256 KiB. A pack contains
+at most 8 MiB of logical content. The command writes an immutable pack, verifies
+its footer, and publishes a derived pack index.
 
 ```shell
 ofs volume pack workspace
@@ -216,6 +221,13 @@ ofs volume pack workspace --reclaim-loose-after-seconds 30
 Repack publishes replacement locations before retiring an old pack. Loose
 reclamation removes content only when a verified pack location still serves
 the same `ContentRef`.
+
+Loose reclamation and garbage collection each read one recursive inventory of
+loose objects. Eligible keys are submitted through the OpenDAL deleter, which
+uses the provider's batch limits. Malformed loose keys remain untouched. A live
+digest stored with an unexpected object length fails closed before deletion. If
+deletion stops after some provider batches, rerun the command; the next
+inventory continues with the objects that remain.
 
 Unreachable loose objects require a namespace maintenance fence:
 
@@ -273,15 +285,16 @@ command.
 ## OpenDAL boundary
 
 Managed data and colocated Object metadata use OpenDAL `Operator` directly for
-read, range read, create-only write, stat, list, delete, and head
-compare-and-swap. Local Sync scanning and ordinary file I/O use the OpenDAL
-filesystem service. Native filesystem calls remain where object operations
-cannot express an atomic local state replacement, Unix link inspection, or
-permission handling.
+read, range read, create-only write, stat, recursive list, provider-batched
+deletion, and head compare-and-swap. Local Sync scanning and ordinary file I/O
+use the OpenDAL filesystem service. Native filesystem calls remain where object
+operations cannot express an atomic local state replacement, Unix link
+inspection, or permission handling.
 
 A custom OpenDAL layer is appropriate only when it preserves the object
 operation contract and can report its capabilities accurately. Retry,
 timeouts, telemetry, immutable caching, or a self-describing object codec can
 fit that boundary. Namespace transactions, `FileVersion` construction,
-packing, and Sync reconciliation do not. The default assembly has no custom
-layers because OpenDAL already supplies the storage behavior it needs.
+packing, and Sync reconciliation do not. Each assembled storage operator uses
+OpenDAL's `ConcurrentLimitLayer` with the shared runtime concurrency value. OFS
+does not add a project-specific storage layer.

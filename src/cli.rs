@@ -20,7 +20,7 @@ pub(crate) struct Cli {
     #[arg(long, env = "OFS_CONFIG", global = true, value_name = "PATH")]
     pub config: Option<PathBuf>,
 
-    /// Maximum number of concurrent storage transfer jobs.
+    /// Maximum concurrency for OFS storage operations.
     #[arg(
         long,
         env = "OFS_TRANSFER_CONCURRENCY",

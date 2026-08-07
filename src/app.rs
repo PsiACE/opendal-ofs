@@ -476,7 +476,16 @@ fn status(
             "metadata_authority": metadata_authority,
             "data_operator": "opendal",
             "local_tree_operator": "opendal_fs",
-            "custom_layer_order": [],
+            "runtime": {
+                "transfer_concurrency": transfer_concurrency.get(),
+            },
+            "operator": {
+                "layers": [{
+                    "name": "opendal.concurrent_limit",
+                    "limit": transfer_concurrency.get(),
+                }],
+                "ofs_custom_layer_order": [],
+            },
             "durable_state_owners": ["managed_metadata", "managed_data", "sync_replica"],
         },
         "format": {
