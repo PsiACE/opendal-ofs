@@ -104,7 +104,7 @@ async fn pack_volume(config: Option<&Path>, args: VolumePackArgs) -> Result<()> 
         {
             replacements = retirement.replacement_packs().len();
             if grace_seconds > 0 {
-                std::thread::sleep(Duration::from_secs(grace_seconds));
+                tokio::time::sleep(Duration::from_secs(grace_seconds)).await;
             }
             let current = volume
                 .observe()
@@ -116,14 +116,26 @@ async fn pack_volume(config: Option<&Path>, args: VolumePackArgs) -> Result<()> 
                 .len();
         }
     }
+    let mut reclaimed = 0;
+    if let Some(grace_seconds) = args.reclaim_loose_after_seconds {
+        if grace_seconds > 0 {
+            tokio::time::sleep(Duration::from_secs(grace_seconds)).await;
+        }
+        let current = volume
+            .observe()
+            .await?
+            .context("Managed namespace disappeared during loose data reclamation")?;
+        reclaimed = volume.reclaim_packed_loose(&current).await?;
+    }
     println!(
-        "packed {:?}: packs={} content={} logical_bytes={} replacements={} retired={}",
+        "packed {:?}: packs={} content={} logical_bytes={} replacements={} retired={} reclaimed={}",
         args.alias,
         packed.packs.len(),
         packed.reclaimable_loose.len(),
         packed.logical_bytes,
         replacements,
         retired,
+        reclaimed,
     );
     Ok(())
 }

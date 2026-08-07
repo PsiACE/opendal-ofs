@@ -625,6 +625,49 @@ impl ManagedData {
         Ok(retirement.retired_packs)
     }
 
+    pub(crate) async fn reclaim_packed_loose(
+        &self,
+        snapshot: &NamespaceSnapshot,
+    ) -> Result<usize, ManagedError> {
+        if !self.operator.info().full_capability().delete {
+            return Ok(0);
+        }
+        let contents = reachable_content(snapshot, "reclaim packed loose data")?;
+        let Ok(Some(index)) = PackIndex::open(self.operator.clone()).await else {
+            return Ok(0);
+        };
+        let Ok(store) = PackStore::new(self.operator.clone()) else {
+            return Ok(0);
+        };
+        let mut reclaimed = 0;
+        for content in contents {
+            if content.logical_length == 0 || index.locations(content).is_empty() {
+                continue;
+            }
+            let mut verified = false;
+            for location in index.locations(content) {
+                if store.read(content, *location).await.is_ok() {
+                    verified = true;
+                    break;
+                }
+            }
+            if !verified {
+                continue;
+            }
+            let key = loose_key(&content);
+            match self.operator.stat(&key).await {
+                Ok(metadata)
+                    if metadata.is_file()
+                        && metadata.content_length() == content.logical_length => {}
+                Ok(_) | Err(_) => continue,
+            }
+            if self.operator.delete(&key).await.is_ok() {
+                reclaimed += 1;
+            }
+        }
+        Ok(reclaimed)
+    }
+
     async fn read_loose_content(&self, content: ContentRef) -> Result<Vec<u8>, ManagedError> {
         let key = loose_key(&content);
         let bytes = self
@@ -1434,6 +1477,8 @@ mod tests {
             ]),
         };
 
+        assert_eq!(data.reclaim_packed_loose(&snapshot).await.unwrap(), 0);
+
         let packed = data
             .pack_reachable(&snapshot, OperationId::from_bytes([5; 16]))
             .await
@@ -1452,7 +1497,23 @@ mod tests {
         let index = PackIndex::open(stored.clone()).await.unwrap().unwrap();
         assert!(index.locations(orphan_content).is_empty());
 
-        stored.delete(&loose_key(&small_content)).await.unwrap();
+        let pack_hex = packed.packs[0]
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let pack_key = format!("data/v1/packs/{pack_hex}.pack");
+        let original = stored.read(&pack_key).await.unwrap().to_bytes();
+        let mut corrupt_pack = original.to_vec();
+        corrupt_pack[26] ^= 0xff;
+        stored.write(&pack_key, corrupt_pack).await.unwrap();
+        assert_eq!(data.reclaim_packed_loose(&snapshot).await.unwrap(), 0);
+        assert!(stored.stat(&loose_key(&small_content)).await.is_ok());
+
+        stored.write(&pack_key, original).await.unwrap();
+        assert_eq!(data.reclaim_packed_loose(&snapshot).await.unwrap(), 1);
+        assert!(stored.stat(&loose_key(&small_content)).await.is_err());
+        assert!(stored.stat(&loose_key(&orphan_content)).await.is_ok());
         data.read_to(&small, &target, "restored").await.unwrap();
         assert_eq!(
             target.read("restored").await.unwrap().to_bytes(),

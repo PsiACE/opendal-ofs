@@ -60,6 +60,14 @@ pub(crate) struct VolumePackArgs {
     /// Repack dead entries, then wait this process-local grace period before retiring old packs.
     #[arg(long, env = "OFS_PACK_GRACE_SECONDS", value_name = "SECONDS")]
     pub repack_grace_seconds: Option<u64>,
+
+    /// Wait before reclaiming loose objects that have a verified packed location.
+    #[arg(
+        long,
+        env = "OFS_PACK_RECLAIM_LOOSE_AFTER_SECONDS",
+        value_name = "SECONDS"
+    )]
+    pub reclaim_loose_after_seconds: Option<u64>,
 }
 
 #[derive(Debug, Args)]

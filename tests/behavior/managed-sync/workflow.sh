@@ -102,12 +102,16 @@ chmod u+x "$replica_a/tools/run.sh"
 OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a"
 OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_b" --state "$state_b"
 printf '%s\n' 'acceptance: pack live small content and repeat idempotently'
-first_pack=$(OFS_CONFIG="$config" "$OFS_BIN" volume pack workspace)
+first_pack=$(OFS_CONFIG="$config" "$OFS_BIN" volume pack workspace \
+  --reclaim-loose-after-seconds 0)
 grep -Eq 'packs=[1-9][0-9]*' <<<"$first_pack" || fail 'first pack run produced no pack'
 grep -Eq 'content=[1-9][0-9]*' <<<"$first_pack" || fail 'first pack run indexed no content'
-second_pack=$(OFS_CONFIG="$config" "$OFS_BIN" volume pack workspace)
+grep -Eq 'reclaimed=[1-9][0-9]*' <<<"$first_pack" || fail 'verified loose content was not reclaimed'
+second_pack=$(OFS_CONFIG="$config" "$OFS_BIN" volume pack workspace \
+  --reclaim-loose-after-seconds 0)
 grep -Fq 'packs=0 content=0 logical_bytes=0' <<<"$second_pack" || \
   fail 'second pack run was not idempotent'
+grep -Fq 'reclaimed=0' <<<"$second_pack" || fail 'second pack run reclaimed content twice'
 [[ -d "$replica_b/nested/level" ]] || fail 'nested directories were not materialized'
 cmp "$replica_a/nested/level/entry.txt" "$replica_b/nested/level/entry.txt" || \
   fail 'nested file content did not round trip'

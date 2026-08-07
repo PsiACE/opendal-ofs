@@ -198,6 +198,14 @@ impl ManagedVolume {
             .await
     }
 
+    /// Remove live loose objects only after a packed location is verified.
+    pub async fn reclaim_packed_loose(
+        &self,
+        current: &ManagedObservation,
+    ) -> Result<usize, ManagedError> {
+        self.data.reclaim_packed_loose(current.snapshot()).await
+    }
+
     pub async fn materialize(
         &self,
         version: &FileVersionRecord,
