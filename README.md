@@ -10,11 +10,19 @@
 [chat]: https://img.shields.io/discord/1081052318650339399
 [discord]: https://opendal.apache.org/discord
 
-`ofs` is a userspace filesystem backing by OpenDAL.
+`ofs` is a userspace filesystem backed by OpenDAL.
 
 ## Status
 
-`ofs` is a work in progress. we only support `fs` and `s3` as backend on `Linux` currently.
+`ofs` is a work in progress. It provides the existing Direct Mount interface
+and a Managed Sync implementation of the two-axis filesystem architecture in
+[RFC 016](rfcs/0016_filesystem_architecture.md).
+
+Managed Sync uses a local directory as the working filesystem and publishes
+explicitly to a format v1 Managed volume. Namespace metadata can use colocated
+objects or D1, while immutable data is accessed through OpenDAL. See the
+[Managed Sync guide](docs/managed-sync.md) for setup, recovery, maintenance,
+and local acceptance commands.
 
 ## How to use `ofs`
 
@@ -33,13 +41,13 @@ kldload fuse
 
 ### Install `ofs`
 
-`ofs` could be installed by `cargo`:
+`ofs` can be installed by `cargo`:
 
 ```shell
 cargo install ofs
 ```
 
-> `cargo` is the Rust package manager. `cargo` could be installed by following the [Installation](https://www.rust-lang.org/tools/install) from Rust official website.
+> `cargo` is the Rust package manager. Follow the Rust [installation guide](https://www.rust-lang.org/tools/install) to install it.
 
 ### Mount directory
 
