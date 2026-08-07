@@ -17,6 +17,7 @@
 
 //! File manifests backed by immutable loose objects.
 
+use std::collections::BTreeSet;
 use std::ops::Range;
 
 use fastcdc::v2020::{
@@ -27,13 +28,27 @@ use opendal::{ErrorKind, Operator, Writer};
 use sha2::{Digest as _, Sha256};
 
 use super::{ManagedError, ManagedErrorKind};
+use crate::filesystem::{NodeKind, OperationId};
 use crate::managed::namespace::{
     ChunkSpan, ChunkingAlgorithm, ChunkingSpec, ContentRef, DataExtent, FileExtent,
-    FileVersionLayout, FileVersionRecord,
+    FileVersionLayout, FileVersionRecord, NamespaceSnapshot,
 };
+use crate::managed::pack::{PackId, PackIndex, PackLocation, PackStore};
 
 const READ_WINDOW: u64 = 4 * 1024 * 1024;
 const LOOSE_ROOT: &str = "data/v1/loose/sha256";
+const SMALL_CONTENT_LIMIT: u64 = 256 * 1024;
+const PACK_LOGICAL_LIMIT: u64 = 8 * 1024 * 1024;
+
+/// Physical locations published by one explicit small-content maintenance run.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PackMaintenance {
+    pub packs: Vec<PackId>,
+    pub packed_content: Vec<ContentRef>,
+    pub logical_bytes: u64,
+    /// Loose objects that have a verified, published pack location.
+    pub reclaimable_loose: Vec<ContentRef>,
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum FileLayoutPolicy {
@@ -377,6 +392,120 @@ impl ManagedData {
         )
     }
 
+    pub(crate) async fn pack_reachable(
+        &self,
+        snapshot: &NamespaceSnapshot,
+        operation: OperationId,
+    ) -> Result<PackMaintenance, ManagedError> {
+        let mut contents = BTreeSet::new();
+        let mut visited = BTreeSet::new();
+        let mut pending = vec![snapshot.root];
+        while let Some(node_id) = pending.pop() {
+            if !visited.insert(node_id) {
+                continue;
+            }
+            let node = snapshot.nodes.get(&node_id).ok_or_else(|| {
+                corrupt("pack reachable data", "namespace references a missing node")
+            })?;
+            match node.kind {
+                NodeKind::Directory => {
+                    let directory = snapshot.directories.get(&node_id).ok_or_else(|| {
+                        corrupt(
+                            "pack reachable data",
+                            "namespace references a missing directory",
+                        )
+                    })?;
+                    pending.extend(directory.entries.values().map(|entry| entry.node));
+                }
+                NodeKind::RegularFile => {
+                    let version_id = node.file_version.ok_or_else(|| {
+                        corrupt("pack reachable data", "live file has no file version")
+                    })?;
+                    let version = snapshot.file_versions.get(&version_id).ok_or_else(|| {
+                        corrupt(
+                            "pack reachable data",
+                            "live node references a missing file version",
+                        )
+                    })?;
+                    if !version.is_valid() {
+                        return Err(corrupt(
+                            "pack reachable data",
+                            "live node references an invalid file version",
+                        ));
+                    }
+                    collect_content_refs(&version.layout, &mut contents);
+                }
+            }
+        }
+
+        let mut index = PackIndex::open_or_empty(self.operator.clone()).await?;
+        let store = PackStore::new(self.operator.clone())?;
+        let mut batch = Vec::new();
+        let mut batch_bytes = 0_u64;
+        let mut sealed = Vec::new();
+        let mut packed_content = Vec::new();
+        let mut logical_bytes = 0_u64;
+        for content in contents {
+            if content.logical_length == 0
+                || content.logical_length > SMALL_CONTENT_LIMIT
+                || !index.locations(content).is_empty()
+            {
+                continue;
+            }
+            if batch_bytes + content.logical_length > PACK_LOGICAL_LIMIT {
+                let pack = store.seal(operation, std::mem::take(&mut batch)).await?;
+                index.add(&pack);
+                sealed.push(pack);
+                batch_bytes = 0;
+            }
+            batch.push(self.read_loose_content(content).await?);
+            batch_bytes += content.logical_length;
+            logical_bytes += content.logical_length;
+            packed_content.push(content);
+        }
+        if !batch.is_empty() {
+            let pack = store.seal(operation, batch).await?;
+            index.add(&pack);
+            sealed.push(pack);
+        }
+        if sealed.is_empty() {
+            return Ok(PackMaintenance {
+                packs: Vec::new(),
+                packed_content: Vec::new(),
+                logical_bytes: 0,
+                reclaimable_loose: Vec::new(),
+            });
+        }
+
+        index.persist().await?;
+        Ok(PackMaintenance {
+            packs: sealed.iter().map(|pack| pack.id).collect(),
+            reclaimable_loose: packed_content.clone(),
+            packed_content,
+            logical_bytes,
+        })
+    }
+
+    async fn read_loose_content(&self, content: ContentRef) -> Result<Vec<u8>, ManagedError> {
+        let key = loose_key(&content);
+        let bytes = self
+            .operator
+            .read(&key)
+            .await
+            .map_err(|error| referenced_data_error("pack loose data", error))?
+            .to_bytes()
+            .to_vec();
+        if bytes.len() as u64 != content.logical_length
+            || <[u8; 32]>::from(Sha256::digest(&bytes)) != content.digest
+        {
+            return Err(corrupt(
+                "pack loose data",
+                "loose content does not match its reference",
+            ));
+        }
+        Ok(bytes)
+    }
+
     async fn persist_bytes(&self, bytes: &[u8]) -> Result<ContentRef, ManagedError> {
         let content = ContentRef {
             digest: Sha256::digest(bytes).into(),
@@ -398,8 +527,15 @@ impl ManagedData {
             Err(_) => return Err(unavailable("write loose data")),
         }
         let mut digest = Sha256::new();
-        self.copy_content(&content, 0..content.logical_length, None, &mut digest)
-            .await?;
+        let mut pack_index = None;
+        self.copy_content(
+            &content,
+            0..content.logical_length,
+            None,
+            &mut digest,
+            &mut pack_index,
+        )
+        .await?;
         Ok(content)
     }
 
@@ -442,8 +578,15 @@ impl ManagedData {
             }
         }
         let mut observed = Sha256::new();
-        self.copy_content(&content, 0..content.logical_length, None, &mut observed)
-            .await?;
+        let mut pack_index = None;
+        self.copy_content(
+            &content,
+            0..content.logical_length,
+            None,
+            &mut observed,
+            &mut pack_index,
+        )
+        .await?;
         Ok(content)
     }
 
@@ -498,6 +641,7 @@ impl ManagedData {
         mut target: Option<&mut Writer>,
     ) -> Result<(), ManagedError> {
         let mut logical = Sha256::new();
+        let mut pack_index = None;
         match &version.layout {
             FileVersionLayout::Whole { content } => {
                 self.copy_content(
@@ -505,6 +649,7 @@ impl ManagedData {
                     0..content.logical_length,
                     target.as_deref_mut(),
                     &mut logical,
+                    &mut pack_index,
                 )
                 .await?;
             }
@@ -515,6 +660,7 @@ impl ManagedData {
                         0..chunk.content.logical_length,
                         target.as_deref_mut(),
                         &mut logical,
+                        &mut pack_index,
                     )
                     .await?;
                 }
@@ -533,6 +679,7 @@ impl ManagedData {
                                 extent.data_offset..end,
                                 target.as_deref_mut(),
                                 &mut logical,
+                                &mut pack_index,
                             )
                             .await?;
                         }
@@ -556,54 +703,68 @@ impl ManagedData {
         selected: Range<u64>,
         mut target: Option<&mut Writer>,
         logical: &mut Sha256,
+        pack_index: &mut Option<PackIndex>,
     ) -> Result<(), ManagedError> {
         if selected.start > selected.end || selected.end > content.logical_length {
             return Err(corrupt("read loose data", "content range is invalid"));
         }
         let key = loose_key(content);
-        let metadata = self
-            .operator
-            .stat(&key)
-            .await
-            .map_err(|error| referenced_data_error("stat loose data", error))?;
-        if !metadata.is_file() || metadata.content_length() != content.logical_length {
-            return Err(corrupt(
-                "stat loose data",
-                "stored size does not match its content reference",
-            ));
-        }
-        let reader = self
-            .operator
-            .reader(&key)
-            .await
-            .map_err(|error| referenced_data_error("read loose data", error))?;
+        let reader = match self.operator.reader(&key).await {
+            Ok(reader) => reader,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return self
+                    .copy_packed_content(content, selected, target, logical, pack_index)
+                    .await;
+            }
+            Err(error) => return Err(referenced_data_error("read loose data", error)),
+        };
+        let mut stream = match reader.into_stream(..).await {
+            Ok(stream) => stream,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return self
+                    .copy_packed_content(content, selected, target, logical, pack_index)
+                    .await;
+            }
+            Err(error) => return Err(referenced_data_error("read loose data", error)),
+        };
         let mut content_digest = Sha256::new();
-        let mut offset = 0;
-        while offset < content.logical_length {
-            let end = (offset + READ_WINDOW).min(content.logical_length);
-            let bytes = reader
-                .read(offset..end)
-                .await
-                .map_err(|error| referenced_data_error("read loose data", error))?
-                .to_bytes();
-            if bytes.len() as u64 != end - offset {
-                return Err(corrupt("read loose data", "content returned a short range"));
-            }
-            content_digest.update(&bytes);
-            let start = offset.max(selected.start);
-            let selected_end = end.min(selected.end);
-            if start < selected_end {
-                let value =
-                    bytes.slice((start - offset) as usize..(selected_end - offset) as usize);
-                logical.update(&value);
-                if let Some(writer) = target.as_deref_mut() {
-                    writer
-                        .write(value)
-                        .await
-                        .map_err(|_| unavailable("write materialized file"))?;
+        let mut offset = 0_u64;
+        while let Some(buffer) = stream.next().await {
+            let buffer = match buffer {
+                Ok(buffer) => buffer,
+                Err(error) if error.kind() == ErrorKind::NotFound && offset == 0 => {
+                    return self
+                        .copy_packed_content(content, selected, target, logical, pack_index)
+                        .await;
                 }
+                Err(error) => return Err(referenced_data_error("read loose data", error)),
+            };
+            for bytes in buffer {
+                let end = offset
+                    .checked_add(bytes.len() as u64)
+                    .filter(|end| *end <= content.logical_length)
+                    .ok_or_else(|| {
+                        corrupt("read loose data", "content is longer than its reference")
+                    })?;
+                content_digest.update(&bytes);
+                let start = offset.max(selected.start);
+                let selected_end = end.min(selected.end);
+                if start < selected_end {
+                    let value =
+                        bytes.slice((start - offset) as usize..(selected_end - offset) as usize);
+                    logical.update(&value);
+                    if let Some(writer) = target.as_deref_mut() {
+                        writer
+                            .write(value)
+                            .await
+                            .map_err(|_| unavailable("write materialized file"))?;
+                    }
+                }
+                offset = end;
             }
-            offset = end;
+        }
+        if offset != content.logical_length {
+            return Err(corrupt("read loose data", "content returned a short range"));
         }
         let observed: [u8; 32] = content_digest.finalize().into();
         if observed != content.digest {
@@ -613,6 +774,72 @@ impl ManagedData {
             ));
         }
         Ok(())
+    }
+
+    async fn copy_packed_content(
+        &self,
+        content: &ContentRef,
+        selected: Range<u64>,
+        target: Option<&mut Writer>,
+        logical: &mut Sha256,
+        pack_index: &mut Option<PackIndex>,
+    ) -> Result<(), ManagedError> {
+        if pack_index.is_none() {
+            *pack_index = PackIndex::open(self.operator.clone()).await?;
+        }
+        let locations: Vec<PackLocation> = pack_index
+            .as_ref()
+            .map(|index| index.locations(*content).to_vec())
+            .unwrap_or_default();
+        if locations.is_empty() {
+            return Err(corrupt(
+                "read Managed data",
+                "file version references missing content",
+            ));
+        }
+        let store = PackStore::new(self.operator.clone())?;
+        let mut failure = None;
+        let mut packed = None;
+        for location in locations {
+            match store.read(*content, location).await {
+                Ok(bytes) => {
+                    packed = Some(bytes);
+                    break;
+                }
+                Err(error) => failure = Some(error),
+            }
+        }
+        let bytes = packed.ok_or_else(|| {
+            failure.unwrap_or_else(|| {
+                corrupt("read Managed data", "pack locations cannot be resolved")
+            })
+        })?;
+        let value = &bytes[selected.start as usize..selected.end as usize];
+        logical.update(value);
+        if let Some(writer) = target {
+            writer
+                .write(value.to_vec())
+                .await
+                .map_err(|_| unavailable("write materialized file"))?;
+        }
+        Ok(())
+    }
+}
+
+fn collect_content_refs(layout: &FileVersionLayout, output: &mut BTreeSet<ContentRef>) {
+    match layout {
+        FileVersionLayout::Whole { content } => {
+            output.insert(*content);
+        }
+        FileVersionLayout::Chunked { chunks, .. } => {
+            output.extend(chunks.iter().map(|chunk| chunk.content));
+        }
+        FileVersionLayout::Extents { extents } => {
+            output.extend(extents.iter().filter_map(|extent| match extent {
+                FileExtent::Data { extent } => Some(extent.content),
+                FileExtent::Hole { .. } => None,
+            }));
+        }
     }
 }
 
@@ -802,9 +1029,15 @@ fn unavailable(action: &'static str) -> ManagedError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use opendal::services;
 
     use super::*;
+    use crate::filesystem::{
+        ChangeCursor, DirectoryEntry, Generation, NodeAttributes, NodeId, NodeKind, VolumeId,
+    };
+    use crate::managed::namespace::{DirectoryRecord, NodeRecord};
 
     fn memory() -> Operator {
         Operator::new(services::Memory::default()).unwrap().finish()
@@ -867,6 +1100,119 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(invalid.kind(), ManagedErrorKind::Invalid);
+    }
+
+    #[tokio::test]
+    async fn reachable_small_content_falls_back_to_a_published_pack() {
+        let source = memory();
+        let stored = memory();
+        let target = memory();
+        source.write("small", b"small file".to_vec()).await.unwrap();
+        source
+            .write("large", vec![7; SMALL_CONTENT_LIMIT as usize + 1])
+            .await
+            .unwrap();
+        source.write("orphan", b"orphan".to_vec()).await.unwrap();
+        let data = ManagedData::new(stored.clone()).unwrap();
+        let small = data.seal_whole_file(&source, "small").await.unwrap();
+        let large = data.seal_whole_file(&source, "large").await.unwrap();
+        let orphan = data.seal_whole_file(&source, "orphan").await.unwrap();
+
+        let root = NodeId::from_bytes([1; 16]);
+        let small_node = NodeId::from_bytes([2; 16]);
+        let large_node = NodeId::from_bytes([3; 16]);
+        let generation = Generation::from_bytes(vec![1]);
+        let snapshot = NamespaceSnapshot {
+            volume_id: VolumeId::from_bytes([4; 16]),
+            cursor: ChangeCursor::Genesis,
+            root,
+            nodes: BTreeMap::from([
+                (
+                    root,
+                    NodeRecord {
+                        id: root,
+                        generation: generation.clone(),
+                        kind: NodeKind::Directory,
+                        attributes: NodeAttributes::default(),
+                        file_version: None,
+                    },
+                ),
+                (
+                    small_node,
+                    NodeRecord {
+                        id: small_node,
+                        generation: generation.clone(),
+                        kind: NodeKind::RegularFile,
+                        attributes: NodeAttributes::default(),
+                        file_version: Some(small.id),
+                    },
+                ),
+                (
+                    large_node,
+                    NodeRecord {
+                        id: large_node,
+                        generation,
+                        kind: NodeKind::RegularFile,
+                        attributes: NodeAttributes::default(),
+                        file_version: Some(large.id),
+                    },
+                ),
+            ]),
+            directories: BTreeMap::from([(
+                root,
+                DirectoryRecord {
+                    node: root,
+                    generation: Generation::from_bytes(vec![1]),
+                    entries: BTreeMap::from([
+                        (
+                            "large".to_owned(),
+                            DirectoryEntry {
+                                node: large_node,
+                                kind: NodeKind::RegularFile,
+                            },
+                        ),
+                        (
+                            "small".to_owned(),
+                            DirectoryEntry {
+                                node: small_node,
+                                kind: NodeKind::RegularFile,
+                            },
+                        ),
+                    ]),
+                },
+            )]),
+            file_versions: BTreeMap::from([
+                (small.id, small.clone()),
+                (large.id, large.clone()),
+                (orphan.id, orphan.clone()),
+            ]),
+        };
+
+        let packed = data
+            .pack_reachable(&snapshot, OperationId::from_bytes([5; 16]))
+            .await
+            .unwrap();
+        let small_content = match &small.layout {
+            FileVersionLayout::Whole { content } => *content,
+            _ => unreachable!(),
+        };
+        let orphan_content = match &orphan.layout {
+            FileVersionLayout::Whole { content } => *content,
+            _ => unreachable!(),
+        };
+        assert_eq!(packed.packed_content, vec![small_content]);
+        assert_eq!(packed.reclaimable_loose, vec![small_content]);
+        assert_eq!(packed.logical_bytes, small_content.logical_length);
+        let index = PackIndex::open(stored.clone()).await.unwrap().unwrap();
+        assert!(index.locations(orphan_content).is_empty());
+
+        stored.delete(&loose_key(&small_content)).await.unwrap();
+        data.read_to(&small, &target, "restored").await.unwrap();
+        assert_eq!(
+            target.read("restored").await.unwrap().to_bytes(),
+            b"small file".as_slice()
+        );
+        data.read_to(&large, &target, "large").await.unwrap();
     }
 
     #[tokio::test]

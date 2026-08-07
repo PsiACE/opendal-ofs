@@ -354,7 +354,7 @@ impl PackIndex {
 
     /// Open the published index. A missing head means no index exists yet.
     pub async fn open(operator: Operator) -> Result<Option<Self>, ManagedError> {
-        require_index_capabilities(&operator)?;
+        require_index_read_capabilities(&operator)?;
         let Some((head_bytes, etag)) = read_head(&operator).await? else {
             return Ok(None);
         };
@@ -393,13 +393,34 @@ impl PackIndex {
             operator,
             locations,
             revision: Some(head.revision),
-            head_etag: Some(etag),
+            head_etag: etag,
         }))
+    }
+
+    pub(crate) async fn open_or_empty(operator: Operator) -> Result<Self, ManagedError> {
+        match Self::open(operator.clone()).await? {
+            Some(index) => Ok(index),
+            None => Ok(Self {
+                operator,
+                locations: BTreeMap::new(),
+                revision: None,
+                head_etag: None,
+            }),
+        }
     }
 
     /// Publish current entries through immutable records and a conditional head update.
     pub async fn persist(&mut self) -> Result<(), ManagedError> {
-        require_index_capabilities(&self.operator)?;
+        require_index_create_capabilities(&self.operator)?;
+        if self.revision.is_some()
+            && (!self.operator.info().full_capability().write_with_if_match
+                || self.head_etag.is_none())
+        {
+            return Err(unavailable(
+                "persist pack index",
+                "updating an existing pack index requires compare-and-swap and a revision token",
+            ));
+        }
         normalize_locations(&mut self.locations);
         let checkpoint = IndexCheckpoint::from_locations(&self.locations);
         let checkpoint_bytes = encode(&checkpoint, "persist pack index")?;
@@ -475,7 +496,7 @@ impl PackIndex {
             .await?
             .ok_or_else(|| corrupt("persist pack index", "published head is missing"))?;
         self.revision = Some(revision_id);
-        self.head_etag = Some(etag);
+        self.head_etag = etag;
         Ok(())
     }
 }
@@ -571,7 +592,7 @@ struct IndexHead {
     revision: [u8; 32],
 }
 
-async fn read_head(operator: &Operator) -> Result<Option<(Vec<u8>, String)>, ManagedError> {
+async fn read_head(operator: &Operator) -> Result<Option<(Vec<u8>, Option<String>)>, ManagedError> {
     let reader = match operator.reader(HEAD_KEY).await {
         Ok(reader) => reader,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
@@ -585,8 +606,7 @@ async fn read_head(operator: &Operator) -> Result<Option<(Vec<u8>, String)>, Man
     let etag = reader
         .metadata()
         .and_then(|metadata| metadata.etag())
-        .ok_or_else(|| unavailable("read pack index", "index head has no revision token"))?
-        .to_owned();
+        .map(str::to_owned);
     Ok(Some((bytes, etag)))
 }
 
@@ -600,7 +620,7 @@ async fn read_head_state(
         .ok()
         .filter(|head| head.magic == HEAD_MAGIC && head.major == FORMAT_MAJOR)
         .map(|head| head.revision);
-    Ok((revision, Some(etag)))
+    Ok((revision, etag))
 }
 
 async fn read_required(
@@ -657,19 +677,27 @@ async fn create_immutable(
     }
 }
 
-fn require_index_capabilities(operator: &Operator) -> Result<(), ManagedError> {
+fn require_index_read_capabilities(operator: &Operator) -> Result<(), ManagedError> {
     let capability = operator.info().full_capability();
-    if capability.read
-        && capability.write
-        && capability.write_with_if_not_exists
-        && capability.write_with_if_match
-        && capability.stat
-    {
+    if capability.read && capability.stat {
         Ok(())
     } else {
         Err(unavailable(
             "open pack index",
-            "persistent pack index requires read, write, stat, create-only write, and compare-and-swap",
+            "reading a pack index requires read and stat",
+        ))
+    }
+}
+
+fn require_index_create_capabilities(operator: &Operator) -> Result<(), ManagedError> {
+    let capability = operator.info().full_capability();
+    if capability.read && capability.write && capability.write_with_if_not_exists && capability.stat
+    {
+        Ok(())
+    } else {
+        Err(unavailable(
+            "persist pack index",
+            "creating a pack index requires read, write, stat, and create-only write",
         ))
     }
 }
@@ -814,7 +842,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn filesystem_pack_reads_verified_content_without_index_cas() {
+    async fn filesystem_pack_creates_index_but_refuses_unsafe_update() {
         let root = TempDir::new().unwrap();
         let operator = Operator::new(services::Fs::default().root(root.path().to_str().unwrap()))
             .unwrap()
@@ -833,12 +861,15 @@ mod tests {
         let location = sealed.locations[&alpha];
         assert_eq!(store.read(alpha, location).await.unwrap(), b"alpha");
 
-        let error = store.rebuild_index().await.unwrap_err();
+        let rebuilt = store.rebuild_index().await.unwrap();
+        assert_eq!(rebuilt.locations(alpha), &[location]);
+        let mut reopened = PackIndex::open(operator).await.unwrap().unwrap();
+        let error = reopened.persist().await.unwrap_err();
         assert_eq!(error.kind(), ManagedErrorKind::Unavailable);
     }
 
     #[tokio::test]
-    async fn memory_pack_reads_verified_content_without_index_cas() {
+    async fn memory_pack_reads_new_create_only_index() {
         let operator = memory();
         let store = PackStore::new(operator.clone()).unwrap();
         let sealed = store
@@ -853,8 +884,9 @@ mod tests {
                 .unwrap(),
             b"on disk"
         );
-        let error = PackIndex::open(operator).await.unwrap_err();
-        assert_eq!(error.kind(), ManagedErrorKind::Unavailable);
+        store.rebuild_index().await.unwrap();
+        let reopened = PackIndex::open(operator).await.unwrap().unwrap();
+        assert_eq!(reopened.locations(content), &[sealed.locations[&content]]);
     }
 
     #[tokio::test]

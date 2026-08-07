@@ -24,7 +24,8 @@ use super::namespace::{
     NamespacePublication, NamespaceSnapshot, ObjectNamespace,
 };
 use super::{
-    D1Metadata, FileLayoutPolicy, ManagedData, ManagedError, ManagedErrorKind, SparseExtent,
+    D1Metadata, FileLayoutPolicy, ManagedData, ManagedError, ManagedErrorKind, PackMaintenance,
+    SparseExtent,
 };
 use crate::filesystem::{CommitOutcome, OperationId, VolumeId};
 
@@ -162,6 +163,17 @@ impl ManagedVolume {
             NamespaceAuthority::Object(namespace) => namespace.resolve(operation).await,
             NamespaceAuthority::D1(namespace) => namespace.resolve(operation).await,
         }
+    }
+
+    /// Pack small content reachable from one fixed namespace observation.
+    pub async fn pack_reachable_content(
+        &self,
+        observed: &ManagedObservation,
+        operation: OperationId,
+    ) -> Result<PackMaintenance, ManagedError> {
+        self.data
+            .pack_reachable(observed.snapshot(), operation)
+            .await
     }
 
     pub async fn materialize(

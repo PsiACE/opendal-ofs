@@ -27,7 +27,7 @@ pub mod pack;
 mod volume;
 
 pub(crate) use data::ManagedData;
-pub use data::{FileLayoutPolicy, SparseExtent};
+pub use data::{FileLayoutPolicy, PackMaintenance, SparseExtent};
 pub use data_format::{DigestAlgorithm, ManagedDataFormat};
 pub use error::{ManagedError, ManagedErrorKind};
 pub use format::{ManagedFormat, MetadataPlacement, NamingPolicy};
