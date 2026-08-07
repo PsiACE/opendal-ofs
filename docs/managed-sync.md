@@ -142,6 +142,13 @@ ofs status worktree --state state/worktree.json
 ofs status worktree --state state/worktree.json --json
 ```
 
+OFS runs at most four storage transfer jobs at a time by default. Set
+`--transfer-concurrency N` or `OFS_TRANSFER_CONCURRENCY` to change the limit.
+The option is global, so Direct Mount, Managed Sync, and Managed maintenance
+use the same setting. The value must be greater than zero. OpenDAL applies it
+to each assembled storage operator; it is OFS runtime configuration and is not
+part of a volume model, access model, or Managed format v1.
+
 A sync freezes a stable view of local input, records its publication intent,
 writes and verifies data, then publishes one metadata transaction. The common
 base advances only after the committed target has been installed locally. If a

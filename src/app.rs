@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::env;
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::time::Duration;
 
@@ -20,6 +21,7 @@ use ofs::managed::{
 };
 use ofs::sync::{ReplicaState, SyncEngine};
 use opendal::Operator;
+use opendal::layers::ConcurrentLimitLayer;
 use url::Url;
 
 use crate::cli::{
@@ -33,6 +35,7 @@ const DEFAULT_FASTCDC_TARGET_CHUNK_SIZE: u32 = 256 * 1024;
 const DEFAULT_FASTCDC_MAXIMUM_CHUNK_SIZE: u32 = 1024 * 1024;
 
 pub(crate) async fn run(cli: Cli) -> Result<()> {
+    let transfer_concurrency = cli.transfer_concurrency;
     match (cli.command, cli.mount_path, cli.backend) {
         (
             Some(Command::Volume {
@@ -40,24 +43,30 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
             }),
             None,
             None,
-        ) => create_volume(cli.config.as_deref(), args).await,
+        ) => create_volume(cli.config.as_deref(), args, transfer_concurrency).await,
         (
             Some(Command::Volume {
                 command: VolumeCommand::Pack(args),
             }),
             None,
             None,
-        ) => pack_volume(cli.config.as_deref(), args).await,
+        ) => pack_volume(cli.config.as_deref(), args, transfer_concurrency).await,
         (
             Some(Command::Volume {
                 command: VolumeCommand::Gc(args),
             }),
             None,
             None,
-        ) => gc_volume(cli.config.as_deref(), args).await,
-        (Some(Command::Sync(args)), None, None) => sync_volume(cli.config.as_deref(), args).await,
-        (Some(Command::Status(args)), None, None) => status(cli.config.as_deref(), args),
-        (None, Some(mount_path), Some(backend)) => mount(&mount_path, &backend).await,
+        ) => gc_volume(cli.config.as_deref(), args, transfer_concurrency).await,
+        (Some(Command::Sync(args)), None, None) => {
+            sync_volume(cli.config.as_deref(), args, transfer_concurrency).await
+        }
+        (Some(Command::Status(args)), None, None) => {
+            status(cli.config.as_deref(), args, transfer_concurrency)
+        }
+        (None, Some(mount_path), Some(backend)) => {
+            mount(&mount_path, &backend, transfer_concurrency).await
+        }
         (Some(_), _, _) => {
             bail!("a subcommand cannot be combined with Direct Mount arguments; run `ofs --help`")
         }
@@ -67,8 +76,12 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
     }
 }
 
-async fn gc_volume(config: Option<&Path>, args: VolumeGcArgs) -> Result<()> {
-    let volume = open_managed_volume(config, &args.alias).await?;
+async fn gc_volume(
+    config: Option<&Path>,
+    args: VolumeGcArgs,
+    transfer_concurrency: NonZeroUsize,
+) -> Result<()> {
+    let volume = open_managed_volume(config, &args.alias, transfer_concurrency).await?;
     let observed = volume
         .observe()
         .await?
@@ -87,8 +100,12 @@ async fn gc_volume(config: Option<&Path>, args: VolumeGcArgs) -> Result<()> {
     Ok(())
 }
 
-async fn pack_volume(config: Option<&Path>, args: VolumePackArgs) -> Result<()> {
-    let volume = open_managed_volume(config, &args.alias).await?;
+async fn pack_volume(
+    config: Option<&Path>,
+    args: VolumePackArgs,
+    transfer_concurrency: NonZeroUsize,
+) -> Result<()> {
+    let volume = open_managed_volume(config, &args.alias, transfer_concurrency).await?;
     let observed = volume
         .observe()
         .await?
@@ -145,7 +162,11 @@ async fn pack_volume(config: Option<&Path>, args: VolumePackArgs) -> Result<()> 
     Ok(())
 }
 
-async fn open_managed_volume(config: Option<&Path>, alias: &str) -> Result<ManagedVolume> {
+async fn open_managed_volume(
+    config: Option<&Path>,
+    alias: &str,
+    transfer_concurrency: NonZeroUsize,
+) -> Result<ManagedVolume> {
     let catalog = load_catalog(config)?;
     let definition = catalog
         .get(alias)
@@ -155,7 +176,7 @@ async fn open_managed_volume(config: Option<&Path>, alias: &str) -> Result<Manag
         bail!("Managed volume maintenance requires a Managed volume using format v1");
     }
 
-    let data = open_operator(&definition.storage)?;
+    let data = open_operator(&definition.storage, transfer_concurrency)?;
     ManagedDataFormat::read(&data).await?.validate_for_write()?;
     let metadata = open_metadata(data.clone(), definition.metadata.as_ref())?;
     let placement = if definition.metadata.is_some() {
@@ -177,7 +198,11 @@ async fn open_managed_volume(config: Option<&Path>, alias: &str) -> Result<Manag
     })
 }
 
-async fn create_volume(config: Option<&Path>, args: VolumeCreateArgs) -> Result<()> {
+async fn create_volume(
+    config: Option<&Path>,
+    args: VolumeCreateArgs,
+    transfer_concurrency: NonZeroUsize,
+) -> Result<()> {
     if args.model != VolumeModel::Managed {
         bail!(
             "named Direct volumes are not implemented; use `ofs MOUNT_PATH BACKEND_URL` for Direct Mount"
@@ -189,7 +214,6 @@ async fn create_volume(config: Option<&Path>, args: VolumeCreateArgs) -> Result<
         None => Catalog::load_from_env(),
     }
     .context("cannot open the volume catalog; set --config or OFS_CONFIG to a writable path")?;
-
     let configured = catalog.get(&args.alias).cloned();
     let file_layout = requested_file_layout(
         &args,
@@ -222,7 +246,7 @@ async fn create_volume(config: Option<&Path>, args: VolumeCreateArgs) -> Result<
     } else {
         MetadataPlacement::ColocatedObject
     };
-    let data = open_operator(&args.storage)?;
+    let data = open_operator(&args.storage, transfer_concurrency)?;
     ManagedDataFormat::v1()
         .activate(&data)
         .await
@@ -318,7 +342,11 @@ fn open_metadata(data: Operator, metadata: Option<&Url>) -> Result<Metadata> {
     }
 }
 
-async fn sync_volume(config: Option<&Path>, args: SyncArgs) -> Result<()> {
+async fn sync_volume(
+    config: Option<&Path>,
+    args: SyncArgs,
+    transfer_concurrency: NonZeroUsize,
+) -> Result<()> {
     let catalog = load_catalog(config)?;
     let definition = catalog
         .get(&args.alias)
@@ -328,7 +356,7 @@ async fn sync_volume(config: Option<&Path>, args: SyncArgs) -> Result<()> {
         bail!("sync requires a Managed volume using format v1");
     }
 
-    let data = open_operator(&definition.storage)?;
+    let data = open_operator(&definition.storage, transfer_concurrency)?;
     ManagedDataFormat::read(&data).await?.validate_for_write()?;
     let metadata = open_metadata(data.clone(), definition.metadata.as_ref())?;
     let placement = if definition.metadata.is_some() {
@@ -349,7 +377,8 @@ async fn sync_volume(config: Option<&Path>, args: SyncArgs) -> Result<()> {
         Metadata::Object(_) => SyncEngine::object(definition.volume_id, data)?,
         Metadata::D1(metadata) => SyncEngine::d1(definition.volume_id, data, metadata)?,
     }
-    .with_file_layout(definition.file_layout)?;
+    .with_file_layout(definition.file_layout)?
+    .with_transfer_concurrency(transfer_concurrency);
     let resolutions = args.resolve.into_iter().collect::<Vec<_>>();
     let result = engine
         .sync(&args.replica, &args.state, &resolutions)
@@ -372,7 +401,11 @@ async fn sync_volume(config: Option<&Path>, args: SyncArgs) -> Result<()> {
     Ok(())
 }
 
-fn status(config: Option<&Path>, args: StatusArgs) -> Result<()> {
+fn status(
+    config: Option<&Path>,
+    args: StatusArgs,
+    transfer_concurrency: NonZeroUsize,
+) -> Result<()> {
     let state = ReplicaState::load(&args.state)?
         .with_context(|| format!("replica state does not exist: {}", args.state.display()))?;
     let catalog = load_catalog(config)?;
@@ -382,7 +415,7 @@ fn status(config: Option<&Path>, args: StatusArgs) -> Result<()> {
     if definition.model != VolumeModel::Managed {
         bail!("replica state is not bound to a Managed volume");
     }
-    let storage = open_operator(&definition.storage)?;
+    let storage = open_operator(&definition.storage, transfer_concurrency)?;
     let storage_capabilities = storage.info().full_capability();
     let metadata_authority = if definition.metadata.is_some() {
         "d1"
@@ -519,7 +552,7 @@ fn display_path(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-fn open_operator(url: &Url) -> Result<Operator> {
+fn open_operator(url: &Url, transfer_concurrency: NonZeroUsize) -> Result<Operator> {
     let mut arguments = url.query_pairs().into_owned().collect::<Vec<_>>();
     if url.scheme() == "s3" {
         if let Some(bucket) = url.host_str()
@@ -532,9 +565,11 @@ fn open_operator(url: &Url) -> Result<Operator> {
             arguments.push(("root".into(), root.into()));
         }
     }
-    Operator::via_iter(url.scheme(), arguments).map_err(|_| {
-        anyhow!("cannot configure --storage; check its scheme, endpoint, bucket, and root")
-    })
+    Operator::via_iter(url.scheme(), arguments)
+        .map(|operator| operator.layer(ConcurrentLimitLayer::new(transfer_concurrency.get())))
+        .map_err(|_| {
+            anyhow!("cannot configure --storage; check its scheme, endpoint, bucket, and root")
+        })
 }
 
 fn d1_config(url: &Url) -> Result<D1Config> {
@@ -584,7 +619,11 @@ fn create_format_error(error: ManagedError) -> anyhow::Error {
 }
 
 #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
-async fn mount(mount_path: &Path, backend_url: &Url) -> Result<()> {
+async fn mount(
+    mount_path: &Path,
+    backend_url: &Url,
+    transfer_concurrency: NonZeroUsize,
+) -> Result<()> {
     use fuse3::MountOptions;
     use fuse3::path::Session;
     use std::env;
@@ -593,6 +632,7 @@ async fn mount(mount_path: &Path, backend_url: &Url) -> Result<()> {
         log::warn!("backend host will be ignored");
     }
     let backend = Operator::via_iter(backend_url.scheme(), backend_url.query_pairs().into_owned())
+        .map(|operator| operator.layer(ConcurrentLimitLayer::new(transfer_concurrency.get())))
         .map_err(|_| anyhow!("cannot configure BACKEND_URL; check its scheme and arguments"))?;
 
     let mut options = MountOptions::default();
@@ -629,6 +669,6 @@ async fn mount(mount_path: &Path, backend_url: &Url) -> Result<()> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "macos")))]
-async fn mount(_: &Path, _: &Url) -> Result<()> {
+async fn mount(_: &Path, _: &Url, _: NonZeroUsize) -> Result<()> {
     bail!("Direct Mount is supported on Linux, FreeBSD, and macOS")
 }

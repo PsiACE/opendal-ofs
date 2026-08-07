@@ -6,6 +6,7 @@
 // "License"); you may not use this file except in compliance
 // with the License.
 
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -18,6 +19,16 @@ pub(crate) struct Cli {
     /// Volume catalog. OFS_CONFIG provides the same setting.
     #[arg(long, env = "OFS_CONFIG", global = true, value_name = "PATH")]
     pub config: Option<PathBuf>,
+
+    /// Maximum number of concurrent storage transfer jobs.
+    #[arg(
+        long,
+        env = "OFS_TRANSFER_CONCURRENCY",
+        global = true,
+        default_value = "4",
+        value_name = "N"
+    )]
+    pub transfer_concurrency: NonZeroUsize,
 
     #[command(subcommand)]
     pub command: Option<Command>,

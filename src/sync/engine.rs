@@ -10,6 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -41,6 +42,7 @@ pub struct SyncResult {
 pub struct SyncEngine {
     volume_id: VolumeId,
     volume: ManagedVolume,
+    transfer_concurrency: NonZeroUsize,
 }
 
 impl SyncEngine {
@@ -48,6 +50,7 @@ impl SyncEngine {
         Ok(Self {
             volume_id,
             volume: ManagedVolume::object(volume_id, data_operator)?,
+            transfer_concurrency: NonZeroUsize::new(4).expect("default concurrency is non-zero"),
         })
     }
 
@@ -55,12 +58,18 @@ impl SyncEngine {
         Ok(Self {
             volume_id,
             volume: ManagedVolume::d1(volume_id, data_operator, metadata)?,
+            transfer_concurrency: NonZeroUsize::new(4).expect("default concurrency is non-zero"),
         })
     }
 
     pub fn with_file_layout(mut self, policy: FileLayoutPolicy) -> Result<Self> {
         self.volume = self.volume.with_file_layout(policy)?;
         Ok(self)
+    }
+
+    pub fn with_transfer_concurrency(mut self, concurrency: NonZeroUsize) -> Self {
+        self.transfer_concurrency = concurrency;
+        self
     }
 
     pub async fn sync(
@@ -111,8 +120,13 @@ impl SyncEngine {
                             apply_snapshot_attributes(&pending.staging, observed.snapshot())?;
                             install_tree(replica_path, &pending.staging)?;
                         } else {
-                            materialize_tree(&self.volume, replica_path, observed.snapshot())
-                                .await?;
+                            materialize_tree(
+                                &self.volume,
+                                replica_path,
+                                observed.snapshot(),
+                                self.transfer_concurrency,
+                            )
+                            .await?;
                         }
                     }
                     let progress = progress
@@ -252,7 +266,7 @@ impl SyncEngine {
                         Ok::<_, crate::managed::ManagedError>((path, digest))
                     }
                 })
-                .buffer_unordered(4)
+                .buffer_unordered(self.transfer_concurrency.get())
                 .collect::<Vec<_>>()
                 .await;
             for installed in installed {
@@ -342,18 +356,39 @@ impl SyncEngine {
         let requires_materialization = !merged_input.same_content(&frozen_input);
         let frozen = fs_operator(staged.root())?;
         let remote_files = remote.map(snapshot_files).transpose()?.unwrap_or_default();
-        let mut prepared = BTreeMap::new();
-        for (path, entry) in merged.entries() {
-            if entry.kind != LocalKind::File {
-                continue;
-            }
-            let version = match (known_digests.get(path), remote_files.get(path)) {
-                (Some(digest), Some(version)) if *digest == version.logical_digest => {
-                    version.clone()
+        let files = merged
+            .entries()
+            .iter()
+            .filter(|(_, entry)| entry.kind == LocalKind::File)
+            .map(|(path, _)| {
+                let reusable = match (known_digests.get(path), remote_files.get(path)) {
+                    (Some(digest), Some(version)) if *digest == version.logical_digest => {
+                        Some(version.clone())
+                    }
+                    _ => None,
+                };
+                (path.clone(), reusable)
+            })
+            .collect::<Vec<_>>();
+        let sealed = stream::iter(files)
+            .map(|(path, reusable)| {
+                let volume = self.volume.clone();
+                let frozen = frozen.clone();
+                async move {
+                    let version = match reusable {
+                        Some(version) => version,
+                        None => volume.seal_file(&frozen, &path).await?,
+                    };
+                    Ok::<_, anyhow::Error>((path, version))
                 }
-                _ => self.volume.seal_file(&frozen, path).await?,
-            };
-            prepared.insert(path.clone(), version);
+            })
+            .buffer_unordered(self.transfer_concurrency.get())
+            .collect::<Vec<_>>()
+            .await;
+        let mut prepared = BTreeMap::new();
+        for sealed in sealed {
+            let (path, version) = sealed?;
+            prepared.insert(path, version);
         }
 
         let mut publication_state = state.clone();
@@ -718,6 +753,7 @@ async fn materialize_tree(
     volume: &ManagedVolume,
     replica: &Path,
     snapshot: &NamespaceSnapshot,
+    transfer_concurrency: NonZeroUsize,
 ) -> Result<()> {
     let staging = fresh_sibling(replica, "materialize");
     fs::create_dir(&staging).context("create materialization tree")?;
@@ -727,6 +763,7 @@ async fn materialize_tree(
     let target = Operator::new(services::Fs::default().root(root))?.finish();
     let materializer = volume.materializer()?;
     let result = async {
+        let mut files = Vec::new();
         for (path, node) in snapshot_paths(snapshot)? {
             let record = &snapshot.nodes[&node];
             match record.kind {
@@ -738,11 +775,28 @@ async fn materialize_tree(
                     let version = snapshot
                         .file_versions
                         .get(&version)
-                        .context("file version is missing")?;
-                    materializer.materialize(version, &target, &path).await?;
-                    set_executable(&staging.join(&path), record.attributes.executable)?;
+                        .context("file version is missing")?
+                        .clone();
+                    files.push((path, version, record.attributes.executable));
                 }
             }
+        }
+        let installed = stream::iter(files)
+            .map(|(path, version, executable)| {
+                let materializer = materializer.clone();
+                let target = target.clone();
+                let staging = staging.clone();
+                async move {
+                    materializer.materialize(&version, &target, &path).await?;
+                    set_executable(&staging.join(&path), executable)?;
+                    Ok::<_, anyhow::Error>(())
+                }
+            })
+            .buffer_unordered(transfer_concurrency.get())
+            .collect::<Vec<_>>()
+            .await;
+        for installed in installed {
+            installed?;
         }
         Ok::<_, anyhow::Error>(())
     }
