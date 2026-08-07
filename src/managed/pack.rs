@@ -759,13 +759,6 @@ struct IndexCheckpoint {
     sections: Vec<StoredIndexSectionReference>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct IndexEntry {
-    content: ContentRef,
-    locations: Vec<PackLocation>,
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct StoredIndexSectionReference {
@@ -812,13 +805,9 @@ impl IndexCheckpoint {
         let records = locations
             .iter()
             .map(|(content, locations)| {
-                let entry = IndexEntry {
-                    content: *content,
-                    locations: locations.clone(),
-                };
                 Ok(SectionRecord {
                     key: content_key(*content),
-                    value: encode(&entry, "persist pack index")?,
+                    value: encode(locations, "persist pack index")?,
                 })
             })
             .collect::<Result<Vec<_>, ManagedError>>()?;
@@ -892,20 +881,20 @@ impl IndexCheckpoint {
             )
             .await?;
             for record in section::decode(&reference, [0; 16], &bytes, "open pack index")? {
-                let entry: IndexEntry = decode(&record.value, "open pack index")?;
-                if record.key != content_key(entry.content)
-                    || previous.is_some_and(|value| value >= entry.content)
-                    || entry.locations.is_empty()
-                    || !entry.locations.windows(2).all(|pair| pair[0] < pair[1])
-                    || entry
-                        .locations
+                let content = content_from_key(&record.key)
+                    .ok_or_else(|| corrupt("open pack index", "index section key is invalid"))?;
+                let locations: Vec<PackLocation> = decode(&record.value, "open pack index")?;
+                if previous.is_some_and(|value| value >= content)
+                    || locations.is_empty()
+                    || !locations.windows(2).all(|pair| pair[0] < pair[1])
+                    || locations
                         .iter()
-                        .any(|location| location.logical_length != entry.content.logical_length)
+                        .any(|location| location.logical_length != content.logical_length)
                 {
                     return Err(corrupt("open pack index", "checkpoint entries are invalid"));
                 }
-                previous = Some(entry.content);
-                output.insert(entry.content, entry.locations);
+                previous = Some(content);
+                output.insert(content, locations);
             }
             previous_section = Some(stored);
         }
@@ -1077,6 +1066,16 @@ fn content_key(content: ContentRef) -> Vec<u8> {
     key.extend_from_slice(&content.digest);
     key.extend_from_slice(&content.logical_length.to_be_bytes());
     key
+}
+
+fn content_from_key(key: &[u8]) -> Option<ContentRef> {
+    if key.len() != 40 {
+        return None;
+    }
+    Some(ContentRef {
+        digest: key[..32].try_into().expect("fixed digest prefix"),
+        logical_length: u64::from_be_bytes(key[32..].try_into().expect("fixed length suffix")),
+    })
 }
 
 fn revision_key(id: [u8; 32]) -> String {

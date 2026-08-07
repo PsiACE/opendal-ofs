@@ -666,7 +666,7 @@ impl ObjectNamespace {
                     Ok(SectionRecord {
                         key: node.id.as_bytes().to_vec(),
                         value: encode_section_value(
-                            &StoredNode::from(node),
+                            &StoredNodeSection::from(node),
                             "checkpoint Managed namespace",
                         )?,
                     })
@@ -681,10 +681,12 @@ impl ObjectNamespace {
                 .directories
                 .values()
                 .map(|directory| {
-                    let header = StoredDirectoryHeader::from(directory);
                     Ok(SectionRecord {
                         key: directory.node.as_bytes().to_vec(),
-                        value: encode_section_value(&header, "checkpoint Managed namespace")?,
+                        value: encode_section_value(
+                            &StoredDirectorySection::from(directory),
+                            "checkpoint Managed namespace",
+                        )?,
                     })
                 })
                 .collect::<Result<_, ManagedError>>()?,
@@ -698,14 +700,12 @@ impl ObjectNamespace {
                 .values()
                 .flat_map(|directory| {
                     directory.entries.iter().map(move |(name, entry)| {
-                        let stored = StoredNamedDirectoryEntry {
-                            directory: *directory.node.as_bytes(),
-                            name: name.clone(),
-                            entry: (*entry).into(),
-                        };
                         Ok(SectionRecord {
                             key: directory_entry_key(directory.node, name),
-                            value: encode_section_value(&stored, "checkpoint Managed namespace")?,
+                            value: encode_section_value(
+                                &StoredDirectoryEntry::from(*entry),
+                                "checkpoint Managed namespace",
+                            )?,
                         })
                     })
                 })
@@ -722,7 +722,7 @@ impl ObjectNamespace {
                     Ok(SectionRecord {
                         key: version.id.as_bytes().to_vec(),
                         value: encode_section_value(
-                            &StoredFileVersion::from(version),
+                            &StoredFileVersionSection::from(version),
                             "checkpoint Managed namespace",
                         )?,
                     })
@@ -803,29 +803,24 @@ impl ObjectNamespace {
             )? {
                 match reference.kind {
                     NODE_SECTION => {
-                        let stored: StoredNode =
+                        let stored: StoredNodeSection =
                             decode_section_value(&record.value, "read Managed namespace")?;
-                        if record.key != stored.id
-                            || nodes.contains_key(&NodeId::from_bytes(stored.id))
-                        {
+                        let id = section_node_id(&record.key, "node section key is invalid")?;
+                        if nodes.contains_key(&id) {
                             return Err(corrupt(
                                 "read Managed namespace",
                                 "node section key is invalid",
                             ));
                         }
-                        let node = stored.into_record()?;
+                        let node = stored.into_record(id);
                         nodes.insert(node.id, node);
                     }
                     DIRECTORY_SECTION => {
-                        let stored: StoredDirectoryHeader =
+                        let stored: StoredDirectorySection =
                             decode_section_value(&record.value, "read Managed namespace")?;
-                        if record.key != stored.node {
-                            return Err(corrupt(
-                                "read Managed namespace",
-                                "directory section key is invalid",
-                            ));
-                        }
-                        let directory = stored.into_record();
+                        let node =
+                            section_node_id(&record.key, "directory section key is invalid")?;
+                        let directory = stored.into_record(node);
                         if directories.insert(directory.node, directory).is_some() {
                             return Err(corrupt(
                                 "read Managed namespace",
@@ -834,31 +829,16 @@ impl ObjectNamespace {
                         }
                     }
                     DIRECTORY_ENTRY_SECTION => {
-                        let stored: StoredNamedDirectoryEntry =
+                        let stored: StoredDirectoryEntry =
                             decode_section_value(&record.value, "read Managed namespace")?;
-                        if record.key
-                            != directory_entry_key(
-                                NodeId::from_bytes(stored.directory),
-                                &stored.name,
-                            )
-                        {
-                            return Err(corrupt(
-                                "read Managed namespace",
-                                "directory entry section key is invalid",
-                            ));
-                        }
-                        entries.push(stored);
+                        let (directory, name) = section_directory_entry_key(&record.key)?;
+                        entries.push((directory, name, stored));
                     }
                     FILE_VERSION_SECTION => {
-                        let stored: StoredFileVersion =
+                        let stored: StoredFileVersionSection =
                             decode_section_value(&record.value, "read Managed namespace")?;
-                        if record.key != stored.id {
-                            return Err(corrupt(
-                                "read Managed namespace",
-                                "file version section key is invalid",
-                            ));
-                        }
-                        let version = stored.into_record()?;
+                        let id = section_file_version_id(&record.key)?;
+                        let version = stored.into_record(id);
                         if file_versions.insert(version.id, version).is_some() {
                             return Err(corrupt(
                                 "read Managed namespace",
@@ -870,20 +850,14 @@ impl ObjectNamespace {
                 }
             }
         }
-        for stored in entries {
-            let directory = directories
-                .get_mut(&NodeId::from_bytes(stored.directory))
-                .ok_or_else(|| {
-                    corrupt(
-                        "read Managed namespace",
-                        "entry references a missing directory",
-                    )
-                })?;
-            if directory
-                .entries
-                .insert(stored.name, stored.entry.into())
-                .is_some()
-            {
+        for (directory_id, name, stored) in entries {
+            let directory = directories.get_mut(&directory_id).ok_or_else(|| {
+                corrupt(
+                    "read Managed namespace",
+                    "entry references a missing directory",
+                )
+            })?;
+            if directory.entries.insert(name, stored.into()).is_some() {
                 return Err(corrupt(
                     "read Managed namespace",
                     "duplicate directory entry",
@@ -1048,6 +1022,40 @@ fn directory_entry_key(directory: NodeId, name: &str) -> Vec<u8> {
     key.extend_from_slice(directory.as_bytes());
     key.extend_from_slice(name.as_bytes());
     key
+}
+
+fn section_node_id(key: &[u8], message: &'static str) -> Result<NodeId, ManagedError> {
+    let bytes = key
+        .try_into()
+        .map_err(|_| corrupt("read Managed namespace", message))?;
+    Ok(NodeId::from_bytes(bytes))
+}
+
+fn section_directory_entry_key(key: &[u8]) -> Result<(NodeId, String), ManagedError> {
+    let (directory, name) = key.split_at_checked(16).ok_or_else(|| {
+        corrupt(
+            "read Managed namespace",
+            "directory entry section key is invalid",
+        )
+    })?;
+    let directory = NodeId::from_bytes(directory.try_into().expect("fixed key prefix"));
+    let name = String::from_utf8(name.to_vec()).map_err(|_| {
+        corrupt(
+            "read Managed namespace",
+            "directory entry section key is invalid",
+        )
+    })?;
+    Ok((directory, name))
+}
+
+fn section_file_version_id(key: &[u8]) -> Result<FileVersionId, ManagedError> {
+    let bytes = key.try_into().map_err(|_| {
+        corrupt(
+            "read Managed namespace",
+            "file version section key is invalid",
+        )
+    })?;
+    Ok(FileVersionId::from_bytes(bytes))
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -1722,6 +1730,39 @@ impl StoredNode {
     }
 }
 
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StoredNodeSection {
+    generation: u64,
+    kind: StoredNodeKind,
+    attributes: StoredNodeAttributes,
+    file_version: Option<[u8; 32]>,
+}
+
+impl From<&NodeRecord> for StoredNodeSection {
+    fn from(node: &NodeRecord) -> Self {
+        Self {
+            generation: managed_generation_number(&node.generation)
+                .expect("validated Managed node generation"),
+            kind: node.kind.into(),
+            attributes: node.attributes.into(),
+            file_version: node.file_version.map(|version| *version.as_bytes()),
+        }
+    }
+}
+
+impl StoredNodeSection {
+    fn into_record(self, id: NodeId) -> NodeRecord {
+        NodeRecord {
+            id,
+            generation: managed_generation(self.generation),
+            kind: self.kind.into(),
+            attributes: self.attributes.into(),
+            file_version: self.file_version.map(FileVersionId::from_bytes),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct StoredDirectoryHeader {
@@ -1743,6 +1784,31 @@ impl StoredDirectoryHeader {
     fn into_record(self) -> DirectoryRecord {
         DirectoryRecord {
             node: NodeId::from_bytes(self.node),
+            generation: managed_generation(self.generation),
+            entries: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StoredDirectorySection {
+    generation: u64,
+}
+
+impl From<&DirectoryRecord> for StoredDirectorySection {
+    fn from(directory: &DirectoryRecord) -> Self {
+        Self {
+            generation: managed_generation_number(&directory.generation)
+                .expect("validated Managed directory generation"),
+        }
+    }
+}
+
+impl StoredDirectorySection {
+    fn into_record(self, node: NodeId) -> DirectoryRecord {
+        DirectoryRecord {
+            node,
             generation: managed_generation(self.generation),
             entries: BTreeMap::new(),
         }
@@ -1864,6 +1930,35 @@ impl StoredFileVersion {
             logical_digest: self.logical_digest,
             layout: self.layout,
         })
+    }
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StoredFileVersionSection {
+    logical_size: u64,
+    logical_digest: [u8; 32],
+    layout: FileVersionLayout,
+}
+
+impl From<&FileVersionRecord> for StoredFileVersionSection {
+    fn from(version: &FileVersionRecord) -> Self {
+        Self {
+            logical_size: version.logical_size,
+            logical_digest: version.logical_digest,
+            layout: version.layout.clone(),
+        }
+    }
+}
+
+impl StoredFileVersionSection {
+    fn into_record(self, id: FileVersionId) -> FileVersionRecord {
+        FileVersionRecord {
+            id,
+            logical_size: self.logical_size,
+            logical_digest: self.logical_digest,
+            layout: self.layout,
+        }
     }
 }
 
