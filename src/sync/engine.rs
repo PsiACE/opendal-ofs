@@ -154,7 +154,24 @@ impl SyncEngine {
             return Ok(result(&state, false, false));
         }
         let staging_path = fresh_sibling(state_path, "publish");
-        let staged = StagedTree::prepare(&local, &staging_path).await?;
+        let known_digests = local
+            .entries()
+            .iter()
+            .filter_map(|(path, entry)| {
+                let base = state.base.get(path)?;
+                if entry.kind == LocalKind::File
+                    && base.local_identity == entry.native_identity
+                    && base.local_size == Some(entry.size)
+                    && base.local_modified.as_deref() == Some(entry.modified.as_str())
+                    && base.local_executable == Some(entry.executable)
+                {
+                    base.digest.map(|digest| (path.clone(), digest))
+                } else {
+                    None
+                }
+            })
+            .collect::<BTreeMap<_, _>>();
+        let staged = StagedTree::prepare_known(&local, &staging_path, &known_digests).await?;
         let frozen_input = FrozenTree::from_parts(&local, &staged);
         let mut known_digests = staged
             .files()

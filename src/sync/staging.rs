@@ -39,6 +39,14 @@ pub struct StagedTree {
 
 impl StagedTree {
     pub async fn prepare(tree: &LocalTree, root: impl AsRef<Path>) -> Result<Self> {
+        Self::prepare_known(tree, root, &BTreeMap::new()).await
+    }
+
+    pub async fn prepare_known(
+        tree: &LocalTree,
+        root: impl AsRef<Path>,
+        known_digests: &BTreeMap<String, [u8; 32]>,
+    ) -> Result<Self> {
         let root = root.as_ref();
         prepare_root(tree.root(), root).await?;
         let source = tree.operator()?;
@@ -69,6 +77,7 @@ impl StagedTree {
                     let staging_root = root.to_owned();
                     let path = path.clone();
                     let expected = expected.clone();
+                    let known_digest = known_digests.get(&path).copied();
                     async move {
                         let file = stage_file(
                             &source,
@@ -77,6 +86,7 @@ impl StagedTree {
                             &staging_root,
                             &path,
                             &expected,
+                            known_digest,
                         )
                         .await?;
                         Ok::<_, anyhow::Error>((path, file))
@@ -118,6 +128,7 @@ async fn stage_file(
     staging_root: &Path,
     path: &str,
     expected: &LocalEntry,
+    known_digest: Option<[u8; 32]>,
 ) -> Result<StagedFile> {
     let before = source
         .stat(path)
@@ -127,37 +138,48 @@ async fn stage_file(
     require_same_executable(source_root, path, expected.executable)?;
     require_same_identity(source_root, path, LocalKind::File, expected.native_identity)?;
 
-    let reader = source
-        .reader(path)
-        .await
-        .with_context(|| format!("open source file {path:?}"))?;
-    let mut writer = staged
-        .writer(path)
-        .await
-        .with_context(|| format!("open staging file {path:?}"))?;
-    let mut digest = Sha256::new();
-    let mut offset = 0;
-    while offset < expected.size {
-        let end = expected.size.min(offset + COPY_CHUNK);
-        let buffer = reader
-            .read(offset..end)
+    let digest = if let Some(digest) = known_digest {
+        let copied = tokio::fs::copy(source_root.join(path), staging_root.join(path))
             .await
-            .with_context(|| format!("read stable source file {path:?}"))?;
-        let bytes = buffer.to_bytes();
-        if bytes.len() as u64 != end - offset {
-            bail!("source file {path:?} returned a short read; retry sync");
+            .with_context(|| format!("copy unchanged source file {path:?}"))?;
+        if copied != expected.size {
+            bail!("source file {path:?} returned a short copy; retry sync");
         }
-        digest.update(&bytes);
-        writer
-            .write(bytes)
+        digest
+    } else {
+        let reader = source
+            .reader(path)
             .await
-            .with_context(|| format!("write staging file {path:?}"))?;
-        offset = end;
-    }
-    writer
-        .close()
-        .await
-        .with_context(|| format!("finish staging file {path:?}"))?;
+            .with_context(|| format!("open source file {path:?}"))?;
+        let mut writer = staged
+            .writer(path)
+            .await
+            .with_context(|| format!("open staging file {path:?}"))?;
+        let mut digest = Sha256::new();
+        let mut offset = 0;
+        while offset < expected.size {
+            let end = expected.size.min(offset + COPY_CHUNK);
+            let buffer = reader
+                .read(offset..end)
+                .await
+                .with_context(|| format!("read stable source file {path:?}"))?;
+            let bytes = buffer.to_bytes();
+            if bytes.len() as u64 != end - offset {
+                bail!("source file {path:?} returned a short read; retry sync");
+            }
+            digest.update(&bytes);
+            writer
+                .write(bytes)
+                .await
+                .with_context(|| format!("write staging file {path:?}"))?;
+            offset = end;
+        }
+        writer
+            .close()
+            .await
+            .with_context(|| format!("finish staging file {path:?}"))?;
+        digest.finalize().into()
+    };
 
     let after = source
         .stat(path)
@@ -178,7 +200,7 @@ async fn stage_file(
     Ok(StagedFile {
         size: expected.size,
         source_modified: expected.modified.clone(),
-        digest: digest.finalize().into(),
+        digest,
     })
 }
 
