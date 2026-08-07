@@ -88,6 +88,11 @@ impl D1Config {
 /// Managed metadata stored through the D1 Query API.
 #[derive(Clone)]
 pub struct D1Metadata {
+    session: D1Session,
+}
+
+#[derive(Clone)]
+pub(crate) struct D1Session {
     client: reqwest::Client,
     config: D1Config,
 }
@@ -95,9 +100,15 @@ pub struct D1Metadata {
 impl D1Metadata {
     pub fn new(config: D1Config) -> Self {
         Self {
-            client: reqwest::Client::new(),
-            config,
+            session: D1Session {
+                client: reqwest::Client::new(),
+                config,
+            },
         }
+    }
+
+    pub(crate) fn session(&self) -> D1Session {
+        self.session.clone()
     }
 
     pub async fn create_format(
@@ -112,7 +123,9 @@ impl D1Metadata {
                 "format is not UTF-8 JSON",
             )
         })?;
-        self.query(vec![
+        self.session
+            .query(
+                vec![
             statement(
                 format!(
                     "CREATE TABLE IF NOT EXISTS {FORMAT_TABLE} (store_key TEXT PRIMARY KEY, record_json TEXT NOT NULL)"
@@ -123,19 +136,25 @@ impl D1Metadata {
                 format!(
                     "INSERT OR IGNORE INTO {FORMAT_TABLE} (store_key, record_json) VALUES (?, ?)"
                 ),
-                vec![self.config.store_key.clone().into(), record.into()],
+                vec![self.session.store_key().to_owned().into(), record.into()],
             ),
-        ])
-        .await?;
+                ],
+                "create Managed format",
+            )
+            .await?;
         require_same_format(desired, self.read_format().await?)
     }
 
     pub async fn read_format(&self) -> Result<ManagedFormat, ManagedError> {
         let results = self
-            .query(vec![statement(
-                format!("SELECT record_json FROM {FORMAT_TABLE} WHERE store_key = ?"),
-                vec![self.config.store_key.clone().into()],
-            )])
+            .session
+            .query(
+                vec![statement(
+                    format!("SELECT record_json FROM {FORMAT_TABLE} WHERE store_key = ?"),
+                    vec![self.session.store_key().to_owned().into()],
+                )],
+                "read Managed format",
+            )
             .await?;
         let rows = &results
             .first()
@@ -154,8 +173,18 @@ impl D1Metadata {
             .ok_or_else(|| corrupt("read Managed format", "D1 format row is invalid"))?;
         ManagedFormat::decode(record.as_bytes())
     }
+}
 
-    async fn query(&self, statements: Vec<D1Statement>) -> Result<Vec<D1Result>, ManagedError> {
+impl D1Session {
+    pub(crate) fn store_key(&self) -> &str {
+        &self.config.store_key
+    }
+
+    pub(crate) async fn query(
+        &self,
+        statements: Vec<D1Statement>,
+        action: &'static str,
+    ) -> Result<Vec<D1Result>, ManagedError> {
         let endpoint = format!(
             "{}/accounts/{}/d1/database/{}/query",
             self.config.api_base.trim_end_matches('/'),
@@ -169,21 +198,21 @@ impl D1Metadata {
             .json(&D1Request { batch: statements })
             .send()
             .await
-            .map_err(|_| unavailable("query D1 metadata"))?;
+            .map_err(|_| unavailable(action))?;
         if !response.status().is_success() {
-            return Err(unavailable("query D1 metadata"));
+            return Err(unavailable(action));
         }
         let reply: D1Reply = response
             .json()
             .await
-            .map_err(|_| corrupt("query D1 metadata", "D1 returned an invalid response"))?;
+            .map_err(|_| corrupt(action, "D1 returned an invalid response"))?;
         if !reply.success
             || reply
                 .result
                 .iter()
                 .any(|result| !result.success || result.meta.served_by_primary != Some(true))
         {
-            return Err(unavailable("query D1 metadata"));
+            return Err(unavailable(action));
         }
         Ok(reply.result)
     }
@@ -207,12 +236,12 @@ struct D1Request {
 }
 
 #[derive(Serialize)]
-struct D1Statement {
+pub(crate) struct D1Statement {
     sql: String,
     params: Vec<Value>,
 }
 
-fn statement(sql: String, params: Vec<Value>) -> D1Statement {
+pub(crate) fn statement(sql: String, params: Vec<Value>) -> D1Statement {
     D1Statement { sql, params }
 }
 
@@ -224,10 +253,10 @@ struct D1Reply {
 }
 
 #[derive(Deserialize)]
-struct D1Result {
+pub(crate) struct D1Result {
     success: bool,
     #[serde(default)]
-    results: Vec<Value>,
+    pub(crate) results: Vec<Value>,
     #[serde(default)]
     meta: D1Meta,
 }

@@ -20,27 +20,85 @@
 use opendal::Operator;
 
 use super::namespace::{
-    FileVersionRecord, NamespaceObservation, NamespacePublication, ObjectNamespace,
+    D1Namespace, D1NamespaceObservation, FileVersionRecord, NamespaceObservation,
+    NamespacePublication, NamespaceSnapshot, ObjectNamespace,
 };
-use super::{ManagedData, ManagedError};
+use super::{D1Metadata, ManagedData, ManagedError, ManagedErrorKind};
 use crate::filesystem::{CommitOutcome, OperationId, VolumeId};
 
 #[derive(Clone)]
 pub struct ManagedVolume {
-    namespace: ObjectNamespace,
+    namespace: NamespaceAuthority,
     data: ManagedData,
+}
+
+#[derive(Clone)]
+enum NamespaceAuthority {
+    Object(ObjectNamespace),
+    D1(D1Namespace),
+}
+
+#[derive(Clone, Debug)]
+pub struct ManagedObservation {
+    authority: AuthorityObservation,
+}
+
+#[derive(Clone, Debug)]
+enum AuthorityObservation {
+    Object(NamespaceObservation),
+    D1(D1NamespaceObservation),
+}
+
+impl ManagedObservation {
+    pub fn snapshot(&self) -> &NamespaceSnapshot {
+        match &self.authority {
+            AuthorityObservation::Object(observed) => &observed.snapshot,
+            AuthorityObservation::D1(observed) => &observed.snapshot,
+        }
+    }
 }
 
 impl ManagedVolume {
     pub fn object(volume_id: VolumeId, data_operator: Operator) -> Result<Self, ManagedError> {
         Ok(Self {
-            namespace: ObjectNamespace::new(volume_id, data_operator.clone())?,
+            namespace: NamespaceAuthority::Object(ObjectNamespace::new(
+                volume_id,
+                data_operator.clone(),
+            )?),
             data: ManagedData::new(data_operator)?,
         })
     }
 
-    pub async fn observe(&self) -> Result<Option<NamespaceObservation>, ManagedError> {
-        self.namespace.observe().await
+    pub fn d1(
+        volume_id: VolumeId,
+        data_operator: Operator,
+        metadata: D1Metadata,
+    ) -> Result<Self, ManagedError> {
+        Ok(Self {
+            namespace: NamespaceAuthority::D1(D1Namespace::new(volume_id, metadata.session())),
+            data: ManagedData::new(data_operator)?,
+        })
+    }
+
+    pub async fn observe(&self) -> Result<Option<ManagedObservation>, ManagedError> {
+        match &self.namespace {
+            NamespaceAuthority::Object(namespace) => {
+                Ok(namespace
+                    .observe()
+                    .await?
+                    .map(|observed| ManagedObservation {
+                        authority: AuthorityObservation::Object(observed),
+                    }))
+            }
+            NamespaceAuthority::D1(namespace) => {
+                Ok(namespace
+                    .observe()
+                    .await?
+                    .map(|observed| ManagedObservation {
+                        authority: AuthorityObservation::D1(observed),
+                    }))
+            }
+        }
     }
 
     pub async fn seal_whole_file(
@@ -53,14 +111,33 @@ impl ManagedVolume {
 
     pub async fn publish(
         &self,
-        observed: Option<&NamespaceObservation>,
+        observed: Option<&ManagedObservation>,
         publication: &NamespacePublication,
     ) -> Result<CommitOutcome, ManagedError> {
-        self.namespace.publish(observed, publication).await
+        match (&self.namespace, observed.map(|value| &value.authority)) {
+            (NamespaceAuthority::Object(namespace), Some(AuthorityObservation::Object(base))) => {
+                namespace.publish(Some(base), publication).await
+            }
+            (NamespaceAuthority::D1(namespace), Some(AuthorityObservation::D1(base))) => {
+                namespace.publish(Some(base), publication).await
+            }
+            (NamespaceAuthority::Object(namespace), None) => {
+                namespace.publish(None, publication).await
+            }
+            (NamespaceAuthority::D1(namespace), None) => namespace.publish(None, publication).await,
+            _ => Err(ManagedError::new(
+                ManagedErrorKind::Invalid,
+                "publish Managed namespace",
+                "observation belongs to another metadata authority",
+            )),
+        }
     }
 
     pub async fn resolve(&self, operation: OperationId) -> Result<CommitOutcome, ManagedError> {
-        self.namespace.resolve(operation).await
+        match &self.namespace {
+            NamespaceAuthority::Object(namespace) => namespace.resolve(operation).await,
+            NamespaceAuthority::D1(namespace) => namespace.resolve(operation).await,
+        }
     }
 
     pub async fn materialize(

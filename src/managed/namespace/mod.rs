@@ -17,10 +17,12 @@
 
 //! Managed namespace records and authoritative snapshot publication.
 
+mod d1;
 mod object;
 mod records;
 mod validation;
 
+pub(crate) use d1::{D1Namespace, D1NamespaceObservation};
 pub use object::{NamespaceObservation, ObjectNamespace};
 pub use records::{
     ContentRef, DirectoryEntry, DirectoryPrecondition, DirectoryRecord, FileVersionRecord,

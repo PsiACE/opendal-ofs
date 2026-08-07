@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod d1;
+pub(crate) mod d1;
 mod object;
 
 pub use d1::{D1Config, D1Metadata};
