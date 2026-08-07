@@ -12,6 +12,7 @@
 import argparse
 import http.client
 import json
+import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -48,6 +49,10 @@ class RequestLog:
 def handler(upstream_host: str, upstream_port: int, request_log: RequestLog):
     class Proxy(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+
+        def setup(self) -> None:
+            super().setup()
+            self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
         def read_body(self) -> bytes:
             if self.headers.get("Transfer-Encoding", "").lower() != "chunked":
@@ -91,6 +96,7 @@ def handler(upstream_host: str, upstream_port: int, request_log: RequestLog):
                 self.end_headers()
                 if self.command != "HEAD":
                     self.wfile.write(response_body)
+                    self.wfile.flush()
             except BrokenPipeError:
                 pass
             except (OSError, http.client.HTTPException) as error:
