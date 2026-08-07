@@ -10,14 +10,17 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use futures::{StreamExt as _, TryStreamExt as _, stream};
+use opendal::Operator;
 use sha2::{Digest as _, Sha256};
 
 use super::local::{
-    LocalKind, LocalTree, NativeIdentity, executable_at, fs_operator, native_identity_at,
-    set_executable,
+    LocalEntry, LocalKind, LocalTree, NativeIdentity, executable_at, fs_operator,
+    native_identity_at, set_executable,
 };
 
 const COPY_CHUNK: u64 = 1024 * 1024;
+const COPY_CONCURRENCY: usize = 8;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StagedFile {
@@ -55,76 +58,36 @@ impl StagedTree {
             .map(|(path, entry)| (path.clone(), entry.native_identity))
             .collect();
 
-        let mut files = BTreeMap::new();
-        for (path, expected) in tree.entries() {
-            if expected.kind != LocalKind::File {
-                continue;
-            }
-            let before = source
-                .stat(path)
-                .await
-                .with_context(|| format!("inspect source file {path:?} before staging"))?;
-            require_same(path, expected.size, &expected.modified, &before)?;
-            require_same_executable(tree.root(), path, expected.executable)?;
-            require_same_identity(tree.root(), path, LocalKind::File, expected.native_identity)?;
-
-            let reader = source
-                .reader(path)
-                .await
-                .with_context(|| format!("open source file {path:?}"))?;
-            let mut writer = staged
-                .writer(path)
-                .await
-                .with_context(|| format!("open staging file {path:?}"))?;
-            let mut digest = Sha256::new();
-            let mut offset = 0;
-            while offset < expected.size {
-                let end = expected.size.min(offset + COPY_CHUNK);
-                let buffer = reader
-                    .read(offset..end)
-                    .await
-                    .with_context(|| format!("read stable source file {path:?}"))?;
-                let bytes = buffer.to_bytes();
-                if bytes.len() as u64 != end - offset {
-                    bail!("source file {path:?} returned a short read; retry sync");
-                }
-                digest.update(&bytes);
-                writer
-                    .write(bytes)
-                    .await
-                    .with_context(|| format!("write staging file {path:?}"))?;
-                offset = end;
-            }
-            writer
-                .close()
-                .await
-                .with_context(|| format!("finish staging file {path:?}"))?;
-
-            let after = source
-                .stat(path)
-                .await
-                .with_context(|| format!("inspect source file {path:?} after staging"))?;
-            require_same(path, expected.size, &expected.modified, &after)?;
-            require_same_executable(tree.root(), path, expected.executable)?;
-            require_same_identity(tree.root(), path, LocalKind::File, expected.native_identity)?;
-            set_executable(&root.join(path), expected.executable)
-                .with_context(|| format!("preserve executable bit for {path:?}"))?;
-            let staged_metadata = staged
-                .stat(path)
-                .await
-                .with_context(|| format!("verify staging file {path:?}"))?;
-            if staged_metadata.content_length() != expected.size {
-                bail!("staging file {path:?} is incomplete; retry sync");
-            }
-            files.insert(
-                path.clone(),
-                StagedFile {
-                    size: expected.size,
-                    source_modified: expected.modified.clone(),
-                    digest: digest.finalize().into(),
-                },
-            );
-        }
+        let files = stream::iter(
+            tree.entries()
+                .iter()
+                .filter(|(_, expected)| expected.kind == LocalKind::File)
+                .map(|(path, expected)| {
+                    let source = source.clone();
+                    let staged = staged.clone();
+                    let source_root = tree.root().to_owned();
+                    let staging_root = root.to_owned();
+                    let path = path.clone();
+                    let expected = expected.clone();
+                    async move {
+                        let file = stage_file(
+                            &source,
+                            &staged,
+                            &source_root,
+                            &staging_root,
+                            &path,
+                            &expected,
+                        )
+                        .await?;
+                        Ok::<_, anyhow::Error>((path, file))
+                    }
+                }),
+        )
+        .buffer_unordered(COPY_CONCURRENCY)
+        .try_collect::<Vec<_>>()
+        .await?
+        .into_iter()
+        .collect();
         for (path, entry) in tree.entries() {
             require_same_identity(tree.root(), path, entry.kind, entry.native_identity)?;
         }
@@ -146,6 +109,77 @@ impl StagedTree {
     pub(crate) fn source_identities(&self) -> &BTreeMap<String, Option<NativeIdentity>> {
         &self.source_identities
     }
+}
+
+async fn stage_file(
+    source: &Operator,
+    staged: &Operator,
+    source_root: &Path,
+    staging_root: &Path,
+    path: &str,
+    expected: &LocalEntry,
+) -> Result<StagedFile> {
+    let before = source
+        .stat(path)
+        .await
+        .with_context(|| format!("inspect source file {path:?} before staging"))?;
+    require_same(path, expected.size, &expected.modified, &before)?;
+    require_same_executable(source_root, path, expected.executable)?;
+    require_same_identity(source_root, path, LocalKind::File, expected.native_identity)?;
+
+    let reader = source
+        .reader(path)
+        .await
+        .with_context(|| format!("open source file {path:?}"))?;
+    let mut writer = staged
+        .writer(path)
+        .await
+        .with_context(|| format!("open staging file {path:?}"))?;
+    let mut digest = Sha256::new();
+    let mut offset = 0;
+    while offset < expected.size {
+        let end = expected.size.min(offset + COPY_CHUNK);
+        let buffer = reader
+            .read(offset..end)
+            .await
+            .with_context(|| format!("read stable source file {path:?}"))?;
+        let bytes = buffer.to_bytes();
+        if bytes.len() as u64 != end - offset {
+            bail!("source file {path:?} returned a short read; retry sync");
+        }
+        digest.update(&bytes);
+        writer
+            .write(bytes)
+            .await
+            .with_context(|| format!("write staging file {path:?}"))?;
+        offset = end;
+    }
+    writer
+        .close()
+        .await
+        .with_context(|| format!("finish staging file {path:?}"))?;
+
+    let after = source
+        .stat(path)
+        .await
+        .with_context(|| format!("inspect source file {path:?} after staging"))?;
+    require_same(path, expected.size, &expected.modified, &after)?;
+    require_same_executable(source_root, path, expected.executable)?;
+    require_same_identity(source_root, path, LocalKind::File, expected.native_identity)?;
+    set_executable(&staging_root.join(path), expected.executable)
+        .with_context(|| format!("preserve executable bit for {path:?}"))?;
+    let staged_metadata = staged
+        .stat(path)
+        .await
+        .with_context(|| format!("verify staging file {path:?}"))?;
+    if staged_metadata.content_length() != expected.size {
+        bail!("staging file {path:?} is incomplete; retry sync");
+    }
+    Ok(StagedFile {
+        size: expected.size,
+        source_modified: expected.modified.clone(),
+        digest: digest.finalize().into(),
+    })
 }
 
 fn require_same_identity(

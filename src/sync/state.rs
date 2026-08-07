@@ -30,6 +30,9 @@ pub struct BaseEntry {
     pub directory_generation: Option<Generation>,
     pub digest: Option<[u8; 32]>,
     pub local_identity: Option<NativeIdentity>,
+    pub local_size: Option<u64>,
+    pub local_modified: Option<String>,
+    pub local_executable: Option<bool>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -140,6 +143,12 @@ struct BaseWire {
     digest: Option<[u8; 32]>,
     #[serde(default)]
     local_identity: Option<NativeIdentityWire>,
+    #[serde(default)]
+    local_size: Option<u64>,
+    #[serde(default)]
+    local_modified: Option<String>,
+    #[serde(default)]
+    local_executable: Option<bool>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -194,6 +203,9 @@ impl From<&ReplicaState> for StateWire {
                                     inode: identity.inode,
                                 }
                             }),
+                            local_size: entry.local_size,
+                            local_modified: entry.local_modified.clone(),
+                            local_executable: entry.local_executable,
                         },
                     )
                 })
@@ -241,6 +253,9 @@ impl TryFrom<StateWire> for ReplicaState {
                             device: identity.device,
                             inode: identity.inode,
                         }),
+                        local_size: entry.local_size,
+                        local_modified: entry.local_modified,
+                        local_executable: entry.local_executable,
                     },
                 ))
             })

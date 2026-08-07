@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use opendal::{Operator, services};
 
-use super::local::{NativeIdentity, fs_operator, native_identity_at, set_executable};
+use super::local::{NativeIdentity, fs_operator, set_executable};
 use super::{
     BaseEntry, ConflictRecord, LocalKind, LocalTree, PendingIntent, ReconcileAction, ReplicaState,
     StagedTree, build_publication, reconcile,
@@ -100,7 +100,7 @@ impl SyncEngine {
                                 .await?;
                         }
                     }
-                    state = state_from_snapshot(observed.snapshot(), replica_path)?;
+                    state = state_from_snapshot(observed.snapshot(), replica_path).await?;
                     state.install(state_path)?;
                     return Ok(result(&state, true, materialized));
                 }
@@ -123,6 +123,15 @@ impl SyncEngine {
 
         let source = prior_staging.as_deref().unwrap_or(replica_path);
         let local = LocalTree::scan(source).await?;
+        if prior_staging.is_none()
+            && resolve_paths.is_empty()
+            && state.conflicts.is_empty()
+            && remote.is_some_and(|snapshot| {
+                snapshot.cursor == state.common && local_matches_state(&local, &state)
+            })
+        {
+            return Ok(result(&state, false, false));
+        }
         let staging_path = fresh_sibling(state_path, "publish");
         let staged = StagedTree::prepare(&local, &staging_path).await?;
         let frozen_input = FrozenTree::from_parts(&local, &staged);
@@ -222,7 +231,7 @@ impl SyncEngine {
                         install_remote = false;
                     }
                 }
-                state = state_from_snapshot(remote, replica_path)?;
+                state = state_from_snapshot(remote, replica_path).await?;
             } else {
                 state.pending = None;
             }
@@ -281,7 +290,7 @@ impl SyncEngine {
                 (Some(digest), Some(version)) if *digest == version.logical_digest => {
                     version.clone()
                 }
-                _ => self.volume.seal_whole_file(&frozen, path).await?,
+                _ => self.volume.seal_file(&frozen, path).await?,
             };
             prepared.insert(path.clone(), version);
         }
@@ -304,7 +313,7 @@ impl SyncEngine {
                     apply_snapshot_attributes(staged.root(), &publication.target)?;
                     install_tree(replica_path, &staging_path)?;
                 }
-                state = state_from_snapshot(&publication.target, replica_path)?;
+                state = state_from_snapshot(&publication.target, replica_path).await?;
                 state.install(state_path)?;
                 if let Some(old) = prior_staging {
                     remove_tree(&old)?;
@@ -554,7 +563,8 @@ async fn delete_absent_directories(
     Ok(())
 }
 
-fn state_from_snapshot(snapshot: &NamespaceSnapshot, replica: &Path) -> Result<ReplicaState> {
+async fn state_from_snapshot(snapshot: &NamespaceSnapshot, replica: &Path) -> Result<ReplicaState> {
+    let local = LocalTree::scan(replica).await?;
     let mut state = ReplicaState::empty(snapshot.volume_id);
     state.common = snapshot.cursor;
     for (path, node) in snapshot_paths(snapshot)? {
@@ -566,11 +576,10 @@ fn state_from_snapshot(snapshot: &NamespaceSnapshot, replica: &Path) -> Result<R
             NodeKind::Directory => LocalKind::Directory,
             NodeKind::RegularFile => LocalKind::File,
         };
-        let local_identity = if replica.join(&path).exists() {
-            native_identity_at(replica, &path, local_kind)?
-        } else {
-            None
-        };
+        let local_entry = local.entries().get(&path);
+        if local_entry.is_some_and(|entry| entry.kind != local_kind) {
+            bail!("installed local path {path:?} has the wrong kind");
+        }
         let directory_generation = snapshot
             .directories
             .get(&node)
@@ -582,11 +591,27 @@ fn state_from_snapshot(snapshot: &NamespaceSnapshot, replica: &Path) -> Result<R
                 generation: record.generation.clone(),
                 directory_generation,
                 digest,
-                local_identity,
+                local_identity: local_entry.and_then(|entry| entry.native_identity),
+                local_size: local_entry.map(|entry| entry.size),
+                local_modified: local_entry.map(|entry| entry.modified.clone()),
+                local_executable: local_entry.map(|entry| entry.executable),
             },
         );
     }
     Ok(state)
+}
+
+fn local_matches_state(local: &LocalTree, state: &ReplicaState) -> bool {
+    local.entries().len() == state.base.len()
+        && local.entries().iter().all(|(path, entry)| {
+            state.base.get(path).is_some_and(|base| {
+                base.local_identity == entry.native_identity
+                    && base.local_size == Some(entry.size)
+                    && base.local_modified.as_deref() == Some(entry.modified.as_str())
+                    && base.local_executable == Some(entry.executable)
+                    && base.digest.is_some() == (entry.kind == LocalKind::File)
+            })
+        })
 }
 
 fn apply_snapshot_attributes(root: &Path, snapshot: &NamespaceSnapshot) -> Result<()> {
