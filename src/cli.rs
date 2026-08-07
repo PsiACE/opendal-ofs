@@ -38,6 +38,10 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: VolumeCommand,
     },
+    /// Reconcile and publish a local Sync replica.
+    Sync(SyncArgs),
+    /// Report the durable state of a local replica.
+    Status(StatusArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -61,6 +65,37 @@ pub(crate) struct VolumeCreateArgs {
     /// Credential-free D1 metadata URL. Set its token with OFS_D1_TOKEN.
     #[arg(long, env = "OFS_METADATA_URL", value_name = "URL")]
     pub metadata: Option<Url>,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct SyncArgs {
+    /// Named Managed volume from the local catalog.
+    pub alias: String,
+
+    /// Local directory used as the Sync replica.
+    pub replica: PathBuf,
+
+    /// Durable replica state stored outside the replica directory.
+    #[arg(long, value_name = "PATH")]
+    pub state: PathBuf,
+
+    /// Resolve this retained conflict with the current local candidate.
+    #[arg(long, value_name = "RELATIVE_PATH")]
+    pub resolve: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct StatusArgs {
+    /// Local directory used as the Sync replica.
+    pub replica: PathBuf,
+
+    /// Durable replica state stored outside the replica directory.
+    #[arg(long, value_name = "PATH")]
+    pub state: PathBuf,
+
+    /// Emit a machine-readable status object.
+    #[arg(long)]
+    pub json: bool,
 }
 
 fn parse_volume_model(value: &str) -> Result<VolumeModel, String> {

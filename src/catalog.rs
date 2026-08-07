@@ -110,6 +110,13 @@ impl Catalog {
         self.volumes.get(alias)
     }
 
+    pub fn find_by_id(&self, volume_id: VolumeId) -> Option<(&str, &VolumeDefinition)> {
+        self.volumes
+            .iter()
+            .find(|(_, definition)| definition.volume_id == volume_id)
+            .map(|(alias, definition)| (alias.as_str(), definition))
+    }
+
     /// Returns true when a new binding was added and false for an idempotent reopen.
     pub fn create(&mut self, alias: &str, definition: VolumeDefinition) -> Result<bool> {
         if alias.is_empty() {
