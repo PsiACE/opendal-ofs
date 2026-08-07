@@ -265,3 +265,161 @@ fn node_body(node: &NodeRecord) -> (NodeId, NodeKind, NodeAttributes, Option<Fil
 fn invalid(action: &'static str, message: &'static str) -> ManagedError {
     ManagedError::new(ManagedErrorKind::Invalid, action, message)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU64;
+
+    use super::*;
+    use crate::filesystem::{DirectoryEntry, OperationId, VolumeId};
+    use crate::managed::namespace::FileVersionRecord;
+
+    const ROOT: NodeId = NodeId::from_bytes([1; 16]);
+    const FILE: NodeId = NodeId::from_bytes([2; 16]);
+
+    fn operation(byte: u8) -> OperationId {
+        OperationId::from_bytes([byte; 16])
+    }
+
+    fn cursor(sequence: u64, byte: u8) -> ChangeCursor {
+        ChangeCursor::at(NonZeroU64::new(sequence).unwrap(), operation(byte))
+    }
+
+    fn base_snapshot() -> NamespaceSnapshot {
+        let version = FileVersionRecord::whole(3, [3; 32]);
+        NamespaceSnapshot {
+            volume_id: VolumeId::from_bytes([7; 16]),
+            cursor: cursor(1, 1),
+            root: ROOT,
+            nodes: BTreeMap::from([
+                (
+                    ROOT,
+                    NodeRecord {
+                        id: ROOT,
+                        generation: managed_generation(1),
+                        kind: NodeKind::Directory,
+                        attributes: NodeAttributes::default(),
+                        file_version: None,
+                    },
+                ),
+                (
+                    FILE,
+                    NodeRecord {
+                        id: FILE,
+                        generation: managed_generation(1),
+                        kind: NodeKind::RegularFile,
+                        attributes: NodeAttributes::default(),
+                        file_version: Some(version.id),
+                    },
+                ),
+            ]),
+            directories: BTreeMap::from([(
+                ROOT,
+                DirectoryRecord {
+                    node: ROOT,
+                    generation: managed_generation(1),
+                    entries: BTreeMap::from([(
+                        "old".to_owned(),
+                        DirectoryEntry {
+                            node: FILE,
+                            kind: NodeKind::RegularFile,
+                        },
+                    )]),
+                },
+            )]),
+            file_versions: BTreeMap::from([(version.id, version)]),
+        }
+    }
+
+    fn publication(base: &NamespaceSnapshot, target: NamespaceSnapshot) -> NamespacePublication {
+        NamespacePublication {
+            operation: operation(2),
+            parent: base.cursor,
+            expected_nodes: Vec::new(),
+            expected_directories: Vec::new(),
+            target,
+        }
+    }
+
+    #[test]
+    fn rename_preserves_file_identity_and_advances_only_the_directory() {
+        let base = base_snapshot();
+        let mut target = base.clone();
+        target.cursor = cursor(2, 2);
+        let directory = target.directories.get_mut(&ROOT).unwrap();
+        let entry = directory.entries.remove("old").unwrap();
+        directory.entries.insert("new".to_owned(), entry);
+        directory.generation = managed_generation(2);
+        let mut publication = publication(&base, target);
+        publication
+            .expected_directories
+            .push(DirectoryPrecondition {
+                directory: ROOT,
+                expected_generation: Some(managed_generation(1)),
+            });
+
+        assert_eq!(
+            publication.target.directories[&ROOT].entries["new"].node,
+            FILE
+        );
+        assert_eq!(
+            publication.target.nodes[&FILE].generation,
+            base.nodes[&FILE].generation
+        );
+        assert!(validate_publication(&publication, Some(&base)).unwrap());
+    }
+
+    #[test]
+    fn file_content_or_attributes_require_the_next_node_generation() {
+        let base = base_snapshot();
+        let mut content_changed = base.clone();
+        content_changed.cursor = cursor(2, 2);
+        let version = FileVersionRecord::whole(4, [4; 32]);
+        content_changed.nodes.get_mut(&FILE).unwrap().file_version = Some(version.id);
+        content_changed.file_versions = BTreeMap::from([(version.id, version)]);
+
+        let mut attributes_changed = base.clone();
+        attributes_changed.cursor = cursor(2, 2);
+        attributes_changed
+            .nodes
+            .get_mut(&FILE)
+            .unwrap()
+            .attributes
+            .executable = true;
+
+        for target in [content_changed, attributes_changed] {
+            let mut publication = publication(&base, target);
+            publication.expected_nodes.push(NodePrecondition {
+                node: FILE,
+                expected_generation: Some(managed_generation(1)),
+            });
+            assert!(validate_publication(&publication, Some(&base)).is_err());
+
+            publication.target.nodes.get_mut(&FILE).unwrap().generation = managed_generation(2);
+            assert!(validate_publication(&publication, Some(&base)).unwrap());
+        }
+    }
+
+    #[test]
+    fn stale_node_or_directory_precondition_is_a_conflict() {
+        let base = base_snapshot();
+        let mut target = base.clone();
+        target.cursor = cursor(2, 2);
+
+        let mut stale_node = publication(&base, target.clone());
+        stale_node.expected_nodes.push(NodePrecondition {
+            node: FILE,
+            expected_generation: Some(managed_generation(2)),
+        });
+        assert!(!validate_publication(&stale_node, Some(&base)).unwrap());
+
+        let mut stale_directory = publication(&base, target);
+        stale_directory
+            .expected_directories
+            .push(DirectoryPrecondition {
+                directory: ROOT,
+                expected_generation: Some(managed_generation(2)),
+            });
+        assert!(!validate_publication(&stale_directory, Some(&base)).unwrap());
+    }
+}
