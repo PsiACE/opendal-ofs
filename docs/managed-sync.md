@@ -56,9 +56,37 @@ a file manifest, node generation, or change cursor.
 
 Metadata can be colocated with data as immutable objects plus a compare-and-swap
 head, or stored in D1 as normalized rows and transactions. Both adapters apply
-the same logical namespace changes and recover from a checkpoint plus a bounded
-change tail. Unknown major formats and unknown required features fail before a
-mutation.
+the same logical namespace changes. The object placement stores its v1 authority
+under `.ofs/managed/v1/`; D1 remains a separate physical authority. Unknown
+major formats and unknown required features fail before a mutation.
+
+Object checkpoints are small descriptors over immutable, content-addressed
+binary sections. Nodes, directory headers, directory entries, and file versions
+are separate ordered record streams. FastCDC cuts each stream at content-defined
+record boundaries with 2 MiB minimum, 4 MiB target, and 8 MiB maximum encoded
+section sizes. A single record can exceed the maximum. Each section carries its
+kind, volume scope, key range, record count, encoded length, and SHA-256 identity,
+so it is independently verifiable and does not depend on an object listing or a
+root-only schema interpretation. Checkpoints reuse unchanged section identities.
+
+Object transactions encode directory entries as entry-level effects instead of
+copying a whole directory record. Recovery normally reads a checkpoint descriptor,
+its referenced sections, and a bounded transaction tail. If a descriptor or
+section is missing or corrupt, the retained committed transaction ancestry can
+reconstruct the namespace from genesis. The compare-and-swap head is still the
+commit authority: deleting it cannot be repaired unambiguously from concurrent
+winning and losing transaction objects.
+
+The derived pack index uses the same section envelope and can also be rebuilt by
+scanning verified pack footers. These metadata sections are independent of the
+`whole` and `fastcdc` file-content policies and of whether loose content has been
+packed. Consequently whole, CDC, whole-plus-pack, and CDC-plus-pack remain valid
+and directly comparable data layouts.
+
+This is an in-place redefinition of the unreleased v1 object format, not a
+migration path. Colocated v1 volumes lacking the `object-sections-v1` feature and
+data roots lacking `sectioned-pack-index-v1` are rejected instead of being
+silently reinterpreted. D1 volumes require neither object metadata feature.
 
 Data is written and verified before metadata can reference it. If publication
 fails after that write, the result may be an unreachable loose object. The
