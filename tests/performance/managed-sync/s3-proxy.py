@@ -53,6 +53,15 @@ def handler(upstream_host: str, upstream_port: int, request_log: RequestLog):
         def setup(self) -> None:
             super().setup()
             self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            self.upstream = http.client.HTTPConnection(
+                upstream_host, upstream_port, timeout=30
+            )
+            self.upstream_requests = 0
+            self.upstream_used_ns = time.monotonic_ns()
+
+        def finish(self) -> None:
+            self.upstream.close()
+            super().finish()
 
         def read_body(self) -> bytes:
             if self.headers.get("Transfer-Encoding", "").lower() != "chunked":
@@ -77,12 +86,31 @@ def handler(upstream_host: str, upstream_port: int, request_log: RequestLog):
                 if name.lower() not in HOP_HEADERS
             }
             headers["Content-Length"] = str(len(request_body))
-            connection = http.client.HTTPConnection(upstream_host, upstream_port, timeout=300)
             status = 502
             response_body = b""
             try:
-                connection.request(self.command, self.path, request_body, headers)
-                response = connection.getresponse()
+                now = time.monotonic_ns()
+                if (
+                    self.upstream_requests >= 128
+                    or now - self.upstream_used_ns >= 1_000_000_000
+                ):
+                    self.upstream.close()
+                    self.upstream_requests = 0
+                attempts = 2 if self.command in {"GET", "HEAD"} else 1
+                for attempt in range(attempts):
+                    try:
+                        self.upstream.request(
+                            self.command, self.path, request_body, headers
+                        )
+                        response = self.upstream.getresponse()
+                        break
+                    except (OSError, http.client.HTTPException):
+                        self.upstream.close()
+                        self.upstream_requests = 0
+                        if attempt + 1 == attempts:
+                            raise
+                self.upstream_requests += 1
+                self.upstream_used_ns = time.monotonic_ns()
                 status = response.status
                 response_length = response.getheader("Content-Length")
                 response_body = response.read()
@@ -100,13 +128,13 @@ def handler(upstream_host: str, upstream_port: int, request_log: RequestLog):
             except BrokenPipeError:
                 pass
             except (OSError, http.client.HTTPException) as error:
+                self.upstream.close()
                 response_body = str(error).encode()
                 try:
                     self.send_error(502, explain=str(error))
                 except BrokenPipeError:
                     pass
             finally:
-                connection.close()
                 request_log.append(
                     {
                         "bytes_in": len(request_body),
