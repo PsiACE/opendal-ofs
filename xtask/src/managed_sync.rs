@@ -97,6 +97,8 @@ fn run_bub_with_fixtures(output: Option<&str>) -> Result<(), String> {
     }
     std::fs::create_dir_all(&run_root)
         .map_err(|error| format!("could not create Bub output: {error}"))?;
+    let run_root = std::fs::canonicalize(&run_root)
+        .map_err(|error| format!("could not resolve Bub output: {error}"))?;
     let endpoint = format!("http%3A%2F%2F127.0.0.1%3A{}", minio_port());
     let storage = format!("s3://managed-sync/bub?endpoint={endpoint}&region=us-east-1");
     let mut command = Command::new("bash");
