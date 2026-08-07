@@ -20,3 +20,4 @@
 pub mod catalog;
 pub mod filesystem;
 pub mod managed;
+pub mod sync;
