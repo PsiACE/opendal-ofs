@@ -251,6 +251,14 @@ grep -Eq '"volume_model"[[:space:]]*:[[:space:]]*"managed"' <<<"$status_json" ||
   fail 'status did not report volume_model=managed'
 grep -Eq '"access_model"[[:space:]]*:[[:space:]]*"sync"' <<<"$status_json" || \
   fail 'status did not report access_model=sync'
+grep -Eq '"metadata_authority"[[:space:]]*:[[:space:]]*"(object|d1)"' <<<"$status_json" || \
+  fail 'status did not report its metadata authority'
+grep -Fq '"local_tree_operator":"opendal_fs"' <<<"$status_json" || \
+  fail 'status did not report OpenDAL fs local I/O'
+grep -Fq '"durable_state_owners":' <<<"$status_json" || \
+  fail 'status omitted durable state ownership'
+grep -Fq '"foreground_layout":"whole"' <<<"$status_json" || \
+  fail 'status did not report the default file layout'
 grep -Eq '"conflicts"[[:space:]]*:[[:space:]]*0' <<<"$status_json" || \
   fail 'status still reports conflicts after explicit resolution'
 for capability in stable_node_identity object_scoped_generations \

@@ -249,6 +249,13 @@ fn status(config: Option<&Path>, args: StatusArgs) -> Result<()> {
     if definition.model != VolumeModel::Managed {
         bail!("replica state is not bound to a Managed volume");
     }
+    let storage = open_operator(&definition.storage)?;
+    let storage_capabilities = storage.info().full_capability();
+    let metadata_authority = if definition.metadata.is_some() {
+        "d1"
+    } else {
+        "object"
+    };
     let capabilities = Capabilities::managed_sync_v1();
     let guarantees = capabilities
         .guarantees()
@@ -278,6 +285,33 @@ fn status(config: Option<&Path>, args: StatusArgs) -> Result<()> {
         "conflicts": state.conflicts.len(),
         "capabilities": guarantees,
         "limitations": limitations,
+        "assembly": {
+            "volume": "managed",
+            "access": "sync",
+            "metadata_authority": metadata_authority,
+            "data_operator": "opendal",
+            "local_tree_operator": "opendal_fs",
+            "custom_layer_order": [],
+            "durable_state_owners": ["managed_metadata", "managed_data", "sync_replica"],
+        },
+        "format": {
+            "managed_volume_major": definition.format_major,
+            "managed_data_major": 1,
+        },
+        "data_policy": {
+            "foreground_layout": "whole",
+            "foreground_placement": "loose",
+            "pack_maintenance": "explicit",
+        },
+        "storage_capabilities": {
+            "read": storage_capabilities.read,
+            "range_read": storage_capabilities.read,
+            "write": storage_capabilities.write,
+            "create_only": storage_capabilities.write_with_if_not_exists,
+            "compare_and_swap": storage_capabilities.write_with_if_match,
+            "stat": storage_capabilities.stat,
+            "list": storage_capabilities.list,
+        },
     });
     if args.json {
         println!("{}", serde_json::to_string(&value)?);
