@@ -26,7 +26,7 @@ use crate::filesystem::{
     ChangeCursor, NodeId, NodeKind, OperationId, PublicationProgress, VolumeId,
 };
 use crate::managed::namespace::{FileVersionRecord, NamespaceSnapshot};
-use crate::managed::{D1Metadata, FileLayoutPolicy, ManagedVolume};
+use crate::managed::{AuthorityKnownContent, D1Metadata, FileLayoutPolicy, ManagedVolume};
 
 #[derive(Clone, Debug)]
 pub struct SyncResult {
@@ -345,6 +345,10 @@ impl SyncEngine {
         );
         let requires_materialization = !merged_input.same_content(&frozen_input);
         let frozen = fs_operator(staged.root())?;
+        let known_content = remote
+            .map(AuthorityKnownContent::from_snapshot)
+            .transpose()?
+            .unwrap_or_default();
         let remote_files = remote.map(snapshot_files).transpose()?.unwrap_or_default();
         let files = merged
             .entries()
@@ -364,10 +368,15 @@ impl SyncEngine {
             .map(|(path, reusable)| {
                 let volume = self.volume.clone();
                 let frozen = frozen.clone();
+                let known_content = &known_content;
                 async move {
                     let version = match reusable {
                         Some(version) => version,
-                        None => volume.seal_file(&frozen, &path).await?,
+                        None => {
+                            volume
+                                .seal_file_with_known_content(&frozen, &path, known_content)
+                                .await?
+                        }
                     };
                     Ok::<_, anyhow::Error>((path, version))
                 }

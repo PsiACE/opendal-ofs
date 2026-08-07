@@ -112,6 +112,11 @@ second_pack=$(OFS_CONFIG="$config" "$OFS_BIN" volume pack workspace \
 grep -Fq 'packs=0 content=0 logical_bytes=0' <<<"$second_pack" || \
   fail 'second pack run was not idempotent'
 grep -Fq 'reclaimed=0' <<<"$second_pack" || fail 'second pack run reclaimed content twice'
+cp "$replica_a/first.txt" "$replica_a/reused-from-pack.txt"
+OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a"
+OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_b" --state "$state_b"
+cmp "$replica_a/reused-from-pack.txt" "$replica_b/reused-from-pack.txt" || \
+  fail 'authority-known packed content did not round trip at a new path'
 [[ -d "$replica_b/nested/level" ]] || fail 'nested directories were not materialized'
 cmp "$replica_a/nested/level/entry.txt" "$replica_b/nested/level/entry.txt" || \
   fail 'nested file content did not round trip'

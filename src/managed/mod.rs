@@ -26,7 +26,7 @@ pub mod namespace;
 pub mod pack;
 mod volume;
 
-pub(crate) use data::ManagedData;
+pub(crate) use data::{AuthorityKnownContent, ManagedData};
 pub use data::{
     FileLayoutPolicy, LooseGcMaintenance, PackMaintenance, PackRetirement, SparseExtent,
 };

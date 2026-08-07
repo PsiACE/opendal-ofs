@@ -24,8 +24,8 @@ use super::namespace::{
     NamespacePublication, NamespaceSnapshot, ObjectNamespace,
 };
 use super::{
-    D1Metadata, FileLayoutPolicy, LooseGcMaintenance, ManagedData, ManagedError, ManagedErrorKind,
-    PackMaintenance, PackRetirement, SparseExtent,
+    AuthorityKnownContent, D1Metadata, FileLayoutPolicy, LooseGcMaintenance, ManagedData,
+    ManagedError, ManagedErrorKind, PackMaintenance, PackRetirement, SparseExtent,
 };
 use crate::filesystem::{CommitOutcome, OperationId, VolumeId};
 use crate::managed::pack::PackReadSession;
@@ -175,6 +175,17 @@ impl ManagedVolume {
         path: &str,
     ) -> Result<FileVersionRecord, ManagedError> {
         self.data.seal_file(frozen, path).await
+    }
+
+    pub(crate) async fn seal_file_with_known_content(
+        &self,
+        frozen: &Operator,
+        path: &str,
+        known: &AuthorityKnownContent,
+    ) -> Result<FileVersionRecord, ManagedError> {
+        self.data
+            .seal_file_with_known_content(frozen, path, known)
+            .await
     }
 
     pub async fn seal_extents(

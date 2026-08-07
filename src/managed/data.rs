@@ -61,6 +61,20 @@ pub struct LooseGcMaintenance {
     pub deleted_bytes: u64,
 }
 
+/// Content identities already referenced by one fixed authority snapshot.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct AuthorityKnownContent(BTreeSet<ContentRef>);
+
+impl AuthorityKnownContent {
+    pub(crate) fn from_snapshot(snapshot: &NamespaceSnapshot) -> Result<Self, ManagedError> {
+        reachable_content(snapshot, "derive authority-known content").map(Self)
+    }
+
+    fn contains(&self, content: &ContentRef) -> bool {
+        self.0.contains(content)
+    }
+}
+
 /// One process-local grace boundary after replacement locations are published.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PackRetirement {
@@ -186,10 +200,23 @@ impl ManagedData {
         local: &Operator,
         frozen_path: &str,
     ) -> Result<FileVersionRecord, ManagedError> {
+        self.seal_file_with_known_content(local, frozen_path, &AuthorityKnownContent::default())
+            .await
+    }
+
+    pub(crate) async fn seal_file_with_known_content(
+        &self,
+        local: &Operator,
+        frozen_path: &str,
+        known: &AuthorityKnownContent,
+    ) -> Result<FileVersionRecord, ManagedError> {
         match self.policy {
-            FileLayoutPolicy::Whole => self.seal_whole_file(local, frozen_path).await,
+            FileLayoutPolicy::Whole => {
+                self.seal_whole_file_with_known_content(local, frozen_path, known)
+                    .await
+            }
             FileLayoutPolicy::Fixed { chunk_size } => {
-                self.seal_fixed(local, frozen_path, chunk_size).await
+                self.seal_fixed(local, frozen_path, chunk_size, known).await
             }
             FileLayoutPolicy::FastCdcV2020 {
                 minimum_file_size,
@@ -198,10 +225,18 @@ impl ManagedData {
                 maximum_size,
             } => {
                 if frozen_size(local, frozen_path).await? < minimum_file_size {
-                    self.seal_whole_file(local, frozen_path).await
-                } else {
-                    self.seal_fastcdc(local, frozen_path, minimum_size, target_size, maximum_size)
+                    self.seal_whole_file_with_known_content(local, frozen_path, known)
                         .await
+                } else {
+                    self.seal_fastcdc(
+                        local,
+                        frozen_path,
+                        minimum_size,
+                        target_size,
+                        maximum_size,
+                        known,
+                    )
+                    .await
                 }
             }
         }
@@ -212,6 +247,20 @@ impl ManagedData {
         &self,
         local: &Operator,
         frozen_path: &str,
+    ) -> Result<FileVersionRecord, ManagedError> {
+        self.seal_whole_file_with_known_content(
+            local,
+            frozen_path,
+            &AuthorityKnownContent::default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn seal_whole_file_with_known_content(
+        &self,
+        local: &Operator,
+        frozen_path: &str,
+        known: &AuthorityKnownContent,
     ) -> Result<FileVersionRecord, ManagedError> {
         let metadata = local
             .stat(frozen_path)
@@ -231,6 +280,9 @@ impl ManagedData {
         let FileVersionLayout::Whole { content } = &version.layout else {
             unreachable!("whole-file sealing created another layout")
         };
+        if known.contains(content) {
+            return Ok(version);
+        }
         let key = loose_key(content);
 
         match self.operator.writer_with(&key).if_not_exists(true).await {
@@ -270,6 +322,7 @@ impl ManagedData {
         local: &Operator,
         path: &str,
         chunk_size: u32,
+        known: &AuthorityKnownContent,
     ) -> Result<FileVersionRecord, ManagedError> {
         let size = frozen_size(local, path).await?;
         if size == 0 {
@@ -293,7 +346,7 @@ impl ManagedData {
                 return Err(corrupt("read frozen file", "source returned a short range"));
             }
             logical.update(&bytes);
-            let content = self.persist_bytes(&bytes).await?;
+            let content = self.persist_bytes(&bytes, known).await?;
             chunks.push(ChunkSpan {
                 logical_offset: offset,
                 logical_length: content.logical_length,
@@ -324,6 +377,7 @@ impl ManagedData {
         minimum_size: u32,
         target_size: u32,
         maximum_size: u32,
+        known: &AuthorityKnownContent,
     ) -> Result<FileVersionRecord, ManagedError> {
         let size = frozen_size(local, path).await?;
         if size == 0 {
@@ -344,7 +398,7 @@ impl ManagedData {
         while let Some(chunk) = chunks.next().await {
             let chunk = chunk.map_err(|_| unavailable("chunk frozen file"))?;
             logical.update(&chunk.data);
-            let content = self.persist_bytes(&chunk.data).await?;
+            let content = self.persist_bytes(&chunk.data, known).await?;
             spans.push(ChunkSpan {
                 logical_offset: chunk.offset,
                 logical_length: content.logical_length,
@@ -371,6 +425,17 @@ impl ManagedData {
         local: &Operator,
         path: &str,
         staged: &[SparseExtent],
+    ) -> Result<FileVersionRecord, ManagedError> {
+        self.seal_extents_with_known_content(local, path, staged, &AuthorityKnownContent::default())
+            .await
+    }
+
+    pub(crate) async fn seal_extents_with_known_content(
+        &self,
+        local: &Operator,
+        path: &str,
+        staged: &[SparseExtent],
+        known: &AuthorityKnownContent,
     ) -> Result<FileVersionRecord, ManagedError> {
         let size = frozen_size(local, path).await?;
         if size == 0 && staged.is_empty() {
@@ -430,7 +495,7 @@ impl ManagedData {
                     let digest =
                         digest_range(local, path, logical_offset..end, &mut logical).await?;
                     let content = self
-                        .persist_range(local, path, logical_offset..end, digest)
+                        .persist_range(local, path, logical_offset..end, digest, known)
                         .await?;
                     extents.push(FileExtent::Data {
                         extent: DataExtent {
@@ -815,13 +880,17 @@ impl ManagedData {
         Ok(bytes)
     }
 
-    async fn persist_bytes(&self, bytes: &[u8]) -> Result<ContentRef, ManagedError> {
+    async fn persist_bytes(
+        &self,
+        bytes: &[u8],
+        known: &AuthorityKnownContent,
+    ) -> Result<ContentRef, ManagedError> {
         let content = ContentRef {
             digest: Sha256::digest(bytes).into(),
             logical_length: u64::try_from(bytes.len())
                 .map_err(|_| invalid("write loose data", "content length exceeds format v1"))?,
         };
-        if content.logical_length == 0 {
+        if content.logical_length == 0 || known.contains(&content) {
             return Ok(content);
         }
         let key = loose_key(&content);
@@ -853,11 +922,15 @@ impl ManagedData {
         path: &str,
         range: Range<u64>,
         digest: Digest,
+        known: &AuthorityKnownContent,
     ) -> Result<ContentRef, ManagedError> {
         let content = ContentRef {
             digest: *digest.as_bytes(),
             logical_length: range.end - range.start,
         };
+        if known.contains(&content) {
+            return Ok(content);
+        }
         let key = loose_key(&content);
         match self.operator.writer_with(&key).if_not_exists(true).await {
             Err(error) if already_exists(&error) => {}

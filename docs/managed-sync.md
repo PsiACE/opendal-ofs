@@ -55,6 +55,12 @@ fails after that write, the result may be an unreachable loose object. The
 namespace remains valid, and explicit garbage collection can reclaim the
 object later.
 
+During an update, the fixed parent snapshot is also proof that its reachable
+`ContentRef` values are durable. Sync still reads and hashes changed local
+input, but it does not probe or download matching content again. New content
+keeps the same create-only write and read-back verification. This applies to
+whole files, chunks, and sparse data extents without changing format v1.
+
 ## Create an Object metadata volume on MinIO
 
 Keep provider credentials in the environment. The volume catalog stores only
