@@ -17,6 +17,7 @@
 
 //! Managed namespace records and authoritative snapshot publication.
 
+mod change;
 mod d1;
 mod object;
 mod records;

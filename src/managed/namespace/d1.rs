@@ -21,6 +21,7 @@ use std::num::NonZeroU64;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::change::NamespaceChange;
 use super::validation::{validate_publication, validate_snapshot};
 use super::{
     DirectoryPrecondition, DirectoryRecord, FileVersionLayout, FileVersionRecord,
@@ -72,19 +73,7 @@ impl D1Namespace {
             vec![self.store_key().into(), self.volume().into()],
             ),
             statement(
-                format!("SELECT node_id, generation, record_json FROM {NODES} WHERE store_key = ? ORDER BY node_id"),
-                vec![self.store_key().into()],
-            ),
-            statement(
-                format!("SELECT node_id, generation, record_json FROM {DIRECTORIES} WHERE store_key = ? ORDER BY node_id"),
-                vec![self.store_key().into()],
-            ),
-            statement(
-                format!("SELECT file_version_id, record_json FROM {FILE_VERSIONS} WHERE store_key = ? ORDER BY file_version_id"),
-                vec![self.store_key().into()],
-            ),
-            statement(
-                format!("SELECT operation_id, parent_sequence, parent_operation, target_sequence FROM {TRANSACTIONS} WHERE store_key = ? AND target_sequence > COALESCE((SELECT checkpoint_sequence FROM {HEADS} WHERE store_key = ?), 0) AND status = 'committed' ORDER BY target_sequence"),
+                format!("SELECT operation_id, parent_sequence, parent_operation, target_sequence, payload_json FROM {TRANSACTIONS} WHERE store_key = ? AND target_sequence > COALESCE((SELECT checkpoint_sequence FROM {HEADS} WHERE store_key = ?), 0) AND status = 'committed' ORDER BY target_sequence"),
                 vec![self.store_key().into(), self.store_key().into()],
             ),
         ]);
@@ -111,47 +100,22 @@ impl D1Namespace {
             text(head, "snapshot_json", "read Managed namespace")?,
             "read Managed namespace",
         )?;
-        let checkpoint = checkpoint.into_snapshot()?;
-        if checkpoint.volume_id != self.volume_id
-            || checkpoint.cursor.sequence() != checkpoint_sequence
+        let mut snapshot = checkpoint.into_snapshot()?;
+        if snapshot.volume_id != self.volume_id || snapshot.cursor.sequence() != checkpoint_sequence
         {
             return Err(corrupt(
                 "read Managed namespace",
                 "checkpoint does not match the namespace head",
             ));
         }
-        validate_snapshot(&checkpoint)
+        validate_snapshot(&snapshot)
             .map_err(|_| corrupt("read Managed namespace", "checkpoint is invalid"))?;
-        validate_tail(
-            checkpoint.cursor,
-            cursor,
-            rows(&results, SCHEMA_RESULTS + 4, "read Managed namespace")?,
-        )?;
-        let nodes = read_nodes(rows(
-            &results,
-            SCHEMA_RESULTS + 1,
-            "read Managed namespace",
-        )?)?;
-        let directories = read_directories(rows(
-            &results,
-            SCHEMA_RESULTS + 2,
-            "read Managed namespace",
-        )?)?;
-        let file_versions = read_file_versions(rows(
-            &results,
-            SCHEMA_RESULTS + 3,
-            "read Managed namespace",
-        )?)?;
-        let snapshot = NamespaceSnapshot {
-            volume_id: self.volume_id,
+        snapshot = replay_tail(
+            snapshot,
             cursor,
             root,
-            nodes,
-            directories,
-            file_versions,
-        };
-        validate_snapshot(&snapshot)
-            .map_err(|_| corrupt("read Managed namespace", "snapshot is invalid"))?;
+            rows(&results, SCHEMA_RESULTS + 1, "read Managed namespace")?,
+        )?;
         Ok(Some(D1NamespaceObservation { snapshot, revision }))
     }
 
@@ -258,6 +222,14 @@ impl D1Namespace {
                 "node_id",
                 self.store_key(),
                 &delta.directories,
+                &guard,
+                guarded(),
+            )?,
+            delete_records(
+                FILE_VERSIONS,
+                "file_version_id",
+                self.store_key(),
+                &delta.deleted_file_versions,
                 &guard,
                 guarded(),
             )?,
@@ -722,85 +694,6 @@ const fn is_checkpoint(sequence: u64) -> bool {
     sequence == 1 || sequence % CHECKPOINT_INTERVAL == 0
 }
 
-fn read_nodes(rows: &[Value]) -> Result<BTreeMap<NodeId, NodeRecord>, ManagedError> {
-    let mut records = BTreeMap::new();
-    for row in rows {
-        let key = node_id(text(row, "node_id", "read Managed namespace")?)?;
-        let generation = integer(row, "generation", "read Managed namespace")?;
-        let stored: StoredNode = decode(
-            text(row, "record_json", "read Managed namespace")?,
-            "read Managed namespace",
-        )?;
-        let record = stored.into_record();
-        if record.id != key || managed_generation_number(&record.generation) != Some(generation) {
-            return Err(corrupt(
-                "read Managed namespace",
-                "node row disagrees with its record",
-            ));
-        }
-        if records.insert(key, record).is_some() {
-            return Err(corrupt(
-                "read Managed namespace",
-                "D1 returned duplicate nodes",
-            ));
-        }
-    }
-    Ok(records)
-}
-
-fn read_directories(rows: &[Value]) -> Result<BTreeMap<NodeId, DirectoryRecord>, ManagedError> {
-    let mut records = BTreeMap::new();
-    for row in rows {
-        let key = node_id(text(row, "node_id", "read Managed namespace")?)?;
-        let generation = integer(row, "generation", "read Managed namespace")?;
-        let stored: StoredDirectory = decode(
-            text(row, "record_json", "read Managed namespace")?,
-            "read Managed namespace",
-        )?;
-        let record = stored.into_record();
-        if record.node != key || managed_generation_number(&record.generation) != Some(generation) {
-            return Err(corrupt(
-                "read Managed namespace",
-                "directory row disagrees with its record",
-            ));
-        }
-        if records.insert(key, record).is_some() {
-            return Err(corrupt(
-                "read Managed namespace",
-                "D1 returned duplicate directories",
-            ));
-        }
-    }
-    Ok(records)
-}
-
-fn read_file_versions(
-    rows: &[Value],
-) -> Result<BTreeMap<FileVersionId, FileVersionRecord>, ManagedError> {
-    let mut records = BTreeMap::new();
-    for row in rows {
-        let key = file_version_id(text(row, "file_version_id", "read Managed namespace")?)?;
-        let stored: StoredFileVersion = decode(
-            text(row, "record_json", "read Managed namespace")?,
-            "read Managed namespace",
-        )?;
-        let record = stored.into_record();
-        if record.id != key {
-            return Err(corrupt(
-                "read Managed namespace",
-                "file-version row disagrees with its record",
-            ));
-        }
-        if records.insert(key, record).is_some() {
-            return Err(corrupt(
-                "read Managed namespace",
-                "D1 returned duplicate file versions",
-            ));
-        }
-    }
-    Ok(records)
-}
-
 fn validate_tail(
     mut cursor: ChangeCursor,
     head: ChangeCursor,
@@ -838,6 +731,40 @@ fn validate_tail(
     Ok(())
 }
 
+fn replay_tail(
+    mut snapshot: NamespaceSnapshot,
+    head: ChangeCursor,
+    root: NodeId,
+    rows: &[Value],
+) -> Result<NamespaceSnapshot, ManagedError> {
+    validate_tail(snapshot.cursor, head, rows)?;
+    for row in rows {
+        let stored: StoredChange = decode(
+            text(row, "payload_json", "read Managed namespace")?,
+            "read Managed namespace",
+        )?;
+        let change = stored.into_change(snapshot.volume_id)?;
+        let row_cursor = stored_cursor(
+            integer(row, "target_sequence", "read Managed namespace")?,
+            Some(text(row, "operation_id", "read Managed namespace")?),
+        )?;
+        if change.parent != snapshot.cursor || change.cursor != row_cursor {
+            return Err(corrupt(
+                "read Managed namespace",
+                "change record disagrees with its transaction row",
+            ));
+        }
+        snapshot = change.apply(Some(snapshot))?;
+    }
+    if snapshot.cursor != head || snapshot.root != root {
+        return Err(corrupt(
+            "read Managed namespace",
+            "replayed namespace does not match its head",
+        ));
+    }
+    Ok(snapshot)
+}
+
 fn stored_cursor(sequence: u64, operation: Option<&str>) -> Result<ChangeCursor, ManagedError> {
     match (sequence, operation) {
         (0, None) => Ok(ChangeCursor::Genesis),
@@ -852,10 +779,6 @@ fn stored_cursor(sequence: u64, operation: Option<&str>) -> Result<ChangeCursor,
 
 fn node_id(value: &str) -> Result<NodeId, ManagedError> {
     Ok(NodeId::from_bytes(decode_hex(value)?))
-}
-
-fn file_version_id(value: &str) -> Result<FileVersionId, ManagedError> {
-    Ok(FileVersionId::from_bytes(decode_hex(value)?))
 }
 
 fn decode_hex<const N: usize>(value: &str) -> Result<[u8; N], ManagedError> {
@@ -963,6 +886,7 @@ struct PublicationDelta {
     directories: Vec<RecordRow>,
     deleted_directories: Vec<String>,
     file_versions: Vec<FileVersionRow>,
+    deleted_file_versions: Vec<String>,
     effects: Vec<String>,
 }
 
@@ -971,98 +895,123 @@ impl PublicationDelta {
         publication: &NamespacePublication,
         base: Option<&NamespaceSnapshot>,
     ) -> Result<Self, ManagedError> {
-        let empty_nodes = BTreeMap::new();
-        let empty_directories = BTreeMap::new();
-        let empty_versions = BTreeMap::new();
-        let base_nodes = base.map_or(&empty_nodes, |snapshot| &snapshot.nodes);
-        let base_directories = base.map_or(&empty_directories, |snapshot| &snapshot.directories);
-        let base_versions = base.map_or(&empty_versions, |snapshot| &snapshot.file_versions);
-        let mut nodes = Vec::new();
-        let mut deleted_nodes = Vec::new();
-        let mut directories = Vec::new();
-        let mut deleted_directories = Vec::new();
-        let mut file_versions = Vec::new();
-        let mut effects = Vec::new();
-
-        for (id, version) in &publication.target.file_versions {
-            if base_versions.get(id) != Some(version) {
-                let stored = StoredFileVersion::from(version);
-                file_versions.push(FileVersionRow {
-                    key: hex(id.as_bytes()),
-                    record: encode(&stored, "publish Managed namespace")?,
-                });
-                effects.push(StoredEffect::PutFileVersion(stored));
-            }
-        }
-        for id in base_directories.keys() {
-            if !publication.target.directories.contains_key(id) {
-                deleted_directories.push(hex(id.as_bytes()));
-                effects.push(StoredEffect::DeleteDirectory(*id.as_bytes()));
-            }
-        }
-        for id in base_nodes.keys() {
-            if !publication.target.nodes.contains_key(id) {
-                deleted_nodes.push(hex(id.as_bytes()));
-                effects.push(StoredEffect::DeleteNode(*id.as_bytes()));
-            }
-        }
-        for (id, node) in &publication.target.nodes {
-            if base_nodes.get(id) != Some(node) {
+        let change = NamespaceChange::from_publication(publication, base);
+        let nodes = change
+            .put_nodes
+            .iter()
+            .map(|node| {
                 let stored = StoredNode::from(node);
-                nodes.push(RecordRow {
-                    key: hex(id.as_bytes()),
+                Ok(RecordRow {
+                    key: hex(node.id.as_bytes()),
                     generation: managed_generation_number(&node.generation)
                         .expect("validated Managed node generation"),
                     record: encode(&stored, "publish Managed namespace")?,
-                });
-                effects.push(StoredEffect::PutNode(stored));
-            }
-        }
-        for (id, directory) in &publication.target.directories {
-            if base_directories.get(id) != Some(directory) {
+                })
+            })
+            .collect::<Result<Vec<_>, ManagedError>>()?;
+        let deleted_nodes = change
+            .remove_nodes
+            .iter()
+            .map(|id| hex(id.as_bytes()))
+            .collect();
+        let directories = change
+            .put_directories
+            .iter()
+            .map(|directory| {
                 let stored = StoredDirectory::from(directory);
-                directories.push(RecordRow {
-                    key: hex(id.as_bytes()),
+                Ok(RecordRow {
+                    key: hex(directory.node.as_bytes()),
                     generation: managed_generation_number(&directory.generation)
                         .expect("validated Managed directory generation"),
                     record: encode(&stored, "publish Managed namespace")?,
-                });
-                effects.push(StoredEffect::PutDirectory(stored));
-            }
-        }
-        effects.push(StoredEffect::SetRoot(*publication.target.root.as_bytes()));
+                })
+            })
+            .collect::<Result<Vec<_>, ManagedError>>()?;
+        let deleted_directories = change
+            .remove_directories
+            .iter()
+            .map(|id| hex(id.as_bytes()))
+            .collect();
+        let file_versions = change
+            .put_file_versions
+            .iter()
+            .map(|version| {
+                let stored = StoredFileVersion::from(version);
+                Ok(FileVersionRow {
+                    key: hex(version.id.as_bytes()),
+                    record: encode(&stored, "publish Managed namespace")?,
+                })
+            })
+            .collect::<Result<Vec<_>, ManagedError>>()?;
+        let deleted_file_versions = change
+            .remove_file_versions
+            .iter()
+            .map(|id| hex(id.as_bytes()))
+            .collect();
+        let mut effects =
+            change
+                .remove_nodes
+                .iter()
+                .map(|id| StoredEffect::DeleteNode(*id.as_bytes()))
+                .chain(
+                    change
+                        .put_nodes
+                        .iter()
+                        .map(|node| StoredEffect::PutNode(StoredNode::from(node))),
+                )
+                .chain(
+                    change
+                        .remove_directories
+                        .iter()
+                        .map(|id| StoredEffect::DeleteDirectory(*id.as_bytes())),
+                )
+                .chain(
+                    change.put_directories.iter().map(|directory| {
+                        StoredEffect::PutDirectory(StoredDirectory::from(directory))
+                    }),
+                )
+                .chain(
+                    change
+                        .remove_file_versions
+                        .iter()
+                        .map(|id| StoredEffect::DeleteFileVersion(*id.as_bytes())),
+                )
+                .chain(
+                    change.put_file_versions.iter().map(|version| {
+                        StoredEffect::PutFileVersion(StoredFileVersion::from(version))
+                    }),
+                )
+                .collect::<Vec<_>>();
+        effects.push(StoredEffect::SetRoot(*change.root.as_bytes()));
         let encoded_effects = effects
             .iter()
             .map(|effect| encode(effect, "publish Managed namespace"))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut change = StoredChange {
-            operation: *publication.operation.as_bytes(),
-            parent: publication.parent.into(),
-            target: publication.target.cursor.into(),
-            root: *publication.target.root.as_bytes(),
-            expected_nodes: publication
+        let stored_change = StoredChange {
+            operation: *change.operation.as_bytes(),
+            parent: change.parent.into(),
+            target: change.cursor.into(),
+            root: *change.root.as_bytes(),
+            expected_nodes: change
                 .expected_nodes
                 .iter()
                 .map(StoredNodePrecondition::from)
                 .collect(),
-            expected_directories: publication
+            expected_directories: change
                 .expected_directories
                 .iter()
                 .map(StoredDirectoryPrecondition::from)
                 .collect(),
             effects,
         };
-        change.expected_nodes.sort_by_key(|value| value.node);
-        change
-            .expected_directories
-            .sort_by_key(|value| value.directory);
         Ok(Self {
-            change,
+            change: stored_change,
             nodes,
             deleted_nodes,
             directories,
             deleted_directories,
             file_versions,
+            deleted_file_versions,
             effects: encoded_effects,
         })
     }
@@ -1080,6 +1029,72 @@ struct StoredChange {
     effects: Vec<StoredEffect>,
 }
 
+impl StoredChange {
+    fn into_change(self, volume_id: VolumeId) -> Result<NamespaceChange, ManagedError> {
+        let mut put_nodes = Vec::new();
+        let mut remove_nodes = Vec::new();
+        let mut put_directories = Vec::new();
+        let mut remove_directories = Vec::new();
+        let mut put_file_versions = Vec::new();
+        let mut remove_file_versions = Vec::new();
+        let mut effect_root = None;
+        for effect in self.effects {
+            match effect {
+                StoredEffect::PutNode(node) => put_nodes.push(node.into_record()),
+                StoredEffect::DeleteNode(id) => remove_nodes.push(NodeId::from_bytes(id)),
+                StoredEffect::PutDirectory(directory) => {
+                    put_directories.push(directory.into_record());
+                }
+                StoredEffect::DeleteDirectory(id) => {
+                    remove_directories.push(NodeId::from_bytes(id));
+                }
+                StoredEffect::PutFileVersion(version) => {
+                    put_file_versions.push(version.into_record());
+                }
+                StoredEffect::DeleteFileVersion(id) => {
+                    remove_file_versions.push(FileVersionId::from_bytes(id));
+                }
+                StoredEffect::SetRoot(root) if effect_root.replace(root).is_none() => {}
+                StoredEffect::SetRoot(_) => {
+                    return Err(corrupt(
+                        "read Managed namespace",
+                        "change contains duplicate root effects",
+                    ));
+                }
+            }
+        }
+        if effect_root != Some(self.root) {
+            return Err(corrupt(
+                "read Managed namespace",
+                "change root effect is invalid",
+            ));
+        }
+        Ok(NamespaceChange {
+            volume_id,
+            operation: OperationId::from_bytes(self.operation),
+            parent: self.parent.into_cursor()?,
+            cursor: self.target.into_cursor()?,
+            root: NodeId::from_bytes(self.root),
+            expected_nodes: self
+                .expected_nodes
+                .into_iter()
+                .map(StoredNodePrecondition::into_record)
+                .collect(),
+            expected_directories: self
+                .expected_directories
+                .into_iter()
+                .map(StoredDirectoryPrecondition::into_record)
+                .collect(),
+            put_nodes,
+            remove_nodes,
+            put_directories,
+            remove_directories,
+            put_file_versions,
+            remove_file_versions,
+        })
+    }
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(
     deny_unknown_fields,
@@ -1093,6 +1108,7 @@ enum StoredEffect {
     PutDirectory(StoredDirectory),
     DeleteDirectory([u8; 16]),
     PutFileVersion(StoredFileVersion),
+    DeleteFileVersion([u8; 32]),
     SetRoot([u8; 16]),
 }
 
@@ -1395,6 +1411,15 @@ impl From<&NodePrecondition> for StoredNodePrecondition {
     }
 }
 
+impl StoredNodePrecondition {
+    fn into_record(self) -> NodePrecondition {
+        NodePrecondition {
+            node: NodeId::from_bytes(self.node),
+            expected_generation: self.expected_generation.map(managed_generation),
+        }
+    }
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct StoredDirectoryPrecondition {
@@ -1414,6 +1439,15 @@ impl From<&DirectoryPrecondition> for StoredDirectoryPrecondition {
     }
 }
 
+impl StoredDirectoryPrecondition {
+    fn into_record(self) -> DirectoryPrecondition {
+        DirectoryPrecondition {
+            directory: NodeId::from_bytes(self.directory),
+            expected_generation: self.expected_generation.map(managed_generation),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1424,6 +1458,34 @@ mod tests {
 
     fn cursor(sequence: u64, byte: u8) -> ChangeCursor {
         ChangeCursor::at(NonZeroU64::new(sequence).unwrap(), operation(byte))
+    }
+
+    fn root_snapshot(cursor: ChangeCursor) -> NamespaceSnapshot {
+        let root = NodeId::from_bytes([2; 16]);
+        NamespaceSnapshot {
+            volume_id: VolumeId::from_bytes([1; 16]),
+            cursor,
+            root,
+            nodes: BTreeMap::from([(
+                root,
+                NodeRecord {
+                    id: root,
+                    generation: managed_generation(1),
+                    kind: NodeKind::Directory,
+                    attributes: NodeAttributes { executable: false },
+                    file_version: None,
+                },
+            )]),
+            directories: BTreeMap::from([(
+                root,
+                DirectoryRecord {
+                    node: root,
+                    generation: managed_generation(1),
+                    entries: BTreeMap::new(),
+                },
+            )]),
+            file_versions: BTreeMap::new(),
+        }
     }
 
     #[test]
@@ -1445,36 +1507,6 @@ mod tests {
         assert!(!record.contains("\"nodes\""));
         assert!(!record.contains("\"directories\""));
         assert!(!record.contains("\"file_versions\""));
-    }
-
-    #[test]
-    fn normalized_row_and_strict_record_must_agree() {
-        let stored = StoredNode {
-            id: [2; 16],
-            generation: 1,
-            kind: StoredNodeKind::Directory,
-            attributes: StoredNodeAttributes { executable: false },
-            file_version: None,
-        };
-        let row = serde_json::json!({
-            "node_id": hex(&[1; 16]),
-            "generation": 1,
-            "record_json": encode(&stored, "test D1 node record").unwrap(),
-        });
-        assert_eq!(
-            read_nodes(&[row]).unwrap_err().kind(),
-            ManagedErrorKind::Corrupt
-        );
-
-        let record = serde_json::json!({
-            "id": vec![2; 16],
-            "generation": 1,
-            "kind": "directory",
-            "attributes": { "executable": false },
-            "file_version": null,
-            "unexpected": true,
-        });
-        assert!(decode::<StoredNode>(&record.to_string(), "test D1 node record").is_err());
     }
 
     #[test]
@@ -1504,5 +1536,37 @@ mod tests {
             }
             assert!(sequence - recovery_root < CHECKPOINT_INTERVAL);
         }
+    }
+
+    #[test]
+    fn checkpoint_tail_replays_change_payloads() {
+        let checkpoint = root_snapshot(cursor(1, 1));
+        let target = root_snapshot(cursor(2, 2));
+        let publication = NamespacePublication {
+            operation: operation(2),
+            parent: checkpoint.cursor,
+            expected_nodes: Vec::new(),
+            expected_directories: Vec::new(),
+            target: target.clone(),
+        };
+        let payload = encode(
+            &PublicationDelta::new(&publication, Some(&checkpoint))
+                .unwrap()
+                .change,
+            "test D1 replay",
+        )
+        .unwrap();
+        let rows = [serde_json::json!({
+            "operation_id": hex(operation(2).as_bytes()),
+            "parent_sequence": 1,
+            "parent_operation": hex(operation(1).as_bytes()),
+            "target_sequence": 2,
+            "payload_json": payload,
+        })];
+
+        assert_eq!(
+            replay_tail(checkpoint, target.cursor, target.root, &rows).unwrap(),
+            target
+        );
     }
 }

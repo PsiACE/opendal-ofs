@@ -25,6 +25,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
+use super::change::NamespaceChange;
 use super::validation::{validate_publication, validate_snapshot};
 use super::{
     DirectoryPrecondition, DirectoryRecord, FileVersionLayout, FileVersionRecord,
@@ -802,71 +803,51 @@ impl StoredTransaction {
         publication: &NamespacePublication,
         base: Option<&NamespaceSnapshot>,
     ) -> Self {
-        let empty_nodes = BTreeMap::new();
-        let empty_directories = BTreeMap::new();
-        let empty_versions = BTreeMap::new();
-        let base_nodes = base.map_or(&empty_nodes, |value| &value.nodes);
-        let base_directories = base.map_or(&empty_directories, |value| &value.directories);
-        let base_versions = base.map_or(&empty_versions, |value| &value.file_versions);
-        let target = &publication.target;
-        let mut stored = Self {
+        let change = NamespaceChange::from_publication(publication, base);
+        Self {
             major: FORMAT_MAJOR,
-            volume_id: *target.volume_id.as_bytes(),
-            operation: *publication.operation.as_bytes(),
-            parent: publication.parent.into(),
-            cursor: target.cursor.into(),
-            root: *target.root.as_bytes(),
-            expected_nodes: publication
+            volume_id: *change.volume_id.as_bytes(),
+            operation: *change.operation.as_bytes(),
+            parent: change.parent.into(),
+            cursor: change.cursor.into(),
+            root: *change.root.as_bytes(),
+            expected_nodes: change
                 .expected_nodes
                 .iter()
                 .map(StoredNodePrecondition::from)
                 .collect(),
-            expected_directories: publication
+            expected_directories: change
                 .expected_directories
                 .iter()
                 .map(StoredDirectoryPrecondition::from)
                 .collect(),
-            put_nodes: target
-                .nodes
+            put_nodes: change.put_nodes.iter().map(StoredNode::from).collect(),
+            remove_nodes: change
+                .remove_nodes
                 .iter()
-                .filter(|(id, record)| base_nodes.get(id) != Some(record))
-                .map(|(_, record)| record.into())
-                .collect(),
-            remove_nodes: base_nodes
-                .keys()
-                .filter(|id| !target.nodes.contains_key(id))
                 .map(|id| *id.as_bytes())
                 .collect(),
-            put_directories: target
-                .directories
+            put_directories: change
+                .put_directories
                 .iter()
-                .filter(|(id, record)| base_directories.get(id) != Some(record))
-                .map(|(_, record)| record.into())
+                .map(StoredDirectory::from)
                 .collect(),
-            remove_directories: base_directories
-                .keys()
-                .filter(|id| !target.directories.contains_key(id))
+            remove_directories: change
+                .remove_directories
+                .iter()
                 .map(|id| *id.as_bytes())
                 .collect(),
-            put_file_versions: target
-                .file_versions
+            put_file_versions: change
+                .put_file_versions
                 .iter()
-                .filter(|(id, record)| base_versions.get(id) != Some(record))
-                .map(|(_, record)| record.into())
+                .map(StoredFileVersion::from)
                 .collect(),
-            remove_file_versions: base_versions
-                .keys()
-                .filter(|id| !target.file_versions.contains_key(id))
+            remove_file_versions: change
+                .remove_file_versions
+                .iter()
                 .map(|id| *id.as_bytes())
                 .collect(),
-        };
-        stored
-            .expected_nodes
-            .sort_by_key(|condition| condition.node);
-        stored
-            .expected_directories
-            .sort_by_key(|condition| condition.directory);
-        stored
+        }
     }
 
     fn validate(&self, volume_id: VolumeId) -> Result<(), ManagedError> {
@@ -884,128 +865,73 @@ impl StoredTransaction {
         }
         Ok(())
     }
+
+    fn to_change(&self) -> Result<NamespaceChange, ManagedError> {
+        let volume_id = VolumeId::from_bytes(self.volume_id);
+        self.validate(volume_id)?;
+        Ok(NamespaceChange {
+            volume_id,
+            operation: OperationId::from_bytes(self.operation),
+            parent: self.parent.into_cursor()?,
+            cursor: self.cursor.into_cursor()?,
+            root: NodeId::from_bytes(self.root),
+            expected_nodes: self
+                .expected_nodes
+                .iter()
+                .cloned()
+                .map(StoredNodePrecondition::into_record)
+                .collect(),
+            expected_directories: self
+                .expected_directories
+                .iter()
+                .cloned()
+                .map(StoredDirectoryPrecondition::into_record)
+                .collect(),
+            put_nodes: self
+                .put_nodes
+                .iter()
+                .cloned()
+                .map(StoredNode::into_record)
+                .collect::<Result<_, _>>()?,
+            remove_nodes: self
+                .remove_nodes
+                .iter()
+                .copied()
+                .map(NodeId::from_bytes)
+                .collect(),
+            put_directories: self
+                .put_directories
+                .iter()
+                .cloned()
+                .map(StoredDirectory::into_record)
+                .collect::<Result<_, _>>()?,
+            remove_directories: self
+                .remove_directories
+                .iter()
+                .copied()
+                .map(NodeId::from_bytes)
+                .collect(),
+            put_file_versions: self
+                .put_file_versions
+                .iter()
+                .cloned()
+                .map(StoredFileVersion::into_record)
+                .collect::<Result<_, _>>()?,
+            remove_file_versions: self
+                .remove_file_versions
+                .iter()
+                .copied()
+                .map(FileVersionId::from_bytes)
+                .collect(),
+        })
+    }
 }
 
 fn apply_transaction(
     base: Option<NamespaceSnapshot>,
     transaction: &StoredTransaction,
 ) -> Result<NamespaceSnapshot, ManagedError> {
-    let volume_id = VolumeId::from_bytes(transaction.volume_id);
-    transaction.validate(volume_id)?;
-    let parent = transaction.parent.into_cursor()?;
-    let validation_base = base.clone();
-    let mut target = match base {
-        Some(base) if base.volume_id == volume_id && base.cursor == parent => base,
-        Some(_) => {
-            return Err(corrupt(
-                "read Managed transaction",
-                "transaction base is invalid",
-            ));
-        }
-        None if parent == ChangeCursor::Genesis => NamespaceSnapshot {
-            volume_id,
-            cursor: ChangeCursor::Genesis,
-            root: NodeId::from_bytes(transaction.root),
-            nodes: BTreeMap::new(),
-            directories: BTreeMap::new(),
-            file_versions: BTreeMap::new(),
-        },
-        None => {
-            return Err(corrupt(
-                "read Managed transaction",
-                "initial transaction does not begin at genesis",
-            ));
-        }
-    };
-    let mut changed_nodes = BTreeSet::new();
-    for id in &transaction.remove_nodes {
-        if !changed_nodes.insert(*id) || target.nodes.remove(&NodeId::from_bytes(*id)).is_none() {
-            return Err(corrupt("read Managed transaction", "node delta is invalid"));
-        }
-    }
-    for node in &transaction.put_nodes {
-        if !changed_nodes.insert(node.id) {
-            return Err(corrupt("read Managed transaction", "node delta is invalid"));
-        }
-        let node = node.clone().into_record()?;
-        target.nodes.insert(node.id, node);
-    }
-    let mut changed_directories = BTreeSet::new();
-    for id in &transaction.remove_directories {
-        if !changed_directories.insert(*id)
-            || target
-                .directories
-                .remove(&NodeId::from_bytes(*id))
-                .is_none()
-        {
-            return Err(corrupt(
-                "read Managed transaction",
-                "directory delta is invalid",
-            ));
-        }
-    }
-    for directory in &transaction.put_directories {
-        if !changed_directories.insert(directory.node) {
-            return Err(corrupt(
-                "read Managed transaction",
-                "directory delta is invalid",
-            ));
-        }
-        let directory = directory.clone().into_record()?;
-        target.directories.insert(directory.node, directory);
-    }
-    let mut changed_versions = BTreeSet::new();
-    for id in &transaction.remove_file_versions {
-        if !changed_versions.insert(*id)
-            || target
-                .file_versions
-                .remove(&FileVersionId::from_bytes(*id))
-                .is_none()
-        {
-            return Err(corrupt(
-                "read Managed transaction",
-                "file version delta is invalid",
-            ));
-        }
-    }
-    for version in &transaction.put_file_versions {
-        if !changed_versions.insert(version.id) {
-            return Err(corrupt(
-                "read Managed transaction",
-                "file version delta is invalid",
-            ));
-        }
-        let version = version.clone().into_record()?;
-        target.file_versions.insert(version.id, version);
-    }
-    target.root = NodeId::from_bytes(transaction.root);
-    target.cursor = transaction.cursor.into_cursor()?;
-    let publication = NamespacePublication {
-        operation: OperationId::from_bytes(transaction.operation),
-        parent,
-        expected_nodes: transaction
-            .expected_nodes
-            .iter()
-            .cloned()
-            .map(StoredNodePrecondition::into_record)
-            .collect(),
-        expected_directories: transaction
-            .expected_directories
-            .iter()
-            .cloned()
-            .map(StoredDirectoryPrecondition::into_record)
-            .collect(),
-        target: target.clone(),
-    };
-    if !validate_publication(&publication, validation_base.as_ref())
-        .map_err(|_| corrupt("read Managed transaction", "transaction is invalid"))?
-    {
-        return Err(corrupt(
-            "read Managed transaction",
-            "transaction preconditions are stale",
-        ));
-    }
-    Ok(target)
+    transaction.to_change()?.apply(base)
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
