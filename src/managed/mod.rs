@@ -15,7 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Shared filesystem semantics used by ofs access and volume implementations.
+//! Managed volume authority and its durable format.
 
-pub mod filesystem;
-pub mod managed;
+mod error;
+mod format;
+mod metadata;
+
+pub use error::{ManagedError, ManagedErrorKind};
+pub use format::{ManagedFormat, NamingPolicy};
+pub use metadata::{D1Config, D1Metadata, Metadata, ObjectMetadata};
