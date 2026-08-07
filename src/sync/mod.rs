@@ -9,9 +9,11 @@
 //! Local replica foundations owned by the Sync access model.
 
 mod local;
+mod publication;
 mod staging;
 mod state;
 
 pub use local::{LocalEntry, LocalKind, LocalTree};
+pub use publication::build_publication;
 pub use staging::{StagedFile, StagedTree};
 pub use state::{BaseEntry, ConflictRecord, PendingIntent, ReplicaState};

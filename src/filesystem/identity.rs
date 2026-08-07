@@ -46,6 +46,18 @@ impl VolumeId {
         Self::from_bytes(*uuid::Uuid::new_v4().as_bytes())
     }
 }
+
+impl NodeId {
+    pub fn generate() -> Self {
+        Self::from_bytes(*uuid::Uuid::new_v4().as_bytes())
+    }
+}
+
+impl OperationId {
+    pub fn generate() -> Self {
+        Self::from_bytes(*uuid::Uuid::new_v4().as_bytes())
+    }
+}
 fixed_identity!(
     /// Identity of one filesystem node.
     ///

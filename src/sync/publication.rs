@@ -1,0 +1,404 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU64;
+
+use anyhow::{Context, Result, bail};
+
+use super::{LocalKind, LocalTree, ReplicaState};
+use crate::filesystem::{ChangeCursor, NodeId, OperationId, VolumeId};
+use crate::managed::namespace::{
+    DirectoryEntry, DirectoryPrecondition, DirectoryRecord, FileVersionRecord,
+    NamespacePublication, NamespaceSnapshot, NodeAttributes, NodeKind, NodePrecondition,
+    NodeRecord,
+};
+
+/// Build one complete Managed namespace target from a stable local observation.
+///
+/// Rename identity belongs to reconciliation. This builder preserves identity
+/// at an unchanged path, but never treats equal content as proof of a rename.
+pub fn build_publication(
+    volume: VolumeId,
+    operation: OperationId,
+    authoritative: Option<&NamespaceSnapshot>,
+    replica: &ReplicaState,
+    local: &LocalTree,
+    prepared: &BTreeMap<String, FileVersionRecord>,
+) -> Result<NamespacePublication> {
+    let parent = authoritative.map_or(ChangeCursor::Genesis, |state| state.cursor);
+    validate_ancestry(volume, parent, authoritative, replica)?;
+
+    let old_paths = match authoritative {
+        Some(state) => snapshot_paths(state)?,
+        None => BTreeMap::new(),
+    };
+    validate_replica_paths(&old_paths, replica)?;
+    let kinds = local_kinds(local)?;
+    validate_prepared(local, prepared)?;
+    reject_unresolved_renames(&kinds, &old_paths, authoritative, replica, prepared)?;
+
+    let old_nodes = authoritative.map(|state| &state.nodes);
+    let old_directories = authoritative.map(|state| &state.directories);
+    let root = authoritative.map_or_else(NodeId::generate, |state| state.root);
+    let mut identities = BTreeMap::from([(String::new(), root)]);
+    let mut used = BTreeSet::from([root]);
+    for (path, kind) in &kinds {
+        let identity = old_paths
+            .get(path)
+            .and_then(|id| old_nodes.and_then(|nodes| nodes.get(id)))
+            .filter(|node| node.kind == *kind)
+            .map(|node| node.id)
+            .unwrap_or_else(|| fresh_node(&mut used, old_nodes));
+        used.insert(identity);
+        identities.insert(path.clone(), identity);
+    }
+
+    let mut nodes = BTreeMap::new();
+    let mut file_versions = BTreeMap::new();
+    for (path, kind) in std::iter::once((&String::new(), &NodeKind::Directory)).chain(kinds.iter())
+    {
+        let id = identities[path];
+        let file_version = if *kind == NodeKind::RegularFile {
+            let version = &prepared[path];
+            match file_versions.insert(version.id, version.clone()) {
+                Some(existing) if existing != *version => {
+                    bail!("prepared file version identity is reused with different content")
+                }
+                _ => {}
+            }
+            Some(version.id)
+        } else {
+            None
+        };
+        let body = (*kind, NodeAttributes::default(), file_version);
+        let generation = next_node_generation(id, body, old_nodes)?;
+        nodes.insert(
+            id,
+            NodeRecord {
+                id,
+                generation,
+                kind: *kind,
+                attributes: body.1,
+                file_version,
+            },
+        );
+    }
+
+    let entries = directory_entries(&kinds, &identities)?;
+    let mut directories = BTreeMap::new();
+    for (path, kind) in std::iter::once((&String::new(), &NodeKind::Directory)).chain(kinds.iter())
+    {
+        if *kind != NodeKind::Directory {
+            continue;
+        }
+        let node = identities[path];
+        let current = entries.get(path).cloned().unwrap_or_default();
+        let generation = next_directory_generation(node, &current, old_directories)?;
+        directories.insert(
+            node,
+            DirectoryRecord {
+                node,
+                generation,
+                entries: current,
+            },
+        );
+    }
+
+    let cursor = ChangeCursor::at(
+        NonZeroU64::new(
+            parent
+                .sequence()
+                .checked_add(1)
+                .context("namespace cursor overflow")?,
+        )
+        .context("namespace cursor cannot be zero")?,
+        operation,
+    );
+    let target = NamespaceSnapshot {
+        volume_id: volume,
+        cursor,
+        root,
+        nodes,
+        directories,
+        file_versions,
+    };
+    Ok(NamespacePublication {
+        operation,
+        parent,
+        expected_nodes: node_preconditions(authoritative, &target),
+        expected_directories: directory_preconditions(authoritative, &target),
+        target,
+    })
+}
+
+fn validate_ancestry(
+    volume: VolumeId,
+    parent: ChangeCursor,
+    authoritative: Option<&NamespaceSnapshot>,
+    replica: &ReplicaState,
+) -> Result<()> {
+    if authoritative.is_some_and(|state| state.volume_id != volume) || replica.volume != volume {
+        bail!("namespace, replica state, and requested volume disagree");
+    }
+    if replica.common != parent {
+        bail!("local replica is not based on the authoritative cursor; reconcile before publish");
+    }
+    Ok(())
+}
+
+fn local_kinds(local: &LocalTree) -> Result<BTreeMap<String, NodeKind>> {
+    let mut kinds = BTreeMap::new();
+    for (path, entry) in local.entries() {
+        let (parent, name) = split_path(path)?;
+        if !parent.is_empty()
+            && !kinds
+                .get(parent)
+                .is_some_and(|kind| *kind == NodeKind::Directory)
+        {
+            bail!("local path {path:?} has no directory parent");
+        }
+        let kind = match entry.kind {
+            LocalKind::Directory => NodeKind::Directory,
+            LocalKind::File => NodeKind::RegularFile,
+        };
+        if name.is_empty() || kinds.insert(path.clone(), kind).is_some() {
+            bail!("local path {path:?} is invalid");
+        }
+    }
+    Ok(kinds)
+}
+
+fn validate_prepared(
+    local: &LocalTree,
+    prepared: &BTreeMap<String, FileVersionRecord>,
+) -> Result<()> {
+    for (path, entry) in local.entries() {
+        match (entry.kind, prepared.get(path)) {
+            (LocalKind::File, Some(version))
+                if version.logical_size == entry.size
+                    && version.logical_size == version.content.logical_length
+                    && version.logical_digest == version.content.digest => {}
+            (LocalKind::File, Some(_)) => {
+                bail!("prepared file version for {path:?} does not match the local file")
+            }
+            (LocalKind::File, None) => bail!("local file {path:?} has no prepared file version"),
+            (LocalKind::Directory, None) => {}
+            (LocalKind::Directory, Some(_)) => {
+                bail!("directory {path:?} has a prepared file version")
+            }
+        }
+    }
+    if prepared
+        .keys()
+        .any(|path| !local.entries().contains_key(path))
+    {
+        bail!("prepared file versions contain a path outside the local tree");
+    }
+    Ok(())
+}
+
+fn validate_replica_paths(
+    authoritative: &BTreeMap<String, NodeId>,
+    replica: &ReplicaState,
+) -> Result<()> {
+    for (path, base) in &replica.base {
+        if let Some(node) = authoritative.get(path)
+            && *node != base.node
+        {
+            bail!("replica identity for {path:?} disagrees with the authoritative namespace");
+        }
+    }
+    Ok(())
+}
+
+fn reject_unresolved_renames(
+    local: &BTreeMap<String, NodeKind>,
+    old_paths: &BTreeMap<String, NodeId>,
+    authoritative: Option<&NamespaceSnapshot>,
+    replica: &ReplicaState,
+    prepared: &BTreeMap<String, FileVersionRecord>,
+) -> Result<()> {
+    let Some(authoritative) = authoritative else {
+        return Ok(());
+    };
+    for (path, kind) in local {
+        if old_paths.contains_key(path) || *kind != NodeKind::RegularFile {
+            continue;
+        }
+        let digest = prepared[path].logical_digest;
+        let possible = replica.base.iter().any(|(old_path, base)| {
+            !local.contains_key(old_path)
+                && base.digest == Some(digest)
+                && authoritative.nodes.contains_key(&base.node)
+        });
+        if possible {
+            bail!(
+                "local path {path:?} may be a rename; reconcile it before building a publication"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn snapshot_paths(snapshot: &NamespaceSnapshot) -> Result<BTreeMap<String, NodeId>> {
+    let mut paths = BTreeMap::new();
+    let mut pending = vec![(String::new(), snapshot.root)];
+    let mut expanded = BTreeSet::new();
+    while let Some((path, node)) = pending.pop() {
+        if paths.insert(path.clone(), node).is_some() {
+            bail!("authoritative namespace contains a duplicate path");
+        }
+        let record = snapshot
+            .nodes
+            .get(&node)
+            .context("authoritative namespace references a missing node")?;
+        if record.kind != NodeKind::Directory {
+            continue;
+        }
+        if !expanded.insert(node) {
+            bail!("authoritative namespace is not a directory tree");
+        }
+        let directory = snapshot
+            .directories
+            .get(&node)
+            .context("authoritative namespace references a missing directory")?;
+        for (name, entry) in directory.entries.iter().rev() {
+            let child = if path.is_empty() {
+                name.clone()
+            } else {
+                format!("{path}/{name}")
+            };
+            pending.push((child, entry.node));
+        }
+    }
+    paths.remove("");
+    Ok(paths)
+}
+
+fn directory_entries(
+    kinds: &BTreeMap<String, NodeKind>,
+    identities: &BTreeMap<String, NodeId>,
+) -> Result<BTreeMap<String, BTreeMap<String, DirectoryEntry>>> {
+    let mut directories = BTreeMap::<String, BTreeMap<String, DirectoryEntry>>::new();
+    directories.insert(String::new(), BTreeMap::new());
+    for (path, kind) in kinds {
+        let (parent, name) = split_path(path)?;
+        directories.entry(parent.to_owned()).or_default().insert(
+            name.to_owned(),
+            DirectoryEntry {
+                node: identities[path],
+                kind: *kind,
+            },
+        );
+        if *kind == NodeKind::Directory {
+            directories.entry(path.clone()).or_default();
+        }
+    }
+    Ok(directories)
+}
+
+fn split_path(path: &str) -> Result<(&str, &str)> {
+    let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+    if path.starts_with('/')
+        || path.ends_with('/')
+        || path.contains("//")
+        || name == "."
+        || name == ".."
+    {
+        bail!("local path {path:?} is not canonical");
+    }
+    Ok((parent, name))
+}
+
+fn fresh_node(used: &mut BTreeSet<NodeId>, old: Option<&BTreeMap<NodeId, NodeRecord>>) -> NodeId {
+    loop {
+        let node = NodeId::generate();
+        if !used.contains(&node) && old.is_none_or(|nodes| !nodes.contains_key(&node)) {
+            return node;
+        }
+    }
+}
+
+fn next_node_generation(
+    id: NodeId,
+    body: (
+        NodeKind,
+        NodeAttributes,
+        Option<crate::filesystem::FileVersionId>,
+    ),
+    old: Option<&BTreeMap<NodeId, NodeRecord>>,
+) -> Result<u64> {
+    let Some(previous) = old.and_then(|nodes| nodes.get(&id)) else {
+        return Ok(1);
+    };
+    if (previous.kind, previous.attributes, previous.file_version) == body {
+        Ok(previous.generation)
+    } else {
+        previous
+            .generation
+            .checked_add(1)
+            .context("node generation overflow")
+    }
+}
+
+fn next_directory_generation(
+    id: NodeId,
+    entries: &BTreeMap<String, DirectoryEntry>,
+    old: Option<&BTreeMap<NodeId, DirectoryRecord>>,
+) -> Result<u64> {
+    let Some(previous) = old.and_then(|directories| directories.get(&id)) else {
+        return Ok(1);
+    };
+    if previous.entries == *entries {
+        Ok(previous.generation)
+    } else {
+        previous
+            .generation
+            .checked_add(1)
+            .context("directory generation overflow")
+    }
+}
+
+fn node_preconditions(
+    authoritative: Option<&NamespaceSnapshot>,
+    target: &NamespaceSnapshot,
+) -> Vec<NodePrecondition> {
+    let empty = BTreeMap::new();
+    let old = authoritative.map_or(&empty, |state| &state.nodes);
+    old.keys()
+        .chain(target.nodes.keys())
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|id| old.get(id) != target.nodes.get(id))
+        .map(|node| NodePrecondition {
+            node,
+            expected_generation: old.get(&node).map(|record| record.generation),
+        })
+        .collect()
+}
+
+fn directory_preconditions(
+    authoritative: Option<&NamespaceSnapshot>,
+    target: &NamespaceSnapshot,
+) -> Vec<DirectoryPrecondition> {
+    let empty = BTreeMap::new();
+    let old = authoritative.map_or(&empty, |state| &state.directories);
+    old.keys()
+        .chain(target.directories.keys())
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|id| old.get(id) != target.directories.get(id))
+        .map(|directory| DirectoryPrecondition {
+            directory,
+            expected_generation: old.get(&directory).map(|record| record.generation),
+        })
+        .collect()
+}
