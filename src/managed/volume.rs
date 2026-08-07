@@ -24,8 +24,8 @@ use super::namespace::{
     NamespacePublication, NamespaceSnapshot, ObjectNamespace,
 };
 use super::{
-    D1Metadata, FileLayoutPolicy, ManagedData, ManagedError, ManagedErrorKind, PackMaintenance,
-    PackRetirement, SparseExtent,
+    D1Metadata, FileLayoutPolicy, LooseGcMaintenance, ManagedData, ManagedError, ManagedErrorKind,
+    PackMaintenance, PackRetirement, SparseExtent,
 };
 use crate::filesystem::{CommitOutcome, OperationId, VolumeId};
 
@@ -198,6 +198,25 @@ impl ManagedVolume {
             NamespaceAuthority::Object(namespace) => namespace.finish_gc(sweep).await,
             NamespaceAuthority::D1(namespace) => namespace.finish_gc(sweep).await,
         }
+    }
+
+    /// Delete loose objects unreachable from the snapshot fixed by this sweep.
+    pub async fn collect_unreachable_loose(
+        &self,
+        observed: &ManagedObservation,
+        sweep: NamespaceGcSweep,
+    ) -> Result<LooseGcMaintenance, ManagedError> {
+        if observed.gc_sweep() != Some(sweep) || observed.snapshot().cursor != sweep.fixed_cursor()
+        {
+            return Err(ManagedError::new(
+                ManagedErrorKind::Invalid,
+                "collect unreachable loose data",
+                "observation does not hold this active GC sweep",
+            ));
+        }
+        self.data
+            .collect_unreachable_loose(observed.snapshot())
+            .await
     }
 
     /// Pack small content reachable from one fixed namespace observation.

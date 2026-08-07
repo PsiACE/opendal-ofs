@@ -50,6 +50,14 @@ pub(crate) enum VolumeCommand {
     Create(VolumeCreateArgs),
     /// Pack live small content through the current Managed namespace root.
     Pack(VolumePackArgs),
+    /// Remove loose data unreachable from the current Managed namespace root.
+    Gc(VolumeGcArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct VolumeGcArgs {
+    /// Named Managed volume from the local catalog.
+    pub alias: String,
 }
 
 #[derive(Debug, Args)]

@@ -23,7 +23,8 @@ use opendal::Operator;
 use url::Url;
 
 use crate::cli::{
-    Cli, Command, StatusArgs, SyncArgs, VolumeCommand, VolumeCreateArgs, VolumePackArgs,
+    Cli, Command, StatusArgs, SyncArgs, VolumeCommand, VolumeCreateArgs, VolumeGcArgs,
+    VolumePackArgs,
 };
 
 pub(crate) async fn run(cli: Cli) -> Result<()> {
@@ -42,6 +43,13 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
             None,
             None,
         ) => pack_volume(cli.config.as_deref(), args).await,
+        (
+            Some(Command::Volume {
+                command: VolumeCommand::Gc(args),
+            }),
+            None,
+            None,
+        ) => gc_volume(cli.config.as_deref(), args).await,
         (Some(Command::Sync(args)), None, None) => sync_volume(cli.config.as_deref(), args).await,
         (Some(Command::Status(args)), None, None) => status(cli.config.as_deref(), args),
         (None, Some(mount_path), Some(backend)) => mount(&mount_path, &backend).await,
@@ -54,36 +62,28 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
     }
 }
 
-async fn pack_volume(config: Option<&Path>, args: VolumePackArgs) -> Result<()> {
-    let catalog = load_catalog(config)?;
-    let definition = catalog
-        .get(&args.alias)
-        .with_context(|| format!("volume alias {:?} is not in the catalog", args.alias))?
-        .clone();
-    if definition.model != VolumeModel::Managed || definition.format_major != 1 {
-        bail!("volume pack requires a Managed volume using format v1");
-    }
+async fn gc_volume(config: Option<&Path>, args: VolumeGcArgs) -> Result<()> {
+    let volume = open_managed_volume(config, &args.alias).await?;
+    let observed = volume
+        .observe()
+        .await?
+        .context("Managed volume has no published namespace to collect")?;
+    let sweep = volume.begin_gc(&observed).await?;
+    let fixed = volume
+        .observe()
+        .await?
+        .context("Managed namespace disappeared after starting collection")?;
+    let collected = volume.collect_unreachable_loose(&fixed, sweep).await?;
+    volume.finish_gc(sweep).await?;
+    println!(
+        "garbage collected {:?}: scanned={} deleted={} bytes={}",
+        args.alias, collected.scanned, collected.deleted, collected.deleted_bytes,
+    );
+    Ok(())
+}
 
-    let data = open_operator(&definition.storage)?;
-    ManagedDataFormat::read(&data).await?.validate_for_write()?;
-    let metadata = open_metadata(data.clone(), definition.metadata.as_ref())?;
-    let placement = if definition.metadata.is_some() {
-        MetadataPlacement::ExternalD1
-    } else {
-        MetadataPlacement::ColocatedObject
-    };
-    let expected = ManagedFormat::v1(
-        definition.volume_id,
-        placement,
-        definition.storage.to_string(),
-    )?;
-    if metadata.read_format().await? != expected {
-        bail!("volume catalog and Managed format v1 binding disagree");
-    }
-    let volume = match metadata {
-        Metadata::Object(_) => ManagedVolume::object(definition.volume_id, data)?,
-        Metadata::D1(metadata) => ManagedVolume::d1(definition.volume_id, data, metadata)?,
-    };
+async fn pack_volume(config: Option<&Path>, args: VolumePackArgs) -> Result<()> {
+    let volume = open_managed_volume(config, &args.alias).await?;
     let observed = volume
         .observe()
         .await?
@@ -138,6 +138,38 @@ async fn pack_volume(config: Option<&Path>, args: VolumePackArgs) -> Result<()> 
         reclaimed,
     );
     Ok(())
+}
+
+async fn open_managed_volume(config: Option<&Path>, alias: &str) -> Result<ManagedVolume> {
+    let catalog = load_catalog(config)?;
+    let definition = catalog
+        .get(alias)
+        .with_context(|| format!("volume alias {alias:?} is not in the catalog"))?
+        .clone();
+    if definition.model != VolumeModel::Managed || definition.format_major != 1 {
+        bail!("Managed volume maintenance requires a Managed volume using format v1");
+    }
+
+    let data = open_operator(&definition.storage)?;
+    ManagedDataFormat::read(&data).await?.validate_for_write()?;
+    let metadata = open_metadata(data.clone(), definition.metadata.as_ref())?;
+    let placement = if definition.metadata.is_some() {
+        MetadataPlacement::ExternalD1
+    } else {
+        MetadataPlacement::ColocatedObject
+    };
+    let expected = ManagedFormat::v1(
+        definition.volume_id,
+        placement,
+        definition.storage.to_string(),
+    )?;
+    if metadata.read_format().await? != expected {
+        bail!("volume catalog and Managed format v1 binding disagree");
+    }
+    Ok(match metadata {
+        Metadata::Object(_) => ManagedVolume::object(definition.volume_id, data)?,
+        Metadata::D1(metadata) => ManagedVolume::d1(definition.volume_id, data, metadata)?,
+    })
 }
 
 async fn create_volume(config: Option<&Path>, args: VolumeCreateArgs) -> Result<()> {

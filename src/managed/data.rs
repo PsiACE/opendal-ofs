@@ -52,6 +52,14 @@ pub struct PackMaintenance {
     pub reclaimable_loose: Vec<ContentRef>,
 }
 
+/// Loose data removed by one namespace-fenced garbage-collection sweep.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LooseGcMaintenance {
+    pub scanned: usize,
+    pub deleted: usize,
+    pub deleted_bytes: u64,
+}
+
 /// One process-local grace boundary after replacement locations are published.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PackRetirement {
@@ -668,6 +676,75 @@ impl ManagedData {
         Ok(reclaimed)
     }
 
+    pub(crate) async fn collect_unreachable_loose(
+        &self,
+        snapshot: &NamespaceSnapshot,
+    ) -> Result<LooseGcMaintenance, ManagedError> {
+        let capability = self.operator.info().full_capability();
+        if !capability.list || !capability.stat || !capability.delete {
+            return Err(unavailable("collect unreachable loose data"));
+        }
+        let live = reachable_content(snapshot, "collect unreachable loose data")?;
+        let mut result = LooseGcMaintenance::default();
+        let entries = self
+            .operator
+            .list_with(&format!("{LOOSE_ROOT}/"))
+            .recursive(true)
+            .await
+            .map_err(|_| unavailable("collect unreachable loose data"))?;
+        for entry in entries {
+            if entry.metadata().is_dir() {
+                continue;
+            }
+            if !entry.metadata().is_file() {
+                continue;
+            }
+            let Some(digest) = parse_loose_key(entry.path()) else {
+                continue;
+            };
+            let metadata = self
+                .operator
+                .stat(entry.path())
+                .await
+                .map_err(|_| unavailable("collect unreachable loose data"))?;
+            if !metadata.is_file() {
+                return Err(corrupt(
+                    "collect unreachable loose data",
+                    "loose data path changed while the namespace was fenced",
+                ));
+            }
+            let content = ContentRef {
+                digest,
+                logical_length: metadata.content_length(),
+            };
+            result.scanned += 1;
+            if live.contains(&content) {
+                continue;
+            }
+            if live.iter().any(|candidate| candidate.digest == digest) {
+                return Err(corrupt(
+                    "collect unreachable loose data",
+                    "live loose content has an unexpected length",
+                ));
+            }
+            self.operator
+                .delete(entry.path())
+                .await
+                .map_err(|_| unavailable("collect unreachable loose data"))?;
+            result.deleted += 1;
+            result.deleted_bytes = result
+                .deleted_bytes
+                .checked_add(content.logical_length)
+                .ok_or_else(|| {
+                    corrupt(
+                        "collect unreachable loose data",
+                        "deleted byte count exceeds format v1",
+                    )
+                })?;
+        }
+        Ok(result)
+    }
+
     async fn read_loose_content(&self, content: ContentRef) -> Result<Vec<u8>, ManagedError> {
         let key = loose_key(&content);
         let bytes = self
@@ -1219,6 +1296,33 @@ fn whole_file_version(size: u64, digest: Digest) -> FileVersionRecord {
 fn loose_key(content: &ContentRef) -> String {
     let digest = Digest::from_bytes(content.digest).hex();
     format!("{LOOSE_ROOT}/{}/{digest}", &digest[..2])
+}
+
+fn parse_loose_key(path: &str) -> Option<[u8; 32]> {
+    let relative = path.strip_prefix(&format!("{LOOSE_ROOT}/"))?;
+    let (partition, encoded) = relative.split_once('/')?;
+    if partition.len() != 2
+        || encoded.len() != 64
+        || encoded.contains('/')
+        || partition != &encoded[..2]
+    {
+        return None;
+    }
+    let mut digest = [0_u8; 32];
+    for (output, pair) in digest.iter_mut().zip(encoded.as_bytes().chunks_exact(2)) {
+        let high = decode_lower_hex(pair[0])?;
+        let low = decode_lower_hex(pair[1])?;
+        *output = high << 4 | low;
+    }
+    Some(digest)
+}
+
+const fn decode_lower_hex(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        _ => None,
+    }
 }
 
 fn already_exists(error: &opendal::Error) -> bool {

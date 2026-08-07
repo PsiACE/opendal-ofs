@@ -238,6 +238,9 @@ grep -Fxq 'history change 60' "$replica_b/checkpoint.txt" || \
 repack=$(OFS_CONFIG="$config" "$OFS_BIN" volume pack workspace --repack-grace-seconds 0)
 grep -Eq 'retired=[1-9][0-9]*' <<<"$repack" || \
   fail 'repack did not retire packs containing dead entries'
+garbage_collection=$(OFS_CONFIG="$config" "$OFS_BIN" volume gc workspace)
+grep -Eq 'deleted=[1-9][0-9]*' <<<"$garbage_collection" || \
+  fail 'namespace-fenced collection removed no unreachable loose data'
 
 printf '%s\n' 'acceptance: rebuild a cold client from remote authority'
 OFS_CONFIG="$cold_config" "$OFS_BIN" "${volume_create[@]}"
