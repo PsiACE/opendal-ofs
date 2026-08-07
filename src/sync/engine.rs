@@ -21,8 +21,8 @@ use super::{
     StagedTree, build_publication, reconcile,
 };
 use crate::filesystem::{ChangeCursor, CommitOutcome, Generation, NodeId, OperationId, VolumeId};
-use crate::managed::ManagedVolume;
 use crate::managed::namespace::{FileVersionRecord, NamespaceSnapshot, NodeKind};
+use crate::managed::{D1Metadata, ManagedVolume};
 
 #[derive(Clone, Debug)]
 pub struct SyncResult {
@@ -45,6 +45,13 @@ impl SyncEngine {
         Ok(Self {
             volume_id,
             volume: ManagedVolume::object(volume_id, data_operator)?,
+        })
+    }
+
+    pub fn d1(volume_id: VolumeId, data_operator: Operator, metadata: D1Metadata) -> Result<Self> {
+        Ok(Self {
+            volume_id,
+            volume: ManagedVolume::d1(volume_id, data_operator, metadata)?,
         })
     }
 

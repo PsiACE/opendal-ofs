@@ -12,15 +12,16 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 use ofs::catalog::{Catalog, VolumeDefinition};
-use ofs::filesystem::{VolumeId, VolumeModel};
+use ofs::filesystem::{AccessModel, VolumeId, VolumeModel};
 use ofs::managed::{
     D1Config, D1Metadata, ManagedDataFormat, ManagedError, ManagedErrorKind, ManagedFormat,
     Metadata, MetadataPlacement, ObjectMetadata,
 };
+use ofs::sync::{ReplicaState, SyncEngine};
 use opendal::Operator;
 use url::Url;
 
-use crate::cli::{Cli, Command, VolumeCommand, VolumeCreateArgs};
+use crate::cli::{Cli, Command, StatusArgs, SyncArgs, VolumeCommand, VolumeCreateArgs};
 
 pub(crate) async fn run(cli: Cli) -> Result<()> {
     match (cli.command, cli.mount_path, cli.backend) {
@@ -31,6 +32,8 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
             None,
             None,
         ) => create_volume(cli.config.as_deref(), args).await,
+        (Some(Command::Sync(args)), None, None) => sync_volume(cli.config.as_deref(), args).await,
+        (Some(Command::Status(args)), None, None) => status(cli.config.as_deref(), args),
         (None, Some(mount_path), Some(backend)) => mount(&mount_path, &backend).await,
         (Some(_), _, _) => {
             bail!("a subcommand cannot be combined with Direct Mount arguments; run `ofs --help`")
@@ -54,35 +57,61 @@ async fn create_volume(config: Option<&Path>, args: VolumeCreateArgs) -> Result<
     }
     .context("cannot open the volume catalog; set --config or OFS_CONFIG to a writable path")?;
 
-    let volume_id = catalog
-        .get(&args.alias)
+    let configured = catalog.get(&args.alias).cloned();
+    let provisional_id = configured
+        .as_ref()
         .map(|definition| definition.volume_id)
         .unwrap_or_else(VolumeId::generate);
-    let definition = VolumeDefinition::new(
-        volume_id,
+    let provisional = VolumeDefinition::new(
+        provisional_id,
         args.model,
         args.storage.clone(),
         args.metadata.clone(),
         1,
     )
     .context("volume URLs must be credential-free; supply credentials through provider environment variables")?;
-    let created = catalog.create(&args.alias, definition.clone())?;
+    if configured
+        .as_ref()
+        .is_some_and(|current| current != &provisional)
+    {
+        bail!(
+            "volume alias {:?} conflicts with its existing configuration",
+            args.alias
+        );
+    }
     let placement = if args.metadata.is_some() {
         MetadataPlacement::ExternalD1
     } else {
         MetadataPlacement::ColocatedObject
     };
-    let format = ManagedFormat::v1(volume_id, placement, definition.storage.to_string())?;
     let data = open_operator(&args.storage)?;
     ManagedDataFormat::v1()
         .activate(&data)
         .await
         .map_err(create_format_error)?;
     let metadata = open_metadata(data, args.metadata.as_ref())?;
-    metadata
-        .create_format(&format)
-        .await
-        .map_err(create_format_error)?;
+    let desired = ManagedFormat::v1(provisional_id, placement, args.storage.to_string())?;
+    let format = match metadata.create_format(&desired).await {
+        Ok(format) => format,
+        Err(error) if configured.is_none() && error.kind() == ManagedErrorKind::Conflict => {
+            let observed = metadata.read_format().await.map_err(create_format_error)?;
+            let expected =
+                ManagedFormat::v1(observed.volume_id(), placement, args.storage.to_string())?;
+            if observed != expected {
+                return Err(create_format_error(error));
+            }
+            observed
+        }
+        Err(error) => return Err(create_format_error(error)),
+    };
+    let definition = VolumeDefinition::new(
+        format.volume_id(),
+        args.model,
+        args.storage,
+        args.metadata,
+        1,
+    )?;
+    let created = catalog.create(&args.alias, definition)?;
 
     catalog
         .save()
@@ -99,6 +128,118 @@ fn open_metadata(data: Operator, metadata: Option<&Url>) -> Result<Metadata> {
         Some(url) if url.scheme() == "d1" => Ok(Metadata::D1(D1Metadata::new(d1_config(url)?))),
         Some(_) => bail!("--metadata must use d1://ACCOUNT/DATABASE/STORE"),
     }
+}
+
+async fn sync_volume(config: Option<&Path>, args: SyncArgs) -> Result<()> {
+    let catalog = load_catalog(config)?;
+    let definition = catalog
+        .get(&args.alias)
+        .with_context(|| format!("volume alias {:?} is not in the catalog", args.alias))?
+        .clone();
+    if definition.model != VolumeModel::Managed || definition.format_major != 1 {
+        bail!("sync requires a Managed volume using format v1");
+    }
+
+    let data = open_operator(&definition.storage)?;
+    ManagedDataFormat::read(&data).await?.validate_for_write()?;
+    let metadata = open_metadata(data.clone(), definition.metadata.as_ref())?;
+    let placement = if definition.metadata.is_some() {
+        MetadataPlacement::ExternalD1
+    } else {
+        MetadataPlacement::ColocatedObject
+    };
+    let expected = ManagedFormat::v1(
+        definition.volume_id,
+        placement,
+        definition.storage.to_string(),
+    )?;
+    if metadata.read_format().await? != expected {
+        bail!("volume catalog and Managed format v1 binding disagree");
+    }
+
+    let engine = match metadata {
+        Metadata::Object(_) => SyncEngine::object(definition.volume_id, data)?,
+        Metadata::D1(metadata) => SyncEngine::d1(definition.volume_id, data, metadata)?,
+    };
+    let resolutions = args.resolve.into_iter().collect::<Vec<_>>();
+    let result = engine
+        .sync(&args.replica, &args.state, &resolutions)
+        .await?;
+    if !result.conflicts.is_empty() {
+        bail!(
+            "sync retained {} conflict(s); inspect `ofs status` and resolve explicitly",
+            result.conflicts.len()
+        );
+    }
+    if result.pending {
+        bail!("publication result is unknown; repeat sync to resolve its durable intent");
+    }
+    println!(
+        "synced {:?} at change {}{}",
+        args.alias,
+        result.common.sequence(),
+        if result.published { " (published)" } else { "" }
+    );
+    Ok(())
+}
+
+fn status(config: Option<&Path>, args: StatusArgs) -> Result<()> {
+    let state = ReplicaState::load(&args.state)?
+        .with_context(|| format!("replica state does not exist: {}", args.state.display()))?;
+    let catalog = load_catalog(config)?;
+    let (alias, definition) = catalog
+        .find_by_id(state.volume)
+        .context("replica volume is not in the local catalog")?;
+    if definition.model != VolumeModel::Managed {
+        bail!("replica state is not bound to a Managed volume");
+    }
+    let value = serde_json::json!({
+        "volume": alias,
+        "volume_model": model_name(definition.model),
+        "access_model": access_name(AccessModel::Sync),
+        "replica": display_path(&args.replica),
+        "common_sequence": state.common.sequence(),
+        "pending": state.pending.is_some(),
+        "conflicts": state.conflicts.len(),
+    });
+    if args.json {
+        println!("{}", serde_json::to_string(&value)?);
+    } else {
+        println!(
+            "{}: Managed Sync at change {}, {} pending, {} conflict(s)",
+            display_path(&args.replica),
+            state.common.sequence(),
+            usize::from(state.pending.is_some()),
+            state.conflicts.len()
+        );
+    }
+    Ok(())
+}
+
+fn load_catalog(config: Option<&Path>) -> Result<Catalog> {
+    match config {
+        Some(path) => Catalog::load(path),
+        None => Catalog::load_from_env(),
+    }
+    .context("cannot open the volume catalog; set --config or OFS_CONFIG")
+}
+
+fn model_name(model: VolumeModel) -> &'static str {
+    match model {
+        VolumeModel::Direct => "direct",
+        VolumeModel::Managed => "managed",
+    }
+}
+
+fn access_name(model: AccessModel) -> &'static str {
+    match model {
+        AccessModel::Mount => "mount",
+        AccessModel::Sync => "sync",
+    }
+}
+
+fn display_path(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
 }
 
 fn open_operator(url: &Url) -> Result<Operator> {
