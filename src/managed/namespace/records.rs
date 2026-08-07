@@ -17,39 +17,24 @@
 
 use std::collections::BTreeMap;
 
-use crate::filesystem::{ChangeCursor, FileVersionId, NodeId, OperationId, VolumeId};
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NodeKind {
-    Directory,
-    RegularFile,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-pub struct NodeAttributes {
-    pub executable: bool,
-}
+use crate::filesystem::{
+    ChangeCursor, DirectoryEntry, FileVersionId, Generation, NodeAttributes, NodeId, NodeKind,
+    OperationId, VolumeId,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NodeRecord {
     pub id: NodeId,
-    pub generation: u64,
+    pub generation: Generation,
     pub kind: NodeKind,
     pub attributes: NodeAttributes,
     pub file_version: Option<FileVersionId>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DirectoryEntry {
-    pub node: NodeId,
-    pub kind: NodeKind,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DirectoryRecord {
     pub node: NodeId,
-    pub generation: u64,
+    pub generation: Generation,
     pub entries: BTreeMap<String, DirectoryEntry>,
 }
 
@@ -77,16 +62,16 @@ pub struct NamespaceSnapshot {
     pub file_versions: BTreeMap<FileVersionId, FileVersionRecord>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NodePrecondition {
     pub node: NodeId,
-    pub expected_generation: Option<u64>,
+    pub expected_generation: Option<Generation>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DirectoryPrecondition {
     pub directory: NodeId,
-    pub expected_generation: Option<u64>,
+    pub expected_generation: Option<Generation>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -96,4 +81,23 @@ pub struct NamespacePublication {
     pub expected_nodes: Vec<NodePrecondition>,
     pub expected_directories: Vec<DirectoryPrecondition>,
     pub target: NamespaceSnapshot,
+}
+
+pub(crate) fn managed_generation(value: u64) -> Generation {
+    Generation::from_bytes(value.to_be_bytes().to_vec())
+}
+
+pub(crate) fn managed_generation_number(generation: &Generation) -> Option<u64> {
+    generation
+        .as_bytes()
+        .try_into()
+        .ok()
+        .map(u64::from_be_bytes)
+        .filter(|value| *value != 0)
+}
+
+pub(crate) fn next_managed_generation(generation: &Generation) -> Option<Generation> {
+    managed_generation_number(generation)
+        .and_then(|value| value.checked_add(1))
+        .map(managed_generation)
 }

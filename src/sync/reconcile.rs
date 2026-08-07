@@ -11,8 +11,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{Context, Result, bail};
 
 use super::{ConflictRecord, ReplicaState, StagedTree};
+use crate::filesystem::NodeKind;
 use crate::filesystem::{ChangeCursor, FileVersionId, NodeId};
-use crate::managed::namespace::{FileVersionRecord, NamespaceSnapshot, NodeKind};
+use crate::managed::namespace::{FileVersionRecord, NamespaceSnapshot};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReconcilePlan {

@@ -19,9 +19,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::records::{
     DirectoryPrecondition, DirectoryRecord, NamespacePublication, NamespaceSnapshot,
-    NodeAttributes, NodeKind, NodePrecondition, NodeRecord,
+    NodePrecondition, NodeRecord, managed_generation, managed_generation_number,
+    next_managed_generation,
 };
-use crate::filesystem::{ChangeCursor, FileVersionId, NodeId};
+use crate::filesystem::{ChangeCursor, FileVersionId, NodeAttributes, NodeId, NodeKind};
 use crate::managed::{ManagedError, ManagedErrorKind};
 
 pub(super) fn validate_publication(
@@ -81,7 +82,7 @@ pub(super) fn validate_snapshot(snapshot: &NamespaceSnapshot) -> Result<(), Mana
         ));
     }
     for (id, node) in &snapshot.nodes {
-        if *id != node.id || node.generation == 0 {
+        if *id != node.id || managed_generation_number(&node.generation).is_none() {
             return Err(invalid("read Managed namespace", "node record is invalid"));
         }
         match node.kind {
@@ -95,7 +96,7 @@ pub(super) fn validate_snapshot(snapshot: &NamespaceSnapshot) -> Result<(), Mana
     }
     for (id, directory) in &snapshot.directories {
         if *id != directory.node
-            || directory.generation == 0
+            || managed_generation_number(&directory.generation).is_none()
             || !snapshot
                 .nodes
                 .get(id)
@@ -146,7 +147,8 @@ fn preconditions_match_nodes(
                 "duplicate node precondition",
             ));
         }
-        if current.get(&condition.node).map(|node| node.generation) != condition.expected_generation
+        if current.get(&condition.node).map(|node| &node.generation)
+            != condition.expected_generation.as_ref()
         {
             return Ok(false);
         }
@@ -168,8 +170,8 @@ fn preconditions_match_directories(
         }
         if current
             .get(&condition.directory)
-            .map(|directory| directory.generation)
-            != condition.expected_generation
+            .map(|directory| &directory.generation)
+            != condition.expected_generation.as_ref()
         {
             return Ok(false);
         }
@@ -192,11 +194,9 @@ fn validate_generations(
         let target = publication.target.nodes.get(id);
         let changed = current.map(node_body) != target.map(node_body);
         let expected = match (current, target, changed) {
-            (None, Some(_), _) => 1,
-            (Some(node), Some(_), false) => node.generation,
-            (Some(node), Some(_), true) => node
-                .generation
-                .checked_add(1)
+            (None, Some(_), _) => managed_generation(1),
+            (Some(node), Some(_), false) => node.generation.clone(),
+            (Some(node), Some(_), true) => next_managed_generation(&node.generation)
                 .ok_or_else(|| invalid("publish Managed namespace", "node generation overflow"))?,
             (Some(_), None, _) => {
                 if !node_conditions.contains(id) {
@@ -232,13 +232,12 @@ fn validate_generations(
         let target = publication.target.directories.get(id);
         let changed = current.map(|item| &item.entries) != target.map(|item| &item.entries);
         let expected = match (current, target, changed) {
-            (None, Some(_), _) => 1,
-            (Some(directory), Some(_), false) => directory.generation,
-            (Some(directory), Some(_), true) => {
-                directory.generation.checked_add(1).ok_or_else(|| {
+            (None, Some(_), _) => managed_generation(1),
+            (Some(directory), Some(_), false) => directory.generation.clone(),
+            (Some(directory), Some(_), true) => next_managed_generation(&directory.generation)
+                .ok_or_else(|| {
                     invalid("publish Managed namespace", "directory generation overflow")
-                })?
-            }
+                })?,
             (Some(_), None, _) => {
                 if !directory_conditions.contains(id) {
                     return Err(invalid(

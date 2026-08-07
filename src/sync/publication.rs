@@ -12,11 +12,12 @@ use std::num::NonZeroU64;
 use anyhow::{Context, Result, bail};
 
 use super::{LocalKind, LocalTree, ReplicaState};
-use crate::filesystem::{ChangeCursor, NodeId, OperationId, VolumeId};
+use crate::filesystem::{
+    ChangeCursor, DirectoryEntry, NodeAttributes, NodeId, NodeKind, OperationId, VolumeId,
+};
 use crate::managed::namespace::{
-    DirectoryEntry, DirectoryPrecondition, DirectoryRecord, FileVersionRecord,
-    NamespacePublication, NamespaceSnapshot, NodeAttributes, NodeKind, NodePrecondition,
-    NodeRecord,
+    DirectoryPrecondition, DirectoryRecord, FileVersionRecord, NamespacePublication,
+    NamespaceSnapshot, NodePrecondition, NodeRecord, managed_generation, next_managed_generation,
 };
 
 /// Build one complete Managed namespace target from a stable local observation.
@@ -333,17 +334,14 @@ fn next_node_generation(
         Option<crate::filesystem::FileVersionId>,
     ),
     old: Option<&BTreeMap<NodeId, NodeRecord>>,
-) -> Result<u64> {
+) -> Result<crate::filesystem::Generation> {
     let Some(previous) = old.and_then(|nodes| nodes.get(&id)) else {
-        return Ok(1);
+        return Ok(managed_generation(1));
     };
     if (previous.kind, previous.attributes, previous.file_version) == body {
-        Ok(previous.generation)
+        Ok(previous.generation.clone())
     } else {
-        previous
-            .generation
-            .checked_add(1)
-            .context("node generation overflow")
+        next_managed_generation(&previous.generation).context("node generation overflow")
     }
 }
 
@@ -351,17 +349,14 @@ fn next_directory_generation(
     id: NodeId,
     entries: &BTreeMap<String, DirectoryEntry>,
     old: Option<&BTreeMap<NodeId, DirectoryRecord>>,
-) -> Result<u64> {
+) -> Result<crate::filesystem::Generation> {
     let Some(previous) = old.and_then(|directories| directories.get(&id)) else {
-        return Ok(1);
+        return Ok(managed_generation(1));
     };
     if previous.entries == *entries {
-        Ok(previous.generation)
+        Ok(previous.generation.clone())
     } else {
-        previous
-            .generation
-            .checked_add(1)
-            .context("directory generation overflow")
+        next_managed_generation(&previous.generation).context("directory generation overflow")
     }
 }
 
@@ -379,7 +374,7 @@ fn node_preconditions(
         .filter(|id| old.get(id) != target.nodes.get(id))
         .map(|node| NodePrecondition {
             node,
-            expected_generation: old.get(&node).map(|record| record.generation),
+            expected_generation: old.get(&node).map(|record| record.generation.clone()),
         })
         .collect()
 }
@@ -398,7 +393,7 @@ fn directory_preconditions(
         .filter(|id| old.get(id) != target.directories.get(id))
         .map(|directory| DirectoryPrecondition {
             directory,
-            expected_generation: old.get(&directory).map(|record| record.generation),
+            expected_generation: old.get(&directory).map(|record| record.generation.clone()),
         })
         .collect()
 }

@@ -23,11 +23,12 @@ use serde::{Deserialize, Serialize};
 
 use super::validation::{validate_publication, validate_snapshot};
 use super::{
-    ContentRef, DirectoryEntry, DirectoryPrecondition, DirectoryRecord, FileVersionRecord,
-    NamespacePublication, NamespaceSnapshot, NodePrecondition, NodeRecord,
+    ContentRef, DirectoryPrecondition, DirectoryRecord, FileVersionRecord, NamespacePublication,
+    NamespaceSnapshot, NodePrecondition, NodeRecord, managed_generation, managed_generation_number,
 };
 use crate::filesystem::{
-    ChangeCursor, CommitOutcome, FileVersionId, NodeId, OperationId, VolumeId,
+    ChangeCursor, CommitOutcome, DirectoryEntry, FileVersionId, NodeAttributes, NodeId, NodeKind,
+    OperationId, VolumeId,
 };
 use crate::managed::{ManagedError, ManagedErrorKind};
 
@@ -526,8 +527,8 @@ impl StoredSnapshot {
 struct StoredNode {
     id: [u8; 16],
     generation: u64,
-    kind: super::NodeKind,
-    attributes: super::NodeAttributes,
+    kind: StoredNodeKind,
+    attributes: StoredNodeAttributes,
     file_version: Option<[u8; 32]>,
 }
 
@@ -535,9 +536,10 @@ impl From<&NodeRecord> for StoredNode {
     fn from(node: &NodeRecord) -> Self {
         Self {
             id: *node.id.as_bytes(),
-            generation: node.generation,
-            kind: node.kind,
-            attributes: node.attributes,
+            generation: managed_generation_number(&node.generation)
+                .expect("validated Managed node generation"),
+            kind: node.kind.into(),
+            attributes: node.attributes.into(),
             file_version: node.file_version.map(|version| *version.as_bytes()),
         }
     }
@@ -547,9 +549,9 @@ impl StoredNode {
     fn into_record(self) -> Result<NodeRecord, ManagedError> {
         Ok(NodeRecord {
             id: NodeId::from_bytes(self.id),
-            generation: self.generation,
-            kind: self.kind,
-            attributes: self.attributes,
+            generation: managed_generation(self.generation),
+            kind: self.kind.into(),
+            attributes: self.attributes.into(),
             file_version: self.file_version.map(FileVersionId::from_bytes),
         })
     }
@@ -566,7 +568,8 @@ impl From<&DirectoryRecord> for StoredDirectory {
     fn from(directory: &DirectoryRecord) -> Self {
         Self {
             node: *directory.node.as_bytes(),
-            generation: directory.generation,
+            generation: managed_generation_number(&directory.generation)
+                .expect("validated Managed directory generation"),
             entries: directory
                 .entries
                 .iter()
@@ -580,7 +583,7 @@ impl StoredDirectory {
     fn into_record(self) -> Result<DirectoryRecord, ManagedError> {
         Ok(DirectoryRecord {
             node: NodeId::from_bytes(self.node),
-            generation: self.generation,
+            generation: managed_generation(self.generation),
             entries: self
                 .entries
                 .into_iter()
@@ -593,14 +596,14 @@ impl StoredDirectory {
 #[derive(Clone, Copy, Deserialize, Serialize)]
 struct StoredDirectoryEntry {
     node: [u8; 16],
-    kind: super::NodeKind,
+    kind: StoredNodeKind,
 }
 
 impl From<DirectoryEntry> for StoredDirectoryEntry {
     fn from(entry: DirectoryEntry) -> Self {
         Self {
             node: *entry.node.as_bytes(),
-            kind: entry.kind,
+            kind: entry.kind.into(),
         }
     }
 }
@@ -609,7 +612,53 @@ impl From<StoredDirectoryEntry> for DirectoryEntry {
     fn from(entry: StoredDirectoryEntry) -> Self {
         Self {
             node: NodeId::from_bytes(entry.node),
-            kind: entry.kind,
+            kind: entry.kind.into(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum StoredNodeKind {
+    Directory,
+    RegularFile,
+}
+
+impl From<NodeKind> for StoredNodeKind {
+    fn from(kind: NodeKind) -> Self {
+        match kind {
+            NodeKind::Directory => Self::Directory,
+            NodeKind::RegularFile => Self::RegularFile,
+        }
+    }
+}
+
+impl From<StoredNodeKind> for NodeKind {
+    fn from(kind: StoredNodeKind) -> Self {
+        match kind {
+            StoredNodeKind::Directory => Self::Directory,
+            StoredNodeKind::RegularFile => Self::RegularFile,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+struct StoredNodeAttributes {
+    executable: bool,
+}
+
+impl From<NodeAttributes> for StoredNodeAttributes {
+    fn from(attributes: NodeAttributes) -> Self {
+        Self {
+            executable: attributes.executable,
+        }
+    }
+}
+
+impl From<StoredNodeAttributes> for NodeAttributes {
+    fn from(attributes: StoredNodeAttributes) -> Self {
+        Self {
+            executable: attributes.executable,
         }
     }
 }
@@ -659,7 +708,10 @@ impl From<&NodePrecondition> for StoredNodePrecondition {
     fn from(condition: &NodePrecondition) -> Self {
         Self {
             node: *condition.node.as_bytes(),
-            expected_generation: condition.expected_generation,
+            expected_generation: condition.expected_generation.as_ref().map(|value| {
+                managed_generation_number(value)
+                    .expect("validated Managed node precondition generation")
+            }),
         }
     }
 }
@@ -674,7 +726,10 @@ impl From<&DirectoryPrecondition> for StoredDirectoryPrecondition {
     fn from(condition: &DirectoryPrecondition) -> Self {
         Self {
             directory: *condition.directory.as_bytes(),
-            expected_generation: condition.expected_generation,
+            expected_generation: condition.expected_generation.as_ref().map(|value| {
+                managed_generation_number(value)
+                    .expect("validated Managed directory precondition generation")
+            }),
         }
     }
 }

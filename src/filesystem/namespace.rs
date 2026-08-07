@@ -15,17 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Managed namespace records and authoritative snapshot publication.
+use super::NodeId;
 
-mod d1;
-mod object;
-mod records;
-mod validation;
+/// Kind of node visible through a filesystem namespace.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NodeKind {
+    Directory,
+    RegularFile,
+}
 
-pub(crate) use d1::{D1Namespace, D1NamespaceObservation};
-pub use object::{NamespaceObservation, ObjectNamespace};
-pub use records::{
-    ContentRef, DirectoryPrecondition, DirectoryRecord, FileVersionRecord, NamespacePublication,
-    NamespaceSnapshot, NodePrecondition, NodeRecord,
-};
-pub(crate) use records::{managed_generation, managed_generation_number, next_managed_generation};
+/// Portable attributes shared by namespace implementations and access models.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NodeAttributes {
+    pub executable: bool,
+}
+
+/// One named edge from a directory to a filesystem node.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DirectoryEntry {
+    pub node: NodeId,
+    pub kind: NodeKind,
+}

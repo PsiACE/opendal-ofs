@@ -23,9 +23,11 @@
 mod capability;
 mod identity;
 mod model;
+mod namespace;
 mod publication;
 
 pub use capability::{Capabilities, Capability};
 pub use identity::{ChangeCursor, FileVersionId, Generation, NodeId, OperationId, VolumeId};
 pub use model::{AccessModel, VolumeModel};
+pub use namespace::{DirectoryEntry, NodeAttributes, NodeKind};
 pub use publication::CommitOutcome;

@@ -20,8 +20,8 @@ use super::{
     BaseEntry, ConflictRecord, LocalKind, LocalTree, PendingIntent, ReconcileAction, ReplicaState,
     StagedTree, build_publication, reconcile,
 };
-use crate::filesystem::{ChangeCursor, CommitOutcome, Generation, NodeId, OperationId, VolumeId};
-use crate::managed::namespace::{FileVersionRecord, NamespaceSnapshot, NodeKind};
+use crate::filesystem::{ChangeCursor, CommitOutcome, NodeId, NodeKind, OperationId, VolumeId};
+use crate::managed::namespace::{FileVersionRecord, NamespaceSnapshot};
 use crate::managed::{D1Metadata, ManagedVolume};
 
 #[derive(Clone, Debug)]
@@ -498,7 +498,7 @@ fn state_from_snapshot(snapshot: &NamespaceSnapshot) -> Result<ReplicaState> {
             path,
             BaseEntry {
                 node,
-                generation: Generation::from_bytes(record.generation.to_be_bytes().to_vec()),
+                generation: record.generation.clone(),
                 digest,
             },
         );
