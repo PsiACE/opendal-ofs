@@ -30,4 +30,4 @@ pub use data_format::{DigestAlgorithm, ManagedDataFormat};
 pub use error::{ManagedError, ManagedErrorKind};
 pub use format::{ManagedFormat, MetadataPlacement, NamingPolicy};
 pub use metadata::{D1Config, D1Metadata, Metadata, ObjectMetadata};
-pub use volume::ManagedVolume;
+pub use volume::{ManagedObservation, ManagedVolume};

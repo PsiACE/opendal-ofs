@@ -8,12 +8,14 @@
 
 //! Local replica foundations owned by the Sync access model.
 
+mod engine;
 mod local;
 mod publication;
 mod reconcile;
 mod staging;
 mod state;
 
+pub use engine::{SyncEngine, SyncResult};
 pub use local::{LocalEntry, LocalKind, LocalTree};
 pub use publication::build_publication;
 pub use reconcile::{ReconcileAction, ReconcilePlan, reconcile};
