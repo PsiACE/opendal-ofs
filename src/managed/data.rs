@@ -85,6 +85,9 @@ impl ManagedData {
             .await
             .map_err(|_| unavailable("read frozen file"))?;
         let version = whole_file_version(size, digest);
+        if size == 0 {
+            return Ok(version);
+        }
         let key = loose_key(&version.content);
 
         match self.operator.writer_with(&key).if_not_exists(true).await {
@@ -127,6 +130,13 @@ impl ManagedData {
         target_path: &str,
     ) -> Result<(), ManagedError> {
         self.verify_metadata(version).await?;
+        if version.logical_size == 0 {
+            target
+                .write(target_path, Vec::<u8>::new())
+                .await
+                .map_err(|_| unavailable("create materialized file"))?;
+            return Ok(());
+        }
         let key = loose_key(&version.content);
         let mut writer = target
             .writer(target_path)
@@ -173,6 +183,19 @@ impl ManagedData {
     }
 
     async fn verify_metadata(&self, version: &FileVersionRecord) -> Result<(), ManagedError> {
+        let canonical = whole_file_version(
+            version.logical_size,
+            Digest::from_bytes(version.logical_digest),
+        );
+        if version != &canonical || version.content.digest != version.logical_digest {
+            return Err(corrupt(
+                "read loose data",
+                "whole-file manifest identity is invalid",
+            ));
+        }
+        if version.logical_size == 0 {
+            return Ok(());
+        }
         let metadata = self
             .operator
             .stat(&loose_key(&version.content))
