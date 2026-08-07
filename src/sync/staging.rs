@@ -22,7 +22,6 @@ use super::local::{
     set_executable,
 };
 
-const COPY_CHUNK: u64 = 1024 * 1024;
 const COPY_CONCURRENCY: usize = 8;
 const MANIFEST_FORMAT: &str = "ofs-staged-tree";
 const MANIFEST_MAJOR: u16 = 1;
@@ -398,28 +397,32 @@ async fn stage_file(
         .reader(path)
         .await
         .with_context(|| format!("open source file {path:?}"))?;
+    let mut input = reader
+        .into_bytes_stream(..)
+        .await
+        .with_context(|| format!("stream stable source file {path:?}"))?;
     let mut writer = staged
         .writer(path)
         .await
         .with_context(|| format!("open staging file {path:?}"))?;
     let mut digest = Sha256::new();
-    let mut offset = 0;
-    while offset < expected.size {
-        let end = expected.size.min(offset + COPY_CHUNK);
-        let buffer = reader
-            .read(offset..end)
-            .await
-            .with_context(|| format!("read stable source file {path:?}"))?;
-        let bytes = buffer.to_bytes();
-        if bytes.len() as u64 != end - offset {
-            bail!("source file {path:?} returned a short read; retry sync");
+    let mut copied = 0_u64;
+    while let Some(bytes) = input.next().await {
+        let bytes = bytes.with_context(|| format!("read stable source file {path:?}"))?;
+        copied = copied
+            .checked_add(bytes.len() as u64)
+            .with_context(|| format!("source file {path:?} exceeds supported length"))?;
+        if copied > expected.size {
+            bail!("source file {path:?} returned more data than expected; retry sync");
         }
         digest.update(&bytes);
         writer
             .write(bytes)
             .await
             .with_context(|| format!("write staging file {path:?}"))?;
-        offset = end;
+    }
+    if copied != expected.size {
+        bail!("source file {path:?} returned a short read; retry sync");
     }
     writer
         .close()
