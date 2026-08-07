@@ -29,9 +29,11 @@ use tokio::sync::{Mutex, OnceCell};
 use super::{ManagedError, ManagedErrorKind};
 use crate::filesystem::OperationId;
 use crate::managed::namespace::ContentRef;
+use crate::managed::section::{self, Record as SectionRecord, Reference as SectionReference};
 
 const PACK_ROOT: &str = "data/v1/packs";
 const INDEX_ROOT: &str = "data/v1/pack-index";
+const INDEX_SECTION_ROOT: &str = "data/v1/pack-index/sections/sha256";
 const HEAD_KEY: &str = "data/v1/pack-index/head.cbor";
 const PACK_MAGIC: &[u8; 8] = b"OFSPACK1";
 const TRAILER_MAGIC: &[u8; 8] = b"OFSPTRL1";
@@ -40,6 +42,7 @@ const CHECKPOINT_MAGIC: &str = "ofs-pack-index-checkpoint";
 const REVISION_MAGIC: &str = "ofs-pack-index-revision";
 const HEAD_MAGIC: &str = "ofs-pack-index-head";
 const FORMAT_MAJOR: u16 = 1;
+const INDEX_SECTION: u8 = 32;
 const HEADER_LENGTH: u64 = 26;
 const TRAILER_LENGTH: u64 = 56;
 
@@ -455,6 +458,7 @@ impl PackStore {
         let mut index = PackIndex {
             operator: self.operator.clone(),
             locations,
+            sections: BTreeSet::new(),
             revision: parent,
             head_etag,
         };
@@ -501,6 +505,7 @@ fn validate_location(
 pub struct PackIndex {
     operator: Operator,
     locations: BTreeMap<ContentRef, Vec<PackLocation>>,
+    sections: BTreeSet<[u8; 32]>,
     revision: Option<[u8; 32]>,
     head_etag: Option<String>,
 }
@@ -604,10 +609,16 @@ impl PackIndex {
             CHECKPOINT_MAGIC,
             "open pack index",
         )?;
-        let locations = checkpoint.into_locations()?;
+        let sections = checkpoint
+            .sections
+            .iter()
+            .map(|section| section.id)
+            .collect();
+        let locations = checkpoint.into_locations(&operator).await?;
         Ok(Some(Self {
             operator,
             locations,
+            sections,
             revision: Some(head.revision),
             head_etag: etag,
         }))
@@ -619,6 +630,7 @@ impl PackIndex {
             None => Ok(Self {
                 operator,
                 locations: BTreeMap::new(),
+                sections: BTreeSet::new(),
                 revision: None,
                 head_etag: None,
             }),
@@ -630,7 +642,9 @@ impl PackIndex {
         require_index_create_capabilities(&self.operator)?;
         self.require_update()?;
         normalize_locations(&mut self.locations);
-        let checkpoint = IndexCheckpoint::from_locations(&self.locations);
+        let checkpoint =
+            IndexCheckpoint::from_locations(&self.operator, &self.locations, &self.sections)
+                .await?;
         let checkpoint_bytes = encode(&checkpoint, "persist pack index")?;
         let checkpoint_id = digest(&checkpoint_bytes);
         create_immutable(
@@ -704,6 +718,11 @@ impl PackIndex {
             .await?
             .ok_or_else(|| corrupt("persist pack index", "published head is missing"))?;
         self.revision = Some(revision_id);
+        self.sections = checkpoint
+            .sections
+            .iter()
+            .map(|section| section.id)
+            .collect();
         self.head_etag = etag;
         Ok(())
     }
@@ -737,7 +756,7 @@ enum Codec {
 struct IndexCheckpoint {
     magic: String,
     major: u16,
-    entries: Vec<IndexEntry>,
+    sections: Vec<StoredIndexSectionReference>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -747,37 +766,148 @@ struct IndexEntry {
     locations: Vec<PackLocation>,
 }
 
-impl IndexCheckpoint {
-    fn from_locations(locations: &BTreeMap<ContentRef, Vec<PackLocation>>) -> Self {
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StoredIndexSectionReference {
+    kind: u8,
+    id: [u8; 32],
+    first_key: Vec<u8>,
+    last_key: Vec<u8>,
+    records: u32,
+    encoded_bytes: u64,
+}
+
+impl From<SectionReference> for StoredIndexSectionReference {
+    fn from(reference: SectionReference) -> Self {
         Self {
-            magic: CHECKPOINT_MAGIC.to_owned(),
-            major: FORMAT_MAJOR,
-            entries: locations
-                .iter()
-                .map(|(content, locations)| IndexEntry {
-                    content: *content,
-                    locations: locations.clone(),
-                })
-                .collect(),
+            kind: reference.kind,
+            id: reference.id,
+            first_key: reference.first_key,
+            last_key: reference.last_key,
+            records: reference.records,
+            encoded_bytes: reference.encoded_bytes,
         }
     }
+}
 
-    fn into_locations(self) -> Result<BTreeMap<ContentRef, Vec<PackLocation>>, ManagedError> {
+impl StoredIndexSectionReference {
+    fn as_reference(&self) -> SectionReference {
+        SectionReference {
+            kind: self.kind,
+            id: self.id,
+            first_key: self.first_key.clone(),
+            last_key: self.last_key.clone(),
+            records: self.records,
+            encoded_bytes: self.encoded_bytes,
+        }
+    }
+}
+
+impl IndexCheckpoint {
+    async fn from_locations(
+        operator: &Operator,
+        locations: &BTreeMap<ContentRef, Vec<PackLocation>>,
+        known_sections: &BTreeSet<[u8; 32]>,
+    ) -> Result<Self, ManagedError> {
+        let records = locations
+            .iter()
+            .map(|(content, locations)| {
+                let entry = IndexEntry {
+                    content: *content,
+                    locations: locations.clone(),
+                };
+                Ok(SectionRecord {
+                    key: content_key(*content),
+                    value: encode(&entry, "persist pack index")?,
+                })
+            })
+            .collect::<Result<Vec<_>, ManagedError>>()?;
+        let encoded = section::encode([0; 16], INDEX_SECTION, records, "persist pack index")?;
+        let mut sections = Vec::with_capacity(encoded.len());
+        for section in encoded {
+            let present = if known_sections.contains(&section.reference.id) {
+                match operator
+                    .stat(&index_section_key(section.reference.id))
+                    .await
+                {
+                    Ok(metadata) if metadata.content_length() == section.bytes.len() as u64 => true,
+                    Ok(_) => {
+                        return Err(corrupt(
+                            "persist pack index",
+                            "existing index section has another length",
+                        ));
+                    }
+                    Err(error) if error.kind() == ErrorKind::NotFound => false,
+                    Err(_) => {
+                        return Err(unavailable(
+                            "persist pack index",
+                            "index section cannot be inspected",
+                        ));
+                    }
+                }
+            } else {
+                false
+            };
+            if !present {
+                create_immutable(
+                    operator,
+                    &index_section_key(section.reference.id),
+                    &section.bytes,
+                    "persist pack index",
+                )
+                .await?;
+            }
+            sections.push(section.reference.into());
+        }
+        Ok(Self {
+            magic: CHECKPOINT_MAGIC.to_owned(),
+            major: FORMAT_MAJOR,
+            sections,
+        })
+    }
+
+    async fn into_locations(
+        self,
+        operator: &Operator,
+    ) -> Result<BTreeMap<ContentRef, Vec<PackLocation>>, ManagedError> {
         let mut output = BTreeMap::new();
         let mut previous = None;
-        for entry in self.entries {
-            if previous.is_some_and(|value| value >= entry.content)
-                || entry.locations.is_empty()
-                || !entry.locations.windows(2).all(|pair| pair[0] < pair[1])
-                || entry
-                    .locations
-                    .iter()
-                    .any(|location| location.logical_length != entry.content.logical_length)
+        let mut previous_section: Option<&StoredIndexSectionReference> = None;
+        for stored in &self.sections {
+            if stored.kind != INDEX_SECTION
+                || stored.records == 0
+                || stored.first_key > stored.last_key
+                || previous_section.is_some_and(|previous| previous.last_key >= stored.first_key)
             {
-                return Err(corrupt("open pack index", "checkpoint entries are invalid"));
+                return Err(corrupt(
+                    "open pack index",
+                    "index section references are invalid",
+                ));
             }
-            previous = Some(entry.content);
-            output.insert(entry.content, entry.locations);
+            let reference = stored.as_reference();
+            let bytes = read_required(
+                operator,
+                &index_section_key(reference.id),
+                "open pack index",
+            )
+            .await?;
+            for record in section::decode(&reference, [0; 16], &bytes, "open pack index")? {
+                let entry: IndexEntry = decode(&record.value, "open pack index")?;
+                if record.key != content_key(entry.content)
+                    || previous.is_some_and(|value| value >= entry.content)
+                    || entry.locations.is_empty()
+                    || !entry.locations.windows(2).all(|pair| pair[0] < pair[1])
+                    || entry
+                        .locations
+                        .iter()
+                        .any(|location| location.logical_length != entry.content.logical_length)
+                {
+                    return Err(corrupt("open pack index", "checkpoint entries are invalid"));
+                }
+                previous = Some(entry.content);
+                output.insert(entry.content, entry.locations);
+            }
+            previous_section = Some(stored);
         }
         Ok(output)
     }
@@ -935,6 +1065,18 @@ fn pack_key(id: PackId) -> String {
 
 fn checkpoint_key(id: [u8; 32]) -> String {
     format!("{INDEX_ROOT}/checkpoints/{}.cbor", hex(&id))
+}
+
+fn index_section_key(id: [u8; 32]) -> String {
+    let encoded = hex(&id);
+    format!("{INDEX_SECTION_ROOT}/{}/{}.section", &encoded[..2], encoded)
+}
+
+fn content_key(content: ContentRef) -> Vec<u8> {
+    let mut key = Vec::with_capacity(40);
+    key.extend_from_slice(&content.digest);
+    key.extend_from_slice(&content.logical_length.to_be_bytes());
+    key
 }
 
 fn revision_key(id: [u8; 32]) -> String {
