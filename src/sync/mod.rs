@@ -10,10 +10,12 @@
 
 mod local;
 mod publication;
+mod reconcile;
 mod staging;
 mod state;
 
 pub use local::{LocalEntry, LocalKind, LocalTree};
 pub use publication::build_publication;
+pub use reconcile::{ReconcileAction, ReconcilePlan, reconcile};
 pub use staging::{StagedFile, StagedTree};
 pub use state::{BaseEntry, ConflictRecord, PendingIntent, ReplicaState};
