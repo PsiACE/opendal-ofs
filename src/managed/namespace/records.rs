@@ -41,7 +41,7 @@ pub struct DirectoryRecord {
     pub entries: BTreeMap<String, DirectoryEntry>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContentRef {
     pub digest: [u8; 32],

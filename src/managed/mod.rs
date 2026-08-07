@@ -23,6 +23,7 @@ mod error;
 mod format;
 mod metadata;
 pub mod namespace;
+pub mod pack;
 mod volume;
 
 pub(crate) use data::ManagedData;

@@ -1,0 +1,876 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Immutable content packs and their rebuildable physical index.
+
+use std::collections::BTreeMap;
+use std::io::Cursor;
+
+use opendal::{ErrorKind, Operator};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
+
+use super::{ManagedError, ManagedErrorKind};
+use crate::filesystem::OperationId;
+use crate::managed::namespace::ContentRef;
+
+const PACK_ROOT: &str = "data/v1/packs";
+const INDEX_ROOT: &str = "data/v1/pack-index";
+const HEAD_KEY: &str = "data/v1/pack-index/head.cbor";
+const PACK_MAGIC: &[u8; 8] = b"OFSPACK1";
+const TRAILER_MAGIC: &[u8; 8] = b"OFSPTRL1";
+const FOOTER_MAGIC: &str = "ofs-pack-footer";
+const CHECKPOINT_MAGIC: &str = "ofs-pack-index-checkpoint";
+const REVISION_MAGIC: &str = "ofs-pack-index-revision";
+const HEAD_MAGIC: &str = "ofs-pack-index-head";
+const FORMAT_MAJOR: u16 = 1;
+const HEADER_LENGTH: u64 = 26;
+const TRAILER_LENGTH: u64 = 56;
+
+/// Identity of an immutable pack. It is the SHA-256 checksum in its trailer.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct PackId([u8; 32]);
+
+impl PackId {
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// Physical range containing one content object.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackLocation {
+    pub pack: PackId,
+    pub offset: u64,
+    pub stored_length: u64,
+    pub logical_length: u64,
+}
+
+/// Result of sealing one immutable pack.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SealedPack {
+    pub id: PackId,
+    pub locations: BTreeMap<ContentRef, PackLocation>,
+}
+
+/// Concrete pack storage backed by one OpenDAL operator.
+#[derive(Clone, Debug)]
+pub struct PackStore {
+    operator: Operator,
+}
+
+impl PackStore {
+    pub fn new(operator: Operator) -> Result<Self, ManagedError> {
+        let capability = operator.info().full_capability();
+        if !capability.read
+            || !capability.write
+            || !capability.write_with_if_not_exists
+            || !capability.stat
+            || !capability.list
+        {
+            return Err(unavailable(
+                "open pack store",
+                "pack storage requires read, write, stat, list, and create-only write",
+            ));
+        }
+        Ok(Self { operator })
+    }
+
+    /// Seal distinct, non-empty content objects into a format-v1 pack.
+    pub async fn seal(
+        &self,
+        operation: OperationId,
+        contents: impl IntoIterator<Item = Vec<u8>>,
+    ) -> Result<SealedPack, ManagedError> {
+        let mut unique = BTreeMap::new();
+        for bytes in contents {
+            if bytes.is_empty() {
+                continue;
+            }
+            unique.entry(content_ref(&bytes)).or_insert(bytes);
+        }
+        if unique.is_empty() {
+            return Err(invalid(
+                "seal pack",
+                "a pack must contain non-empty content",
+            ));
+        }
+
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(PACK_MAGIC);
+        encoded.extend_from_slice(&FORMAT_MAJOR.to_be_bytes());
+        encoded.extend_from_slice(operation.as_bytes());
+
+        let mut footer_entries = Vec::with_capacity(unique.len());
+        for (content, bytes) in unique {
+            let offset = encoded.len() as u64;
+            encoded.extend_from_slice(&bytes);
+            footer_entries.push(FooterEntry {
+                content,
+                offset,
+                stored_length: bytes.len() as u64,
+                codec: Codec::Raw,
+            });
+        }
+        let footer_offset = encoded.len() as u64;
+        let footer = encode(
+            &Footer {
+                magic: FOOTER_MAGIC.to_owned(),
+                major: FORMAT_MAJOR,
+                entries: footer_entries,
+            },
+            "seal pack",
+        )?;
+        encoded.extend_from_slice(&footer);
+        encoded.extend_from_slice(TRAILER_MAGIC);
+        encoded.extend_from_slice(&footer_offset.to_be_bytes());
+        encoded.extend_from_slice(&(footer.len() as u64).to_be_bytes());
+        let checksum: [u8; 32] = Sha256::digest(&encoded).into();
+        encoded.extend_from_slice(&checksum);
+
+        let id = PackId(checksum);
+        let key = pack_key(id);
+        create_immutable(&self.operator, &key, &encoded, "seal pack").await?;
+        self.inspect(id).await
+    }
+
+    /// Verify the complete pack and return its footer-derived locations.
+    pub async fn inspect(&self, id: PackId) -> Result<SealedPack, ManagedError> {
+        self.inspect_inner(id, true).await
+    }
+
+    async fn inspect_inner(
+        &self,
+        id: PackId,
+        verify_checksum: bool,
+    ) -> Result<SealedPack, ManagedError> {
+        let key = pack_key(id);
+        let metadata = self
+            .operator
+            .stat(&key)
+            .await
+            .map_err(|_| unavailable("inspect pack", "pack metadata is unavailable"))?;
+        let length = metadata.content_length();
+        if length < HEADER_LENGTH + TRAILER_LENGTH {
+            return Err(corrupt("inspect pack", "pack is shorter than its envelope"));
+        }
+
+        let trailer = self
+            .operator
+            .read_with(&key)
+            .range(length - TRAILER_LENGTH..length)
+            .await
+            .map_err(|_| unavailable("inspect pack", "pack trailer is unavailable"))?
+            .to_bytes();
+        if trailer.len() != TRAILER_LENGTH as usize || &trailer[..8] != TRAILER_MAGIC {
+            return Err(corrupt("inspect pack", "pack trailer is invalid"));
+        }
+        let footer_offset = u64_at(&trailer, 8);
+        let footer_length = u64_at(&trailer, 16);
+        let expected_checksum: [u8; 32] = trailer[24..56]
+            .try_into()
+            .expect("trailer checksum has fixed length");
+        if expected_checksum != id.0 {
+            return Err(corrupt(
+                "inspect pack",
+                "pack trailer does not match its identity",
+            ));
+        }
+        let trailer_offset = length - TRAILER_LENGTH;
+        if footer_offset < HEADER_LENGTH
+            || footer_offset.checked_add(footer_length) != Some(trailer_offset)
+        {
+            return Err(corrupt("inspect pack", "pack footer range is invalid"));
+        }
+
+        if verify_checksum {
+            let body = self
+                .operator
+                .read_with(&key)
+                .range(0..length - 32)
+                .await
+                .map_err(|_| unavailable("inspect pack", "pack checksum input is unavailable"))?
+                .to_bytes();
+            let actual_checksum: [u8; 32] = Sha256::digest(&body).into();
+            if actual_checksum != expected_checksum {
+                return Err(corrupt(
+                    "inspect pack",
+                    "pack checksum does not match its identity",
+                ));
+            }
+            if &body[..8] != PACK_MAGIC || u16_at(&body, 8) != FORMAT_MAJOR {
+                return Err(corrupt("inspect pack", "pack header is invalid"));
+            }
+        }
+
+        let footer_bytes = self
+            .operator
+            .read_with(&key)
+            .range(footer_offset..trailer_offset)
+            .await
+            .map_err(|_| unavailable("inspect pack", "pack footer is unavailable"))?
+            .to_bytes();
+        let footer: Footer = decode(&footer_bytes, "inspect pack")?;
+        if footer.magic != FOOTER_MAGIC || footer.major != FORMAT_MAJOR {
+            return Err(corrupt("inspect pack", "pack footer version is invalid"));
+        }
+
+        let mut locations = BTreeMap::new();
+        let mut previous = None;
+        let mut previous_end = HEADER_LENGTH;
+        for entry in footer.entries {
+            if previous.is_some_and(|value| value >= entry.content)
+                || entry.codec != Codec::Raw
+                || entry.stored_length != entry.content.logical_length
+                || entry.offset < previous_end
+                || entry.offset.checked_add(entry.stored_length).is_none()
+                || entry.offset + entry.stored_length > footer_offset
+            {
+                return Err(corrupt("inspect pack", "pack footer entry is invalid"));
+            }
+            previous = Some(entry.content);
+            previous_end = entry.offset + entry.stored_length;
+            locations.insert(
+                entry.content,
+                PackLocation {
+                    pack: id,
+                    offset: entry.offset,
+                    stored_length: entry.stored_length,
+                    logical_length: entry.content.logical_length,
+                },
+            );
+        }
+        Ok(SealedPack { id, locations })
+    }
+
+    /// Read and validate one indexed content range.
+    pub async fn read(
+        &self,
+        content: ContentRef,
+        location: PackLocation,
+    ) -> Result<Vec<u8>, ManagedError> {
+        if location.logical_length != content.logical_length {
+            return Err(corrupt(
+                "read pack content",
+                "index length disagrees with content",
+            ));
+        }
+        let pack = self.inspect_inner(location.pack, false).await?;
+        if pack.locations.get(&content) != Some(&location) {
+            return Err(corrupt(
+                "read pack content",
+                "index range disagrees with pack footer",
+            ));
+        }
+        let bytes = self
+            .operator
+            .read_with(&pack_key(location.pack))
+            .range(location.offset..location.offset + location.stored_length)
+            .await
+            .map_err(|_| unavailable("read pack content", "content range is unavailable"))?
+            .to_bytes()
+            .to_vec();
+        if bytes.len() as u64 != location.stored_length || content_ref(&bytes) != content {
+            return Err(corrupt(
+                "read pack content",
+                "content range fails validation",
+            ));
+        }
+        Ok(bytes)
+    }
+
+    /// Rebuild and publish the derived pack index from verified pack footers.
+    pub async fn rebuild_index(&self) -> Result<PackIndex, ManagedError> {
+        let mut locations: BTreeMap<ContentRef, Vec<PackLocation>> = BTreeMap::new();
+        let entries = self
+            .operator
+            .list(&format!("{PACK_ROOT}/"))
+            .await
+            .map_err(|_| unavailable("rebuild pack index", "pack listing is unavailable"))?;
+        for entry in entries {
+            let path = entry.path();
+            let Some(id) = pack_id_from_key(path) else {
+                continue;
+            };
+            for (content, location) in self.inspect(id).await?.locations {
+                locations.entry(content).or_default().push(location);
+            }
+        }
+        normalize_locations(&mut locations);
+        let (parent, head_etag) = read_head_state(&self.operator).await?;
+        let mut index = PackIndex {
+            operator: self.operator.clone(),
+            locations,
+            revision: parent,
+            head_etag,
+        };
+        index.persist().await?;
+        Ok(index)
+    }
+}
+
+/// Rebuildable mapping from logical content identities to pack ranges.
+#[derive(Clone, Debug)]
+pub struct PackIndex {
+    operator: Operator,
+    locations: BTreeMap<ContentRef, Vec<PackLocation>>,
+    revision: Option<[u8; 32]>,
+    head_etag: Option<String>,
+}
+
+impl PackIndex {
+    pub fn locations(&self, content: ContentRef) -> &[PackLocation] {
+        self.locations
+            .get(&content)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    pub fn add(&mut self, pack: &SealedPack) {
+        for (content, location) in &pack.locations {
+            let locations = self.locations.entry(*content).or_default();
+            if !locations.contains(location) {
+                locations.push(*location);
+                locations.sort_unstable();
+            }
+        }
+    }
+
+    /// Open the published index. A missing head means no index exists yet.
+    pub async fn open(operator: Operator) -> Result<Option<Self>, ManagedError> {
+        require_index_capabilities(&operator)?;
+        let Some((head_bytes, etag)) = read_head(&operator).await? else {
+            return Ok(None);
+        };
+        let head: IndexHead = decode(&head_bytes, "open pack index")?;
+        validate_record(&head.magic, head.major, HEAD_MAGIC, "open pack index")?;
+        let revision_bytes =
+            read_required(&operator, &revision_key(head.revision), "open pack index").await?;
+        if digest(&revision_bytes) != head.revision {
+            return Err(corrupt("open pack index", "revision identity is invalid"));
+        }
+        let revision: IndexRevision = decode(&revision_bytes, "open pack index")?;
+        validate_record(
+            &revision.magic,
+            revision.major,
+            REVISION_MAGIC,
+            "open pack index",
+        )?;
+        let checkpoint_bytes = read_required(
+            &operator,
+            &checkpoint_key(revision.checkpoint),
+            "open pack index",
+        )
+        .await?;
+        if digest(&checkpoint_bytes) != revision.checkpoint {
+            return Err(corrupt("open pack index", "checkpoint identity is invalid"));
+        }
+        let checkpoint: IndexCheckpoint = decode(&checkpoint_bytes, "open pack index")?;
+        validate_record(
+            &checkpoint.magic,
+            checkpoint.major,
+            CHECKPOINT_MAGIC,
+            "open pack index",
+        )?;
+        let locations = checkpoint.into_locations()?;
+        Ok(Some(Self {
+            operator,
+            locations,
+            revision: Some(head.revision),
+            head_etag: Some(etag),
+        }))
+    }
+
+    /// Publish current entries through immutable records and a conditional head update.
+    pub async fn persist(&mut self) -> Result<(), ManagedError> {
+        require_index_capabilities(&self.operator)?;
+        normalize_locations(&mut self.locations);
+        let checkpoint = IndexCheckpoint::from_locations(&self.locations);
+        let checkpoint_bytes = encode(&checkpoint, "persist pack index")?;
+        let checkpoint_id = digest(&checkpoint_bytes);
+        create_immutable(
+            &self.operator,
+            &checkpoint_key(checkpoint_id),
+            &checkpoint_bytes,
+            "persist pack index",
+        )
+        .await?;
+
+        let revision = IndexRevision {
+            magic: REVISION_MAGIC.to_owned(),
+            major: FORMAT_MAJOR,
+            parent: self.revision,
+            checkpoint: checkpoint_id,
+        };
+        let revision_bytes = encode(&revision, "persist pack index")?;
+        let revision_id = digest(&revision_bytes);
+        create_immutable(
+            &self.operator,
+            &revision_key(revision_id),
+            &revision_bytes,
+            "persist pack index",
+        )
+        .await?;
+
+        let head_bytes = encode(
+            &IndexHead {
+                magic: HEAD_MAGIC.to_owned(),
+                major: FORMAT_MAJOR,
+                revision: revision_id,
+            },
+            "persist pack index",
+        )?;
+        let result = match &self.head_etag {
+            Some(etag) => {
+                self.operator
+                    .write_with(HEAD_KEY, head_bytes)
+                    .if_match(etag)
+                    .await
+            }
+            None => {
+                self.operator
+                    .write_with(HEAD_KEY, head_bytes)
+                    .if_not_exists(true)
+                    .await
+            }
+        };
+        match result {
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::AlreadyExists | ErrorKind::ConditionNotMatch
+                ) =>
+            {
+                return Err(ManagedError::new(
+                    ManagedErrorKind::Conflict,
+                    "persist pack index",
+                    "pack index head changed concurrently",
+                ));
+            }
+            Err(_) => {
+                return Err(unavailable(
+                    "persist pack index",
+                    "pack index head cannot be written",
+                ));
+            }
+        }
+        let (_, etag) = read_head(&self.operator)
+            .await?
+            .ok_or_else(|| corrupt("persist pack index", "published head is missing"))?;
+        self.revision = Some(revision_id);
+        self.head_etag = Some(etag);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Footer {
+    magic: String,
+    major: u16,
+    entries: Vec<FooterEntry>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct FooterEntry {
+    content: ContentRef,
+    offset: u64,
+    stored_length: u64,
+    codec: Codec,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Codec {
+    Raw,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct IndexCheckpoint {
+    magic: String,
+    major: u16,
+    entries: Vec<IndexEntry>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct IndexEntry {
+    content: ContentRef,
+    locations: Vec<PackLocation>,
+}
+
+impl IndexCheckpoint {
+    fn from_locations(locations: &BTreeMap<ContentRef, Vec<PackLocation>>) -> Self {
+        Self {
+            magic: CHECKPOINT_MAGIC.to_owned(),
+            major: FORMAT_MAJOR,
+            entries: locations
+                .iter()
+                .map(|(content, locations)| IndexEntry {
+                    content: *content,
+                    locations: locations.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    fn into_locations(self) -> Result<BTreeMap<ContentRef, Vec<PackLocation>>, ManagedError> {
+        let mut output = BTreeMap::new();
+        let mut previous = None;
+        for entry in self.entries {
+            if previous.is_some_and(|value| value >= entry.content)
+                || entry.locations.is_empty()
+                || !entry.locations.windows(2).all(|pair| pair[0] < pair[1])
+                || entry
+                    .locations
+                    .iter()
+                    .any(|location| location.logical_length != entry.content.logical_length)
+            {
+                return Err(corrupt("open pack index", "checkpoint entries are invalid"));
+            }
+            previous = Some(entry.content);
+            output.insert(entry.content, entry.locations);
+        }
+        Ok(output)
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct IndexRevision {
+    magic: String,
+    major: u16,
+    parent: Option<[u8; 32]>,
+    checkpoint: [u8; 32],
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct IndexHead {
+    magic: String,
+    major: u16,
+    revision: [u8; 32],
+}
+
+async fn read_head(operator: &Operator) -> Result<Option<(Vec<u8>, String)>, ManagedError> {
+    let reader = match operator.reader(HEAD_KEY).await {
+        Ok(reader) => reader,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(unavailable("read pack index", "index head is unavailable")),
+    };
+    let bytes = match reader.read(..).await {
+        Ok(bytes) => bytes.to_bytes().to_vec(),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(unavailable("read pack index", "index head is unavailable")),
+    };
+    let etag = reader
+        .metadata()
+        .and_then(|metadata| metadata.etag())
+        .ok_or_else(|| unavailable("read pack index", "index head has no revision token"))?
+        .to_owned();
+    Ok(Some((bytes, etag)))
+}
+
+async fn read_head_state(
+    operator: &Operator,
+) -> Result<(Option<[u8; 32]>, Option<String>), ManagedError> {
+    let Some((bytes, etag)) = read_head(operator).await? else {
+        return Ok((None, None));
+    };
+    let revision = decode::<IndexHead>(&bytes, "read pack index")
+        .ok()
+        .filter(|head| head.magic == HEAD_MAGIC && head.major == FORMAT_MAJOR)
+        .map(|head| head.revision);
+    Ok((revision, Some(etag)))
+}
+
+async fn read_required(
+    operator: &Operator,
+    key: &str,
+    action: &'static str,
+) -> Result<Vec<u8>, ManagedError> {
+    operator
+        .read(key)
+        .await
+        .map(|bytes| bytes.to_bytes().to_vec())
+        .map_err(|error| {
+            if error.kind() == ErrorKind::NotFound {
+                corrupt(action, "referenced index record is missing")
+            } else {
+                unavailable(action, "index record is unavailable")
+            }
+        })
+}
+
+async fn create_immutable(
+    operator: &Operator,
+    key: &str,
+    bytes: &[u8],
+    action: &'static str,
+) -> Result<(), ManagedError> {
+    match operator
+        .write_with(key, bytes.to_vec())
+        .if_not_exists(true)
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::AlreadyExists | ErrorKind::ConditionNotMatch
+            ) =>
+        {
+            let existing = operator
+                .read(key)
+                .await
+                .map_err(|_| unavailable(action, "existing immutable record is unavailable"))?;
+            if existing.to_bytes().as_ref() == bytes {
+                Ok(())
+            } else {
+                Err(ManagedError::new(
+                    ManagedErrorKind::Conflict,
+                    action,
+                    "immutable key already contains different bytes",
+                ))
+            }
+        }
+        Err(_) => Err(unavailable(action, "immutable record cannot be created")),
+    }
+}
+
+fn require_index_capabilities(operator: &Operator) -> Result<(), ManagedError> {
+    let capability = operator.info().full_capability();
+    if capability.read
+        && capability.write
+        && capability.write_with_if_not_exists
+        && capability.write_with_if_match
+        && capability.stat
+    {
+        Ok(())
+    } else {
+        Err(unavailable(
+            "open pack index",
+            "persistent pack index requires read, write, stat, create-only write, and compare-and-swap",
+        ))
+    }
+}
+
+fn normalize_locations(locations: &mut BTreeMap<ContentRef, Vec<PackLocation>>) {
+    locations.retain(|_, values| {
+        values.sort_unstable();
+        values.dedup();
+        !values.is_empty()
+    });
+}
+
+fn content_ref(bytes: &[u8]) -> ContentRef {
+    ContentRef {
+        digest: digest(bytes),
+        logical_length: bytes.len() as u64,
+    }
+}
+
+fn digest(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+
+fn pack_key(id: PackId) -> String {
+    format!("{PACK_ROOT}/{}.pack", hex(&id.0))
+}
+
+fn checkpoint_key(id: [u8; 32]) -> String {
+    format!("{INDEX_ROOT}/checkpoints/{}.cbor", hex(&id))
+}
+
+fn revision_key(id: [u8; 32]) -> String {
+    format!("{INDEX_ROOT}/revisions/{}.cbor", hex(&id))
+}
+
+fn pack_id_from_key(key: &str) -> Option<PackId> {
+    let value = key
+        .strip_prefix(&format!("{PACK_ROOT}/"))?
+        .strip_suffix(".pack")?;
+    Some(PackId(parse_hex(value)?))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(DIGITS[(byte >> 4) as usize] as char);
+        output.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+fn parse_hex(value: &str) -> Option<[u8; 32]> {
+    if value.len() != 64 {
+        return None;
+    }
+    let mut output = [0; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        output[index] = (hex_digit(pair[0])? << 4) | hex_digit(pair[1])?;
+    }
+    Some(output)
+}
+
+fn hex_digit(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        _ => None,
+    }
+}
+
+fn u16_at(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_be_bytes(
+        bytes[offset..offset + 2]
+            .try_into()
+            .expect("checked envelope"),
+    )
+}
+
+fn u64_at(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_be_bytes(
+        bytes[offset..offset + 8]
+            .try_into()
+            .expect("checked envelope"),
+    )
+}
+
+fn encode(value: &impl Serialize, action: &'static str) -> Result<Vec<u8>, ManagedError> {
+    let mut bytes = Vec::new();
+    ciborium::ser::into_writer(value, &mut bytes)
+        .map_err(|_| invalid(action, "record cannot be encoded"))?;
+    Ok(bytes)
+}
+
+fn decode<T: serde::de::DeserializeOwned>(
+    bytes: &[u8],
+    action: &'static str,
+) -> Result<T, ManagedError> {
+    let mut cursor = Cursor::new(bytes);
+    let value = ciborium::de::from_reader(&mut cursor)
+        .map_err(|_| corrupt(action, "record is not valid deterministic CBOR"))?;
+    if cursor.position() != bytes.len() as u64 {
+        return Err(corrupt(action, "record has trailing bytes"));
+    }
+    Ok(value)
+}
+
+fn validate_record(
+    magic: &str,
+    major: u16,
+    expected_magic: &str,
+    action: &'static str,
+) -> Result<(), ManagedError> {
+    if magic == expected_magic && major == FORMAT_MAJOR {
+        Ok(())
+    } else {
+        Err(corrupt(action, "record version is invalid"))
+    }
+}
+
+fn invalid(action: &'static str, message: &'static str) -> ManagedError {
+    ManagedError::new(ManagedErrorKind::Invalid, action, message)
+}
+
+fn corrupt(action: &'static str, message: &'static str) -> ManagedError {
+    ManagedError::new(ManagedErrorKind::Corrupt, action, message)
+}
+
+fn unavailable(action: &'static str, message: &'static str) -> ManagedError {
+    ManagedError::new(ManagedErrorKind::Unavailable, action, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use opendal::services;
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn memory() -> Operator {
+        Operator::new(services::Memory::default()).unwrap().finish()
+    }
+
+    #[tokio::test]
+    async fn filesystem_pack_reads_verified_content_without_index_cas() {
+        let root = TempDir::new().unwrap();
+        let operator = Operator::new(services::Fs::default().root(root.path().to_str().unwrap()))
+            .unwrap()
+            .finish();
+        let store = PackStore::new(operator.clone()).unwrap();
+        let operation = OperationId::from_bytes([7; 16]);
+        let sealed = store
+            .seal(
+                operation,
+                vec![b"alpha".to_vec(), b"beta".to_vec(), b"alpha".to_vec()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(sealed.locations.len(), 2);
+        let alpha = content_ref(b"alpha");
+        let location = sealed.locations[&alpha];
+        assert_eq!(store.read(alpha, location).await.unwrap(), b"alpha");
+
+        let error = store.rebuild_index().await.unwrap_err();
+        assert_eq!(error.kind(), ManagedErrorKind::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn memory_pack_reads_verified_content_without_index_cas() {
+        let operator = memory();
+        let store = PackStore::new(operator.clone()).unwrap();
+        let sealed = store
+            .seal(OperationId::from_bytes([3; 16]), vec![b"on disk".to_vec()])
+            .await
+            .unwrap();
+        let content = content_ref(b"on disk");
+        assert_eq!(
+            store
+                .read(content, sealed.locations[&content])
+                .await
+                .unwrap(),
+            b"on disk"
+        );
+        let error = PackIndex::open(operator).await.unwrap_err();
+        assert_eq!(error.kind(), ManagedErrorKind::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn corrupted_pack_is_rejected() {
+        let operator = memory();
+        let store = PackStore::new(operator.clone()).unwrap();
+        let sealed = store
+            .seal(OperationId::from_bytes([9; 16]), vec![b"payload".to_vec()])
+            .await
+            .unwrap();
+        let key = pack_key(sealed.id);
+        let mut bytes = operator.read(&key).await.unwrap().to_bytes().to_vec();
+        bytes[HEADER_LENGTH as usize] ^= 0xff;
+        operator.write(&key, bytes).await.unwrap();
+
+        let error = store.inspect(sealed.id).await.unwrap_err();
+        assert_eq!(error.kind(), ManagedErrorKind::Corrupt);
+    }
+}
