@@ -12,7 +12,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use sha2::{Digest as _, Sha256};
 
-use super::local::{LocalKind, LocalTree, executable_at, fs_operator, set_executable};
+use super::local::{
+    LocalKind, LocalTree, NativeFileIdentity, executable_at, fs_operator, native_file_identity_at,
+    set_executable,
+};
 
 const COPY_CHUNK: u64 = 1024 * 1024;
 
@@ -21,6 +24,7 @@ pub struct StagedFile {
     pub size: u64,
     pub source_modified: String,
     pub digest: [u8; 32],
+    pub source_identity: Option<NativeFileIdentity>,
 }
 
 /// Immutable input for a later Managed FileVersion builder.
@@ -57,6 +61,7 @@ impl StagedTree {
                 .with_context(|| format!("inspect source file {path:?} before staging"))?;
             require_same(path, expected.size, &expected.modified, &before)?;
             require_same_executable(tree.root(), path, expected.executable)?;
+            require_same_identity(tree.root(), path, expected.native_identity)?;
 
             let reader = source
                 .reader(path)
@@ -96,6 +101,7 @@ impl StagedTree {
                 .with_context(|| format!("inspect source file {path:?} after staging"))?;
             require_same(path, expected.size, &expected.modified, &after)?;
             require_same_executable(tree.root(), path, expected.executable)?;
+            require_same_identity(tree.root(), path, expected.native_identity)?;
             set_executable(&root.join(path), expected.executable)
                 .with_context(|| format!("preserve executable bit for {path:?}"))?;
             let staged_metadata = staged
@@ -111,6 +117,7 @@ impl StagedTree {
                     size: expected.size,
                     source_modified: expected.modified.clone(),
                     digest: digest.finalize().into(),
+                    source_identity: expected.native_identity,
                 },
             );
         }
@@ -127,6 +134,17 @@ impl StagedTree {
     pub fn files(&self) -> &BTreeMap<String, StagedFile> {
         &self.files
     }
+}
+
+fn require_same_identity(
+    root: &Path,
+    path: &str,
+    expected: Option<NativeFileIdentity>,
+) -> Result<()> {
+    if native_file_identity_at(root, path, LocalKind::File)? != expected {
+        bail!("source file {path:?} was replaced while preparing publication; retry sync");
+    }
+    Ok(())
 }
 
 fn require_same_executable(root: &Path, path: &str, expected: bool) -> Result<()> {

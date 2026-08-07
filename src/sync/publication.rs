@@ -44,6 +44,18 @@ pub fn build_publication(
     validate_prepared(local, prepared)?;
     reject_unresolved_renames(&kinds, &old_paths, authoritative, replica, prepared)?;
 
+    let rename_sources = replica
+        .pending
+        .as_ref()
+        .map(|intent| {
+            intent
+                .renames
+                .iter()
+                .map(|(from, path)| (path.clone(), from.clone()))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+
     let old_nodes = authoritative.map(|state| &state.nodes);
     let old_directories = authoritative.map(|state| &state.directories);
     let root = authoritative.map_or_else(NodeId::generate, |state| state.root);
@@ -52,6 +64,11 @@ pub fn build_publication(
     for (path, kind) in &kinds {
         let identity = old_paths
             .get(path)
+            .or_else(|| {
+                rename_sources
+                    .get(path)
+                    .and_then(|from| old_paths.get(from))
+            })
             .and_then(|id| old_nodes.and_then(|nodes| nodes.get(id)))
             .filter(|node| node.kind == *kind)
             .map(|node| node.id)
@@ -236,6 +253,13 @@ fn reject_unresolved_renames(
     };
     for (path, kind) in local {
         if old_paths.contains_key(path) || *kind != NodeKind::RegularFile {
+            continue;
+        }
+        if replica
+            .pending
+            .as_ref()
+            .is_some_and(|intent| intent.renames.values().any(|target| target == path))
+        {
             continue;
         }
         let digest = prepared[path].logical_digest;

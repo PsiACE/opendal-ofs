@@ -20,6 +20,7 @@ pub struct ReconcilePlan {
     pub base: ChangeCursor,
     pub remote: ChangeCursor,
     pub actions: Vec<ReconcileAction>,
+    pub local_renames: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -40,6 +41,12 @@ pub enum ReconcileAction {
     PublishLocal {
         path: String,
         digest: Option<[u8; 32]>,
+    },
+    PublishRename {
+        from: String,
+        path: String,
+        node: NodeId,
+        digest: [u8; 32],
     },
     Conflict(ConflictRecord),
     Unsupported {
@@ -94,13 +101,8 @@ pub fn reconcile(
         &mut handled,
         &mut actions,
     );
-    reject_possible_local_renames(
-        replica,
-        &local_digests,
-        &remote_files,
-        &mut handled,
-        &mut actions,
-    );
+    let local_renames =
+        reconcile_local_renames(replica, local, &remote_files, &mut handled, &mut actions)?;
 
     let mut paths = replica.base.keys().cloned().collect::<BTreeSet<_>>();
     paths.extend(local_digests.keys().cloned());
@@ -174,6 +176,7 @@ pub fn reconcile(
         base: replica.common,
         remote: remote.cursor,
         actions,
+        local_renames,
     })
 }
 
@@ -235,39 +238,154 @@ fn reconcile_remote_renames(
     }
 }
 
-fn reject_possible_local_renames(
+fn reconcile_local_renames(
     replica: &ReplicaState,
-    local: &BTreeMap<String, [u8; 32]>,
+    local: &StagedTree,
     remote: &BTreeMap<String, RemoteFile>,
     handled: &mut BTreeSet<String>,
     actions: &mut Vec<ReconcileAction>,
-) {
-    let mut suspects = BTreeSet::new();
-    for (new_path, digest) in local {
-        if replica.base.contains_key(new_path) || handled.contains(new_path) {
-            continue;
+) -> Result<BTreeMap<String, String>> {
+    let files = local.files();
+    let mut renames = replica
+        .pending
+        .as_ref()
+        .map(|intent| intent.renames.clone())
+        .unwrap_or_default();
+    let mut base_by_identity = BTreeMap::new();
+    for (path, entry) in &replica.base {
+        if let Some(identity) = entry.local_identity {
+            base_by_identity
+                .entry(identity)
+                .and_modify(|value: &mut Option<String>| *value = None)
+                .or_insert_with(|| Some(path.clone()));
         }
-        let possible_sources = replica.base.iter().filter(|(old_path, base)| {
-            base.digest == Some(*digest)
-                && !local.contains_key(*old_path)
-                && remote
-                    .get(*old_path)
-                    .is_some_and(|file| file.node == base.node && file.digest == *digest)
-        });
-        let sources = possible_sources
-            .map(|(path, _)| path.clone())
-            .collect::<Vec<_>>();
-        if sources.is_empty() {
-            continue;
-        }
-        suspects.insert(new_path.clone());
-        suspects.extend(sources);
     }
+    let mut local_by_identity = BTreeMap::new();
+    for (path, file) in files {
+        if let Some(identity) = file.source_identity {
+            local_by_identity
+                .entry(identity)
+                .and_modify(|value: &mut Option<String>| *value = None)
+                .or_insert_with(|| Some(path.clone()));
+        }
+    }
+    for (identity, from) in base_by_identity {
+        let (Some(from), Some(Some(path))) = (from, local_by_identity.get(&identity)) else {
+            continue;
+        };
+        if !files.contains_key(&from) && !replica.base.contains_key(path) {
+            renames.insert(from, path.clone());
+        }
+    }
+
+    let targets = renames.values().collect::<BTreeSet<_>>();
+    if targets.len() != renames.len() {
+        bail!("remembered local renames contain more than one source for a target");
+    }
+
+    for (from, path) in &renames {
+        if handled.contains(from) && handled.contains(path) {
+            continue;
+        }
+        let base = replica
+            .base
+            .get(from)
+            .with_context(|| format!("remembered rename source {from:?} is not in the base"))?;
+        let base_digest = base
+            .digest
+            .with_context(|| format!("remembered rename source {from:?} is not a file"))?;
+        let digest = files
+            .get(path)
+            .with_context(|| format!("remembered rename target {path:?} is not staged"))?
+            .digest;
+        if files.contains_key(from) || replica.base.contains_key(path) {
+            bail!("remembered rename {from:?} to {path:?} no longer describes the local tree");
+        }
+        let remote_source = remote.get(from);
+        let remote_target = remote.get(path);
+        if remote_source.is_some_and(|file| file.node == base.node && file.digest == base_digest)
+            && remote_target.is_none()
+        {
+            handled.insert(from.clone());
+            handled.insert(path.clone());
+            actions.push(ReconcileAction::PublishRename {
+                from: from.clone(),
+                path: path.clone(),
+                node: base.node,
+                digest,
+            });
+        } else if remote_target.is_some_and(|file| file.node == base.node)
+            && remote_source.is_none()
+            && remote_target.is_some_and(|file| file.digest == digest)
+        {
+            handled.insert(from.clone());
+            handled.insert(path.clone());
+            actions.push(ReconcileAction::KeepLocal {
+                path: path.clone(),
+                digest: Some(digest),
+            });
+        } else {
+            handled.insert(from.clone());
+            handled.insert(path.clone());
+            actions.push(ReconcileAction::Conflict(ConflictRecord {
+                path: path.clone(),
+                local_digest: Some(digest),
+                remote_digest: remote_target.or(remote_source).map(|file| file.digest),
+            }));
+        }
+    }
+
+    reject_unidentified_moves(replica, files, handled, actions);
+    Ok(renames)
+}
+
+fn reject_unidentified_moves(
+    replica: &ReplicaState,
+    local: &BTreeMap<String, super::StagedFile>,
+    handled: &mut BTreeSet<String>,
+    actions: &mut Vec<ReconcileAction>,
+) {
+    let deleted = replica
+        .base
+        .iter()
+        .filter(|(path, entry)| entry.digest.is_some() && !local.contains_key(*path))
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
+    let added = local
+        .keys()
+        .filter(|path| !replica.base.contains_key(*path))
+        .cloned()
+        .collect::<Vec<_>>();
+    let deleted = deleted
+        .into_iter()
+        .filter(|path| !handled.contains(path))
+        .collect::<Vec<_>>();
+    let added = added
+        .into_iter()
+        .filter(|path| !handled.contains(path))
+        .collect::<Vec<_>>();
+    if deleted.is_empty() || added.is_empty() {
+        return;
+    }
+    let identities_are_reliable = deleted.iter().all(|path| {
+        replica
+            .base
+            .get(path)
+            .is_some_and(|entry| entry.local_identity.is_some())
+    }) && added.iter().all(|path| {
+        local
+            .get(path)
+            .is_some_and(|file| file.source_identity.is_some())
+    });
+    if identities_are_reliable {
+        return;
+    }
+    let suspects = deleted.into_iter().chain(added).collect::<BTreeSet<_>>();
     handled.extend(suspects.iter().cloned());
     for path in suspects {
         actions.push(ReconcileAction::Unsupported {
             path,
-            reason: "possible local rename lacks a stable local identity",
+            reason: "local move lacks a stable native file identity",
         });
     }
 }

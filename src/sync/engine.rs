@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use opendal::{Operator, services};
 
-use super::local::{fs_operator, set_executable};
+use super::local::{fs_operator, native_file_identity_at, set_executable};
 use super::{
     BaseEntry, ConflictRecord, LocalKind, LocalTree, PendingIntent, ReconcileAction, ReplicaState,
     StagedTree, build_publication, reconcile,
@@ -91,7 +91,7 @@ impl SyncEngine {
                     if safe_to_install {
                         materialize_tree(&self.volume, replica_path, observed.snapshot()).await?;
                     }
-                    state = state_from_snapshot(observed.snapshot())?;
+                    state = state_from_snapshot(observed.snapshot(), replica_path)?;
                     state.install(state_path)?;
                     return Ok(result(&state, true, safe_to_install));
                 }
@@ -106,10 +106,6 @@ impl SyncEngine {
         } else {
             None
         };
-        if prior_staging.is_some() {
-            state.pending = None;
-        }
-
         let observed = self.volume.observe().await?;
         let remote = observed.as_ref().map(|value| value.snapshot());
         if remote.is_none() && state.common != ChangeCursor::Genesis {
@@ -129,6 +125,7 @@ impl SyncEngine {
         let mut publish = remote.is_none() && !local.entries().is_empty();
         let mut install_remote = false;
         let mut conflicts = Vec::new();
+        let mut local_renames = BTreeMap::new();
         let requested = resolve_paths.iter().cloned().collect::<BTreeSet<_>>();
         if requested.len() != resolve_paths.len() {
             bail!("a conflict resolution path was provided more than once");
@@ -149,10 +146,12 @@ impl SyncEngine {
             if merge_remote_directories {
                 create_remote_directories(&target, remote).await?;
             }
+            local_renames = plan.local_renames;
             for action in plan.actions {
                 match action {
                     ReconcileAction::KeepLocal { .. } => {}
                     ReconcileAction::PublishLocal { .. } => publish = true,
+                    ReconcileAction::PublishRename { .. } => publish = true,
                     ReconcileAction::InstallRemote {
                         path,
                         version,
@@ -192,6 +191,7 @@ impl SyncEngine {
         }
         if !conflicts.is_empty() {
             state.conflicts = conflicts;
+            state.pending = None;
             state.install(state_path)?;
             if let Some(old) = prior_staging {
                 remove_tree(&old)?;
@@ -210,7 +210,7 @@ impl SyncEngine {
                         install_remote = false;
                     }
                 }
-                state = state_from_snapshot(remote)?;
+                state = state_from_snapshot(remote, replica_path)?;
             } else {
                 state.pending = None;
             }
@@ -227,6 +227,7 @@ impl SyncEngine {
             operation,
             base: remote.map_or(ChangeCursor::Genesis, |snapshot| snapshot.cursor),
             staging: staging_path.clone(),
+            renames: local_renames,
         });
         state.conflicts.clear();
         state.install(state_path)?;
@@ -267,7 +268,7 @@ impl SyncEngine {
                 if unchanged {
                     materialize_tree(&self.volume, replica_path, &publication.target).await?;
                 }
-                state = state_from_snapshot(&publication.target)?;
+                state = state_from_snapshot(&publication.target, replica_path)?;
                 state.install(state_path)?;
                 if let Some(old) = prior_staging {
                     remove_tree(&old)?;
@@ -488,7 +489,7 @@ async fn delete_absent_directories(
     Ok(())
 }
 
-fn state_from_snapshot(snapshot: &NamespaceSnapshot) -> Result<ReplicaState> {
+fn state_from_snapshot(snapshot: &NamespaceSnapshot, replica: &Path) -> Result<ReplicaState> {
     let mut state = ReplicaState::empty(snapshot.volume_id);
     state.common = snapshot.cursor;
     for (path, node) in snapshot_paths(snapshot)? {
@@ -496,12 +497,19 @@ fn state_from_snapshot(snapshot: &NamespaceSnapshot) -> Result<ReplicaState> {
         let digest = record
             .file_version
             .map(|version| snapshot.file_versions[&version].logical_digest);
+        let local_identity =
+            if record.kind == NodeKind::RegularFile && replica.join(&path).is_file() {
+                native_file_identity_at(replica, &path, LocalKind::File)?
+            } else {
+                None
+            };
         state.base.insert(
             path,
             BaseEntry {
                 node,
                 generation: record.generation.clone(),
                 digest,
+                local_identity,
             },
         );
     }

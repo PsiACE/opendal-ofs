@@ -17,6 +17,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::filesystem::{ChangeCursor, Generation, NodeId, OperationId, VolumeId};
+use crate::sync::local::NativeFileIdentity;
 
 const STATE_FORMAT: &str = "ofs-sync-replica";
 const STATE_MAJOR: u16 = 1;
@@ -27,6 +28,7 @@ pub struct BaseEntry {
     pub node: NodeId,
     pub generation: Generation,
     pub digest: Option<[u8; 32]>,
+    pub local_identity: Option<NativeFileIdentity>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -34,6 +36,7 @@ pub struct PendingIntent {
     pub operation: OperationId,
     pub base: ChangeCursor,
     pub staging: PathBuf,
+    pub renames: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -132,6 +135,8 @@ struct BaseWire {
     node: [u8; 16],
     generation: Vec<u8>,
     digest: Option<[u8; 32]>,
+    #[serde(default)]
+    local_identity: Option<NativeIdentityWire>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -140,6 +145,15 @@ struct IntentWire {
     operation: [u8; 16],
     base: CursorWire,
     staging: PathBuf,
+    #[serde(default)]
+    renames: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct NativeIdentityWire {
+    device: u64,
+    inode: u64,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -167,6 +181,12 @@ impl From<&ReplicaState> for StateWire {
                             node: *entry.node.as_bytes(),
                             generation: entry.generation.as_bytes().into(),
                             digest: entry.digest,
+                            local_identity: entry.local_identity.map(|identity| {
+                                NativeIdentityWire {
+                                    device: identity.device,
+                                    inode: identity.inode,
+                                }
+                            }),
                         },
                     )
                 })
@@ -175,6 +195,7 @@ impl From<&ReplicaState> for StateWire {
                 operation: *intent.operation.as_bytes(),
                 base: CursorWire::from(intent.base),
                 staging: intent.staging.clone(),
+                renames: intent.renames.clone(),
             }),
             conflicts: state
                 .conflicts
@@ -206,6 +227,10 @@ impl TryFrom<StateWire> for ReplicaState {
                         node: NodeId::from_bytes(entry.node),
                         generation: Generation::from_bytes(entry.generation),
                         digest: entry.digest,
+                        local_identity: entry.local_identity.map(|identity| NativeFileIdentity {
+                            device: identity.device,
+                            inode: identity.inode,
+                        }),
                     },
                 ))
             })
@@ -217,6 +242,7 @@ impl TryFrom<StateWire> for ReplicaState {
                     operation: OperationId::from_bytes(intent.operation),
                     base: intent.base.try_into()?,
                     staging: intent.staging,
+                    renames: intent.renames,
                 })
             })
             .transpose()?;

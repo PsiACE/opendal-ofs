@@ -19,12 +19,19 @@ pub enum LocalKind {
     File,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct NativeFileIdentity {
+    pub device: u64,
+    pub inode: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalEntry {
     pub kind: LocalKind,
     pub size: u64,
     pub modified: String,
     pub executable: bool,
+    pub native_identity: Option<NativeFileIdentity>,
 }
 
 /// One stable, path-sorted observation of an ordinary directory.
@@ -68,6 +75,7 @@ impl LocalTree {
                     size: metadata.content_length(),
                     modified,
                     executable: executable_at(root, path, kind)?,
+                    native_identity: native_file_identity_at(root, path, kind)?,
                 },
             );
         }
@@ -87,6 +95,34 @@ impl LocalTree {
 
     pub(crate) fn operator(&self) -> Result<Operator> {
         fs_operator(&self.root)
+    }
+}
+
+pub(crate) fn native_file_identity_at(
+    root: &Path,
+    path: &str,
+    kind: LocalKind,
+) -> Result<Option<NativeFileIdentity>> {
+    if kind != LocalKind::File {
+        return Ok(None);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = fs::symlink_metadata(root.join(path))
+            .with_context(|| format!("inspect local identity for {path:?}"))?;
+        if !metadata.file_type().is_file() {
+            bail!("local path {path:?} is not a regular file; remove it before sync");
+        }
+        Ok(Some(NativeFileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (root, path);
+        Ok(None)
     }
 }
 
