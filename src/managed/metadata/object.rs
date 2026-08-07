@@ -20,7 +20,7 @@ use opendal::{ErrorKind, Operator};
 use super::require_same_format;
 use crate::managed::{ManagedError, ManagedErrorKind, ManagedFormat};
 
-const FORMAT_KEY: &str = ".ofs/managed/format.json";
+const FORMAT_KEY: &str = ".ofs/managed-sync/format.json";
 
 /// Managed metadata stored beside data through OpenDAL.
 #[derive(Clone)]

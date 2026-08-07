@@ -33,10 +33,18 @@ pub enum NamingPolicy {
     PortableUtf8,
 }
 
+/// Location of the authoritative Managed namespace metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MetadataPlacement {
+    ColocatedObject,
+    ExternalD1,
+}
+
 /// Logical Managed volume format shared by all metadata placements.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManagedFormat {
     volume_id: VolumeId,
+    metadata_placement: MetadataPlacement,
     data_root_binding: String,
     naming_policy: NamingPolicy,
     required_reader_features: BTreeSet<String>,
@@ -46,10 +54,12 @@ pub struct ManagedFormat {
 impl ManagedFormat {
     pub fn v1(
         volume_id: VolumeId,
+        metadata_placement: MetadataPlacement,
         data_root_binding: impl Into<String>,
     ) -> Result<Self, ManagedError> {
         let format = Self {
             volume_id,
+            metadata_placement,
             data_root_binding: data_root_binding.into(),
             naming_policy: NamingPolicy::PortableUtf8,
             required_reader_features: BTreeSet::from(["whole-file-v1".to_owned()]),
@@ -65,6 +75,10 @@ impl ManagedFormat {
 
     pub const fn volume_id(&self) -> VolumeId {
         self.volume_id
+    }
+
+    pub const fn metadata_placement(&self) -> MetadataPlacement {
+        self.metadata_placement
     }
 
     pub fn data_root_binding(&self) -> &str {
@@ -117,14 +131,15 @@ impl ManagedFormat {
                 "format record is not valid JSON",
             )
         })?;
-        if wire.magic != MAGIC || wire.major != MAJOR {
+        if wire.magic != MAGIC || wire.major != MAJOR || wire.minor != MINOR {
             return Err(invalid(
                 "read Managed format",
-                "format major is unsupported",
+                "format version is unsupported",
             ));
         }
         let format = Self {
             volume_id: decode_volume_id(&wire.volume_id)?,
+            metadata_placement: wire.metadata_placement.into(),
             data_root_binding: wire.data_root_binding,
             naming_policy: wire.naming_policy.into(),
             required_reader_features: wire.required_reader_features,
@@ -159,6 +174,7 @@ struct FormatWire {
     major: u16,
     minor: u16,
     volume_id: String,
+    metadata_placement: MetadataPlacementWire,
     data_root_binding: String,
     naming_policy: NamingPolicyWire,
     required_reader_features: BTreeSet<String>,
@@ -172,6 +188,7 @@ impl From<&ManagedFormat> for FormatWire {
             major: MAJOR,
             minor: MINOR,
             volume_id: encode_hex(format.volume_id.as_bytes()),
+            metadata_placement: format.metadata_placement.into(),
             data_root_binding: format.data_root_binding.clone(),
             naming_policy: format.naming_policy.into(),
             required_reader_features: format.required_reader_features.clone(),
@@ -184,6 +201,31 @@ impl From<&ManagedFormat> for FormatWire {
 #[serde(rename_all = "snake_case")]
 enum NamingPolicyWire {
     PortableUtf8,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum MetadataPlacementWire {
+    ColocatedObject,
+    ExternalD1,
+}
+
+impl From<MetadataPlacement> for MetadataPlacementWire {
+    fn from(value: MetadataPlacement) -> Self {
+        match value {
+            MetadataPlacement::ColocatedObject => Self::ColocatedObject,
+            MetadataPlacement::ExternalD1 => Self::ExternalD1,
+        }
+    }
+}
+
+impl From<MetadataPlacementWire> for MetadataPlacement {
+    fn from(value: MetadataPlacementWire) -> Self {
+        match value {
+            MetadataPlacementWire::ColocatedObject => Self::ColocatedObject,
+            MetadataPlacementWire::ExternalD1 => Self::ExternalD1,
+        }
+    }
 }
 
 impl From<NamingPolicy> for NamingPolicyWire {

@@ -14,7 +14,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use ofs::catalog::{Catalog, VolumeDefinition};
 use ofs::filesystem::{VolumeId, VolumeModel};
 use ofs::managed::{
-    D1Config, D1Metadata, ManagedError, ManagedErrorKind, ManagedFormat, Metadata, ObjectMetadata,
+    D1Config, D1Metadata, ManagedDataFormat, ManagedError, ManagedErrorKind, ManagedFormat,
+    Metadata, MetadataPlacement, ObjectMetadata,
 };
 use opendal::Operator;
 use url::Url;
@@ -66,8 +67,18 @@ async fn create_volume(config: Option<&Path>, args: VolumeCreateArgs) -> Result<
     )
     .context("volume URLs must be credential-free; supply credentials through provider environment variables")?;
     let created = catalog.create(&args.alias, definition.clone())?;
-    let format = ManagedFormat::v1(volume_id, definition.storage.to_string())?;
-    let metadata = open_metadata(&args.storage, args.metadata.as_ref())?;
+    let placement = if args.metadata.is_some() {
+        MetadataPlacement::ExternalD1
+    } else {
+        MetadataPlacement::ColocatedObject
+    };
+    let format = ManagedFormat::v1(volume_id, placement, definition.storage.to_string())?;
+    let data = open_operator(&args.storage)?;
+    ManagedDataFormat::v1()
+        .activate(&data)
+        .await
+        .map_err(create_format_error)?;
+    let metadata = open_metadata(data, args.metadata.as_ref())?;
     metadata
         .create_format(&format)
         .await
@@ -82,8 +93,7 @@ async fn create_volume(config: Option<&Path>, args: VolumeCreateArgs) -> Result<
     Ok(())
 }
 
-fn open_metadata(storage: &Url, metadata: Option<&Url>) -> Result<Metadata> {
-    let data = open_operator(storage)?;
+fn open_metadata(data: Operator, metadata: Option<&Url>) -> Result<Metadata> {
     match metadata {
         None => Ok(Metadata::Object(ObjectMetadata::new(data))),
         Some(url) if url.scheme() == "d1" => Ok(Metadata::D1(D1Metadata::new(d1_config(url)?))),
