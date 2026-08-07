@@ -743,10 +743,18 @@ impl ManagedData {
         &self,
         snapshot: &NamespaceSnapshot,
     ) -> Result<usize, ManagedError> {
-        if !self.operator.info().full_capability().delete {
+        let capability = self.operator.info().full_capability();
+        if !capability.list || !capability.delete {
             return Ok(0);
         }
         let contents = reachable_content(snapshot, "reclaim packed loose data")?;
+        let mut live_lengths = BTreeMap::<[u8; 32], BTreeSet<u64>>::new();
+        for content in &contents {
+            live_lengths
+                .entry(content.digest)
+                .or_default()
+                .insert(content.logical_length);
+        }
         let Ok(Some(index)) = PackIndex::open(self.operator.clone()).await else {
             return Ok(0);
         };
@@ -764,7 +772,23 @@ impl ManagedData {
                 verified_packs.insert(id, pack);
             }
         }
-        let mut reclaimed = 0;
+        let loose = list_loose_content(&self.operator, "reclaim packed loose data").await?;
+        for listed in &loose {
+            if live_lengths
+                .get(&listed.content.digest)
+                .is_some_and(|lengths| !lengths.contains(&listed.content.logical_length))
+            {
+                return Err(corrupt(
+                    "reclaim packed loose data",
+                    "live loose content has an unexpected length",
+                ));
+            }
+        }
+        let loose = loose
+            .into_iter()
+            .map(|listed| (listed.content, listed.path))
+            .collect::<BTreeMap<_, _>>();
+        let mut reclaimed = Vec::new();
         for content in contents {
             if content.logical_length == 0 || index.locations(content).is_empty() {
                 continue;
@@ -777,18 +801,15 @@ impl ManagedData {
             if !verified {
                 continue;
             }
-            let key = loose_key(&content);
-            match self.operator.stat(&key).await {
-                Ok(metadata)
-                    if metadata.is_file()
-                        && metadata.content_length() == content.logical_length => {}
-                Ok(_) | Err(_) => continue,
-            }
-            if self.operator.delete(&key).await.is_ok() {
-                reclaimed += 1;
+            if let Some(path) = loose.get(&content) {
+                reclaimed.push(path.clone());
             }
         }
-        Ok(reclaimed)
+        self.operator
+            .delete_iter(reclaimed.iter().map(String::as_str))
+            .await
+            .map_err(|_| unavailable("reclaim packed loose data"))?;
+        Ok(reclaimed.len())
     }
 
     pub(crate) async fn collect_unreachable_loose(
@@ -796,56 +817,36 @@ impl ManagedData {
         snapshot: &NamespaceSnapshot,
     ) -> Result<LooseGcMaintenance, ManagedError> {
         let capability = self.operator.info().full_capability();
-        if !capability.list || !capability.stat || !capability.delete {
+        if !capability.list || !capability.delete {
             return Err(unavailable("collect unreachable loose data"));
         }
         let live = reachable_content(snapshot, "collect unreachable loose data")?;
+        let mut live_lengths = BTreeMap::<[u8; 32], BTreeSet<u64>>::new();
+        for content in &live {
+            live_lengths
+                .entry(content.digest)
+                .or_default()
+                .insert(content.logical_length);
+        }
         let mut result = LooseGcMaintenance::default();
-        let entries = self
-            .operator
-            .list_with(&format!("{LOOSE_ROOT}/"))
-            .recursive(true)
-            .await
-            .map_err(|_| unavailable("collect unreachable loose data"))?;
-        for entry in entries {
-            if entry.metadata().is_dir() {
-                continue;
-            }
-            if !entry.metadata().is_file() {
-                continue;
-            }
-            let Some(digest) = parse_loose_key(entry.path()) else {
-                continue;
-            };
-            let metadata = self
-                .operator
-                .stat(entry.path())
-                .await
-                .map_err(|_| unavailable("collect unreachable loose data"))?;
-            if !metadata.is_file() {
-                return Err(corrupt(
-                    "collect unreachable loose data",
-                    "loose data path changed while the namespace was fenced",
-                ));
-            }
-            let content = ContentRef {
-                digest,
-                logical_length: metadata.content_length(),
-            };
+        let loose = list_loose_content(&self.operator, "collect unreachable loose data").await?;
+        let mut deleted = Vec::new();
+        for listed in loose {
+            let content = listed.content;
             result.scanned += 1;
             if live.contains(&content) {
                 continue;
             }
-            if live.iter().any(|candidate| candidate.digest == digest) {
+            if live_lengths
+                .get(&content.digest)
+                .is_some_and(|lengths| !lengths.contains(&content.logical_length))
+            {
                 return Err(corrupt(
                     "collect unreachable loose data",
                     "live loose content has an unexpected length",
                 ));
             }
-            self.operator
-                .delete(entry.path())
-                .await
-                .map_err(|_| unavailable("collect unreachable loose data"))?;
+            deleted.push(listed.path);
             result.deleted += 1;
             result.deleted_bytes = result
                 .deleted_bytes
@@ -857,6 +858,10 @@ impl ManagedData {
                     )
                 })?;
         }
+        self.operator
+            .delete_iter(deleted.iter().map(String::as_str))
+            .await
+            .map_err(|_| unavailable("collect unreachable loose data"))?;
         Ok(result)
     }
 
@@ -1448,6 +1453,38 @@ fn loose_key(content: &ContentRef) -> String {
     format!("{LOOSE_ROOT}/{}/{digest}", &digest[..2])
 }
 
+struct ListedLooseContent {
+    path: String,
+    content: ContentRef,
+}
+
+async fn list_loose_content(
+    operator: &Operator,
+    action: &'static str,
+) -> Result<Vec<ListedLooseContent>, ManagedError> {
+    let entries = operator
+        .list_with(&format!("{LOOSE_ROOT}/"))
+        .recursive(true)
+        .await
+        .map_err(|_| unavailable(action))?;
+    Ok(entries
+        .into_iter()
+        .filter_map(|entry| {
+            if !entry.metadata().is_file() {
+                return None;
+            }
+            let digest = parse_loose_key(entry.path())?;
+            Some(ListedLooseContent {
+                path: entry.path().to_owned(),
+                content: ContentRef {
+                    digest,
+                    logical_length: entry.metadata().content_length(),
+                },
+            })
+        })
+        .collect())
+}
+
 fn parse_loose_key(path: &str) -> Option<[u8; 32]> {
     let relative = path.strip_prefix(&format!("{LOOSE_ROOT}/"))?;
     let (partition, encoded) = relative.split_once('/')?;
@@ -1669,6 +1706,56 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(invalid.kind(), ManagedErrorKind::Invalid);
+    }
+
+    #[tokio::test]
+    async fn loose_gc_retains_unknown_keys_and_fails_before_deleting_on_live_mismatch() {
+        let source = memory();
+        let stored = memory();
+        source.write("live", b"live".to_vec()).await.unwrap();
+        source.write("orphan", b"orphan".to_vec()).await.unwrap();
+        let data = ManagedData::new(stored.clone()).unwrap();
+        let live = data.seal_whole_file(&source, "live").await.unwrap();
+        let orphan = data.seal_whole_file(&source, "orphan").await.unwrap();
+        let snapshot = snapshot_with_file(live.clone());
+        let FileVersionLayout::Whole {
+            content: live_content,
+        } = live.layout
+        else {
+            unreachable!()
+        };
+        let FileVersionLayout::Whole {
+            content: orphan_content,
+        } = orphan.layout
+        else {
+            unreachable!()
+        };
+        let unknown = format!("{LOOSE_ROOT}/unknown");
+        stored.write(&unknown, b"keep".to_vec()).await.unwrap();
+
+        let collected = data.collect_unreachable_loose(&snapshot).await.unwrap();
+        assert_eq!(collected.scanned, 2);
+        assert_eq!(collected.deleted, 1);
+        assert_eq!(collected.deleted_bytes, orphan_content.logical_length);
+        assert!(stored.stat(&loose_key(&live_content)).await.is_ok());
+        assert!(stored.stat(&loose_key(&orphan_content)).await.is_err());
+        assert!(stored.stat(&unknown).await.is_ok());
+
+        stored
+            .write(&loose_key(&live_content), b"wrong length".to_vec())
+            .await
+            .unwrap();
+        let later = ContentRef {
+            digest: Sha256::digest(b"later orphan").into(),
+            logical_length: b"later orphan".len() as u64,
+        };
+        stored
+            .write(&loose_key(&later), b"later orphan".to_vec())
+            .await
+            .unwrap();
+        let error = data.collect_unreachable_loose(&snapshot).await.unwrap_err();
+        assert_eq!(error.kind(), ManagedErrorKind::Corrupt);
+        assert!(stored.stat(&loose_key(&later)).await.is_ok());
     }
 
     #[tokio::test]
