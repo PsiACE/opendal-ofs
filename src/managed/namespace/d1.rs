@@ -277,13 +277,14 @@ impl D1Namespace {
         batch.extend([
             statement(
                 format!(
-                    "INSERT OR IGNORE INTO {RESULTS} (store_key, operation_id, payload_json, target_sequence) SELECT ?, ?, ?, ? FROM {HEADS} WHERE store_key = ? AND volume_id = ? AND target_sequence = ? AND target_operation = ?"
+                    "INSERT OR IGNORE INTO {RESULTS} (store_key, operation_id, payload_json, outcome, target_sequence, target_operation) SELECT ?, ?, ?, 'committed', ?, ? FROM {HEADS} WHERE store_key = ? AND volume_id = ? AND target_sequence = ? AND target_operation = ?"
                 ),
                 vec![
                     self.store_key().into(),
                     operation.clone().into(),
                     payload.clone().into(),
                     target_sequence.into(),
+                    operation.clone().into(),
                     self.store_key().into(),
                     self.volume().into(),
                     target_sequence.into(),
@@ -291,10 +292,20 @@ impl D1Namespace {
                 ],
             ),
             statement(
-                format!("UPDATE {TRANSACTIONS} SET status = CASE WHEN EXISTS (SELECT 1 FROM {RESULTS} WHERE store_key = ? AND operation_id = ?) THEN 'committed' ELSE 'rejected' END WHERE store_key = ? AND operation_id = ? AND status = 'pending'"),
+                format!("UPDATE {TRANSACTIONS} SET status = CASE WHEN EXISTS (SELECT 1 FROM {RESULTS} WHERE store_key = ? AND operation_id = ? AND payload_json = ? AND outcome = 'committed') THEN 'committed' ELSE 'rejected' END WHERE store_key = ? AND operation_id = ? AND status = 'pending'"),
                 vec![
+                    self.store_key().into(), operation.clone().into(), payload.clone().into(),
                     self.store_key().into(), operation.clone().into(),
-                    self.store_key().into(), operation.clone().into(),
+                ],
+            ),
+            statement(
+                format!(
+                    "INSERT OR IGNORE INTO {RESULTS} (store_key, operation_id, payload_json, outcome, target_sequence, target_operation) SELECT t.store_key, t.operation_id, t.payload_json, 'conflict', COALESCE(h.target_sequence, 0), h.target_operation FROM {TRANSACTIONS} t LEFT JOIN {HEADS} h ON h.store_key = t.store_key WHERE t.store_key = ? AND t.operation_id = ? AND t.payload_json = ? AND t.status = 'rejected'"
+                ),
+                vec![
+                    self.store_key().into(),
+                    operation.clone().into(),
+                    payload.clone().into(),
                 ],
             ),
             put_checkpoint(
@@ -321,7 +332,7 @@ impl D1Namespace {
             ),
             statement(
                 format!(
-                    "SELECT target_sequence FROM {RESULTS} WHERE store_key = ? AND operation_id = ?"
+                    "SELECT outcome, target_sequence, target_operation FROM {RESULTS} WHERE store_key = ? AND operation_id = ?"
                 ),
                 vec![self.store_key().into(), operation.into()],
             ),
@@ -332,7 +343,12 @@ impl D1Namespace {
             Err(_) => {
                 return match self.resolve(publication.operation).await {
                     Ok(CommitOutcome::Committed(cursor)) => Ok(CommitOutcome::Committed(cursor)),
-                    _ => Ok(CommitOutcome::Unknown),
+                    Ok(CommitOutcome::Conflict { observed }) => {
+                        Ok(CommitOutcome::Conflict { observed })
+                    }
+                    Ok(CommitOutcome::Absent | CommitOutcome::Unknown) | Err(_) => {
+                        Ok(CommitOutcome::Unknown)
+                    }
                 };
             }
         };
@@ -343,15 +359,16 @@ impl D1Namespace {
                 "D1 omitted the transaction",
             ));
         };
-        if text(transaction, "payload_json", "publish Managed namespace")? != payload {
-            return Err(ManagedError::new(
-                ManagedErrorKind::Conflict,
-                "publish Managed namespace",
-                "operation identity was reused with another payload",
-            ));
+        validate_operation_payload(transaction, &payload)?;
+        let result = rows(&results, results.len() - 1, "publish Managed namespace")?;
+        if let [result] = result {
+            return operation_result(result, publication.operation, "publish Managed namespace");
         }
-        if !rows(&results, results.len() - 1, "publish Managed namespace")?.is_empty() {
-            return Ok(CommitOutcome::Committed(publication.target.cursor));
+        if result.len() > 1 {
+            return Err(corrupt(
+                "publish Managed namespace",
+                "D1 returned duplicate operation results",
+            ));
         }
         self.outcome_after_race(publication.operation).await
     }
@@ -363,39 +380,38 @@ impl D1Namespace {
         let mut batch = schema_statements();
         batch.push(statement(
             format!(
-                "SELECT target_sequence FROM {RESULTS} WHERE store_key = ? AND operation_id = ?"
+                "SELECT outcome, target_sequence, target_operation FROM {RESULTS} WHERE store_key = ? AND operation_id = ?"
             ),
             vec![self.store_key().into(), hex(operation.as_bytes()).into()],
         ));
-        let results = self
+        let results = match self
             .session
             .query(batch, "resolve Managed publication")
-            .await?;
-        let rows = rows(&results, SCHEMA_RESULTS, "resolve Managed publication")?;
-        let [row] = rows else {
-            return if rows.is_empty() {
-                Ok(CommitOutcome::Absent)
-            } else {
-                Err(corrupt(
-                    "resolve Managed publication",
-                    "D1 returned duplicate results",
-                ))
-            };
+            .await
+        {
+            Ok(results) => results,
+            Err(error) if error.kind() == ManagedErrorKind::Unavailable => {
+                return Ok(CommitOutcome::Unknown);
+            }
+            Err(error) => return Err(error),
         };
-        let sequence = integer(row, "target_sequence", "resolve Managed publication")?;
-        let sequence = NonZeroU64::new(sequence)
-            .ok_or_else(|| corrupt("resolve Managed publication", "committed cursor is invalid"))?;
-        Ok(CommitOutcome::Committed(ChangeCursor::at(
-            sequence, operation,
-        )))
+        resolve_operation_rows(
+            rows(&results, SCHEMA_RESULTS, "resolve Managed publication")?,
+            operation,
+            "resolve Managed publication",
+        )
     }
 
     async fn outcome_after_race(
         &self,
         operation: OperationId,
     ) -> Result<CommitOutcome, ManagedError> {
-        if let CommitOutcome::Committed(cursor) = self.resolve(operation).await? {
-            return Ok(CommitOutcome::Committed(cursor));
+        let outcome = self.resolve(operation).await?;
+        if matches!(
+            outcome,
+            CommitOutcome::Committed(_) | CommitOutcome::Conflict { .. } | CommitOutcome::Unknown
+        ) {
+            return Ok(outcome);
         }
         let observed = self
             .observe()
@@ -496,7 +512,7 @@ fn schema_statements() -> Vec<D1Statement> {
         ),
         statement(
             format!(
-                "CREATE TABLE IF NOT EXISTS {RESULTS} (store_key TEXT NOT NULL, operation_id TEXT NOT NULL, payload_json TEXT NOT NULL, target_sequence INTEGER NOT NULL, PRIMARY KEY (store_key, operation_id))"
+                "CREATE TABLE IF NOT EXISTS {RESULTS} (store_key TEXT NOT NULL, operation_id TEXT NOT NULL, payload_json TEXT NOT NULL, outcome TEXT NOT NULL CHECK (outcome IN ('committed', 'conflict')), target_sequence INTEGER NOT NULL, target_operation TEXT, PRIMARY KEY (store_key, operation_id))"
             ),
             Vec::new(),
         ),
@@ -674,7 +690,7 @@ fn put_checkpoint(
     let checkpoint = checkpoint.map_or(Value::Null, |value| value.to_owned().into());
     Ok(statement(
         format!(
-            "INSERT OR IGNORE INTO {CHECKPOINTS} (store_key, target_sequence, operation_id, root_node, snapshot_json) SELECT ?, ?, ?, ?, ? WHERE ? IS NOT NULL AND EXISTS (SELECT 1 FROM {RESULTS} WHERE store_key = ? AND operation_id = ? AND payload_json = ?)"
+            "INSERT OR IGNORE INTO {CHECKPOINTS} (store_key, target_sequence, operation_id, root_node, snapshot_json) SELECT ?, ?, ?, ?, ? WHERE ? IS NOT NULL AND EXISTS (SELECT 1 FROM {RESULTS} WHERE store_key = ? AND operation_id = ? AND payload_json = ? AND outcome = 'committed')"
         ),
         vec![
             store_key.clone().into(),
@@ -825,6 +841,63 @@ fn integer(row: &Value, field: &str, action: &'static str) -> Result<u64, Manage
     row.get(field)
         .and_then(Value::as_u64)
         .ok_or_else(|| corrupt(action, "D1 returned an invalid namespace row"))
+}
+
+fn nullable_text<'a>(
+    row: &'a Value,
+    field: &str,
+    action: &'static str,
+) -> Result<Option<&'a str>, ManagedError> {
+    match row.get(field) {
+        Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value)),
+        _ => Err(corrupt(action, "D1 returned an invalid namespace row")),
+    }
+}
+
+fn operation_result(
+    row: &Value,
+    operation: OperationId,
+    action: &'static str,
+) -> Result<CommitOutcome, ManagedError> {
+    let cursor = stored_cursor(
+        integer(row, "target_sequence", action)?,
+        nullable_text(row, "target_operation", action)?,
+    )?;
+    match text(row, "outcome", action)? {
+        "committed" if cursor.operation() == Some(operation) => {
+            Ok(CommitOutcome::Committed(cursor))
+        }
+        "committed" => Err(corrupt(
+            action,
+            "committed result identifies another operation",
+        )),
+        "conflict" => Ok(CommitOutcome::Conflict { observed: cursor }),
+        _ => Err(corrupt(action, "operation result outcome is invalid")),
+    }
+}
+
+fn resolve_operation_rows(
+    rows: &[Value],
+    operation: OperationId,
+    action: &'static str,
+) -> Result<CommitOutcome, ManagedError> {
+    match rows {
+        [] => Ok(CommitOutcome::Absent),
+        [row] => operation_result(row, operation, action),
+        _ => Err(corrupt(action, "D1 returned duplicate operation results")),
+    }
+}
+
+fn validate_operation_payload(row: &Value, payload: &str) -> Result<(), ManagedError> {
+    if text(row, "payload_json", "publish Managed namespace")? == payload {
+        return Ok(());
+    }
+    Err(ManagedError::new(
+        ManagedErrorKind::Conflict,
+        "publish Managed namespace",
+        "operation identity was reused with another payload",
+    ))
 }
 
 fn sqlite_integer(value: u64) -> Result<i64, ManagedError> {
@@ -1567,6 +1640,46 @@ mod tests {
         assert_eq!(
             replay_tail(checkpoint, target.cursor, target.root, &rows).unwrap(),
             target
+        );
+    }
+
+    #[test]
+    fn operation_results_preserve_committed_and_conflict_outcomes() {
+        assert_eq!(
+            resolve_operation_rows(&[], operation(2), "test operation result").unwrap(),
+            CommitOutcome::Absent
+        );
+        let committed = serde_json::json!({
+            "outcome": "committed",
+            "target_sequence": 2,
+            "target_operation": hex(operation(2).as_bytes()),
+        });
+        assert_eq!(
+            operation_result(&committed, operation(2), "test operation result").unwrap(),
+            CommitOutcome::Committed(cursor(2, 2))
+        );
+
+        let conflict = serde_json::json!({
+            "outcome": "conflict",
+            "target_sequence": 1,
+            "target_operation": hex(operation(1).as_bytes()),
+        });
+        assert_eq!(
+            operation_result(&conflict, operation(2), "test operation result").unwrap(),
+            CommitOutcome::Conflict {
+                observed: cursor(1, 1)
+            }
+        );
+    }
+
+    #[test]
+    fn operation_identity_rejects_another_payload() {
+        let result = serde_json::json!({"payload_json": "first"});
+        assert_eq!(
+            validate_operation_payload(&result, "second")
+                .unwrap_err()
+                .kind(),
+            ManagedErrorKind::Conflict
         );
     }
 }
