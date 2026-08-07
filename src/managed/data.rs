@@ -19,6 +19,7 @@
 
 use std::collections::BTreeSet;
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use fastcdc::v2020::{
     AVERAGE_MAX, AVERAGE_MIN, AsyncStreamCDC, MAXIMUM_MAX, MAXIMUM_MIN, MINIMUM_MAX, MINIMUM_MIN,
@@ -28,7 +29,7 @@ use opendal::{ErrorKind, Operator, Writer};
 use sha2::{Digest as _, Sha256};
 
 use super::{ManagedError, ManagedErrorKind};
-use crate::filesystem::{NodeKind, OperationId};
+use crate::filesystem::{ChangeCursor, NodeKind, OperationId};
 use crate::managed::namespace::{
     ChunkSpan, ChunkingAlgorithm, ChunkingSpec, ContentRef, DataExtent, FileExtent,
     FileVersionLayout, FileVersionRecord, NamespaceSnapshot,
@@ -39,6 +40,7 @@ const READ_WINDOW: u64 = 4 * 1024 * 1024;
 const LOOSE_ROOT: &str = "data/v1/loose/sha256";
 const SMALL_CONTENT_LIMIT: u64 = 256 * 1024;
 const PACK_LOGICAL_LIMIT: u64 = 8 * 1024 * 1024;
+static PACK_RETIREMENT_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 /// Physical locations published by one explicit small-content maintenance run.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -48,6 +50,34 @@ pub struct PackMaintenance {
     pub logical_bytes: u64,
     /// Loose objects that have a verified, published pack location.
     pub reclaimable_loose: Vec<ContentRef>,
+}
+
+/// One process-local grace boundary after replacement locations are published.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PackRetirement {
+    epoch: u64,
+    fixed_at: ChangeCursor,
+    retired_packs: Vec<PackId>,
+    replacement_packs: Vec<PackId>,
+    protected_content: BTreeSet<ContentRef>,
+}
+
+impl PackRetirement {
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    pub const fn fixed_at(&self) -> ChangeCursor {
+        self.fixed_at
+    }
+
+    pub fn retired_packs(&self) -> &[PackId] {
+        &self.retired_packs
+    }
+
+    pub fn replacement_packs(&self) -> &[PackId] {
+        &self.replacement_packs
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -397,46 +427,7 @@ impl ManagedData {
         snapshot: &NamespaceSnapshot,
         operation: OperationId,
     ) -> Result<PackMaintenance, ManagedError> {
-        let mut contents = BTreeSet::new();
-        let mut visited = BTreeSet::new();
-        let mut pending = vec![snapshot.root];
-        while let Some(node_id) = pending.pop() {
-            if !visited.insert(node_id) {
-                continue;
-            }
-            let node = snapshot.nodes.get(&node_id).ok_or_else(|| {
-                corrupt("pack reachable data", "namespace references a missing node")
-            })?;
-            match node.kind {
-                NodeKind::Directory => {
-                    let directory = snapshot.directories.get(&node_id).ok_or_else(|| {
-                        corrupt(
-                            "pack reachable data",
-                            "namespace references a missing directory",
-                        )
-                    })?;
-                    pending.extend(directory.entries.values().map(|entry| entry.node));
-                }
-                NodeKind::RegularFile => {
-                    let version_id = node.file_version.ok_or_else(|| {
-                        corrupt("pack reachable data", "live file has no file version")
-                    })?;
-                    let version = snapshot.file_versions.get(&version_id).ok_or_else(|| {
-                        corrupt(
-                            "pack reachable data",
-                            "live node references a missing file version",
-                        )
-                    })?;
-                    if !version.is_valid() {
-                        return Err(corrupt(
-                            "pack reachable data",
-                            "live node references an invalid file version",
-                        ));
-                    }
-                    collect_content_refs(&version.layout, &mut contents);
-                }
-            }
-        }
+        let contents = reachable_content(snapshot, "pack reachable data")?;
 
         let mut index = PackIndex::open_or_empty(self.operator.clone()).await?;
         let store = PackStore::new(self.operator.clone())?;
@@ -484,6 +475,154 @@ impl ManagedData {
             packed_content,
             logical_bytes,
         })
+    }
+
+    pub(crate) async fn repack_reachable(
+        &self,
+        snapshot: &NamespaceSnapshot,
+        operation: OperationId,
+    ) -> Result<Option<PackRetirement>, ManagedError> {
+        let live = reachable_content(snapshot, "repack content")?;
+        let Some(mut index) = PackIndex::open(self.operator.clone()).await? else {
+            return Ok(None);
+        };
+        let store = PackStore::new(self.operator.clone())?;
+        let mut retired = BTreeSet::new();
+        let mut protected = BTreeSet::new();
+        for id in index.pack_ids() {
+            let pack = store.inspect(id).await?;
+            index.validate_pack(&pack)?;
+            let pack_live = pack
+                .locations
+                .keys()
+                .filter(|content| live.contains(content))
+                .copied()
+                .collect::<BTreeSet<_>>();
+            if pack_live.len() < pack.locations.len() {
+                retired.insert(id);
+                protected.extend(pack_live);
+            }
+        }
+        if retired.is_empty() {
+            return Ok(None);
+        }
+        index.require_update()?;
+
+        let mut batch = Vec::new();
+        let mut batch_bytes = 0_u64;
+        let mut replacements = Vec::new();
+        for content in &protected {
+            if !batch.is_empty() && batch_bytes + content.logical_length > PACK_LOGICAL_LIMIT {
+                let replacement = store.seal(operation, std::mem::take(&mut batch)).await?;
+                store.inspect(replacement.id).await?;
+                index.add(&replacement);
+                replacements.push(replacement.id);
+                batch_bytes = 0;
+            }
+            let mut bytes = None;
+            let mut failure = None;
+            for location in index.locations(*content) {
+                match store.read(*content, *location).await {
+                    Ok(value) => {
+                        bytes = Some(value);
+                        break;
+                    }
+                    Err(error) => failure = Some(error),
+                }
+            }
+            batch.push(bytes.ok_or_else(|| {
+                failure.unwrap_or_else(|| {
+                    corrupt("repack content", "live pack content cannot be resolved")
+                })
+            })?);
+            batch_bytes += content.logical_length;
+        }
+        if !batch.is_empty() {
+            let replacement = store.seal(operation, batch).await?;
+            store.inspect(replacement.id).await?;
+            index.add(&replacement);
+            replacements.push(replacement.id);
+        }
+        if !replacements.is_empty() {
+            index.persist().await?;
+        }
+
+        Ok(Some(PackRetirement {
+            epoch: PACK_RETIREMENT_EPOCH.fetch_add(1, Ordering::Relaxed),
+            fixed_at: snapshot.cursor,
+            retired_packs: retired.into_iter().collect(),
+            replacement_packs: replacements,
+            protected_content: protected,
+        }))
+    }
+
+    pub(crate) async fn finalize_repack(
+        &self,
+        current: &NamespaceSnapshot,
+        retirement: PackRetirement,
+    ) -> Result<Vec<PackId>, ManagedError> {
+        if current.cursor.sequence() < retirement.fixed_at.sequence() {
+            return Err(invalid(
+                "finalize repack",
+                "current namespace predates the repack recovery root",
+            ));
+        }
+        let current_live = reachable_content(current, "finalize repack")?;
+        let mut index = PackIndex::open(self.operator.clone())
+            .await?
+            .ok_or_else(|| corrupt("finalize repack", "pack index is missing"))?;
+        index.require_update()?;
+        let store = PackStore::new(self.operator.clone())?;
+        if !self.operator.info().full_capability().delete {
+            return Err(unavailable("finalize repack"));
+        }
+
+        let mut verified = BTreeSet::new();
+        for id in &retirement.replacement_packs {
+            verified.extend(store.inspect(*id).await?.locations.into_keys());
+        }
+        if !retirement.protected_content.is_subset(&verified) {
+            return Err(corrupt(
+                "finalize repack",
+                "replacement packs do not cover all retiring live content",
+            ));
+        }
+
+        let retired = retirement
+            .retired_packs
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let at_risk = current_live
+            .into_iter()
+            .filter(|content| {
+                index
+                    .locations(*content)
+                    .iter()
+                    .any(|location| retired.contains(&location.pack))
+            })
+            .collect::<Vec<_>>();
+        index.remove_packs(&retired);
+        for content in at_risk {
+            let mut verified_pack = false;
+            for location in index.locations(content) {
+                if store.read(content, *location).await.is_ok() {
+                    verified_pack = true;
+                    break;
+                }
+            }
+            if !verified_pack && self.read_loose_content(content).await.is_err() {
+                return Err(corrupt(
+                    "finalize repack",
+                    "retiring a pack would remove the last verified live location",
+                ));
+            }
+        }
+        index.persist().await?;
+        for id in &retirement.retired_packs {
+            store.delete(*id).await?;
+        }
+        Ok(retirement.retired_packs)
     }
 
     async fn read_loose_content(&self, content: ContentRef) -> Result<Vec<u8>, ManagedError> {
@@ -826,6 +965,49 @@ impl ManagedData {
     }
 }
 
+fn reachable_content(
+    snapshot: &NamespaceSnapshot,
+    action: &'static str,
+) -> Result<BTreeSet<ContentRef>, ManagedError> {
+    let mut contents = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    let mut pending = vec![snapshot.root];
+    while let Some(node_id) = pending.pop() {
+        if !visited.insert(node_id) {
+            continue;
+        }
+        let node = snapshot
+            .nodes
+            .get(&node_id)
+            .ok_or_else(|| corrupt(action, "namespace references a missing node"))?;
+        match node.kind {
+            NodeKind::Directory => {
+                let directory = snapshot
+                    .directories
+                    .get(&node_id)
+                    .ok_or_else(|| corrupt(action, "namespace references a missing directory"))?;
+                pending.extend(directory.entries.values().map(|entry| entry.node));
+            }
+            NodeKind::RegularFile => {
+                let version_id = node
+                    .file_version
+                    .ok_or_else(|| corrupt(action, "live file has no file version"))?;
+                let version = snapshot.file_versions.get(&version_id).ok_or_else(|| {
+                    corrupt(action, "live node references a missing file version")
+                })?;
+                if !version.is_valid() {
+                    return Err(corrupt(
+                        action,
+                        "live node references an invalid file version",
+                    ));
+                }
+                collect_content_refs(&version.layout, &mut contents);
+            }
+        }
+    }
+    Ok(contents)
+}
+
 fn collect_content_refs(layout: &FileVersionLayout, output: &mut BTreeSet<ContentRef>) {
     match layout {
         FileVersionLayout::Whole { content } => {
@@ -1030,6 +1212,7 @@ fn unavailable(action: &'static str) -> ManagedError {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::num::NonZeroU64;
 
     use opendal::services;
 
@@ -1041,6 +1224,69 @@ mod tests {
 
     fn memory() -> Operator {
         Operator::new(services::Memory::default()).unwrap().finish()
+    }
+
+    fn pack_test_storage() -> Operator {
+        let url = url::Url::parse(
+            &std::env::var("OFS_PACK_TEST_STORAGE")
+                .expect("set OFS_PACK_TEST_STORAGE to an isolated S3-compatible root"),
+        )
+        .unwrap();
+        let mut arguments = url.query_pairs().into_owned().collect::<Vec<_>>();
+        arguments.push(("bucket".to_owned(), url.host_str().unwrap().to_owned()));
+        arguments.push(("root".to_owned(), url.path().trim_matches('/').to_owned()));
+        Operator::via_iter(url.scheme(), arguments).unwrap()
+    }
+
+    fn snapshot_with_file(version: FileVersionRecord) -> NamespaceSnapshot {
+        let root = NodeId::from_bytes([21; 16]);
+        let file = NodeId::from_bytes([22; 16]);
+        let generation = Generation::from_bytes(vec![1]);
+        NamespaceSnapshot {
+            volume_id: VolumeId::from_bytes([23; 16]),
+            cursor: ChangeCursor::at(
+                NonZeroU64::new(1).unwrap(),
+                OperationId::from_bytes([24; 16]),
+            ),
+            root,
+            nodes: BTreeMap::from([
+                (
+                    root,
+                    NodeRecord {
+                        id: root,
+                        generation: generation.clone(),
+                        kind: NodeKind::Directory,
+                        attributes: NodeAttributes::default(),
+                        file_version: None,
+                    },
+                ),
+                (
+                    file,
+                    NodeRecord {
+                        id: file,
+                        generation: generation.clone(),
+                        kind: NodeKind::RegularFile,
+                        attributes: NodeAttributes::default(),
+                        file_version: Some(version.id),
+                    },
+                ),
+            ]),
+            directories: BTreeMap::from([(
+                root,
+                DirectoryRecord {
+                    node: root,
+                    generation,
+                    entries: BTreeMap::from([(
+                        "live".to_owned(),
+                        DirectoryEntry {
+                            node: file,
+                            kind: NodeKind::RegularFile,
+                        },
+                    )]),
+                },
+            )]),
+            file_versions: BTreeMap::from([(version.id, version)]),
+        }
     }
 
     #[tokio::test]
@@ -1213,6 +1459,129 @@ mod tests {
             b"small file".as_slice()
         );
         data.read_to(&large, &target, "large").await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires OFS_PACK_TEST_STORAGE pointing at an isolated MinIO root"]
+    async fn repack_keeps_live_content_until_old_pack_retirement() {
+        let stored = pack_test_storage();
+        let target = memory();
+        let data = ManagedData::new(stored.clone()).unwrap();
+        let live_bytes = b"live after repack".to_vec();
+        let dead_bytes = b"dead before repack".to_vec();
+        let live_content = ContentRef {
+            digest: Sha256::digest(&live_bytes).into(),
+            logical_length: live_bytes.len() as u64,
+        };
+        let dead_content = ContentRef {
+            digest: Sha256::digest(&dead_bytes).into(),
+            logical_length: dead_bytes.len() as u64,
+        };
+        let version = whole_file_version(
+            live_content.logical_length,
+            Digest::from_bytes(live_content.digest),
+        );
+        let snapshot = snapshot_with_file(version.clone());
+        let unchanged = snapshot.clone();
+        let dead_version = whole_file_version(
+            dead_content.logical_length,
+            Digest::from_bytes(dead_content.digest),
+        );
+
+        let store = PackStore::new(stored.clone()).unwrap();
+        let old = store
+            .seal(OperationId::from_bytes([25; 16]), [live_bytes, dead_bytes])
+            .await
+            .unwrap();
+        let mut index = PackIndex::open_or_empty(stored.clone()).await.unwrap();
+        index.add(&old);
+        index.persist().await.unwrap();
+
+        let retirement = data
+            .repack_reachable(&snapshot, OperationId::from_bytes([26; 16]))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot, unchanged);
+        assert_eq!(retirement.retired_packs(), &[old.id]);
+        assert_eq!(retirement.replacement_packs().len(), 1);
+        let replacement = store
+            .inspect(retirement.replacement_packs()[0])
+            .await
+            .unwrap();
+        assert!(replacement.locations.contains_key(&live_content));
+        assert!(!replacement.locations.contains_key(&dead_content));
+
+        let dual = PackIndex::open(stored.clone()).await.unwrap().unwrap();
+        assert_eq!(dual.locations(live_content).len(), 2);
+        assert_eq!(
+            dual.locations(dead_content),
+            &[old.locations[&dead_content]]
+        );
+        data.read_to(&version, &target, "before-finalize")
+            .await
+            .unwrap();
+
+        let mut current = snapshot.clone();
+        let dead_node = NodeId::from_bytes([27; 16]);
+        current.cursor = ChangeCursor::at(
+            NonZeroU64::new(2).unwrap(),
+            OperationId::from_bytes([28; 16]),
+        );
+        current.nodes.insert(
+            dead_node,
+            NodeRecord {
+                id: dead_node,
+                generation: Generation::from_bytes(vec![1]),
+                kind: NodeKind::RegularFile,
+                attributes: NodeAttributes::default(),
+                file_version: Some(dead_version.id),
+            },
+        );
+        current
+            .directories
+            .get_mut(&current.root)
+            .unwrap()
+            .entries
+            .insert(
+                "reintroduced".to_owned(),
+                DirectoryEntry {
+                    node: dead_node,
+                    kind: NodeKind::RegularFile,
+                },
+            );
+        current
+            .file_versions
+            .insert(dead_version.id, dead_version.clone());
+        let error = data
+            .finalize_repack(&current, retirement.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ManagedErrorKind::Corrupt);
+        assert!(store.inspect(old.id).await.is_ok());
+
+        stored
+            .write(&loose_key(&dead_content), b"dead before repack".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(
+            data.finalize_repack(&current, retirement).await.unwrap(),
+            vec![old.id]
+        );
+        assert!(store.inspect(old.id).await.is_err());
+        let finalized = PackIndex::open(stored).await.unwrap().unwrap();
+        assert_eq!(finalized.locations(live_content).len(), 1);
+        assert!(finalized.locations(dead_content).is_empty());
+        data.read_to(&version, &target, "after-finalize")
+            .await
+            .unwrap();
+        data.read_to(&dead_version, &target, "reintroduced")
+            .await
+            .unwrap();
+        assert_eq!(
+            target.read("after-finalize").await.unwrap().to_bytes(),
+            b"live after repack".as_slice()
+        );
     }
 
     #[tokio::test]

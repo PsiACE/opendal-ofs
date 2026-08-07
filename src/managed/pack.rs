@@ -17,7 +17,7 @@
 
 //! Immutable content packs and their rebuildable physical index.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
 
 use opendal::{ErrorKind, Operator};
@@ -323,6 +323,19 @@ impl PackStore {
         index.persist().await?;
         Ok(index)
     }
+
+    pub(crate) async fn delete(&self, id: PackId) -> Result<(), ManagedError> {
+        if !self.operator.info().full_capability().delete {
+            return Err(unavailable(
+                "delete retired pack",
+                "pack storage does not support delete",
+            ));
+        }
+        self.operator
+            .delete(&pack_key(id))
+            .await
+            .map_err(|_| unavailable("delete retired pack", "retired pack cannot be deleted"))
+    }
 }
 
 /// Rebuildable mapping from logical content identities to pack ranges.
@@ -349,6 +362,51 @@ impl PackIndex {
                 locations.push(*location);
                 locations.sort_unstable();
             }
+        }
+    }
+
+    pub(crate) fn pack_ids(&self) -> BTreeSet<PackId> {
+        self.locations
+            .values()
+            .flatten()
+            .map(|location| location.pack)
+            .collect()
+    }
+
+    pub(crate) fn validate_pack(&self, pack: &SealedPack) -> Result<(), ManagedError> {
+        let valid = self.locations.iter().all(|(content, locations)| {
+            locations.iter().all(|location| {
+                location.pack != pack.id || pack.locations.get(content) == Some(location)
+            })
+        });
+        if valid {
+            Ok(())
+        } else {
+            Err(corrupt(
+                "repack content",
+                "pack index disagrees with a verified pack footer",
+            ))
+        }
+    }
+
+    pub(crate) fn remove_packs(&mut self, retired: &BTreeSet<PackId>) {
+        for locations in self.locations.values_mut() {
+            locations.retain(|location| !retired.contains(&location.pack));
+        }
+        normalize_locations(&mut self.locations);
+    }
+
+    pub(crate) fn require_update(&self) -> Result<(), ManagedError> {
+        if self.revision.is_some()
+            && (!self.operator.info().full_capability().write_with_if_match
+                || self.head_etag.is_none())
+        {
+            Err(unavailable(
+                "persist pack index",
+                "updating an existing pack index requires compare-and-swap and a revision token",
+            ))
+        } else {
+            Ok(())
         }
     }
 
@@ -412,15 +470,7 @@ impl PackIndex {
     /// Publish current entries through immutable records and a conditional head update.
     pub async fn persist(&mut self) -> Result<(), ManagedError> {
         require_index_create_capabilities(&self.operator)?;
-        if self.revision.is_some()
-            && (!self.operator.info().full_capability().write_with_if_match
-                || self.head_etag.is_none())
-        {
-            return Err(unavailable(
-                "persist pack index",
-                "updating an existing pack index requires compare-and-swap and a revision token",
-            ));
-        }
+        self.require_update()?;
         normalize_locations(&mut self.locations);
         let checkpoint = IndexCheckpoint::from_locations(&self.locations);
         let checkpoint_bytes = encode(&checkpoint, "persist pack index")?;

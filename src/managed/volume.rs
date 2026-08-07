@@ -25,7 +25,7 @@ use super::namespace::{
 };
 use super::{
     D1Metadata, FileLayoutPolicy, ManagedData, ManagedError, ManagedErrorKind, PackMaintenance,
-    SparseExtent,
+    PackRetirement, SparseExtent,
 };
 use crate::filesystem::{CommitOutcome, OperationId, VolumeId};
 
@@ -173,6 +173,28 @@ impl ManagedVolume {
     ) -> Result<PackMaintenance, ManagedError> {
         self.data
             .pack_reachable(observed.snapshot(), operation)
+            .await
+    }
+
+    /// Repack mixed live/dead packs and publish replacement locations.
+    pub async fn repack_reachable_content(
+        &self,
+        observed: &ManagedObservation,
+        operation: OperationId,
+    ) -> Result<Option<PackRetirement>, ManagedError> {
+        self.data
+            .repack_reachable(observed.snapshot(), operation)
+            .await
+    }
+
+    /// End a process-local grace period and remove retired pack locations.
+    pub async fn finalize_pack_retirement(
+        &self,
+        current: &ManagedObservation,
+        retirement: PackRetirement,
+    ) -> Result<Vec<super::pack::PackId>, ManagedError> {
+        self.data
+            .finalize_repack(current.snapshot(), retirement)
             .await
     }
 
