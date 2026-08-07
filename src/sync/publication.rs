@@ -77,7 +77,13 @@ pub fn build_publication(
         } else {
             None
         };
-        let body = (*kind, NodeAttributes::default(), file_version);
+        let attributes = local
+            .entries()
+            .get(path)
+            .map_or_else(NodeAttributes::default, |entry| NodeAttributes {
+                executable: entry.executable,
+            });
+        let body = (*kind, attributes, file_version);
         let generation = next_node_generation(id, body, old_nodes)?;
         nodes.insert(
             id,

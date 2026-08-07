@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use sha2::{Digest as _, Sha256};
 
-use super::local::{LocalKind, LocalTree, fs_operator};
+use super::local::{LocalKind, LocalTree, executable_at, fs_operator, set_executable};
 
 const COPY_CHUNK: u64 = 1024 * 1024;
 
@@ -56,6 +56,7 @@ impl StagedTree {
                 .await
                 .with_context(|| format!("inspect source file {path:?} before staging"))?;
             require_same(path, expected.size, &expected.modified, &before)?;
+            require_same_executable(tree.root(), path, expected.executable)?;
 
             let reader = source
                 .reader(path)
@@ -94,6 +95,9 @@ impl StagedTree {
                 .await
                 .with_context(|| format!("inspect source file {path:?} after staging"))?;
             require_same(path, expected.size, &expected.modified, &after)?;
+            require_same_executable(tree.root(), path, expected.executable)?;
+            set_executable(&root.join(path), expected.executable)
+                .with_context(|| format!("preserve executable bit for {path:?}"))?;
             let staged_metadata = staged
                 .stat(path)
                 .await
@@ -123,6 +127,13 @@ impl StagedTree {
     pub fn files(&self) -> &BTreeMap<String, StagedFile> {
         &self.files
     }
+}
+
+fn require_same_executable(root: &Path, path: &str, expected: bool) -> Result<()> {
+    if executable_at(root, path, LocalKind::File)? != expected {
+        bail!("source file {path:?} changed permissions while preparing publication; retry sync");
+    }
+    Ok(())
 }
 
 async fn prepare_root(source: &Path, staging: &Path) -> Result<()> {

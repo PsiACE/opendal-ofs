@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use opendal::{Operator, services};
 
-use super::local::fs_operator;
+use super::local::{fs_operator, set_executable};
 use super::{
     BaseEntry, ConflictRecord, LocalKind, LocalTree, PendingIntent, ReconcileAction, ReplicaState,
     StagedTree, build_publication, reconcile,
@@ -301,6 +301,7 @@ struct FrozenEntry {
     kind: LocalKind,
     size: u64,
     digest: Option<[u8; 32]>,
+    executable: bool,
 }
 
 impl FrozenTree {
@@ -317,6 +318,7 @@ impl FrozenTree {
                             kind: entry.kind,
                             size: entry.size,
                             digest,
+                            executable: entry.executable,
                         },
                     )
                 })
@@ -626,24 +628,6 @@ fn remove_tree(path: &Path) -> Result<()> {
     if path.exists() {
         fs::remove_dir_all(path).context("remove completed sync staging")?;
     }
-    Ok(())
-}
-
-fn set_executable(path: &Path, executable: bool) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let mut permissions = fs::metadata(path)?.permissions();
-        let mode = permissions.mode();
-        permissions.set_mode(if executable {
-            mode | 0o111
-        } else {
-            mode & !0o111
-        });
-        fs::set_permissions(path, permissions)?;
-    }
-    #[cfg(not(unix))]
-    let _ = (path, executable);
     Ok(())
 }
 

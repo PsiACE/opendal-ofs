@@ -7,6 +7,7 @@
 // with the License.
 
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -23,6 +24,7 @@ pub struct LocalEntry {
     pub kind: LocalKind,
     pub size: u64,
     pub modified: String,
+    pub executable: bool,
 }
 
 /// One stable, path-sorted observation of an ordinary directory.
@@ -65,6 +67,7 @@ impl LocalTree {
                     kind,
                     size: metadata.content_length(),
                     modified,
+                    executable: executable_at(root, path, kind)?,
                 },
             );
         }
@@ -85,6 +88,45 @@ impl LocalTree {
     pub(crate) fn operator(&self) -> Result<Operator> {
         fs_operator(&self.root)
     }
+}
+
+pub(crate) fn executable_at(root: &Path, path: &str, kind: LocalKind) -> Result<bool> {
+    if kind != LocalKind::File {
+        return Ok(false);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let metadata = fs::symlink_metadata(root.join(path))
+            .with_context(|| format!("inspect local permissions for {path:?}"))?;
+        if metadata.file_type().is_symlink() {
+            bail!("local path {path:?} is a symbolic link; remove it before sync");
+        }
+        Ok(metadata.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (root, path);
+        Ok(false)
+    }
+}
+
+pub(crate) fn set_executable(path: &Path, executable: bool) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut permissions = fs::metadata(path)?.permissions();
+        let mode = permissions.mode();
+        permissions.set_mode(if executable {
+            mode | 0o111
+        } else {
+            mode & !0o111
+        });
+        fs::set_permissions(path, permissions)?;
+    }
+    #[cfg(not(unix))]
+    let _ = (path, executable);
+    Ok(())
 }
 
 pub(crate) fn fs_operator(root: &Path) -> Result<Operator> {
