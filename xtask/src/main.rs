@@ -26,7 +26,7 @@ fn run() -> Result<(), String> {
     match arguments.next().as_deref() {
         Some("managed-sync") => managed_sync::run(arguments),
         Some("-h" | "--help") => {
-            println!("Usage: cargo x managed-sync <doctor|up|down>");
+            println!("Usage: cargo x managed-sync <doctor|up|down|test workflow object|d1>");
             Ok(())
         }
         Some(command) => Err(format!("unknown xtask command {command:?}")),

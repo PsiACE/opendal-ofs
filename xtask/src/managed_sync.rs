@@ -22,19 +22,101 @@ pub(crate) fn run(mut arguments: impl Iterator<Item = String>) -> Result<(), Str
     let command = arguments
         .next()
         .ok_or_else(|| "missing Managed Sync command; expected doctor, up, or down".to_string())?;
-    if let Some(argument) = arguments.next() {
-        return Err(format!("unexpected argument {argument:?}"));
-    }
     match command.as_str() {
-        "doctor" => doctor(),
-        "up" => up(),
-        "down" => down(),
+        "doctor" => no_arguments(arguments, doctor),
+        "up" => no_arguments(arguments, up),
+        "down" => no_arguments(arguments, down),
+        "test" => test(arguments),
         "-h" | "--help" => {
-            println!("Usage: cargo x managed-sync <doctor|up|down>");
+            println!("Usage: cargo x managed-sync <doctor|up|down|test workflow object|d1>");
             Ok(())
         }
         _ => Err(format!("unknown Managed Sync command {command:?}")),
     }
+}
+
+fn no_arguments(
+    mut arguments: impl Iterator<Item = String>,
+    action: fn() -> Result<(), String>,
+) -> Result<(), String> {
+    if let Some(argument) = arguments.next() {
+        return Err(format!("unexpected argument {argument:?}"));
+    }
+    action()
+}
+
+fn test(mut arguments: impl Iterator<Item = String>) -> Result<(), String> {
+    if arguments.next().as_deref() != Some("workflow") {
+        return Err("expected `test workflow object` or `test workflow d1`".into());
+    }
+    let metadata = arguments
+        .next()
+        .ok_or_else(|| "workflow requires object or d1 metadata".to_string())?;
+    if !matches!(metadata.as_str(), "object" | "d1") {
+        return Err("workflow metadata must be object or d1".into());
+    }
+    if let Some(argument) = arguments.next() {
+        return Err(format!("unexpected argument {argument:?}"));
+    }
+
+    up()?;
+    let result = run_workflow(&metadata);
+    let cleanup = down();
+    result?;
+    cleanup
+}
+
+fn run_workflow(metadata: &str) -> Result<(), String> {
+    run_command(
+        Command::new("cargo")
+            .current_dir(workspace_root())
+            .args(["build", "--locked"]),
+        "build ofs for Managed Sync acceptance",
+    )?;
+
+    let run_root = env::temp_dir().join(format!(
+        "ofs-managed-sync-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| format!("system clock is invalid: {error}"))?
+            .as_nanos()
+    ));
+    std::fs::create_dir(&run_root)
+        .map_err(|error| format!("could not create acceptance directory: {error}"))?;
+    let case_root = run_root.join("case");
+    let binary = workspace_root().join("target/debug/ofs");
+    let endpoint = format!("http%3A%2F%2F127.0.0.1%3A{}", minio_port());
+    let storage = format!("s3://managed-sync/acceptance?endpoint={endpoint}&region=us-east-1");
+
+    let mut workflow = Command::new("bash");
+    workflow
+        .current_dir(workspace_root())
+        .arg("tests/behavior/managed-sync/workflow.sh")
+        .env("OFS_BIN", binary)
+        .env("OFS_CASE_ROOT", &case_root)
+        .env("OFS_STORAGE_URL", storage)
+        .env("OFS_METADATA_MODE", metadata)
+        .env("AWS_ACCESS_KEY_ID", "minioadmin")
+        .env("AWS_SECRET_ACCESS_KEY", "minioadmin")
+        .env("AWS_REGION", "us-east-1");
+    if metadata == "d1" {
+        let api_base = format!("http%3A%2F%2F127.0.0.1%3A{}%2Fclient%2Fv4", d1_port());
+        workflow
+            .env(
+                "OFS_METADATA_URL",
+                format!("d1://local/managed-sync/acceptance?api_base={api_base}"),
+            )
+            .env("OFS_D1_TOKEN", "local-d1-token");
+    }
+    let result = run_command(&mut workflow, "run Managed Sync acceptance");
+    if result.is_ok() {
+        std::fs::remove_dir_all(&run_root)
+            .map_err(|error| format!("could not remove acceptance directory: {error}"))?;
+    } else {
+        eprintln!("Managed Sync evidence retained at {}", run_root.display());
+    }
+    result
 }
 
 fn doctor() -> Result<(), String> {
