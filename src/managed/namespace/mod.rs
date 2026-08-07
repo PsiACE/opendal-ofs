@@ -15,13 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Managed volume authority and its durable format.
+//! Managed namespace records and authoritative snapshot publication.
 
-mod error;
-mod format;
-mod metadata;
-pub mod namespace;
+mod records;
 
-pub use error::{ManagedError, ManagedErrorKind};
-pub use format::{ManagedFormat, NamingPolicy};
-pub use metadata::{D1Config, D1Metadata, Metadata, ObjectMetadata};
+pub use records::{
+    ContentRef, DirectoryEntry, DirectoryPrecondition, DirectoryRecord, FileVersionRecord,
+    NamespacePublication, NamespaceSnapshot, NodeAttributes, NodeKind, NodePrecondition,
+    NodeRecord,
+};
