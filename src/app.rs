@@ -12,16 +12,18 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 use ofs::catalog::{Catalog, VolumeDefinition};
-use ofs::filesystem::{AccessModel, Capabilities, VolumeId, VolumeModel};
+use ofs::filesystem::{AccessModel, Capabilities, OperationId, VolumeId, VolumeModel};
 use ofs::managed::{
     D1Config, D1Metadata, ManagedDataFormat, ManagedError, ManagedErrorKind, ManagedFormat,
-    Metadata, MetadataPlacement, ObjectMetadata,
+    ManagedVolume, Metadata, MetadataPlacement, ObjectMetadata,
 };
 use ofs::sync::{ReplicaState, SyncEngine};
 use opendal::Operator;
 use url::Url;
 
-use crate::cli::{Cli, Command, StatusArgs, SyncArgs, VolumeCommand, VolumeCreateArgs};
+use crate::cli::{
+    Cli, Command, StatusArgs, SyncArgs, VolumeCommand, VolumeCreateArgs, VolumePackArgs,
+};
 
 pub(crate) async fn run(cli: Cli) -> Result<()> {
     match (cli.command, cli.mount_path, cli.backend) {
@@ -32,16 +34,70 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
             None,
             None,
         ) => create_volume(cli.config.as_deref(), args).await,
+        (
+            Some(Command::Volume {
+                command: VolumeCommand::Pack(args),
+            }),
+            None,
+            None,
+        ) => pack_volume(cli.config.as_deref(), args).await,
         (Some(Command::Sync(args)), None, None) => sync_volume(cli.config.as_deref(), args).await,
         (Some(Command::Status(args)), None, None) => status(cli.config.as_deref(), args),
         (None, Some(mount_path), Some(backend)) => mount(&mount_path, &backend).await,
         (Some(_), _, _) => {
             bail!("a subcommand cannot be combined with Direct Mount arguments; run `ofs --help`")
         }
-        (None, _, _) => bail!(
-            "provide `volume create ...` or both MOUNT_PATH and BACKEND_URL; run `ofs --help`"
-        ),
+        (None, _, _) => {
+            bail!("provide a volume command or both MOUNT_PATH and BACKEND_URL; run `ofs --help`")
+        }
     }
+}
+
+async fn pack_volume(config: Option<&Path>, args: VolumePackArgs) -> Result<()> {
+    let catalog = load_catalog(config)?;
+    let definition = catalog
+        .get(&args.alias)
+        .with_context(|| format!("volume alias {:?} is not in the catalog", args.alias))?
+        .clone();
+    if definition.model != VolumeModel::Managed || definition.format_major != 1 {
+        bail!("volume pack requires a Managed volume using format v1");
+    }
+
+    let data = open_operator(&definition.storage)?;
+    ManagedDataFormat::read(&data).await?.validate_for_write()?;
+    let metadata = open_metadata(data.clone(), definition.metadata.as_ref())?;
+    let placement = if definition.metadata.is_some() {
+        MetadataPlacement::ExternalD1
+    } else {
+        MetadataPlacement::ColocatedObject
+    };
+    let expected = ManagedFormat::v1(
+        definition.volume_id,
+        placement,
+        definition.storage.to_string(),
+    )?;
+    if metadata.read_format().await? != expected {
+        bail!("volume catalog and Managed format v1 binding disagree");
+    }
+    let volume = match metadata {
+        Metadata::Object(_) => ManagedVolume::object(definition.volume_id, data)?,
+        Metadata::D1(metadata) => ManagedVolume::d1(definition.volume_id, data, metadata)?,
+    };
+    let observed = volume
+        .observe()
+        .await?
+        .context("Managed volume has no published namespace to pack")?;
+    let packed = volume
+        .pack_reachable_content(&observed, OperationId::generate())
+        .await?;
+    println!(
+        "packed {:?}: packs={} content={} logical_bytes={}",
+        args.alias,
+        packed.packs.len(),
+        packed.reclaimable_loose.len(),
+        packed.logical_bytes
+    );
+    Ok(())
 }
 
 async fn create_volume(config: Option<&Path>, args: VolumeCreateArgs) -> Result<()> {

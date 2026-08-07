@@ -101,6 +101,13 @@ printf '%s\n' '#!/bin/sh' 'printf "managed sync executable\\n"' >"$replica_a/too
 chmod u+x "$replica_a/tools/run.sh"
 OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a"
 OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_b" --state "$state_b"
+printf '%s\n' 'acceptance: pack live small content and repeat idempotently'
+first_pack=$(OFS_CONFIG="$config" "$OFS_BIN" volume pack workspace)
+grep -Eq 'packs=[1-9][0-9]*' <<<"$first_pack" || fail 'first pack run produced no pack'
+grep -Eq 'content=[1-9][0-9]*' <<<"$first_pack" || fail 'first pack run indexed no content'
+second_pack=$(OFS_CONFIG="$config" "$OFS_BIN" volume pack workspace)
+grep -Fq 'packs=0 content=0 logical_bytes=0' <<<"$second_pack" || \
+  fail 'second pack run was not idempotent'
 [[ -d "$replica_b/nested/level" ]] || fail 'nested directories were not materialized'
 cmp "$replica_a/nested/level/entry.txt" "$replica_b/nested/level/entry.txt" || \
   fail 'nested file content did not round trip'

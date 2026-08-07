@@ -48,6 +48,14 @@ pub(crate) enum Command {
 pub(crate) enum VolumeCommand {
     /// Create or reopen a volume and save its credential-free binding.
     Create(VolumeCreateArgs),
+    /// Pack live small content through the current Managed namespace root.
+    Pack(VolumePackArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct VolumePackArgs {
+    /// Named Managed volume from the local catalog.
+    pub alias: String,
 }
 
 #[derive(Debug, Args)]
