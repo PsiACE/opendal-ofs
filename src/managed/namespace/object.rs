@@ -47,7 +47,7 @@ const CHECKPOINT_MAGIC: &[u8] = b"OFS1CHK\0";
 const RESULT_MAGIC: &[u8] = b"OFS1RES\0";
 const HEAD_MAGIC: &str = "ofs-managed-sync-head";
 const FORMAT_MAJOR: u16 = 1;
-const MAX_TAIL_TRANSACTIONS: u16 = 32;
+const MAX_TAIL_TRANSACTIONS: u16 = 4;
 
 #[derive(Clone, Debug)]
 pub struct NamespaceObservation {
@@ -467,35 +467,31 @@ impl ObjectNamespace {
             ));
         }
 
-        let latest = OperationId::from_bytes(head.latest_transaction);
-        let latest_transaction = self.required_transaction(latest).await?;
-        let latest_bytes = encode_cbor(
-            TRANSACTION_MAGIC,
-            &latest_transaction,
-            "read Managed namespace",
-        )?;
-        if sha256(&latest_bytes) != head.latest_transaction_sha256
-            || latest_transaction.cursor != head.cursor
-        {
-            return Err(corrupt(
-                "read Managed namespace",
-                "latest transaction and HEAD disagree",
-            ));
-        }
-
         let mut tail = Vec::with_capacity(head.tail_transactions.into());
-        let mut current = latest_transaction;
-        for index in 0..head.tail_transactions {
-            if index != 0 {
-                current = self
-                    .required_transaction(OperationId::from_bytes(
-                        current.parent.operation.ok_or_else(|| {
-                            corrupt("read Managed namespace", "transaction tail is incomplete")
-                        })?,
-                    ))
-                    .await?;
+        if head.tail_transactions > 0 {
+            let latest = OperationId::from_bytes(head.latest_transaction);
+            let mut current = self.required_transaction(latest).await?;
+            let latest_bytes = encode_cbor(TRANSACTION_MAGIC, &current, "read Managed namespace")?;
+            if sha256(&latest_bytes) != head.latest_transaction_sha256
+                || current.cursor != head.cursor
+            {
+                return Err(corrupt(
+                    "read Managed namespace",
+                    "latest transaction and HEAD disagree",
+                ));
             }
-            tail.push(current.clone());
+            for index in 0..head.tail_transactions {
+                if index != 0 {
+                    current = self
+                        .required_transaction(OperationId::from_bytes(
+                            current.parent.operation.ok_or_else(|| {
+                                corrupt("read Managed namespace", "transaction tail is incomplete")
+                            })?,
+                        ))
+                        .await?;
+                }
+                tail.push(current.clone());
+            }
         }
         tail.reverse();
         for transaction in tail {
