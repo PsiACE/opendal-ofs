@@ -37,10 +37,12 @@ placement. Metadata owns stable nodes, directory entries, object-scoped
 generations, immutable `FileVersion` manifests, and the ordered change log.
 Apache OpenDAL™ stores immutable content.
 
-The foreground write path uses whole-file manifests and loose content. A
-`FileVersion` can also describe fixed chunks, content-defined chunks, or sparse
-extents. Packing changes only the physical location of a `ContentRef`; it does
-not change a file manifest, node generation, or change cursor.
+The foreground write path stores loose content and uses the configured file
+layout. Whole-file manifests are the default. FastCDC is available for large
+files, while files below its threshold remain whole. A `FileVersion` can also
+describe fixed chunks or sparse extents. Packing changes only the physical
+location of a `ContentRef`; it does not change a file manifest, node generation,
+or change cursor.
 
 Metadata can be colocated with data as immutable objects plus a compare-and-swap
 head, or stored in D1 as normalized rows and transactions. Both adapters apply
@@ -75,6 +77,36 @@ volume and leaves its identity unchanged.
 
 Use a different storage root for each volume. The root is private Managed
 storage, not an object namespace for other tools to edit.
+
+## Configure large-file chunking
+
+Select FastCDC when creating or reopening a volume:
+
+```shell
+ofs volume create workspace \
+  --model managed \
+  --storage "$OFS_STORAGE_URL" \
+  --file-layout fastcdc
+```
+
+The defaults use FastCDC v2020 for files of at least 1 MiB, with 64 KiB minimum,
+256 KiB target, and 1 MiB maximum chunks. Override them with
+`--fastcdc-minimum-file-size`, `--fastcdc-minimum-chunk-size`,
+`--fastcdc-target-chunk-size`, and `--fastcdc-maximum-chunk-size`. Each option
+takes a byte count. The corresponding environment variables are
+`OFS_FASTCDC_MINIMUM_FILE_SIZE`, `OFS_FASTCDC_MINIMUM_CHUNK_SIZE`,
+`OFS_FASTCDC_TARGET_CHUNK_SIZE`, and `OFS_FASTCDC_MAXIMUM_CHUNK_SIZE`.
+`OFS_FILE_LAYOUT` sets `whole` or `fastcdc`.
+
+The catalog keeps the selected policy. Reopening an existing catalog without
+layout options preserves its current policy. Supplying a layout updates future
+writes without rewriting existing file versions. When rebuilding a lost catalog,
+pass the intended policy again because the remote format record does not choose a
+writer policy.
+
+Small files remain whole when FastCDC is enabled. Run `ofs volume pack` when you
+want to aggregate their physical content. Packing does not change the configured
+file layout or any published `FileVersion`.
 
 ## Create a D1 metadata volume with MinIO data
 
