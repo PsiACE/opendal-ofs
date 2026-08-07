@@ -39,11 +39,11 @@ use crate::filesystem::{
 use crate::managed::section::{self, Record as SectionRecord, Reference as SectionReference};
 use crate::managed::{ManagedError, ManagedErrorKind};
 
-const HEAD_KEY: &str = ".ofs/managed/v1/head.json";
-const TRANSACTION_ROOT: &str = ".ofs/managed/v1/transactions";
-const CHECKPOINT_ROOT: &str = ".ofs/managed/v1/checkpoints";
-const SECTION_ROOT: &str = ".ofs/managed/v1/sections/sha256";
-const RESULT_ROOT: &str = ".ofs/managed/v1/results";
+const HEAD_KEY: &str = ".ofs/managed-sync/head.json";
+const TRANSACTION_ROOT: &str = ".ofs/managed-sync/transactions";
+const CHECKPOINT_ROOT: &str = ".ofs/managed-sync/checkpoints";
+const SECTION_ROOT: &str = ".ofs/managed-sync/sections/sha256";
+const RESULT_ROOT: &str = ".ofs/managed-sync/results";
 const TRANSACTION_MAGIC: &[u8] = b"OFS1TXN\0";
 const CHECKPOINT_MAGIC: &[u8] = b"OFS1CHK\0";
 const RESULT_MAGIC: &[u8] = b"OFS1RES\0";

@@ -57,7 +57,7 @@ a file manifest, node generation, or change cursor.
 Metadata can be colocated with data as immutable objects plus a compare-and-swap
 head, or stored in D1 as normalized rows and transactions. Both adapters apply
 the same logical namespace changes. The object placement stores its v1 authority
-under `.ofs/managed/v1/`; D1 remains a separate physical authority. Unknown
+under `.ofs/managed-sync/`; D1 remains a separate physical authority. Unknown
 major formats and unknown required features fail before a mutation.
 
 Object checkpoints are small descriptors over immutable, content-addressed
