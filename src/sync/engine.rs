@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use opendal::{Operator, services};
 
-use super::local::{fs_operator, native_identity_at, set_executable};
+use super::local::{NativeIdentity, fs_operator, native_identity_at, set_executable};
 use super::{
     BaseEntry, ConflictRecord, LocalKind, LocalTree, PendingIntent, ReconcileAction, ReplicaState,
     StagedTree, build_publication, reconcile,
@@ -92,7 +92,13 @@ impl SyncEngine {
                         .await?;
                     let materialized = safe_to_install && !target_is_live;
                     if materialized {
-                        materialize_tree(&self.volume, replica_path, observed.snapshot()).await?;
+                        if pending.staging.is_dir() {
+                            apply_snapshot_attributes(&pending.staging, observed.snapshot())?;
+                            install_tree(replica_path, &pending.staging)?;
+                        } else {
+                            materialize_tree(&self.volume, replica_path, observed.snapshot())
+                                .await?;
+                        }
                     }
                     state = state_from_snapshot(observed.snapshot(), replica_path)?;
                     state.install(state_path)?;
@@ -205,10 +211,13 @@ impl SyncEngine {
 
         if !publish {
             state.conflicts.clear();
+            let mut staging_installed = false;
             if let Some(remote) = remote {
                 if install_remote {
-                    if matches_frozen(replica_path, &frozen_input, state_path).await? {
-                        materialize_tree(&self.volume, replica_path, remote).await?;
+                    if matches_frozen(replica_path, &frozen_input).await? {
+                        apply_snapshot_attributes(staged.root(), remote)?;
+                        install_tree(replica_path, &staging_path)?;
+                        staging_installed = true;
                     } else {
                         install_remote = false;
                     }
@@ -221,7 +230,9 @@ impl SyncEngine {
             if let Some(old) = prior_staging {
                 remove_tree(&old)?;
             }
-            remove_tree(&staging_path)?;
+            if !staging_installed {
+                remove_tree(&staging_path)?;
+            }
             return Ok(result(&state, false, install_remote));
         }
 
@@ -251,12 +262,14 @@ impl SyncEngine {
                             size: entry.size,
                             digest: known_digests.get(path).copied(),
                             executable: entry.executable,
+                            modified: entry.modified.clone(),
+                            native_identity: entry.native_identity,
                         },
                     )
                 })
                 .collect(),
         );
-        let requires_materialization = merged_input != frozen_input;
+        let requires_materialization = !merged_input.same_content(&frozen_input);
         let frozen = fs_operator(staged.root())?;
         let remote_files = remote.map(snapshot_files).transpose()?.unwrap_or_default();
         let mut prepared = BTreeMap::new();
@@ -285,17 +298,20 @@ impl SyncEngine {
         )?;
         match self.volume.publish(observed.as_ref(), &publication).await? {
             CommitOutcome::Committed(_) => {
-                let unchanged = matches_frozen(replica_path, &frozen_input, state_path).await?;
+                let unchanged = matches_frozen(replica_path, &frozen_input).await?;
                 let materialized = requires_materialization && unchanged;
                 if materialized {
-                    materialize_tree(&self.volume, replica_path, &publication.target).await?;
+                    apply_snapshot_attributes(staged.root(), &publication.target)?;
+                    install_tree(replica_path, &staging_path)?;
                 }
                 state = state_from_snapshot(&publication.target, replica_path)?;
                 state.install(state_path)?;
                 if let Some(old) = prior_staging {
                     remove_tree(&old)?;
                 }
-                remove_tree(&staging_path)?;
+                if !materialized {
+                    remove_tree(&staging_path)?;
+                }
                 Ok(result(&state, true, materialized))
             }
             CommitOutcome::Absent | CommitOutcome::Conflict { .. } | CommitOutcome::Unknown => {
@@ -325,6 +341,8 @@ struct FrozenEntry {
     size: u64,
     digest: Option<[u8; 32]>,
     executable: bool,
+    modified: String,
+    native_identity: Option<NativeIdentity>,
 }
 
 impl FrozenTree {
@@ -342,16 +360,45 @@ impl FrozenTree {
                             size: entry.size,
                             digest,
                             executable: entry.executable,
+                            modified: entry.modified.clone(),
+                            native_identity: entry.native_identity,
                         },
                     )
                 })
                 .collect(),
         )
     }
+
+    fn same_content(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len()
+            && self.0.iter().all(|(path, entry)| {
+                other.0.get(path).is_some_and(|other| {
+                    entry.kind == other.kind
+                        && entry.size == other.size
+                        && entry.digest == other.digest
+                        && entry.executable == other.executable
+                })
+            })
+    }
+
+    fn matches_observation(&self, observed: &LocalTree) -> bool {
+        self.0.len() == observed.entries().len()
+            && self.0.iter().all(|(path, expected)| {
+                observed.entries().get(path).is_some_and(|entry| {
+                    expected.kind == entry.kind
+                        && expected.size == entry.size
+                        && expected.executable == entry.executable
+                        && expected.modified == entry.modified
+                        && expected.native_identity == entry.native_identity
+                })
+            })
+    }
 }
 
 async fn same_tree(left: &Path, right: &Path, anchor: &Path) -> Result<bool> {
-    Ok(freeze_tree(left, anchor).await? == freeze_tree(right, anchor).await?)
+    Ok(freeze_tree(left, anchor)
+        .await?
+        .same_content(&freeze_tree(right, anchor).await?))
 }
 
 async fn committed_tree_is_safe(
@@ -384,8 +431,8 @@ async fn committed_tree_is_safe(
     Ok(safe)
 }
 
-async fn matches_frozen(root: &Path, expected: &FrozenTree, anchor: &Path) -> Result<bool> {
-    Ok(&freeze_tree(root, anchor).await? == expected)
+async fn matches_frozen(root: &Path, expected: &FrozenTree) -> Result<bool> {
+    Ok(expected.matches_observation(&LocalTree::scan(root).await?))
 }
 
 async fn freeze_tree(root: &Path, anchor: &Path) -> Result<FrozenTree> {
@@ -540,6 +587,16 @@ fn state_from_snapshot(snapshot: &NamespaceSnapshot, replica: &Path) -> Result<R
         );
     }
     Ok(state)
+}
+
+fn apply_snapshot_attributes(root: &Path, snapshot: &NamespaceSnapshot) -> Result<()> {
+    for (path, node) in snapshot_paths(snapshot)? {
+        let record = &snapshot.nodes[&node];
+        if record.kind == NodeKind::RegularFile {
+            set_executable(&root.join(path), record.attributes.executable)?;
+        }
+    }
+    Ok(())
 }
 
 async fn materialize_tree(
