@@ -113,6 +113,19 @@ OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_b" --state "$state_b"
 grep -Fxq 'modified before rename' "$replica_b/nested/renamed.txt" || \
   fail 'remote file rename was not materialized'
 
+printf '%s\n' 'acceptance: preserve a moved directory tree'
+mkdir -p "$replica_a/tree-before/branch/empty"
+printf '%s\n' 'directory identity survives a move' >"$replica_a/tree-before/branch/leaf.txt"
+OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a"
+OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_b" --state "$state_b"
+mv "$replica_a/tree-before" "$replica_a/tree-after"
+OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a"
+OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_b" --state "$state_b"
+[[ ! -e "$replica_b/tree-before" ]] || fail 'old directory move path remained remotely'
+[[ -d "$replica_b/tree-after/branch/empty" ]] || fail 'moved empty directory was not materialized'
+grep -Fxq 'directory identity survives a move' "$replica_b/tree-after/branch/leaf.txt" || \
+  fail 'moved directory subtree content was not materialized'
+
 printf '%s\n' 'published by replica a' >"$replica_a/a-only.txt"
 printf '%s\n' 'published by replica b' >"$replica_b/b-only.txt"
 printf '%s\n' 'acceptance: merge disjoint changes from two replicas'
