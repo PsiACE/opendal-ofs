@@ -28,6 +28,7 @@ use super::{
     PackMaintenance, PackRetirement, SparseExtent,
 };
 use crate::filesystem::{CommitOutcome, OperationId, VolumeId};
+use crate::managed::pack::PackReadSession;
 
 #[derive(Clone)]
 pub struct ManagedVolume {
@@ -44,6 +45,26 @@ enum NamespaceAuthority {
 #[derive(Clone, Debug)]
 pub struct ManagedObservation {
     authority: AuthorityObservation,
+}
+
+/// Reader state shared by one Sync materialization operation.
+#[derive(Clone)]
+pub(crate) struct ManagedMaterializer {
+    data: ManagedData,
+    packs: PackReadSession,
+}
+
+impl ManagedMaterializer {
+    pub(crate) async fn materialize(
+        &self,
+        version: &FileVersionRecord,
+        target: &Operator,
+        path: &str,
+    ) -> Result<(), ManagedError> {
+        self.data
+            .read_to_with(version, target, path, &self.packs)
+            .await
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -93,6 +114,13 @@ impl ManagedVolume {
     pub fn with_file_layout(mut self, policy: FileLayoutPolicy) -> Result<Self, ManagedError> {
         self.data.set_policy(policy)?;
         Ok(self)
+    }
+
+    pub(crate) fn materializer(&self) -> Result<ManagedMaterializer, ManagedError> {
+        Ok(ManagedMaterializer {
+            data: self.data.clone(),
+            packs: self.data.read_session()?,
+        })
     }
 
     pub async fn observe(&self) -> Result<Option<ManagedObservation>, ManagedError> {
@@ -236,7 +264,7 @@ impl ManagedVolume {
             .await
     }
 
-    /// Pack small content reachable from one fixed namespace observation.
+    /// Pack small whole-file content reachable from one fixed namespace observation.
     pub async fn pack_reachable_content(
         &self,
         observed: &ManagedObservation,
@@ -283,6 +311,8 @@ impl ManagedVolume {
         target: &Operator,
         path: &str,
     ) -> Result<(), ManagedError> {
-        self.data.read_to(version, target, path).await
+        self.materializer()?
+            .materialize(version, target, path)
+            .await
     }
 }

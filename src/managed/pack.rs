@@ -19,10 +19,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
+use std::sync::Arc;
 
 use opendal::{ErrorKind, Operator};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use tokio::sync::{Mutex, OnceCell};
 
 use super::{ManagedError, ManagedErrorKind};
 use crate::filesystem::OperationId;
@@ -67,6 +69,79 @@ pub struct PackLocation {
 pub struct SealedPack {
     pub id: PackId,
     pub locations: BTreeMap<ContentRef, PackLocation>,
+}
+
+type CachedPack = Arc<OnceCell<Result<Arc<SealedPack>, ManagedError>>>;
+
+/// Pack locations fixed for one materialization operation.
+#[derive(Clone, Debug)]
+pub(crate) struct PackReadSession {
+    operator: Operator,
+    store: PackStore,
+    index: Arc<OnceCell<Result<Option<PackIndex>, ManagedError>>>,
+    packs: Arc<Mutex<BTreeMap<PackId, CachedPack>>>,
+}
+
+impl PackReadSession {
+    pub(crate) fn new(operator: Operator) -> Result<Self, ManagedError> {
+        require_index_read_capabilities(&operator)?;
+        Ok(Self {
+            operator: operator.clone(),
+            store: PackStore { operator },
+            index: Arc::new(OnceCell::new()),
+            packs: Arc::new(Mutex::new(BTreeMap::new())),
+        })
+    }
+
+    /// Read one packed location. `None` means the fixed index has no location.
+    pub(crate) async fn read(&self, content: ContentRef) -> Result<Option<Vec<u8>>, ManagedError> {
+        let operator = self.operator.clone();
+        let index = self
+            .index
+            .get_or_init(|| async move { PackIndex::open(operator).await })
+            .await;
+        let locations = match index {
+            Ok(Some(index)) => index.locations(content).to_vec(),
+            Ok(None) => return Ok(None),
+            Err(error) => return Err(error.clone()),
+        };
+        if locations.is_empty() {
+            return Ok(None);
+        }
+
+        let mut failure = None;
+        for location in locations {
+            let cell = {
+                let mut packs = self.packs.lock().await;
+                packs
+                    .entry(location.pack)
+                    .or_insert_with(|| Arc::new(OnceCell::new()))
+                    .clone()
+            };
+            let store = self.store.clone();
+            let pack = cell
+                .get_or_init(|| async move {
+                    store
+                        .inspect_inner(location.pack, false)
+                        .await
+                        .map(Arc::new)
+                })
+                .await;
+            let pack = match pack {
+                Ok(pack) => pack,
+                Err(error) => {
+                    failure = Some(error.clone());
+                    continue;
+                }
+            };
+            match self.store.read_verified(content, location, pack).await {
+                Ok(bytes) => return Ok(Some(bytes)),
+                Err(error) => failure = Some(error),
+            }
+        }
+        Err(failure
+            .unwrap_or_else(|| corrupt("read Managed data", "pack locations cannot be resolved")))
+    }
 }
 
 /// Concrete pack storage backed by one OpenDAL operator.
@@ -161,23 +236,42 @@ impl PackStore {
         verify_checksum: bool,
     ) -> Result<SealedPack, ManagedError> {
         let key = pack_key(id);
-        let metadata = self
-            .operator
-            .stat(&key)
-            .await
-            .map_err(|_| unavailable("inspect pack", "pack metadata is unavailable"))?;
-        let length = metadata.content_length();
+        let complete = if verify_checksum {
+            Some(
+                self.operator
+                    .read(&key)
+                    .await
+                    .map_err(|_| unavailable("inspect pack", "pack is unavailable"))?
+                    .to_bytes()
+                    .to_vec(),
+            )
+        } else {
+            None
+        };
+        let length = match &complete {
+            Some(bytes) => bytes.len() as u64,
+            None => self
+                .operator
+                .stat(&key)
+                .await
+                .map_err(|_| unavailable("inspect pack", "pack metadata is unavailable"))?
+                .content_length(),
+        };
         if length < HEADER_LENGTH + TRAILER_LENGTH {
             return Err(corrupt("inspect pack", "pack is shorter than its envelope"));
         }
 
-        let trailer = self
-            .operator
-            .read_with(&key)
-            .range(length - TRAILER_LENGTH..length)
-            .await
-            .map_err(|_| unavailable("inspect pack", "pack trailer is unavailable"))?
-            .to_bytes();
+        let trailer = match &complete {
+            Some(bytes) => bytes[(length - TRAILER_LENGTH) as usize..].to_vec(),
+            None => self
+                .operator
+                .read_with(&key)
+                .range(length - TRAILER_LENGTH..length)
+                .await
+                .map_err(|_| unavailable("inspect pack", "pack trailer is unavailable"))?
+                .to_bytes()
+                .to_vec(),
+        };
         if trailer.len() != TRAILER_LENGTH as usize || &trailer[..8] != TRAILER_MAGIC {
             return Err(corrupt("inspect pack", "pack trailer is invalid"));
         }
@@ -199,33 +293,31 @@ impl PackStore {
             return Err(corrupt("inspect pack", "pack footer range is invalid"));
         }
 
-        if verify_checksum {
-            let body = self
-                .operator
-                .read_with(&key)
-                .range(0..length - 32)
-                .await
-                .map_err(|_| unavailable("inspect pack", "pack checksum input is unavailable"))?
-                .to_bytes();
-            let actual_checksum: [u8; 32] = Sha256::digest(&body).into();
+        if let Some(complete) = &complete {
+            let body = &complete[..complete.len() - 32];
+            let actual_checksum: [u8; 32] = Sha256::digest(body).into();
             if actual_checksum != expected_checksum {
                 return Err(corrupt(
                     "inspect pack",
                     "pack checksum does not match its identity",
                 ));
             }
-            if &body[..8] != PACK_MAGIC || u16_at(&body, 8) != FORMAT_MAJOR {
+            if &body[..8] != PACK_MAGIC || u16_at(body, 8) != FORMAT_MAJOR {
                 return Err(corrupt("inspect pack", "pack header is invalid"));
             }
         }
 
-        let footer_bytes = self
-            .operator
-            .read_with(&key)
-            .range(footer_offset..trailer_offset)
-            .await
-            .map_err(|_| unavailable("inspect pack", "pack footer is unavailable"))?
-            .to_bytes();
+        let footer_bytes = match &complete {
+            Some(bytes) => bytes[footer_offset as usize..trailer_offset as usize].to_vec(),
+            None => self
+                .operator
+                .read_with(&key)
+                .range(footer_offset..trailer_offset)
+                .await
+                .map_err(|_| unavailable("inspect pack", "pack footer is unavailable"))?
+                .to_bytes()
+                .to_vec(),
+        };
         let footer: Footer = decode(&footer_bytes, "inspect pack")?;
         if footer.magic != FOOTER_MAGIC || footer.major != FORMAT_MAJOR {
             return Err(corrupt("inspect pack", "pack footer version is invalid"));
@@ -243,6 +335,16 @@ impl PackStore {
                 || entry.offset + entry.stored_length > footer_offset
             {
                 return Err(corrupt("inspect pack", "pack footer entry is invalid"));
+            }
+            if let Some(complete) = &complete {
+                let start = entry.offset as usize;
+                let end = (entry.offset + entry.stored_length) as usize;
+                if content_ref(&complete[start..end]) != entry.content {
+                    return Err(corrupt(
+                        "inspect pack",
+                        "pack entry does not match its content reference",
+                    ));
+                }
             }
             previous = Some(entry.content);
             previous_end = entry.offset + entry.stored_length;
@@ -265,13 +367,22 @@ impl PackStore {
         content: ContentRef,
         location: PackLocation,
     ) -> Result<Vec<u8>, ManagedError> {
+        let pack = self.inspect_inner(location.pack, false).await?;
+        self.read_verified(content, location, &pack).await
+    }
+
+    pub(crate) async fn read_verified(
+        &self,
+        content: ContentRef,
+        location: PackLocation,
+        pack: &SealedPack,
+    ) -> Result<Vec<u8>, ManagedError> {
         if location.logical_length != content.logical_length {
             return Err(corrupt(
                 "read pack content",
                 "index length disagrees with content",
             ));
         }
-        let pack = self.inspect_inner(location.pack, false).await?;
         if pack.locations.get(&content) != Some(&location) {
             return Err(corrupt(
                 "read pack content",
@@ -280,7 +391,7 @@ impl PackStore {
         }
         let bytes = self
             .operator
-            .read_with(&pack_key(location.pack))
+            .read_with(&pack_key(pack.id))
             .range(location.offset..location.offset + location.stored_length)
             .await
             .map_err(|_| unavailable("read pack content", "content range is unavailable"))?

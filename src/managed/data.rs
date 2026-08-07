@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! File manifests backed by immutable loose objects.
+//! File manifests backed by immutable loose objects and whole-file packs.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -35,7 +35,7 @@ use crate::managed::namespace::{
     ChunkSpan, ChunkingAlgorithm, ChunkingSpec, ContentRef, DataExtent, FileExtent,
     FileVersionLayout, FileVersionRecord, NamespaceSnapshot,
 };
-use crate::managed::pack::{PackId, PackIndex, PackLocation, PackStore};
+use crate::managed::pack::{PackId, PackIndex, PackReadSession, PackStore};
 
 const READ_WINDOW: u64 = 4 * 1024 * 1024;
 const LOOSE_ROOT: &str = "data/v1/loose/sha256";
@@ -43,7 +43,7 @@ const SMALL_CONTENT_LIMIT: u64 = 256 * 1024;
 const PACK_LOGICAL_LIMIT: u64 = 8 * 1024 * 1024;
 static PACK_RETIREMENT_EPOCH: AtomicU64 = AtomicU64::new(1);
 
-/// Physical locations published by one explicit small-content maintenance run.
+/// Physical locations published by one explicit small whole-file maintenance run.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PackMaintenance {
     pub packs: Vec<PackId>,
@@ -175,6 +175,10 @@ impl ManagedData {
         policy.validate()?;
         self.policy = policy;
         Ok(())
+    }
+
+    pub(crate) fn read_session(&self) -> Result<PackReadSession, ManagedError> {
+        PackReadSession::new(self.operator.clone())
     }
 
     pub(crate) async fn seal_file(
@@ -458,7 +462,7 @@ impl ManagedData {
         snapshot: &NamespaceSnapshot,
         operation: OperationId,
     ) -> Result<PackMaintenance, ManagedError> {
-        let contents = reachable_content(snapshot, "pack reachable data")?;
+        let contents = reachable_whole_content(snapshot, "pack reachable data")?;
 
         let mut index = PackIndex::open_or_empty(self.operator.clone()).await?;
         let store = PackStore::new(self.operator.clone())?;
@@ -520,6 +524,7 @@ impl ManagedData {
         let store = PackStore::new(self.operator.clone())?;
         let mut retired = BTreeSet::new();
         let mut protected = BTreeSet::new();
+        let mut verified_packs = BTreeMap::new();
         for id in index.pack_ids() {
             let pack = store.inspect(id).await?;
             index.validate_pack(&pack)?;
@@ -533,6 +538,7 @@ impl ManagedData {
                 retired.insert(id);
                 protected.extend(pack_live);
             }
+            verified_packs.insert(id, pack);
         }
         if retired.is_empty() {
             return Ok(None);
@@ -545,7 +551,6 @@ impl ManagedData {
         for content in &protected {
             if !batch.is_empty() && batch_bytes + content.logical_length > PACK_LOGICAL_LIMIT {
                 let replacement = store.seal(operation, std::mem::take(&mut batch)).await?;
-                store.inspect(replacement.id).await?;
                 index.add(&replacement);
                 replacements.push(replacement.id);
                 batch_bytes = 0;
@@ -553,7 +558,10 @@ impl ManagedData {
             let mut bytes = None;
             let mut failure = None;
             for location in index.locations(*content) {
-                match store.read(*content, *location).await {
+                let Some(pack) = verified_packs.get(&location.pack) else {
+                    continue;
+                };
+                match store.read_verified(*content, *location, pack).await {
                     Ok(value) => {
                         bytes = Some(value);
                         break;
@@ -570,7 +578,6 @@ impl ManagedData {
         }
         if !batch.is_empty() {
             let replacement = store.seal(operation, batch).await?;
-            store.inspect(replacement.id).await?;
             index.add(&replacement);
             replacements.push(replacement.id);
         }
@@ -609,8 +616,11 @@ impl ManagedData {
         }
 
         let mut verified = BTreeSet::new();
+        let mut verified_packs = BTreeMap::new();
         for id in &retirement.replacement_packs {
-            verified.extend(store.inspect(*id).await?.locations.into_keys());
+            let pack = store.inspect(*id).await?;
+            verified.extend(pack.locations.keys().copied());
+            verified_packs.insert(*id, pack);
         }
         if !retirement.protected_content.is_subset(&verified) {
             return Err(corrupt(
@@ -637,7 +647,15 @@ impl ManagedData {
         for content in at_risk {
             let mut verified_pack = false;
             for location in index.locations(content) {
-                if store.read(content, *location).await.is_ok() {
+                if !verified_packs.contains_key(&location.pack)
+                    && let Ok(pack) = store.inspect(location.pack).await
+                {
+                    verified_packs.insert(location.pack, pack);
+                }
+                if verified_packs
+                    .get(&location.pack)
+                    .is_some_and(|pack| pack.locations.get(&content) == Some(location))
+                {
                     verified_pack = true;
                     break;
                 }
@@ -670,18 +688,27 @@ impl ManagedData {
         let Ok(store) = PackStore::new(self.operator.clone()) else {
             return Ok(0);
         };
+        let candidate_packs = contents
+            .iter()
+            .flat_map(|content| index.locations(*content))
+            .map(|location| location.pack)
+            .collect::<BTreeSet<_>>();
+        let mut verified_packs = BTreeMap::new();
+        for id in candidate_packs {
+            if let Ok(pack) = store.inspect(id).await {
+                verified_packs.insert(id, pack);
+            }
+        }
         let mut reclaimed = 0;
         for content in contents {
             if content.logical_length == 0 || index.locations(content).is_empty() {
                 continue;
             }
-            let mut verified = false;
-            for location in index.locations(content) {
-                if store.read(content, *location).await.is_ok() {
-                    verified = true;
-                    break;
-                }
-            }
+            let verified = index.locations(content).iter().any(|location| {
+                verified_packs
+                    .get(&location.pack)
+                    .is_some_and(|pack| pack.locations.get(&content) == Some(location))
+            });
             if !verified {
                 continue;
             }
@@ -815,15 +842,8 @@ impl ManagedData {
             Err(_) => return Err(unavailable("inspect loose data")),
         }
         let mut digest = Sha256::new();
-        let mut pack_index = None;
-        self.copy_content(
-            &content,
-            0..content.logical_length,
-            None,
-            &mut digest,
-            &mut pack_index,
-        )
-        .await?;
+        self.copy_content(&content, 0..content.logical_length, None, &mut digest, None)
+            .await?;
         Ok(content)
     }
 
@@ -866,24 +886,36 @@ impl ManagedData {
             }
         }
         let mut observed = Sha256::new();
-        let mut pack_index = None;
         self.copy_content(
             &content,
             0..content.logical_length,
             None,
             &mut observed,
-            &mut pack_index,
+            None,
         )
         .await?;
         Ok(content)
     }
 
     /// Stream verified content into a caller-owned materialization path.
+    #[cfg(test)]
     pub(crate) async fn read_to(
         &self,
         version: &FileVersionRecord,
         target: &Operator,
         target_path: &str,
+    ) -> Result<(), ManagedError> {
+        let packs = self.read_session()?;
+        self.read_to_with(version, target, target_path, &packs)
+            .await
+    }
+
+    pub(crate) async fn read_to_with(
+        &self,
+        version: &FileVersionRecord,
+        target: &Operator,
+        target_path: &str,
+        packs: &PackReadSession,
     ) -> Result<(), ManagedError> {
         if !version.is_valid() {
             return Err(corrupt(
@@ -902,7 +934,10 @@ impl ManagedData {
             .writer(target_path)
             .await
             .map_err(|_| unavailable("create materialized file"))?;
-        if let Err(error) = self.copy_version(version, Some(&mut writer)).await {
+        if let Err(error) = self
+            .copy_version(version, Some(&mut writer), Some(packs))
+            .await
+        {
             let _ = writer.abort().await;
             return Err(error);
         }
@@ -920,16 +955,16 @@ impl ManagedData {
                 "file manifest identity is invalid",
             ));
         }
-        self.copy_version(version, None).await
+        self.copy_version(version, None, None).await
     }
 
     async fn copy_version(
         &self,
         version: &FileVersionRecord,
         mut target: Option<&mut Writer>,
+        packs: Option<&PackReadSession>,
     ) -> Result<(), ManagedError> {
         let mut logical = Sha256::new();
-        let mut pack_index = None;
         match &version.layout {
             FileVersionLayout::Whole { content } => {
                 self.copy_content(
@@ -937,7 +972,7 @@ impl ManagedData {
                     0..content.logical_length,
                     target.as_deref_mut(),
                     &mut logical,
-                    &mut pack_index,
+                    packs,
                 )
                 .await?;
             }
@@ -948,7 +983,7 @@ impl ManagedData {
                         0..chunk.content.logical_length,
                         target.as_deref_mut(),
                         &mut logical,
-                        &mut pack_index,
+                        packs,
                     )
                     .await?;
                 }
@@ -967,7 +1002,7 @@ impl ManagedData {
                                 extent.data_offset..end,
                                 target.as_deref_mut(),
                                 &mut logical,
-                                &mut pack_index,
+                                packs,
                             )
                             .await?;
                         }
@@ -991,27 +1026,44 @@ impl ManagedData {
         selected: Range<u64>,
         mut target: Option<&mut Writer>,
         logical: &mut Sha256,
-        pack_index: &mut Option<PackIndex>,
+        packs: Option<&PackReadSession>,
     ) -> Result<(), ManagedError> {
         if selected.start > selected.end || selected.end > content.logical_length {
             return Err(corrupt("read loose data", "content range is invalid"));
         }
+        let mut pack_failure = None;
+        if let Some(packs) = packs {
+            match packs.read(*content).await {
+                Ok(Some(bytes)) => {
+                    return write_packed_range(&bytes, selected, target, logical).await;
+                }
+                Ok(None) => {}
+                Err(error) => pack_failure = Some(error),
+            }
+        }
+
         let key = loose_key(content);
         let reader = match self.operator.reader(&key).await {
             Ok(reader) => reader,
             Err(error) if error.kind() == ErrorKind::NotFound => {
-                return self
-                    .copy_packed_content(content, selected, target, logical, pack_index)
-                    .await;
+                return Err(pack_failure.unwrap_or_else(|| {
+                    corrupt(
+                        "read Managed data",
+                        "file version references missing content",
+                    )
+                }));
             }
             Err(error) => return Err(referenced_data_error("read loose data", error)),
         };
         let mut stream = match reader.into_stream(..).await {
             Ok(stream) => stream,
             Err(error) if error.kind() == ErrorKind::NotFound => {
-                return self
-                    .copy_packed_content(content, selected, target, logical, pack_index)
-                    .await;
+                return Err(pack_failure.unwrap_or_else(|| {
+                    corrupt(
+                        "read Managed data",
+                        "file version references missing content",
+                    )
+                }));
             }
             Err(error) => return Err(referenced_data_error("read loose data", error)),
         };
@@ -1021,9 +1073,12 @@ impl ManagedData {
             let buffer = match buffer {
                 Ok(buffer) => buffer,
                 Err(error) if error.kind() == ErrorKind::NotFound && offset == 0 => {
-                    return self
-                        .copy_packed_content(content, selected, target, logical, pack_index)
-                        .await;
+                    return Err(pack_failure.unwrap_or_else(|| {
+                        corrupt(
+                            "read Managed data",
+                            "file version references missing content",
+                        )
+                    }));
                 }
                 Err(error) => return Err(referenced_data_error("read loose data", error)),
             };
@@ -1063,55 +1118,23 @@ impl ManagedData {
         }
         Ok(())
     }
+}
 
-    async fn copy_packed_content(
-        &self,
-        content: &ContentRef,
-        selected: Range<u64>,
-        target: Option<&mut Writer>,
-        logical: &mut Sha256,
-        pack_index: &mut Option<PackIndex>,
-    ) -> Result<(), ManagedError> {
-        if pack_index.is_none() {
-            *pack_index = PackIndex::open(self.operator.clone()).await?;
-        }
-        let locations: Vec<PackLocation> = pack_index
-            .as_ref()
-            .map(|index| index.locations(*content).to_vec())
-            .unwrap_or_default();
-        if locations.is_empty() {
-            return Err(corrupt(
-                "read Managed data",
-                "file version references missing content",
-            ));
-        }
-        let store = PackStore::new(self.operator.clone())?;
-        let mut failure = None;
-        let mut packed = None;
-        for location in locations {
-            match store.read(*content, location).await {
-                Ok(bytes) => {
-                    packed = Some(bytes);
-                    break;
-                }
-                Err(error) => failure = Some(error),
-            }
-        }
-        let bytes = packed.ok_or_else(|| {
-            failure.unwrap_or_else(|| {
-                corrupt("read Managed data", "pack locations cannot be resolved")
-            })
-        })?;
-        let value = &bytes[selected.start as usize..selected.end as usize];
-        logical.update(value);
-        if let Some(writer) = target {
-            writer
-                .write(value.to_vec())
-                .await
-                .map_err(|_| unavailable("write materialized file"))?;
-        }
-        Ok(())
+async fn write_packed_range(
+    bytes: &[u8],
+    selected: Range<u64>,
+    target: Option<&mut Writer>,
+    logical: &mut Sha256,
+) -> Result<(), ManagedError> {
+    let value = &bytes[selected.start as usize..selected.end as usize];
+    logical.update(value);
+    if let Some(writer) = target {
+        writer
+            .write(value.to_vec())
+            .await
+            .map_err(|_| unavailable("write materialized file"))?;
     }
+    Ok(())
 }
 
 fn reachable_content(
@@ -1119,6 +1142,30 @@ fn reachable_content(
     action: &'static str,
 ) -> Result<BTreeSet<ContentRef>, ManagedError> {
     let mut contents = BTreeSet::new();
+    visit_reachable_file_versions(snapshot, action, |version| {
+        collect_content_refs(&version.layout, &mut contents);
+    })?;
+    Ok(contents)
+}
+
+fn reachable_whole_content(
+    snapshot: &NamespaceSnapshot,
+    action: &'static str,
+) -> Result<BTreeSet<ContentRef>, ManagedError> {
+    let mut contents = BTreeSet::new();
+    visit_reachable_file_versions(snapshot, action, |version| {
+        if let FileVersionLayout::Whole { content } = version.layout {
+            contents.insert(content);
+        }
+    })?;
+    Ok(contents)
+}
+
+fn visit_reachable_file_versions(
+    snapshot: &NamespaceSnapshot,
+    action: &'static str,
+    mut visit: impl FnMut(&FileVersionRecord),
+) -> Result<(), ManagedError> {
     let mut visited = BTreeSet::new();
     let mut pending = vec![snapshot.root];
     while let Some(node_id) = pending.pop() {
@@ -1150,11 +1197,11 @@ fn reachable_content(
                         "live node references an invalid file version",
                     ));
                 }
-                collect_content_refs(&version.layout, &mut contents);
+                visit(version);
             }
         }
     }
-    Ok(contents)
+    Ok(())
 }
 
 fn collect_content_refs(layout: &FileVersionLayout, output: &mut BTreeSet<ContentRef>) {
@@ -1416,9 +1463,47 @@ mod tests {
     }
 
     fn snapshot_with_file(version: FileVersionRecord) -> NamespaceSnapshot {
+        snapshot_with_files([("live", version)])
+    }
+
+    fn snapshot_with_files<const N: usize>(
+        files: [(&str, FileVersionRecord); N],
+    ) -> NamespaceSnapshot {
         let root = NodeId::from_bytes([21; 16]);
-        let file = NodeId::from_bytes([22; 16]);
         let generation = Generation::from_bytes(vec![1]);
+        let mut nodes = BTreeMap::from([(
+            root,
+            NodeRecord {
+                id: root,
+                generation: generation.clone(),
+                kind: NodeKind::Directory,
+                attributes: NodeAttributes::default(),
+                file_version: None,
+            },
+        )]);
+        let mut entries = BTreeMap::new();
+        let mut file_versions = BTreeMap::new();
+        for (index, (path, version)) in files.into_iter().enumerate() {
+            let file = NodeId::from_bytes([22 + index as u8; 16]);
+            nodes.insert(
+                file,
+                NodeRecord {
+                    id: file,
+                    generation: generation.clone(),
+                    kind: NodeKind::RegularFile,
+                    attributes: NodeAttributes::default(),
+                    file_version: Some(version.id),
+                },
+            );
+            entries.insert(
+                path.to_owned(),
+                DirectoryEntry {
+                    node: file,
+                    kind: NodeKind::RegularFile,
+                },
+            );
+            file_versions.insert(version.id, version);
+        }
         NamespaceSnapshot {
             volume_id: VolumeId::from_bytes([23; 16]),
             cursor: ChangeCursor::at(
@@ -1426,43 +1511,16 @@ mod tests {
                 OperationId::from_bytes([24; 16]),
             ),
             root,
-            nodes: BTreeMap::from([
-                (
-                    root,
-                    NodeRecord {
-                        id: root,
-                        generation: generation.clone(),
-                        kind: NodeKind::Directory,
-                        attributes: NodeAttributes::default(),
-                        file_version: None,
-                    },
-                ),
-                (
-                    file,
-                    NodeRecord {
-                        id: file,
-                        generation: generation.clone(),
-                        kind: NodeKind::RegularFile,
-                        attributes: NodeAttributes::default(),
-                        file_version: Some(version.id),
-                    },
-                ),
-            ]),
+            nodes,
             directories: BTreeMap::from([(
                 root,
                 DirectoryRecord {
                     node: root,
                     generation,
-                    entries: BTreeMap::from([(
-                        "live".to_owned(),
-                        DirectoryEntry {
-                            node: file,
-                            kind: NodeKind::RegularFile,
-                        },
-                    )]),
+                    entries,
                 },
             )]),
-            file_versions: BTreeMap::from([(version.id, version)]),
+            file_versions,
         }
     }
 
@@ -1658,6 +1716,13 @@ mod tests {
         stored.write(&pack_key, corrupt_pack).await.unwrap();
         assert_eq!(data.reclaim_packed_loose(&snapshot).await.unwrap(), 0);
         assert!(stored.stat(&loose_key(&small_content)).await.is_ok());
+        data.read_to(&small, &target, "loose-fallback")
+            .await
+            .unwrap();
+        assert_eq!(
+            target.read("loose-fallback").await.unwrap().to_bytes(),
+            b"small file".as_slice()
+        );
 
         stored.write(&pack_key, original).await.unwrap();
         assert_eq!(data.reclaim_packed_loose(&snapshot).await.unwrap(), 1);
@@ -1669,6 +1734,73 @@ mod tests {
             b"small file".as_slice()
         );
         data.read_to(&large, &target, "large").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn small_file_pack_excludes_chunks_and_extents() {
+        let source = memory();
+        let stored = memory();
+        let target = memory();
+        source.write("whole", b"whole file".to_vec()).await.unwrap();
+        source.write("chunked", b"abcdefgh".to_vec()).await.unwrap();
+        source.write("extent", b"DATA".to_vec()).await.unwrap();
+
+        let mut data = ManagedData::new(stored.clone()).unwrap();
+        let whole = data.seal_whole_file(&source, "whole").await.unwrap();
+        data.set_policy(FileLayoutPolicy::Fixed { chunk_size: 4 })
+            .unwrap();
+        let chunked = data.seal_file(&source, "chunked").await.unwrap();
+        let extent = data
+            .seal_extents(
+                &source,
+                "extent",
+                &[SparseExtent::Data { logical_length: 4 }],
+            )
+            .await
+            .unwrap();
+        let snapshot = snapshot_with_files([
+            ("whole", whole.clone()),
+            ("chunked", chunked.clone()),
+            ("extent", extent.clone()),
+        ]);
+
+        let packed = data
+            .pack_reachable(&snapshot, OperationId::from_bytes([31; 16]))
+            .await
+            .unwrap();
+        let FileVersionLayout::Whole { content: whole_ref } = whole.layout else {
+            unreachable!()
+        };
+        assert_eq!(packed.packed_content, vec![whole_ref]);
+
+        let index = PackIndex::open(stored.clone()).await.unwrap().unwrap();
+        let FileVersionLayout::Chunked { chunks, .. } = &chunked.layout else {
+            unreachable!()
+        };
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| index.locations(chunk.content).is_empty())
+        );
+        let FileVersionLayout::Extents { extents } = &extent.layout else {
+            unreachable!()
+        };
+        assert!(extents.iter().all(|extent| match extent {
+            FileExtent::Data { extent } => index.locations(extent.content).is_empty(),
+            FileExtent::Hole { .. } => true,
+        }));
+
+        assert_eq!(data.reclaim_packed_loose(&snapshot).await.unwrap(), 1);
+        data.read_to(&chunked, &target, "chunked").await.unwrap();
+        data.read_to(&extent, &target, "extent").await.unwrap();
+        assert_eq!(
+            target.read("chunked").await.unwrap().to_bytes(),
+            b"abcdefgh".as_slice()
+        );
+        assert_eq!(
+            target.read("extent").await.unwrap().to_bytes(),
+            b"DATA".as_slice()
+        );
     }
 
     #[tokio::test]

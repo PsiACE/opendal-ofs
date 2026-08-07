@@ -48,7 +48,7 @@ pub(crate) enum Command {
 pub(crate) enum VolumeCommand {
     /// Create or reopen a volume and save its credential-free binding.
     Create(VolumeCreateArgs),
-    /// Pack live small content through the current Managed namespace root.
+    /// Pack live small whole files through the current Managed namespace root.
     Pack(VolumePackArgs),
     /// Remove loose data unreachable from the current Managed namespace root.
     Gc(VolumeGcArgs),

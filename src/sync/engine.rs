@@ -242,12 +242,13 @@ impl SyncEngine {
                     }
                 }
             }
+            let materializer = self.volume.materializer()?;
             let installed = stream::iter(installs)
                 .map(|(path, file, digest)| {
-                    let volume = self.volume.clone();
+                    let materializer = materializer.clone();
                     let target = target.clone();
                     async move {
-                        volume.materialize(&file, &target, &path).await?;
+                        materializer.materialize(&file, &target, &path).await?;
                         Ok::<_, crate::managed::ManagedError>((path, digest))
                     }
                 })
@@ -724,6 +725,7 @@ async fn materialize_tree(
         .to_str()
         .context("materialization path is not valid Unicode")?;
     let target = Operator::new(services::Fs::default().root(root))?.finish();
+    let materializer = volume.materializer()?;
     let result = async {
         for (path, node) in snapshot_paths(snapshot)? {
             let record = &snapshot.nodes[&node];
@@ -737,7 +739,7 @@ async fn materialize_tree(
                         .file_versions
                         .get(&version)
                         .context("file version is missing")?;
-                    volume.materialize(version, &target, &path).await?;
+                    materializer.materialize(version, &target, &path).await?;
                     set_executable(&staging.join(&path), record.attributes.executable)?;
                 }
             }

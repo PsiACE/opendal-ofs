@@ -170,7 +170,7 @@ file before running the command. Sync never chooses a last writer silently.
 
 ## Pack and reclaim data
 
-Packing is explicit maintenance. It groups reachable small content into an
+Packing is explicit maintenance. It groups reachable small whole-file content into an
 immutable pack, verifies its footer, and publishes a derived pack index.
 
 ```shell
