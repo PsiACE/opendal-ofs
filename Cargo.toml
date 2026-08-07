@@ -32,6 +32,9 @@ rust-version = "1.85"
 [dependencies]
 anyhow = { version = "1" }
 clap = { version = "4.5.40", features = ["derive", "env"] }
+ciborium = "0.2"
+fastcdc = { version = "3", features = ["futures"] }
+futures = "0.3"
 log = { version = "0.4.22" }
 logforth = { version = "0.28.1", features = ["starter-log"] }
 opendal = { version = "0.57.0" }
