@@ -17,11 +17,15 @@
 
 //! Managed volume authority and its durable format.
 
+mod data;
 mod error;
 mod format;
 mod metadata;
 pub mod namespace;
+mod volume;
 
+pub(crate) use data::ManagedData;
 pub use error::{ManagedError, ManagedErrorKind};
 pub use format::{ManagedFormat, NamingPolicy};
 pub use metadata::{D1Config, D1Metadata, Metadata, ObjectMetadata};
+pub use volume::ManagedVolume;
