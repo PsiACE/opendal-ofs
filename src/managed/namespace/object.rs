@@ -28,7 +28,7 @@ use sha2::{Digest as _, Sha256};
 use super::change::NamespaceChange;
 use super::validation::{validate_publication, validate_snapshot};
 use super::{
-    DirectoryPrecondition, DirectoryRecord, FileVersionLayout, FileVersionRecord,
+    DirectoryPrecondition, DirectoryRecord, FileVersionLayout, FileVersionRecord, NamespaceGcSweep,
     NamespacePublication, NamespaceSnapshot, NodePrecondition, NodeRecord, managed_generation,
     managed_generation_number,
 };
@@ -54,6 +54,15 @@ pub struct NamespaceObservation {
     pub snapshot: NamespaceSnapshot,
     revision: String,
     authority: Box<ObservationAuthority>,
+}
+
+impl NamespaceObservation {
+    pub fn gc_sweep(&self) -> Option<NamespaceGcSweep> {
+        self.authority
+            .head
+            .gc_sweep()
+            .expect("observed HEAD has valid maintenance state")
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -114,6 +123,11 @@ impl ObjectNamespace {
                 "publication belongs to another volume",
             ));
         }
+        if observed.is_some_and(|value| value.gc_sweep().is_some()) {
+            return Ok(CommitOutcome::Conflict {
+                observed: observed.expect("checked above").snapshot.cursor,
+            });
+        }
         let base = observed.map(|value| &value.snapshot);
         if !validate_publication(publication, base)? {
             return Ok(CommitOutcome::Conflict {
@@ -172,7 +186,8 @@ impl ObjectNamespace {
             checkpoint,
             checkpoint_cursor,
             tail_transactions,
-        )?;
+        )?
+        .with_maintenance_epoch(observed.map_or(0, |value| value.authority.head.maintenance_epoch));
         let head = encode_head(&head)?;
         let replaced = match observed {
             Some(observed) => self.replace_head(&observed.revision, head).await,
@@ -191,6 +206,74 @@ impl ObjectNamespace {
                 Ok(CommitOutcome::Committed(cursor)) => Ok(CommitOutcome::Committed(cursor)),
                 _ => Ok(CommitOutcome::Unknown),
             },
+        }
+    }
+
+    pub async fn begin_gc(
+        &self,
+        observed: &NamespaceObservation,
+    ) -> Result<NamespaceGcSweep, ManagedError> {
+        if observed.snapshot.volume_id != self.volume_id {
+            return Err(invalid(
+                "begin Managed namespace GC",
+                "observation belongs to another volume",
+            ));
+        }
+        if let Some(sweep) = observed.gc_sweep() {
+            return Ok(sweep);
+        }
+        let mut head = observed.authority.head.clone();
+        let sweep = head.begin_gc()?;
+        if self
+            .replace_head(&observed.revision, encode_head(&head)?)
+            .await?
+        {
+            return Ok(sweep);
+        }
+        let current = self
+            .observe()
+            .await?
+            .ok_or_else(|| conflict("begin Managed namespace GC", "namespace authority changed"))?;
+        current
+            .gc_sweep()
+            .filter(|value| value.fixed_cursor() == observed.snapshot.cursor)
+            .ok_or_else(|| conflict("begin Managed namespace GC", "namespace authority changed"))
+    }
+
+    pub async fn finish_gc(&self, sweep: NamespaceGcSweep) -> Result<(), ManagedError> {
+        let observed = self.observe().await?.ok_or_else(|| {
+            conflict("finish Managed namespace GC", "namespace authority changed")
+        })?;
+        if observed.authority.head.maintenance_epoch == sweep.epoch()
+            && observed.gc_sweep().is_none()
+        {
+            return Ok(());
+        }
+        if observed.gc_sweep() != Some(sweep) {
+            return Err(conflict(
+                "finish Managed namespace GC",
+                "GC sweep token does not match the authority",
+            ));
+        }
+        let mut head = observed.authority.head.clone();
+        head.finish_gc(sweep)?;
+        if self
+            .replace_head(&observed.revision, encode_head(&head)?)
+            .await?
+        {
+            return Ok(());
+        }
+        let current = self.observe().await?.ok_or_else(|| {
+            conflict("finish Managed namespace GC", "namespace authority changed")
+        })?;
+        if current.authority.head.maintenance_epoch == sweep.epoch() && current.gc_sweep().is_none()
+        {
+            Ok(())
+        } else {
+            Err(conflict(
+                "finish Managed namespace GC",
+                "namespace authority changed",
+            ))
         }
     }
 
@@ -645,6 +728,10 @@ fn corrupt(action: &'static str, message: &'static str) -> ManagedError {
     ManagedError::new(ManagedErrorKind::Corrupt, action, message)
 }
 
+fn conflict(action: &'static str, message: &'static str) -> ManagedError {
+    ManagedError::new(ManagedErrorKind::Conflict, action, message)
+}
+
 fn unavailable(action: &'static str) -> ManagedError {
     ManagedError::new(
         ManagedErrorKind::Unavailable,
@@ -670,7 +757,17 @@ struct StoredHead {
     checkpoint: [u8; 32],
     checkpoint_cursor: StoredCursor,
     tail_transactions: u16,
+    maintenance_epoch: u64,
+    maintenance_state: StoredMaintenanceState,
+    maintenance_fixed_cursor: Option<StoredCursor>,
     checksum: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum StoredMaintenanceState {
+    Idle,
+    Sweeping,
 }
 
 impl StoredHead {
@@ -693,11 +790,20 @@ impl StoredHead {
             checkpoint,
             checkpoint_cursor,
             tail_transactions,
+            maintenance_epoch: 0,
+            maintenance_state: StoredMaintenanceState::Idle,
+            maintenance_fixed_cursor: None,
             checksum: [0; 32],
         };
         head.validate_shape()?;
         head.checksum = head_checksum(&head);
         Ok(head)
+    }
+
+    fn with_maintenance_epoch(mut self, epoch: u64) -> Self {
+        self.maintenance_epoch = epoch;
+        self.checksum = head_checksum(&self);
+        self
     }
 
     fn validate(&self, volume_id: VolumeId) -> Result<(), ManagedError> {
@@ -722,9 +828,60 @@ impl StoredHead {
                 .sequence()
                 .checked_add(u64::from(self.tail_transactions))
                 != Some(cursor.sequence())
+            || self.gc_sweep().is_err()
         {
             return Err(corrupt("read Managed namespace", "HEAD shape is invalid"));
         }
+        Ok(())
+    }
+
+    fn gc_sweep(&self) -> Result<Option<NamespaceGcSweep>, ManagedError> {
+        match (self.maintenance_state, self.maintenance_fixed_cursor) {
+            (StoredMaintenanceState::Idle, None) => Ok(None),
+            (StoredMaintenanceState::Sweeping, Some(fixed))
+                if self.maintenance_epoch > 0 && fixed == self.cursor =>
+            {
+                Ok(Some(NamespaceGcSweep::new(
+                    self.maintenance_epoch,
+                    fixed.into_cursor()?,
+                )))
+            }
+            _ => Err(corrupt(
+                "read Managed namespace",
+                "HEAD maintenance state is invalid",
+            )),
+        }
+    }
+
+    fn begin_gc(&mut self) -> Result<NamespaceGcSweep, ManagedError> {
+        if let Some(sweep) = self.gc_sweep()? {
+            return Ok(sweep);
+        }
+        self.maintenance_epoch = self.maintenance_epoch.checked_add(1).ok_or_else(|| {
+            corrupt(
+                "begin Managed namespace GC",
+                "maintenance epoch is exhausted",
+            )
+        })?;
+        self.maintenance_state = StoredMaintenanceState::Sweeping;
+        self.maintenance_fixed_cursor = Some(self.cursor);
+        self.checksum = head_checksum(self);
+        Ok(NamespaceGcSweep::new(
+            self.maintenance_epoch,
+            self.cursor.into_cursor()?,
+        ))
+    }
+
+    fn finish_gc(&mut self, sweep: NamespaceGcSweep) -> Result<(), ManagedError> {
+        if self.gc_sweep()? != Some(sweep) {
+            return Err(conflict(
+                "finish Managed namespace GC",
+                "GC sweep token does not match the authority",
+            ));
+        }
+        self.maintenance_state = StoredMaintenanceState::Idle;
+        self.maintenance_fixed_cursor = None;
+        self.checksum = head_checksum(self);
         Ok(())
     }
 }
@@ -741,6 +898,18 @@ fn head_checksum(head: &StoredHead) -> [u8; 32] {
     digest.update(head.checkpoint);
     update_cursor_digest(&mut digest, head.checkpoint_cursor);
     digest.update(head.tail_transactions.to_be_bytes());
+    digest.update(head.maintenance_epoch.to_be_bytes());
+    digest.update([match head.maintenance_state {
+        StoredMaintenanceState::Idle => 0,
+        StoredMaintenanceState::Sweeping => 1,
+    }]);
+    match head.maintenance_fixed_cursor {
+        Some(cursor) => {
+            digest.update([1]);
+            update_cursor_digest(&mut digest, cursor);
+        }
+        None => digest.update([0]),
+    }
     digest.finalize().into()
 }
 
@@ -1329,6 +1498,34 @@ mod tests {
         let mut corrupt = encoded;
         corrupt[last] ^= 1;
         assert!(decode_cbor::<StoredResult>(RESULT_MAGIC, &corrupt, "test").is_err());
+    }
+
+    #[test]
+    fn head_recovers_the_same_gc_sweep_until_it_is_finished() {
+        let volume = VolumeId::from_bytes([1; 16]);
+        let operation = OperationId::from_bytes([2; 16]);
+        let cursor = ChangeCursor::at(NonZeroU64::new(1).unwrap(), operation);
+        let mut head = StoredHead::new(
+            volume,
+            cursor.into(),
+            *operation.as_bytes(),
+            [3; 32],
+            [4; 32],
+            cursor.into(),
+            0,
+        )
+        .unwrap();
+
+        let sweep = head.begin_gc().unwrap();
+        let mut recovered = decode_head(&encode_head(&head).unwrap()).unwrap();
+        recovered.validate(volume).unwrap();
+        assert_eq!(recovered.gc_sweep().unwrap(), Some(sweep));
+
+        recovered.finish_gc(sweep).unwrap();
+        let idle = decode_head(&encode_head(&recovered).unwrap()).unwrap();
+        idle.validate(volume).unwrap();
+        assert_eq!(idle.gc_sweep().unwrap(), None);
+        assert_eq!(idle.maintenance_epoch, sweep.epoch());
     }
 
     #[test]

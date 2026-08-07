@@ -335,6 +335,27 @@ pub struct NamespacePublication {
     pub target: NamespaceSnapshot,
 }
 
+/// Durable identity of one namespace garbage-collection sweep.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NamespaceGcSweep {
+    epoch: u64,
+    fixed: ChangeCursor,
+}
+
+impl NamespaceGcSweep {
+    pub fn epoch(self) -> u64 {
+        self.epoch
+    }
+
+    pub fn fixed_cursor(self) -> ChangeCursor {
+        self.fixed
+    }
+
+    pub(crate) const fn new(epoch: u64, fixed: ChangeCursor) -> Self {
+        Self { epoch, fixed }
+    }
+}
+
 pub(crate) fn managed_generation(value: u64) -> Generation {
     Generation::from_bytes(value.to_be_bytes().to_vec())
 }

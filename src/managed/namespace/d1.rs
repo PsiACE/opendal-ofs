@@ -24,7 +24,7 @@ use serde_json::Value;
 use super::change::NamespaceChange;
 use super::validation::{validate_publication, validate_snapshot};
 use super::{
-    DirectoryPrecondition, DirectoryRecord, FileVersionLayout, FileVersionRecord,
+    DirectoryPrecondition, DirectoryRecord, FileVersionLayout, FileVersionRecord, NamespaceGcSweep,
     NamespacePublication, NamespaceSnapshot, NodePrecondition, NodeRecord, managed_generation,
     managed_generation_number,
 };
@@ -50,6 +50,14 @@ const SCHEMA_RESULTS: usize = 8;
 pub(crate) struct D1NamespaceObservation {
     pub(crate) snapshot: NamespaceSnapshot,
     revision: u64,
+    maintenance_epoch: u64,
+    gc_sweep: Option<NamespaceGcSweep>,
+}
+
+impl D1NamespaceObservation {
+    pub(crate) fn gc_sweep(&self) -> Option<NamespaceGcSweep> {
+        self.gc_sweep
+    }
 }
 
 #[derive(Clone)]
@@ -68,7 +76,7 @@ impl D1Namespace {
         batch.extend([
             statement(
             format!(
-                "SELECT h.revision, h.target_sequence, h.target_operation, h.root_node, h.checkpoint_sequence, c.snapshot_json FROM {HEADS} h JOIN {CHECKPOINTS} c ON c.store_key = h.store_key AND c.target_sequence = h.checkpoint_sequence WHERE h.store_key = ? AND h.volume_id = ?"
+                "SELECT h.revision, h.target_sequence, h.target_operation, h.root_node, h.checkpoint_sequence, h.maintenance_epoch, h.maintenance_state, h.maintenance_fixed_sequence, h.maintenance_fixed_operation, c.snapshot_json FROM {HEADS} h JOIN {CHECKPOINTS} c ON c.store_key = h.store_key AND c.target_sequence = h.checkpoint_sequence WHERE h.store_key = ? AND h.volume_id = ?"
             ),
             vec![self.store_key().into(), self.volume().into()],
             ),
@@ -94,6 +102,8 @@ impl D1Namespace {
             integer(head, "target_sequence", "read Managed namespace")?,
             Some(text(head, "target_operation", "read Managed namespace")?),
         )?;
+        let maintenance_epoch = integer(head, "maintenance_epoch", "read Managed namespace")?;
+        let gc_sweep = gc_sweep(head, maintenance_epoch, cursor)?;
         let root = node_id(text(head, "root_node", "read Managed namespace")?)?;
         let checkpoint_sequence = integer(head, "checkpoint_sequence", "read Managed namespace")?;
         let checkpoint: StoredSnapshot = decode(
@@ -116,7 +126,12 @@ impl D1Namespace {
             root,
             rows(&results, SCHEMA_RESULTS + 1, "read Managed namespace")?,
         )?;
-        Ok(Some(D1NamespaceObservation { snapshot, revision }))
+        Ok(Some(D1NamespaceObservation {
+            snapshot,
+            revision,
+            maintenance_epoch,
+            gc_sweep,
+        }))
     }
 
     pub(crate) async fn publish(
@@ -129,6 +144,11 @@ impl D1Namespace {
                 "publish Managed namespace",
                 "publication belongs to another volume",
             ));
+        }
+        if observed.is_some_and(|value| value.gc_sweep().is_some()) {
+            return Ok(CommitOutcome::Conflict {
+                observed: observed.expect("checked above").snapshot.cursor,
+            });
         }
         let base = observed.map(|value| &value.snapshot);
         if !validate_publication(publication, base)? {
@@ -246,7 +266,7 @@ impl D1Namespace {
         batch.push(match observed {
             Some(observed) => statement(
                 format!(
-                    "UPDATE {HEADS} SET revision = revision + 1, target_sequence = ?, target_operation = ?, root_node = ? WHERE store_key = ? AND volume_id = ? AND revision = ? AND target_sequence = ? AND target_operation IS ? AND {guard} RETURNING revision"
+                    "UPDATE {HEADS} SET revision = revision + 1, target_sequence = ?, target_operation = ?, root_node = ? WHERE store_key = ? AND volume_id = ? AND revision = ? AND target_sequence = ? AND target_operation IS ? AND maintenance_state = 'idle' AND {guard} RETURNING revision"
                 ),
                 guarded_params(vec![
                     target_sequence.into(),
@@ -261,7 +281,7 @@ impl D1Namespace {
             ),
             None => statement(
                 format!(
-                    "INSERT OR IGNORE INTO {HEADS} (store_key, volume_id, revision, target_sequence, target_operation, root_node, checkpoint_sequence) SELECT ?, ?, 1, ?, ?, ?, 0 WHERE ? = 0 AND ? IS NULL AND {guard} RETURNING revision"
+                    "INSERT OR IGNORE INTO {HEADS} (store_key, volume_id, revision, target_sequence, target_operation, root_node, checkpoint_sequence, maintenance_epoch, maintenance_state, maintenance_fixed_sequence, maintenance_fixed_operation) SELECT ?, ?, 1, ?, ?, ?, 0, 0, 'idle', NULL, NULL WHERE ? = 0 AND ? IS NULL AND {guard} RETURNING revision"
                 ),
                 guarded_params(vec![
                     self.store_key().into(),
@@ -402,6 +422,113 @@ impl D1Namespace {
         )
     }
 
+    pub(crate) async fn begin_gc(
+        &self,
+        observed: &D1NamespaceObservation,
+    ) -> Result<NamespaceGcSweep, ManagedError> {
+        if observed.snapshot.volume_id != self.volume_id {
+            return Err(invalid(
+                "begin Managed namespace GC",
+                "observation belongs to another volume",
+            ));
+        }
+        if let Some(sweep) = observed.gc_sweep() {
+            return Ok(sweep);
+        }
+        let mut batch = schema_statements();
+        batch.push(statement(
+            format!(
+                "UPDATE {HEADS} SET revision = revision + 1, maintenance_epoch = maintenance_epoch + 1, maintenance_state = 'sweeping', maintenance_fixed_sequence = target_sequence, maintenance_fixed_operation = target_operation WHERE store_key = ? AND volume_id = ? AND revision = ? AND target_sequence = ? AND target_operation = ? AND maintenance_epoch = ? AND maintenance_state = 'idle' RETURNING maintenance_epoch"
+            ),
+            vec![
+                self.store_key().into(),
+                self.volume().into(),
+                sqlite_integer(observed.revision)?.into(),
+                sqlite_integer(observed.snapshot.cursor.sequence())?.into(),
+                hex(
+                    observed
+                        .snapshot
+                        .cursor
+                        .operation()
+                        .expect("a namespace head is not genesis")
+                        .as_bytes(),
+                )
+                .into(),
+                sqlite_integer(observed.maintenance_epoch)?.into(),
+            ],
+        ));
+        let results = self
+            .session
+            .query(batch, "begin Managed namespace GC")
+            .await?;
+        let changed = rows(&results, SCHEMA_RESULTS, "begin Managed namespace GC")?;
+        if let [row] = changed {
+            return Ok(NamespaceGcSweep::new(
+                integer(row, "maintenance_epoch", "begin Managed namespace GC")?,
+                observed.snapshot.cursor,
+            ));
+        }
+        if !changed.is_empty() {
+            return Err(corrupt(
+                "begin Managed namespace GC",
+                "D1 returned duplicate namespace heads",
+            ));
+        }
+        self.observe()
+            .await?
+            .and_then(|value| value.gc_sweep())
+            .filter(|value| value.fixed_cursor() == observed.snapshot.cursor)
+            .ok_or_else(|| conflict("begin Managed namespace GC", "namespace authority changed"))
+    }
+
+    pub(crate) async fn finish_gc(&self, sweep: NamespaceGcSweep) -> Result<(), ManagedError> {
+        let mut batch = schema_statements();
+        batch.push(statement(
+            format!(
+                "UPDATE {HEADS} SET revision = revision + 1, maintenance_state = 'idle', maintenance_fixed_sequence = NULL, maintenance_fixed_operation = NULL WHERE store_key = ? AND volume_id = ? AND maintenance_epoch = ? AND maintenance_state = 'sweeping' AND maintenance_fixed_sequence = ? AND maintenance_fixed_operation = ? RETURNING revision"
+            ),
+            vec![
+                self.store_key().into(),
+                self.volume().into(),
+                sqlite_integer(sweep.epoch())?.into(),
+                sqlite_integer(sweep.fixed_cursor().sequence())?.into(),
+                hex(
+                    sweep
+                        .fixed_cursor()
+                        .operation()
+                        .expect("a namespace GC cursor is not genesis")
+                        .as_bytes(),
+                )
+                .into(),
+            ],
+        ));
+        let results = self
+            .session
+            .query(batch, "finish Managed namespace GC")
+            .await?;
+        let changed = rows(&results, SCHEMA_RESULTS, "finish Managed namespace GC")?;
+        if changed.len() == 1 {
+            return Ok(());
+        }
+        if !changed.is_empty() {
+            return Err(corrupt(
+                "finish Managed namespace GC",
+                "D1 returned duplicate namespace heads",
+            ));
+        }
+        let current = self.observe().await?.ok_or_else(|| {
+            conflict("finish Managed namespace GC", "namespace authority changed")
+        })?;
+        if current.maintenance_epoch == sweep.epoch() && current.gc_sweep().is_none() {
+            Ok(())
+        } else {
+            Err(conflict(
+                "finish Managed namespace GC",
+                "GC sweep token does not match the authority",
+            ))
+        }
+    }
+
     async fn outcome_after_race(
         &self,
         operation: OperationId,
@@ -445,7 +572,7 @@ impl D1Namespace {
         ];
         match observed {
             Some(observed) => {
-                sql.push_str(&format!(" AND EXISTS (SELECT 1 FROM {HEADS} WHERE store_key = ? AND volume_id = ? AND revision = ? AND target_sequence = ? AND target_operation IS ?)"));
+                sql.push_str(&format!(" AND EXISTS (SELECT 1 FROM {HEADS} WHERE store_key = ? AND volume_id = ? AND revision = ? AND target_sequence = ? AND target_operation IS ? AND maintenance_state = 'idle')"));
                 params.extend([
                     self.store_key().into(),
                     self.volume().into(),
@@ -476,7 +603,7 @@ fn schema_statements() -> Vec<D1Statement> {
     vec![
         statement(
             format!(
-                "CREATE TABLE IF NOT EXISTS {HEADS} (store_key TEXT PRIMARY KEY, volume_id TEXT NOT NULL, revision INTEGER NOT NULL, target_sequence INTEGER NOT NULL, target_operation TEXT NOT NULL, root_node TEXT NOT NULL, checkpoint_sequence INTEGER NOT NULL)"
+                "CREATE TABLE IF NOT EXISTS {HEADS} (store_key TEXT PRIMARY KEY, volume_id TEXT NOT NULL, revision INTEGER NOT NULL, target_sequence INTEGER NOT NULL, target_operation TEXT NOT NULL, root_node TEXT NOT NULL, checkpoint_sequence INTEGER NOT NULL, maintenance_epoch INTEGER NOT NULL, maintenance_state TEXT NOT NULL CHECK (maintenance_state IN ('idle', 'sweeping')), maintenance_fixed_sequence INTEGER, maintenance_fixed_operation TEXT)"
             ),
             Vec::new(),
         ),
@@ -793,6 +920,38 @@ fn stored_cursor(sequence: u64, operation: Option<&str>) -> Result<ChangeCursor,
     }
 }
 
+fn gc_sweep(
+    row: &Value,
+    epoch: u64,
+    head: ChangeCursor,
+) -> Result<Option<NamespaceGcSweep>, ManagedError> {
+    let fixed_sequence =
+        nullable_integer(row, "maintenance_fixed_sequence", "read Managed namespace")?;
+    let fixed_operation =
+        nullable_text(row, "maintenance_fixed_operation", "read Managed namespace")?;
+    match (
+        text(row, "maintenance_state", "read Managed namespace")?,
+        fixed_sequence,
+        fixed_operation,
+    ) {
+        ("idle", None, None) => Ok(None),
+        ("sweeping", Some(sequence), operation) if epoch > 0 => {
+            let fixed = stored_cursor(sequence, operation)?;
+            if fixed != head {
+                return Err(corrupt(
+                    "read Managed namespace",
+                    "GC sweep is not fixed at the namespace head",
+                ));
+            }
+            Ok(Some(NamespaceGcSweep::new(epoch, fixed)))
+        }
+        _ => Err(corrupt(
+            "read Managed namespace",
+            "namespace maintenance state is invalid",
+        )),
+    }
+}
+
 fn node_id(value: &str) -> Result<NodeId, ManagedError> {
     Ok(NodeId::from_bytes(decode_hex(value)?))
 }
@@ -841,6 +1000,21 @@ fn integer(row: &Value, field: &str, action: &'static str) -> Result<u64, Manage
     row.get(field)
         .and_then(Value::as_u64)
         .ok_or_else(|| corrupt(action, "D1 returned an invalid namespace row"))
+}
+
+fn nullable_integer(
+    row: &Value,
+    field: &str,
+    action: &'static str,
+) -> Result<Option<u64>, ManagedError> {
+    match row.get(field) {
+        Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| corrupt(action, "D1 returned an invalid namespace row")),
+        None => Err(corrupt(action, "D1 returned an invalid namespace row")),
+    }
 }
 
 fn nullable_text<'a>(
@@ -937,6 +1111,10 @@ fn invalid(action: &'static str, message: &'static str) -> ManagedError {
 
 fn corrupt(action: &'static str, message: &'static str) -> ManagedError {
     ManagedError::new(ManagedErrorKind::Corrupt, action, message)
+}
+
+fn conflict(action: &'static str, message: &'static str) -> ManagedError {
+    ManagedError::new(ManagedErrorKind::Conflict, action, message)
 }
 
 #[derive(Serialize)]
@@ -1609,6 +1787,29 @@ mod tests {
             }
             assert!(sequence - recovery_root < CHECKPOINT_INTERVAL);
         }
+    }
+
+    #[test]
+    fn head_row_recovers_the_fixed_gc_sweep() {
+        let fixed = cursor(7, 7);
+        let sweeping = serde_json::json!({
+            "maintenance_state": "sweeping",
+            "maintenance_fixed_sequence": 7,
+            "maintenance_fixed_operation": hex(operation(7).as_bytes()),
+        });
+        let sweep = gc_sweep(&sweeping, 3, fixed).unwrap().unwrap();
+        assert_eq!(sweep.epoch(), 3);
+        assert_eq!(sweep.fixed_cursor(), fixed);
+
+        let idle = serde_json::json!({
+            "maintenance_state": "idle",
+            "maintenance_fixed_sequence": null,
+            "maintenance_fixed_operation": null,
+        });
+        assert_eq!(gc_sweep(&idle, 3, fixed).unwrap(), None);
+
+        let wrong_head = cursor(8, 8);
+        assert!(gc_sweep(&sweeping, 3, wrong_head).is_err());
     }
 
     #[test]

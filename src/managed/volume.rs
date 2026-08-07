@@ -20,7 +20,7 @@
 use opendal::Operator;
 
 use super::namespace::{
-    D1Namespace, D1NamespaceObservation, FileVersionRecord, NamespaceObservation,
+    D1Namespace, D1NamespaceObservation, FileVersionRecord, NamespaceGcSweep, NamespaceObservation,
     NamespacePublication, NamespaceSnapshot, ObjectNamespace,
 };
 use super::{
@@ -57,6 +57,13 @@ impl ManagedObservation {
         match &self.authority {
             AuthorityObservation::Object(observed) => &observed.snapshot,
             AuthorityObservation::D1(observed) => &observed.snapshot,
+        }
+    }
+
+    pub fn gc_sweep(&self) -> Option<NamespaceGcSweep> {
+        match &self.authority {
+            AuthorityObservation::Object(observed) => observed.gc_sweep(),
+            AuthorityObservation::D1(observed) => observed.gc_sweep(),
         }
     }
 }
@@ -162,6 +169,34 @@ impl ManagedVolume {
         match &self.namespace {
             NamespaceAuthority::Object(namespace) => namespace.resolve(operation).await,
             NamespaceAuthority::D1(namespace) => namespace.resolve(operation).await,
+        }
+    }
+
+    /// Fence namespace publication and fix the snapshot used by one GC sweep.
+    pub async fn begin_gc(
+        &self,
+        observed: &ManagedObservation,
+    ) -> Result<NamespaceGcSweep, ManagedError> {
+        match (&self.namespace, &observed.authority) {
+            (NamespaceAuthority::Object(namespace), AuthorityObservation::Object(observed)) => {
+                namespace.begin_gc(observed).await
+            }
+            (NamespaceAuthority::D1(namespace), AuthorityObservation::D1(observed)) => {
+                namespace.begin_gc(observed).await
+            }
+            _ => Err(ManagedError::new(
+                ManagedErrorKind::Invalid,
+                "begin Managed namespace GC",
+                "observation belongs to another metadata authority",
+            )),
+        }
+    }
+
+    /// Release the publication fence for the matching GC sweep.
+    pub async fn finish_gc(&self, sweep: NamespaceGcSweep) -> Result<(), ManagedError> {
+        match &self.namespace {
+            NamespaceAuthority::Object(namespace) => namespace.finish_gc(sweep).await,
+            NamespaceAuthority::D1(namespace) => namespace.finish_gc(sweep).await,
         }
     }
 
