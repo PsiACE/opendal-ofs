@@ -24,6 +24,7 @@ mod format;
 mod metadata;
 pub mod namespace;
 pub mod pack;
+mod section;
 mod volume;
 
 pub(crate) use data::{AuthorityKnownContent, ManagedData};

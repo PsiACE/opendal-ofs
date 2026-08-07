@@ -25,7 +25,7 @@ use crate::filesystem::{VolumeId, VolumeModel};
 const MAGIC: &str = "ofs-managed-volume";
 const MAJOR: u16 = 1;
 const MINOR: u16 = 0;
-const SUPPORTED_FEATURES: &[&str] = &["file-version-layouts-v1"];
+const SUPPORTED_FEATURES: &[&str] = &["file-version-layouts-v1", "object-sections-v1"];
 
 /// Naming rules fixed by the Managed volume format.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -57,13 +57,17 @@ impl ManagedFormat {
         metadata_placement: MetadataPlacement,
         data_root_binding: impl Into<String>,
     ) -> Result<Self, ManagedError> {
+        let mut required_features = BTreeSet::from(["file-version-layouts-v1".to_owned()]);
+        if metadata_placement == MetadataPlacement::ColocatedObject {
+            required_features.insert("object-sections-v1".to_owned());
+        }
         let format = Self {
             volume_id,
             metadata_placement,
             data_root_binding: data_root_binding.into(),
             naming_policy: NamingPolicy::PortableUtf8,
-            required_reader_features: BTreeSet::from(["file-version-layouts-v1".to_owned()]),
-            required_writer_features: BTreeSet::from(["file-version-layouts-v1".to_owned()]),
+            required_reader_features: required_features.clone(),
+            required_writer_features: required_features,
         };
         format.validate_for_write()?;
         Ok(format)
@@ -98,7 +102,8 @@ impl ManagedFormat {
     }
 
     pub fn validate_for_read(&self) -> Result<(), ManagedError> {
-        validate_features(&self.required_reader_features)
+        validate_features(&self.required_reader_features)?;
+        self.validate_placement_features(&self.required_reader_features)
     }
 
     pub fn validate_for_write(&self) -> Result<(), ManagedError> {
@@ -109,7 +114,8 @@ impl ManagedFormat {
             ));
         }
         self.validate_for_read()?;
-        validate_features(&self.required_writer_features)
+        validate_features(&self.required_writer_features)?;
+        self.validate_placement_features(&self.required_writer_features)
     }
 
     pub(crate) fn encode(&self) -> Result<Vec<u8>, ManagedError> {
@@ -147,6 +153,19 @@ impl ManagedFormat {
         };
         format.validate_for_read()?;
         Ok(format)
+    }
+
+    fn validate_placement_features(&self, features: &BTreeSet<String>) -> Result<(), ManagedError> {
+        let object_sections = features.contains("object-sections-v1");
+        if !features.contains("file-version-layouts-v1")
+            || object_sections != (self.metadata_placement == MetadataPlacement::ColocatedObject)
+        {
+            return Err(invalid(
+                "activate Managed volume",
+                "format does not identify its v1 metadata placement",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -266,4 +285,49 @@ fn corrupt_volume_id() -> ManagedError {
         "read Managed format",
         "volume identity is invalid",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn v1_features_identify_the_physical_metadata_placement() {
+        let object = ManagedFormat::v1(
+            VolumeId::from_bytes([1; 16]),
+            MetadataPlacement::ColocatedObject,
+            "s3://bucket/prefix",
+        )
+        .unwrap();
+        assert!(
+            object
+                .required_reader_features()
+                .contains("object-sections-v1")
+        );
+
+        let d1 = ManagedFormat::v1(
+            VolumeId::from_bytes([2; 16]),
+            MetadataPlacement::ExternalD1,
+            "s3://bucket/prefix",
+        )
+        .unwrap();
+        assert!(!d1.required_reader_features().contains("object-sections-v1"));
+    }
+
+    #[test]
+    fn pre_section_object_v1_is_not_silently_reinterpreted() {
+        let bytes = br#"{
+            "magic":"ofs-managed-volume",
+            "major":1,
+            "minor":0,
+            "volume_id":"01010101010101010101010101010101",
+            "metadata_placement":"colocated_object",
+            "data_root_binding":"s3://bucket/prefix",
+            "naming_policy":"portable_utf8",
+            "required_reader_features":["file-version-layouts-v1"],
+            "required_writer_features":["file-version-layouts-v1"]
+        }"#;
+        let error = ManagedFormat::decode(bytes).unwrap_err();
+        assert_eq!(error.kind(), ManagedErrorKind::Invalid);
+    }
 }
