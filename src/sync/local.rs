@@ -20,7 +20,7 @@ pub enum LocalKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct NativeFileIdentity {
+pub struct NativeIdentity {
     pub device: u64,
     pub inode: u64,
 }
@@ -31,7 +31,7 @@ pub struct LocalEntry {
     pub size: u64,
     pub modified: String,
     pub executable: bool,
-    pub native_identity: Option<NativeFileIdentity>,
+    pub native_identity: Option<NativeIdentity>,
 }
 
 /// One stable, path-sorted observation of an ordinary directory.
@@ -75,7 +75,7 @@ impl LocalTree {
                     size: metadata.content_length(),
                     modified,
                     executable: executable_at(root, path, kind)?,
-                    native_identity: native_file_identity_at(root, path, kind)?,
+                    native_identity: native_identity_at(root, path, kind)?,
                 },
             );
         }
@@ -98,23 +98,24 @@ impl LocalTree {
     }
 }
 
-pub(crate) fn native_file_identity_at(
+pub(crate) fn native_identity_at(
     root: &Path,
     path: &str,
     kind: LocalKind,
-) -> Result<Option<NativeFileIdentity>> {
-    if kind != LocalKind::File {
-        return Ok(None);
-    }
+) -> Result<Option<NativeIdentity>> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
         let metadata = fs::symlink_metadata(root.join(path))
             .with_context(|| format!("inspect local identity for {path:?}"))?;
-        if !metadata.file_type().is_file() {
-            bail!("local path {path:?} is not a regular file; remove it before sync");
+        let expected = match kind {
+            LocalKind::Directory => metadata.file_type().is_dir(),
+            LocalKind::File => metadata.file_type().is_file(),
+        };
+        if !expected {
+            bail!("local path {path:?} changed kind while it was being inspected; retry sync");
         }
-        Ok(Some(NativeFileIdentity {
+        Ok(Some(NativeIdentity {
             device: metadata.dev(),
             inode: metadata.ino(),
         }))

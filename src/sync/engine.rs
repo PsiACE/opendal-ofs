@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use opendal::{Operator, services};
 
-use super::local::{fs_operator, native_file_identity_at, set_executable};
+use super::local::{fs_operator, native_identity_at, set_executable};
 use super::{
     BaseEntry, ConflictRecord, LocalKind, LocalTree, PendingIntent, ReconcileAction, ReplicaState,
     StagedTree, build_publication, reconcile,
@@ -80,20 +80,23 @@ impl SyncEngine {
                         .observe()
                         .await?
                         .context("committed publication has no authoritative namespace")?;
-                    let safe_to_install = committed_tree_is_safe(
-                        &state,
-                        replica_path,
-                        &pending.staging,
-                        observed.snapshot(),
-                        state_path,
-                    )
-                    .await?;
-                    if safe_to_install {
+                    let target_is_live = pending.staging.is_dir()
+                        && same_tree(replica_path, &pending.staging, state_path).await?;
+                    let safe_to_install = target_is_live
+                        || committed_tree_is_safe(
+                            &state,
+                            replica_path,
+                            observed.snapshot(),
+                            state_path,
+                        )
+                        .await?;
+                    let materialized = safe_to_install && !target_is_live;
+                    if materialized {
                         materialize_tree(&self.volume, replica_path, observed.snapshot()).await?;
                     }
                     state = state_from_snapshot(observed.snapshot(), replica_path)?;
                     state.install(state_path)?;
-                    return Ok(result(&state, true, safe_to_install));
+                    return Ok(result(&state, true, materialized));
                 }
                 CommitOutcome::Unknown => return Ok(result(&state, false, false)),
                 CommitOutcome::Absent | CommitOutcome::Conflict { .. } => {
@@ -236,6 +239,24 @@ impl SyncEngine {
         }
 
         let merged = LocalTree::scan(staged.root()).await?;
+        let merged_input = FrozenTree(
+            merged
+                .entries()
+                .iter()
+                .map(|(path, entry)| {
+                    (
+                        path.clone(),
+                        FrozenEntry {
+                            kind: entry.kind,
+                            size: entry.size,
+                            digest: known_digests.get(path).copied(),
+                            executable: entry.executable,
+                        },
+                    )
+                })
+                .collect(),
+        );
+        let requires_materialization = merged_input != frozen_input;
         let frozen = fs_operator(staged.root())?;
         let remote_files = remote.map(snapshot_files).transpose()?.unwrap_or_default();
         let mut prepared = BTreeMap::new();
@@ -265,7 +286,8 @@ impl SyncEngine {
         match self.volume.publish(observed.as_ref(), &publication).await? {
             CommitOutcome::Committed(_) => {
                 let unchanged = matches_frozen(replica_path, &frozen_input, state_path).await?;
-                if unchanged {
+                let materialized = requires_materialization && unchanged;
+                if materialized {
                     materialize_tree(&self.volume, replica_path, &publication.target).await?;
                 }
                 state = state_from_snapshot(&publication.target, replica_path)?;
@@ -274,7 +296,7 @@ impl SyncEngine {
                     remove_tree(&old)?;
                 }
                 remove_tree(&staging_path)?;
-                Ok(result(&state, true, unchanged))
+                Ok(result(&state, true, materialized))
             }
             CommitOutcome::Absent | CommitOutcome::Conflict { .. } | CommitOutcome::Unknown => {
                 Ok(result(&state, false, false))
@@ -335,13 +357,9 @@ async fn same_tree(left: &Path, right: &Path, anchor: &Path) -> Result<bool> {
 async fn committed_tree_is_safe(
     state: &ReplicaState,
     replica: &Path,
-    original_staging: &Path,
     committed: &NamespaceSnapshot,
     anchor: &Path,
 ) -> Result<bool> {
-    if original_staging.is_dir() && same_tree(replica, original_staging, anchor).await? {
-        return Ok(true);
-    }
     let local = LocalTree::scan(replica).await?;
     let staging_path = fresh_sibling(anchor, "recovery-compare");
     let staged = StagedTree::prepare(&local, &staging_path).await?;
@@ -497,17 +515,25 @@ fn state_from_snapshot(snapshot: &NamespaceSnapshot, replica: &Path) -> Result<R
         let digest = record
             .file_version
             .map(|version| snapshot.file_versions[&version].logical_digest);
-        let local_identity =
-            if record.kind == NodeKind::RegularFile && replica.join(&path).is_file() {
-                native_file_identity_at(replica, &path, LocalKind::File)?
-            } else {
-                None
-            };
+        let local_kind = match record.kind {
+            NodeKind::Directory => LocalKind::Directory,
+            NodeKind::RegularFile => LocalKind::File,
+        };
+        let local_identity = if replica.join(&path).exists() {
+            native_identity_at(replica, &path, local_kind)?
+        } else {
+            None
+        };
+        let directory_generation = snapshot
+            .directories
+            .get(&node)
+            .map(|directory| directory.generation.clone());
         state.base.insert(
             path,
             BaseEntry {
                 node,
                 generation: record.generation.clone(),
+                directory_generation,
                 digest,
                 local_identity,
             },

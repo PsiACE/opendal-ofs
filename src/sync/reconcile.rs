@@ -12,7 +12,7 @@ use anyhow::{Context, Result, bail};
 
 use super::{ConflictRecord, ReplicaState, StagedTree};
 use crate::filesystem::NodeKind;
-use crate::filesystem::{ChangeCursor, FileVersionId, NodeId};
+use crate::filesystem::{ChangeCursor, FileVersionId, Generation, NodeId};
 use crate::managed::namespace::{FileVersionRecord, NamespaceSnapshot};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -46,7 +46,6 @@ pub enum ReconcileAction {
         from: String,
         path: String,
         node: NodeId,
-        digest: [u8; 32],
     },
     Conflict(ConflictRecord),
     Unsupported {
@@ -55,11 +54,19 @@ pub enum ReconcileAction {
     },
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct RemoteFile {
     node: NodeId,
+    generation: Generation,
     version: FileVersionId,
     digest: [u8; 32],
+}
+
+#[derive(Clone)]
+struct RemoteDirectory {
+    node: NodeId,
+    generation: Generation,
+    directory_generation: Generation,
 }
 
 /// Reconcile staged local file content with one authoritative Managed snapshot.
@@ -82,8 +89,8 @@ pub fn reconcile(
     let remote_files = remote_paths
         .iter()
         .filter_map(|(path, value)| match value {
-            RemotePath::File(file) => Some((path.clone(), *file)),
-            RemotePath::Directory => None,
+            RemotePath::File(file) => Some((path.clone(), file.clone())),
+            RemotePath::Directory(_) => None,
         })
         .collect::<BTreeMap<_, _>>();
     let local_digests = local
@@ -102,7 +109,7 @@ pub fn reconcile(
         &mut actions,
     );
     let local_renames =
-        reconcile_local_renames(replica, local, &remote_files, &mut handled, &mut actions)?;
+        reconcile_local_renames(replica, local, &remote_paths, &mut handled, &mut actions)?;
 
     let mut paths = replica.base.keys().cloned().collect::<BTreeSet<_>>();
     paths.extend(local_digests.keys().cloned());
@@ -117,7 +124,7 @@ pub fn reconcile(
         let remote_digest = remote_path.and_then(RemotePath::digest);
 
         if base.is_some_and(|entry| entry.digest.is_none())
-            || matches!(remote_path, Some(RemotePath::Directory))
+            || matches!(remote_path, Some(RemotePath::Directory(_)))
         {
             if local_digest.is_some() {
                 actions.push(ReconcileAction::Unsupported {
@@ -189,7 +196,7 @@ fn remote_action(path: String, remote: Option<&RemotePath>) -> ReconcileAction {
             digest: file.digest,
         },
         None => ReconcileAction::DeleteLocal { path },
-        Some(RemotePath::Directory) => ReconcileAction::Unsupported {
+        Some(RemotePath::Directory(_)) => ReconcileAction::Unsupported {
             path,
             reason: "directory installation belongs to namespace reconciliation",
         },
@@ -218,7 +225,7 @@ fn reconcile_remote_renames(
         handled.insert(new_path.clone());
         let old_local = local.get(old_path).copied();
         let new_local = local.get(new_path).copied();
-        let renamed = remote[new_path];
+        let renamed = remote[new_path].clone();
         if old_local == Some(base_digest) && new_local.is_none() {
             actions.push(ReconcileAction::DeleteLocal {
                 path: old_path.clone(),
@@ -241,11 +248,11 @@ fn reconcile_remote_renames(
 fn reconcile_local_renames(
     replica: &ReplicaState,
     local: &StagedTree,
-    remote: &BTreeMap<String, RemoteFile>,
+    remote: &BTreeMap<String, RemotePath>,
     handled: &mut BTreeSet<String>,
     actions: &mut Vec<ReconcileAction>,
 ) -> Result<BTreeMap<String, String>> {
-    let files = local.files();
+    let local_paths = local.source_identities();
     let mut renames = replica
         .pending
         .as_ref()
@@ -261,10 +268,10 @@ fn reconcile_local_renames(
         }
     }
     let mut local_by_identity = BTreeMap::new();
-    for (path, file) in files {
-        if let Some(identity) = file.source_identity {
+    for (path, identity) in local_paths {
+        if let Some(identity) = identity {
             local_by_identity
-                .entry(identity)
+                .entry(*identity)
                 .and_modify(|value: &mut Option<String>| *value = None)
                 .or_insert_with(|| Some(path.clone()));
         }
@@ -273,7 +280,7 @@ fn reconcile_local_renames(
         let (Some(from), Some(Some(path))) = (from, local_by_identity.get(&identity)) else {
             continue;
         };
-        if !files.contains_key(&from) && !replica.base.contains_key(path) {
+        if !local_paths.contains_key(&from) && !replica.base.contains_key(path) {
             renames.insert(from, path.clone());
         }
     }
@@ -282,6 +289,7 @@ fn reconcile_local_renames(
     if targets.len() != renames.len() {
         bail!("remembered local renames contain more than one source for a target");
     }
+    validate_subtree_renames(replica, local_paths, &renames)?;
 
     for (from, path) in &renames {
         if handled.contains(from) && handled.contains(path) {
@@ -291,19 +299,15 @@ fn reconcile_local_renames(
             .base
             .get(from)
             .with_context(|| format!("remembered rename source {from:?} is not in the base"))?;
-        let base_digest = base
-            .digest
-            .with_context(|| format!("remembered rename source {from:?} is not a file"))?;
-        let digest = files
-            .get(path)
-            .with_context(|| format!("remembered rename target {path:?} is not staged"))?
-            .digest;
-        if files.contains_key(from) || replica.base.contains_key(path) {
+        if !local_paths.contains_key(path) {
+            bail!("remembered rename target {path:?} is not staged");
+        }
+        if local_paths.contains_key(from) || replica.base.contains_key(path) {
             bail!("remembered rename {from:?} to {path:?} no longer describes the local tree");
         }
         let remote_source = remote.get(from);
         let remote_target = remote.get(path);
-        if remote_source.is_some_and(|file| file.node == base.node && file.digest == base_digest)
+        if remote_source.is_some_and(|entry| remote_matches_base(entry, base))
             && remote_target.is_none()
         {
             handled.insert(from.clone());
@@ -312,46 +316,105 @@ fn reconcile_local_renames(
                 from: from.clone(),
                 path: path.clone(),
                 node: base.node,
-                digest,
             });
-        } else if remote_target.is_some_and(|file| file.node == base.node)
+        } else if remote_target.is_some_and(|entry| entry.node() == base.node)
             && remote_source.is_none()
-            && remote_target.is_some_and(|file| file.digest == digest)
+            && remote_target.is_some_and(|entry| local_matches_remote(local, path, entry))
         {
             handled.insert(from.clone());
             handled.insert(path.clone());
             actions.push(ReconcileAction::KeepLocal {
                 path: path.clone(),
-                digest: Some(digest),
+                digest: local.files().get(path).map(|file| file.digest),
             });
         } else {
             handled.insert(from.clone());
             handled.insert(path.clone());
             actions.push(ReconcileAction::Conflict(ConflictRecord {
                 path: path.clone(),
-                local_digest: Some(digest),
-                remote_digest: remote_target.or(remote_source).map(|file| file.digest),
+                local_digest: local.files().get(path).map(|file| file.digest),
+                remote_digest: remote_target.or(remote_source).and_then(RemotePath::digest),
             }));
         }
     }
 
-    reject_unidentified_moves(replica, files, handled, actions);
+    reject_unidentified_moves(replica, local, handled, actions);
     Ok(renames)
+}
+
+fn validate_subtree_renames(
+    replica: &ReplicaState,
+    local: &BTreeMap<String, Option<super::local::NativeIdentity>>,
+    renames: &BTreeMap<String, String>,
+) -> Result<()> {
+    for (from, path) in renames {
+        if replica.base[from].digest.is_some() {
+            continue;
+        }
+        let source_prefix = format!("{from}/");
+        let target_prefix = format!("{path}/");
+        for child_from in replica
+            .base
+            .keys()
+            .filter(|candidate| candidate.starts_with(&source_prefix))
+        {
+            let suffix = &child_from[source_prefix.len()..];
+            let child_path = format!("{target_prefix}{suffix}");
+            if local.contains_key(&child_path)
+                && renames.get(child_from).map(String::as_str) != Some(child_path.as_str())
+            {
+                bail!("local directory subtree was copied without stable identity");
+            }
+        }
+        for (child_from, child_path) in renames {
+            let Some(suffix) = child_from.strip_prefix(&source_prefix) else {
+                continue;
+            };
+            if child_path != &format!("{target_prefix}{suffix}") {
+                bail!("local directory rename overlaps another local move");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn remote_matches_base(remote: &RemotePath, base: &super::BaseEntry) -> bool {
+    if remote.node() != base.node || remote.generation() != &base.generation {
+        return false;
+    }
+    match remote {
+        RemotePath::File(file) => base.digest == Some(file.digest),
+        RemotePath::Directory(directory) => {
+            base.digest.is_none()
+                && base.directory_generation.as_ref() == Some(&directory.directory_generation)
+        }
+    }
+}
+
+fn local_matches_remote(local: &StagedTree, path: &str, remote: &RemotePath) -> bool {
+    match remote {
+        RemotePath::File(file) => local
+            .files()
+            .get(path)
+            .is_some_and(|local| local.digest == file.digest),
+        RemotePath::Directory(_) => !local.files().contains_key(path),
+    }
 }
 
 fn reject_unidentified_moves(
     replica: &ReplicaState,
-    local: &BTreeMap<String, super::StagedFile>,
+    local: &StagedTree,
     handled: &mut BTreeSet<String>,
     actions: &mut Vec<ReconcileAction>,
 ) {
+    let local_paths = local.source_identities();
     let deleted = replica
         .base
         .iter()
-        .filter(|(path, entry)| entry.digest.is_some() && !local.contains_key(*path))
+        .filter(|(path, _)| !local_paths.contains_key(*path))
         .map(|(path, _)| path.clone())
         .collect::<Vec<_>>();
-    let added = local
+    let added = local_paths
         .keys()
         .filter(|path| !replica.base.contains_key(*path))
         .cloned()
@@ -372,12 +435,20 @@ fn reject_unidentified_moves(
             .base
             .get(path)
             .is_some_and(|entry| entry.local_identity.is_some())
-    }) && added.iter().all(|path| {
-        local
-            .get(path)
-            .is_some_and(|file| file.source_identity.is_some())
+    }) && added
+        .iter()
+        .all(|path| local_paths.get(path).is_some_and(Option::is_some));
+    let crosses_devices = deleted.iter().any(|from| {
+        replica.base[from].digest.is_none()
+            && added.iter().any(|path| {
+                !local.files().contains_key(path)
+                    && replica.base[from]
+                        .local_identity
+                        .zip(local_paths[path])
+                        .is_some_and(|(from, to)| from.device != to.device)
+            })
     });
-    if identities_are_reliable {
+    if identities_are_reliable && !crosses_devices {
         return;
     }
     let suspects = deleted.into_iter().chain(added).collect::<BTreeSet<_>>();
@@ -385,7 +456,7 @@ fn reject_unidentified_moves(
     for path in suspects {
         actions.push(ReconcileAction::Unsupported {
             path,
-            reason: "local move lacks a stable native file identity",
+            reason: "local move lacks a stable same-filesystem identity",
         });
     }
 }
@@ -410,16 +481,30 @@ fn install_remote(path: String, file: RemoteFile) -> ReconcileAction {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum RemotePath {
-    Directory,
+    Directory(RemoteDirectory),
     File(RemoteFile),
 }
 
 impl RemotePath {
+    fn node(&self) -> NodeId {
+        match self {
+            Self::Directory(directory) => directory.node,
+            Self::File(file) => file.node,
+        }
+    }
+
+    fn generation(&self) -> &Generation {
+        match self {
+            Self::Directory(directory) => &directory.generation,
+            Self::File(file) => &file.generation,
+        }
+    }
+
     fn digest(&self) -> Option<[u8; 32]> {
         match self {
-            Self::Directory => None,
+            Self::Directory(_) => None,
             Self::File(file) => Some(file.digest),
         }
     }
@@ -448,6 +533,7 @@ fn remote_paths(snapshot: &NamespaceSnapshot) -> Result<BTreeMap<String, RemoteP
                         path,
                         RemotePath::File(RemoteFile {
                             node,
+                            generation: record.generation.clone(),
                             version: version_id,
                             digest: version.logical_digest,
                         }),
@@ -458,13 +544,20 @@ fn remote_paths(snapshot: &NamespaceSnapshot) -> Result<BTreeMap<String, RemoteP
                 if !expanded.insert(node) {
                     bail!("remote namespace is not a directory tree");
                 }
-                if !path.is_empty() {
-                    paths.insert(path.clone(), RemotePath::Directory);
-                }
                 let directory = snapshot
                     .directories
                     .get(&node)
                     .context("remote directory record is missing")?;
+                if !path.is_empty() {
+                    paths.insert(
+                        path.clone(),
+                        RemotePath::Directory(RemoteDirectory {
+                            node,
+                            generation: record.generation.clone(),
+                            directory_generation: directory.generation.clone(),
+                        }),
+                    );
+                }
                 for (name, entry) in directory.entries.iter().rev() {
                     let child = if path.is_empty() {
                         name.clone()

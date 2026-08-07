@@ -17,7 +17,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::filesystem::{ChangeCursor, Generation, NodeId, OperationId, VolumeId};
-use crate::sync::local::NativeFileIdentity;
+use crate::sync::local::NativeIdentity;
 
 const STATE_FORMAT: &str = "ofs-sync-replica";
 const STATE_MAJOR: u16 = 1;
@@ -27,8 +27,9 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub struct BaseEntry {
     pub node: NodeId,
     pub generation: Generation,
+    pub directory_generation: Option<Generation>,
     pub digest: Option<[u8; 32]>,
-    pub local_identity: Option<NativeFileIdentity>,
+    pub local_identity: Option<NativeIdentity>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -134,6 +135,8 @@ struct CursorWire {
 struct BaseWire {
     node: [u8; 16],
     generation: Vec<u8>,
+    #[serde(default)]
+    directory_generation: Option<Vec<u8>>,
     digest: Option<[u8; 32]>,
     #[serde(default)]
     local_identity: Option<NativeIdentityWire>,
@@ -180,6 +183,10 @@ impl From<&ReplicaState> for StateWire {
                         BaseWire {
                             node: *entry.node.as_bytes(),
                             generation: entry.generation.as_bytes().into(),
+                            directory_generation: entry
+                                .directory_generation
+                                .as_ref()
+                                .map(|generation| generation.as_bytes().into()),
                             digest: entry.digest,
                             local_identity: entry.local_identity.map(|identity| {
                                 NativeIdentityWire {
@@ -226,8 +233,11 @@ impl TryFrom<StateWire> for ReplicaState {
                     BaseEntry {
                         node: NodeId::from_bytes(entry.node),
                         generation: Generation::from_bytes(entry.generation),
+                        directory_generation: entry
+                            .directory_generation
+                            .map(Generation::from_bytes),
                         digest: entry.digest,
-                        local_identity: entry.local_identity.map(|identity| NativeFileIdentity {
+                        local_identity: entry.local_identity.map(|identity| NativeIdentity {
                             device: identity.device,
                             inode: identity.inode,
                         }),
