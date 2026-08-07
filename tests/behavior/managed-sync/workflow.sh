@@ -77,6 +77,42 @@ OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a"
 OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_b" --state "$state_b"
 cmp "$replica_a/first.txt" "$replica_b/first.txt" || fail 'empty replica did not materialize first.txt'
 
+printf '%s\n' 'acceptance: publish nested, empty, executable, and large files'
+mkdir -p "$replica_a/nested/level" "$replica_a/tools"
+printf '%s\n' 'created in a nested directory' >"$replica_a/nested/level/entry.txt"
+printf '%s\n' 'removed after publication' >"$replica_a/nested/level/removed.txt"
+: >"$replica_a/empty.bin"
+dd if=/dev/zero of="$replica_a/large.bin" bs=1048576 count=8 2>/dev/null
+printf '%s\n' '#!/bin/sh' 'printf "managed sync executable\\n"' >"$replica_a/tools/run.sh"
+chmod u+x "$replica_a/tools/run.sh"
+OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a"
+OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_b" --state "$state_b"
+[[ -d "$replica_b/nested/level" ]] || fail 'nested directories were not materialized'
+cmp "$replica_a/nested/level/entry.txt" "$replica_b/nested/level/entry.txt" || \
+  fail 'nested file content did not round trip'
+[[ ! -s "$replica_b/empty.bin" ]] || fail 'empty file did not round trip'
+cmp "$replica_a/large.bin" "$replica_b/large.bin" || fail 'large file did not round trip'
+if [[ "$(uname -s)" != MINGW* && "$(uname -s)" != MSYS* ]]; then
+  [[ -x "$replica_b/tools/run.sh" ]] || fail 'executable bit did not round trip'
+fi
+
+printf '%s\n' 'acceptance: modify, rename, and delete remote entries'
+printf '%s\n' 'modified before rename' >"$replica_a/nested/level/entry.txt"
+OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a"
+OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_b" --state "$state_b"
+grep -Fxq 'modified before rename' "$replica_b/nested/level/entry.txt" || \
+  fail 'remote file modification was not materialized'
+mv "$replica_a/nested/level/entry.txt" "$replica_a/nested/renamed.txt"
+rm "$replica_a/nested/level/removed.txt"
+rmdir "$replica_a/nested/level"
+OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a"
+OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_b" --state "$state_b"
+[[ ! -e "$replica_b/nested/level" ]] || fail 'deleted remote directory remained locally'
+[[ ! -e "$replica_b/nested/level/entry.txt" ]] || fail 'old remote rename path remained locally'
+[[ ! -e "$replica_b/nested/level/removed.txt" ]] || fail 'deleted remote file remained locally'
+grep -Fxq 'modified before rename' "$replica_b/nested/renamed.txt" || \
+  fail 'remote file rename was not materialized'
+
 printf '%s\n' 'published by replica a' >"$replica_a/a-only.txt"
 printf '%s\n' 'published by replica b' >"$replica_b/b-only.txt"
 printf '%s\n' 'acceptance: merge disjoint changes from two replicas'
@@ -112,6 +148,9 @@ printf '%s\n' 'acceptance: rebuild a cold client from remote authority'
 OFS_CONFIG="$cold_config" "$OFS_BIN" "${volume_create[@]}"
 OFS_CONFIG="$cold_config" "$OFS_BIN" sync workspace "$cold_replica" --state "$cold_state"
 diff -ru "$replica_a" "$cold_replica" || fail 'cold replica does not match the published tree'
+if [[ "$(uname -s)" != MINGW* && "$(uname -s)" != MSYS* ]]; then
+  [[ -x "$cold_replica/tools/run.sh" ]] || fail 'cold rebuild lost executable bit'
+fi
 
 before_noop=$(cd "$cold_replica" && find . -type f -exec sha256sum {} + | LC_ALL=C sort)
 OFS_CONFIG="$cold_config" "$OFS_BIN" sync workspace "$cold_replica" --state "$cold_state"
