@@ -27,12 +27,91 @@ pub(crate) fn run(mut arguments: impl Iterator<Item = String>) -> Result<(), Str
         "up" => no_arguments(arguments, up),
         "down" => no_arguments(arguments, down),
         "test" => test(arguments),
+        "perf" => optional_output(arguments, run_performance),
+        "bub" => optional_output(arguments, run_bub),
         "-h" | "--help" => {
-            println!("Usage: cargo x managed-sync <doctor|up|down|test workflow object|d1>");
+            println!(
+                "Usage: cargo x managed-sync <doctor|up|down|test workflow object|d1|perf [OUTPUT]|bub [OUTPUT]>"
+            );
             Ok(())
         }
         _ => Err(format!("unknown Managed Sync command {command:?}")),
     }
+}
+
+fn optional_output(
+    mut arguments: impl Iterator<Item = String>,
+    action: fn(Option<&str>) -> Result<(), String>,
+) -> Result<(), String> {
+    let output = arguments.next();
+    if let Some(argument) = arguments.next() {
+        return Err(format!("unexpected argument {argument:?}"));
+    }
+    action(output.as_deref())
+}
+
+fn run_performance(output: Option<&str>) -> Result<(), String> {
+    let mut command = Command::new("bash");
+    command
+        .current_dir(workspace_root())
+        .arg("tests/performance/managed-sync/run.sh");
+    if let Some(output) = output {
+        command.arg(output);
+    }
+    run_command(&mut command, "run Managed Sync release A/B")
+}
+
+fn run_bub(output: Option<&str>) -> Result<(), String> {
+    let bub_available = Command::new("bub")
+        .arg("--help")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if !bub_available {
+        return Err("Bub is required for the agent workflow".into());
+    }
+    up()?;
+    let result = run_bub_with_fixtures(output);
+    let cleanup = down();
+    result?;
+    cleanup
+}
+
+fn run_bub_with_fixtures(output: Option<&str>) -> Result<(), String> {
+    run_command(
+        Command::new("cargo")
+            .current_dir(workspace_root())
+            .args(["build", "--locked"]),
+        "build ofs for the Bub workflow",
+    )?;
+    let run_root = output.map(PathBuf::from).unwrap_or_else(|| {
+        workspace_root().join(format!(
+            ".local/evidence/managed-sync-bub-{}",
+            std::process::id()
+        ))
+    });
+    if run_root.exists() {
+        return Err(format!("Bub output already exists: {}", run_root.display()));
+    }
+    std::fs::create_dir_all(&run_root)
+        .map_err(|error| format!("could not create Bub output: {error}"))?;
+    let endpoint = format!("http%3A%2F%2F127.0.0.1%3A{}", minio_port());
+    let storage = format!("s3://managed-sync/bub?endpoint={endpoint}&region=us-east-1");
+    let mut command = Command::new("bash");
+    command
+        .current_dir(workspace_root())
+        .arg("tests/agent/managed-sync/run.sh")
+        .env("OFS_BIN", workspace_root().join("target/debug/ofs"))
+        .env("OFS_RUN_ROOT", &run_root)
+        .env("OFS_STORAGE_URL", storage)
+        .env("AWS_ACCESS_KEY_ID", "minioadmin")
+        .env("AWS_SECRET_ACCESS_KEY", "minioadmin")
+        .env("AWS_REGION", "us-east-1");
+    let result = run_command(&mut command, "run Bub Managed Sync workflow");
+    println!("Bub evidence: {}", run_root.display());
+    result
 }
 
 fn no_arguments(

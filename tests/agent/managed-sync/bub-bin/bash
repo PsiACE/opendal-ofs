@@ -1,0 +1,22 @@
+#!/bin/bash
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements. See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership. The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.
+
+set -euo pipefail
+
+clean_env=(
+  "PATH=${PATH:?}"
+  "LANG=${LANG:-C.UTF-8}"
+)
+for name in OFS_BIN OFS_CONFIG OFS_VOLUME OFS_RUN_ROOT OFS_SANDBOX_A \
+  OFS_SANDBOX_B OFS_SANDBOX_C OFS_STATE_A OFS_STATE_B OFS_STATE_C; do
+  if [[ -v $name ]]; then
+    clean_env+=("$name=${!name}")
+  fi
+done
+exec env -i "${clean_env[@]}" /bin/bash "$@"
