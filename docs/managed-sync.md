@@ -156,6 +156,12 @@ process stops after its intent becomes durable, repeat the same `ofs sync`
 command. Recovery uses the original operation identity instead of guessing
 whether the transaction committed.
 
+The durable staging area records the complete logical tree but stores file
+content only for changed paths. Unchanged files reuse the `FileVersion` fixed
+by the authority snapshot. Remote reconciliation installs only affected local
+paths. This keeps update staging proportional to the change while preserving
+the same crash-recovery contract.
+
 A no-op sync does not republish unchanged content. Hard links and symbolic
 links are rejected before publication because format v1 does not advertise
 those capabilities. Regular files, directories, empty files, executable bits,

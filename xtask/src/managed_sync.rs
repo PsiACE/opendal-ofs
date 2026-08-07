@@ -31,7 +31,7 @@ pub(crate) fn run(mut arguments: impl Iterator<Item = String>) -> Result<(), Str
         "bub" => optional_output(arguments, run_bub),
         "-h" | "--help" => {
             println!(
-                "Usage: cargo x managed-sync <doctor|up|down|test workflow object|d1|perf [OUTPUT]|bub [OUTPUT]>"
+                "Usage: cargo x managed-sync <doctor|up|down|test workflow object|d1|test staging|perf [OUTPUT]|bub [OUTPUT]>"
             );
             Ok(())
         }
@@ -127,24 +127,75 @@ fn no_arguments(
 }
 
 fn test(mut arguments: impl Iterator<Item = String>) -> Result<(), String> {
-    if arguments.next().as_deref() != Some("workflow") {
-        return Err("expected `test workflow object` or `test workflow d1`".into());
-    }
-    let metadata = arguments
+    let kind = arguments
         .next()
-        .ok_or_else(|| "workflow requires object or d1 metadata".to_string())?;
-    if !matches!(metadata.as_str(), "object" | "d1") {
-        return Err("workflow metadata must be object or d1".into());
-    }
+        .ok_or_else(|| "expected `test workflow object|d1` or `test staging`".to_string())?;
+    let metadata = match kind.as_str() {
+        "workflow" => {
+            let metadata = arguments
+                .next()
+                .ok_or_else(|| "workflow requires object or d1 metadata".to_string())?;
+            if !matches!(metadata.as_str(), "object" | "d1") {
+                return Err("workflow metadata must be object or d1".into());
+            }
+            Some(metadata)
+        }
+        "staging" => None,
+        _ => return Err("expected `test workflow object|d1` or `test staging`".into()),
+    };
     if let Some(argument) = arguments.next() {
         return Err(format!("unexpected argument {argument:?}"));
     }
 
     up()?;
-    let result = run_workflow(&metadata);
+    let result = match metadata {
+        Some(metadata) => run_workflow(&metadata),
+        None => run_staging_regression(),
+    };
     let cleanup = down();
     result?;
     cleanup
+}
+
+fn run_staging_regression() -> Result<(), String> {
+    run_command(
+        Command::new("cargo")
+            .current_dir(workspace_root())
+            .args(["build", "--locked"]),
+        "build ofs for the Managed Sync staging regression",
+    )?;
+    let run_root = env::temp_dir().join(format!(
+        "ofs-managed-sync-staging-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| format!("system clock is invalid: {error}"))?
+            .as_nanos()
+    ));
+    std::fs::create_dir(&run_root)
+        .map_err(|error| format!("could not create staging regression directory: {error}"))?;
+    let endpoint = format!("http%3A%2F%2F127.0.0.1%3A{}", minio_port());
+    let case_id = run_root.file_name().unwrap().to_string_lossy();
+    let storage = format!("s3://managed-sync/{case_id}?endpoint={endpoint}&region=us-east-1");
+    let result = run_command(
+        Command::new("bash")
+            .current_dir(workspace_root())
+            .arg("tests/performance/managed-sync/staging.sh")
+            .env("OFS_BIN", workspace_root().join("target/debug/ofs"))
+            .env("OFS_CASE_ROOT", &run_root)
+            .env("OFS_STORAGE_URL", storage)
+            .env("AWS_ACCESS_KEY_ID", "minioadmin")
+            .env("AWS_SECRET_ACCESS_KEY", "minioadmin")
+            .env("AWS_REGION", "us-east-1"),
+        "run Managed Sync staging regression",
+    );
+    if result.is_ok() {
+        std::fs::remove_dir_all(&run_root)
+            .map_err(|error| format!("could not remove staging regression directory: {error}"))?;
+    } else {
+        eprintln!("Managed Sync evidence retained at {}", run_root.display());
+    }
+    result
 }
 
 fn run_workflow(metadata: &str) -> Result<(), String> {

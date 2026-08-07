@@ -12,20 +12,24 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use opendal::{EntryMode, Operator, services};
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LocalKind {
     Directory,
     File,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct NativeIdentity {
     pub device: u64,
     pub inode: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct LocalEntry {
     pub kind: LocalKind,
     pub size: u64,
@@ -118,6 +122,46 @@ impl LocalTree {
     pub(crate) fn operator(&self) -> Result<Operator> {
         fs_operator(&self.root)
     }
+
+    pub(crate) fn from_entries(
+        root: impl Into<PathBuf>,
+        entries: BTreeMap<String, LocalEntry>,
+    ) -> Self {
+        Self {
+            root: root.into(),
+            entries,
+        }
+    }
+
+    pub(crate) fn insert(&mut self, path: String, entry: LocalEntry) {
+        self.entries.insert(path, entry);
+    }
+
+    pub(crate) fn remove(&mut self, path: &str) {
+        self.entries.remove(path);
+    }
+}
+
+pub(crate) async fn entry_at(root: &Path, path: &str) -> Result<LocalEntry> {
+    let metadata = fs_operator(root)?
+        .stat(path)
+        .await
+        .with_context(|| format!("inspect materialized path {path:?}"))?;
+    let kind = match metadata.mode() {
+        EntryMode::DIR => LocalKind::Directory,
+        EntryMode::FILE => LocalKind::File,
+        _ => bail!("materialized path {path:?} is a symbolic link or special file"),
+    };
+    Ok(LocalEntry {
+        kind,
+        size: metadata.content_length(),
+        modified: metadata
+            .last_modified()
+            .context("local filesystem did not report modification time")?
+            .to_string(),
+        executable: executable_at(root, path, kind)?,
+        native_identity: native_identity_at(root, path, kind)?,
+    })
 }
 
 pub(crate) fn native_identity_at(
