@@ -223,6 +223,15 @@ OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_b" --state "$state_b"
 cmp "$replica_a/crash-recovery/128.bin" "$replica_b/crash-recovery/128.bin" || \
   fail 'recovered publication did not materialize on another replica'
 
+printf '%s\n' 'acceptance: recover through a long bounded change history'
+for generation in $(seq 1 60); do
+  printf 'history change %s\n' "$generation" >"$replica_a/checkpoint.txt"
+  OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a" >/dev/null
+done
+OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_b" --state "$state_b"
+grep -Fxq 'history change 60' "$replica_b/checkpoint.txt" || \
+  fail 'replica did not recover the fixed target after a long change history'
+
 printf '%s\n' 'acceptance: rebuild a cold client from remote authority'
 OFS_CONFIG="$cold_config" "$OFS_BIN" "${volume_create[@]}"
 OFS_CONFIG="$cold_config" "$OFS_BIN" sync workspace "$cold_replica" --state "$cold_state"
