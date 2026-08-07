@@ -17,5 +17,6 @@
 
 //! Shared filesystem semantics used by ofs access and volume implementations.
 
+pub mod catalog;
 pub mod filesystem;
 pub mod managed;
