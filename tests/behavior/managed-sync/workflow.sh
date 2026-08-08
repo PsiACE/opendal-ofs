@@ -49,6 +49,7 @@ esac
 
 config="$OFS_CASE_ROOT/client/config.json"
 cold_config="$OFS_CASE_ROOT/cold-client/config.json"
+direct_config="$OFS_CASE_ROOT/direct-client/config.json"
 replica_a="$OFS_CASE_ROOT/replica-a"
 replica_b="$OFS_CASE_ROOT/replica-b"
 cold_replica="$OFS_CASE_ROOT/cold-replica"
@@ -56,8 +57,30 @@ state_a="$OFS_CASE_ROOT/state/replica-a.json"
 state_b="$OFS_CASE_ROOT/state/replica-b.json"
 cold_state="$OFS_CASE_ROOT/state/cold-replica.json"
 
-mkdir -p "$(dirname "$config")" "$(dirname "$cold_config")" \
+mkdir -p "$(dirname "$config")" "$(dirname "$cold_config")" "$(dirname "$direct_config")" \
   "$replica_a" "$replica_b" "$cold_replica" "$(dirname "$state_a")"
+
+printf '%s\n' 'acceptance: expose only named volume access commands'
+cli_help=$("$OFS_BIN" --help)
+grep -Eq '^  mount[[:space:]]' <<<"$cli_help" || fail 'help omitted the Mount access command'
+grep -Eq '^  sync[[:space:]]' <<<"$cli_help" || fail 'help omitted the Sync access command'
+if grep -Eq 'MOUNT_PATH.*BACKEND_URL|OFS_MOUNT_PATH|OFS_BACKEND' <<<"$cli_help"; then
+  fail 'help still advertises the obsolete positional Direct Mount form'
+fi
+direct_create=$(OFS_CONFIG="$direct_config" "$OFS_BIN" volume create archive \
+  --model direct --storage 'memory:///acceptance')
+grep -Fq 'created direct volume "archive"' <<<"$direct_create" || \
+  fail 'named Direct volume creation did not report its result'
+direct_reopen=$(OFS_CONFIG="$direct_config" "$OFS_BIN" volume create archive \
+  --model direct --storage 'memory:///acceptance')
+grep -Fq 'opened direct volume "archive"' <<<"$direct_reopen" || \
+  fail 'named Direct volume creation was not idempotent'
+if direct_sync_error=$(OFS_CONFIG="$direct_config" "$OFS_BIN" sync archive "$cold_replica" \
+  --state "$OFS_CASE_ROOT/state/direct.json" 2>&1); then
+  fail 'Direct Sync started even though that access combination is unavailable'
+fi
+grep -Fq 'sync requires a Managed volume' <<<"$direct_sync_error" || \
+  fail 'unavailable Direct Sync did not report an actionable admission error'
 
 volume_create=(volume create workspace --model managed --storage "$OFS_STORAGE_URL")
 if [[ "$OFS_METADATA_MODE" == d1 ]]; then
@@ -67,6 +90,11 @@ fi
 printf '%s\n' 'acceptance: create and reopen one managed volume'
 OFS_CONFIG="$config" "$OFS_BIN" "${volume_create[@]}"
 OFS_CONFIG="$config" "$OFS_BIN" "${volume_create[@]}"
+if managed_mount_error=$(OFS_CONFIG="$config" "$OFS_BIN" mount workspace "$cold_replica" 2>&1); then
+  fail 'Managed Mount started even though that access combination is unavailable'
+fi
+grep -Fq 'mount currently supports Direct volumes' <<<"$managed_mount_error" || \
+  fail 'unavailable Managed Mount did not report an actionable admission error'
 
 printf '%s\n' 'private before sync' >"$replica_a/first.txt"
 OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_b" --state "$state_b"
@@ -107,6 +135,9 @@ first_pack=$(OFS_CONFIG="$config" "$OFS_BIN" volume pack workspace \
 grep -Eq 'packs=[1-9][0-9]*' <<<"$first_pack" || fail 'first pack run produced no pack'
 grep -Eq 'content=[1-9][0-9]*' <<<"$first_pack" || fail 'first pack run indexed no content'
 grep -Eq 'reclaimed=[1-9][0-9]*' <<<"$first_pack" || fail 'verified loose content was not reclaimed'
+rebuilt_index=$(OFS_CONFIG="$config" "$OFS_BIN" volume pack workspace --rebuild-index)
+grep -Eq 'rebuilt_index_content=[1-9][0-9]*' <<<"$rebuilt_index" || \
+  fail 'pack index rebuild did not recover verified content locations'
 second_pack=$(OFS_CONFIG="$config" "$OFS_BIN" volume pack workspace \
   --reclaim-loose-after-seconds 0)
 grep -Fq 'packs=0 content=0 logical_bytes=0' <<<"$second_pack" || \
@@ -166,26 +197,36 @@ cmp "$replica_a/a-only.txt" "$replica_b/a-only.txt" || fail 'replica b lost repl
 cmp "$replica_a/b-only.txt" "$replica_b/b-only.txt" || fail 'replica a lost replica b disjoint change'
 
 printf '%s\n' 'common base' >"$replica_a/shared.txt"
+printf '%s\n' 'second common base' >"$replica_a/shared-two.txt"
 OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a"
 OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_b" --state "$state_b"
 printf '%s\n' 'candidate from replica a' >"$replica_a/shared.txt"
+printf '%s\n' 'second candidate from replica a' >"$replica_a/shared-two.txt"
 printf '%s\n' 'candidate from replica b' >"$replica_b/shared.txt"
+printf '%s\n' 'second candidate from replica b' >"$replica_b/shared-two.txt"
 OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a"
 
-printf '%s\n' 'acceptance: retain and report a same-path conflict'
+printf '%s\n' 'acceptance: retain and report same-path conflicts'
 if OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_b" --state "$state_b"; then
   fail 'same-path concurrent edits succeeded without an explicit resolution'
 fi
 grep -Fxq 'candidate from replica a' "$replica_a/shared.txt" || fail 'remote conflict candidate was lost'
 grep -Fxq 'candidate from replica b' "$replica_b/shared.txt" || fail 'local conflict candidate was lost'
+grep -Fxq 'second candidate from replica a' "$replica_a/shared-two.txt" || \
+  fail 'second remote conflict candidate was lost'
+grep -Fxq 'second candidate from replica b' "$replica_b/shared-two.txt" || \
+  fail 'second local conflict candidate was lost'
 conflict_status=$(OFS_CONFIG="$config" "$OFS_BIN" status "$replica_b" --state "$state_b" --json)
-grep -Eq '"conflicts"[[:space:]]*:[[:space:]]*1' <<<"$conflict_status" || \
-  fail 'status did not report the unresolved conflict'
+grep -Eq '"conflicts"[[:space:]]*:[[:space:]]*2' <<<"$conflict_status" || \
+  fail 'status did not report both unresolved conflicts'
 
-printf '%s\n' 'acceptance: resolve explicitly with the retained local candidate'
-OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_b" --state "$state_b" --resolve shared.txt
+printf '%s\n' 'acceptance: resolve multiple conflicts explicitly with retained local candidates'
+OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_b" --state "$state_b" \
+  --resolve shared.txt --resolve shared-two.txt
 OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a"
 grep -Fxq 'candidate from replica b' "$replica_a/shared.txt" || fail 'resolved content was not published'
+grep -Fxq 'second candidate from replica b' "$replica_a/shared-two.txt" || \
+  fail 'second resolved content was not published'
 
 printf '%s\n' 'acceptance: recover a durable publication intent after process death'
 mkdir "$replica_a/crash-recovery"
@@ -276,17 +317,11 @@ grep -Fq '"foreground_layout":"whole"' <<<"$status_json" || \
   fail 'status did not report the default file layout'
 grep -Eq '"conflicts"[[:space:]]*:[[:space:]]*0' <<<"$status_json" || \
   fail 'status still reports conflicts after explicit resolution'
-for capability in stable_node_identity object_scoped_generations \
-  atomic_namespace_publication durable_common_base explicit_conflict_retention; do
-  grep -Fq -- "\"name\":\"$capability\"" <<<"$status_json" || \
-    fail "status did not report capability: $capability"
-done
-grep -Fq -- '"guarantee":' <<<"$status_json" || fail 'status omitted capability guarantees'
-for limitation in hard_links symbolic_links random_write; do
-  grep -Fq -- "\"name\":\"$limitation\"" <<<"$status_json" || \
-    fail "status did not report limitation: $limitation"
-done
-grep -Fq -- '"reason":' <<<"$status_json" || fail 'status omitted limitation reasons'
+if grep -Eq '"capabilities"|"limitations"|"guarantee"' <<<"$status_json"; then
+  fail 'status exposed a static Managed-Sync capability bundle'
+fi
+grep -Fq -- '"storage_capabilities":' <<<"$status_json" || \
+  fail 'status omitted observed storage capabilities'
 
 for name in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN OFS_D1_TOKEN; do
   secret=${!name:-}
