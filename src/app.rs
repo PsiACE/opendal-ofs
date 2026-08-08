@@ -10,7 +10,6 @@ use std::collections::BTreeMap;
 use std::env;
 use std::num::NonZeroUsize;
 use std::path::Path;
-use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use ofs::catalog::{Catalog, VolumeDefinition};
@@ -21,7 +20,7 @@ use ofs::managed::{
 };
 use ofs::sync::{ReplicaState, SyncEngine};
 use opendal::Operator;
-use opendal::layers::ConcurrentLimitLayer;
+use opendal::layers::{ConcurrentLimitLayer, RetryLayer};
 use url::Url;
 
 use crate::cli::{
@@ -39,7 +38,7 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Volume {
             command: VolumeCommand::Create(args),
-        } => create_volume(cli.config.as_deref(), args, transfer_concurrency).await,
+        } => create_volume(cli.config.as_deref(), *args, transfer_concurrency).await,
         Command::Volume {
             command: VolumeCommand::Pack(args),
         } => pack_volume(cli.config.as_deref(), args, transfer_concurrency).await,
@@ -96,51 +95,12 @@ async fn pack_volume(
     let packed = volume
         .pack_reachable_content(&observed, OperationId::generate())
         .await?;
-    let mut retired = 0;
-    let mut replacements = 0;
-    if let Some(grace_seconds) = args.repack_grace_seconds {
-        let fixed = volume
-            .observe()
-            .await?
-            .context("Managed volume has no namespace recovery root for repack")?;
-        if let Some(retirement) = volume
-            .repack_reachable_content(&fixed, OperationId::generate())
-            .await?
-        {
-            replacements = retirement.replacement_packs().len();
-            if grace_seconds > 0 {
-                tokio::time::sleep(Duration::from_secs(grace_seconds)).await;
-            }
-            let current = volume
-                .observe()
-                .await?
-                .context("Managed namespace disappeared during pack retirement")?;
-            retired = volume
-                .finalize_pack_retirement(&current, retirement)
-                .await?
-                .len();
-        }
-    }
-    let mut reclaimed = 0;
-    if let Some(grace_seconds) = args.reclaim_loose_after_seconds {
-        if grace_seconds > 0 {
-            tokio::time::sleep(Duration::from_secs(grace_seconds)).await;
-        }
-        let current = volume
-            .observe()
-            .await?
-            .context("Managed namespace disappeared during loose data reclamation")?;
-        reclaimed = volume.reclaim_packed_loose(&current).await?;
-    }
     println!(
-        "packed {:?}: packs={} content={} logical_bytes={} replacements={} retired={} reclaimed={}{}",
+        "packed {:?}: packs={} content={} logical_bytes={}{}",
         args.alias,
-        packed.packs.len(),
-        packed.reclaimable_loose.len(),
+        packed.pack_count(),
+        packed.content_count(),
         packed.logical_bytes,
-        replacements,
-        retired,
-        reclaimed,
         rebuilt
             .map(|content| format!(" rebuilt_index_content={content}"))
             .unwrap_or_default(),
@@ -381,12 +341,7 @@ fn open_metadata(data: Operator, metadata: Option<&Url>) -> Result<Metadata> {
 }
 
 fn managed_format(volume_id: VolumeId, placement: MetadataPlacement) -> Result<ManagedFormat> {
-    ManagedFormat::v1(
-        volume_id,
-        placement,
-        [ManagedExtension::FastCdc, ManagedExtension::Pack],
-    )
-    .map_err(Into::into)
+    ManagedFormat::v1(volume_id, placement, [ManagedExtension::FastCdc]).map_err(Into::into)
 }
 
 async fn sync_volume(
@@ -505,10 +460,17 @@ fn status(
                 "transfer_concurrency": transfer_concurrency.get(),
             },
             "operator": {
-                "layers": [{
-                    "name": "opendal.concurrent_limit",
-                    "limit": transfer_concurrency.get(),
-                }],
+                "layers": [
+                    {
+                        "name": "opendal.concurrent_limit",
+                        "limit": transfer_concurrency.get(),
+                    },
+                    {
+                        "name": "opendal.retry",
+                        "jitter": true,
+                        "max_times": 4,
+                    },
+                ],
                 "ofs_custom_layer_order": [],
             },
             "durable_state_owners": ["managed_metadata", "managed_data", "sync_replica"],
@@ -525,7 +487,6 @@ fn status(
         },
         "storage_capabilities": {
             "read": storage_capabilities.read,
-            "range_read": storage_capabilities.read,
             "write": storage_capabilities.write,
             "create_only": storage_capabilities.write_with_if_not_exists,
             "compare_and_swap": storage_capabilities.write_with_if_match,
@@ -589,7 +550,11 @@ fn open_operator(url: &Url, transfer_concurrency: NonZeroUsize) -> Result<Operat
         }
     }
     Operator::via_iter(url.scheme(), arguments)
-        .map(|operator| operator.layer(ConcurrentLimitLayer::new(transfer_concurrency.get())))
+        .map(|operator| {
+            operator
+                .layer(ConcurrentLimitLayer::new(transfer_concurrency.get()))
+                .layer(RetryLayer::new().with_jitter().with_max_times(4))
+        })
         .map_err(|_| {
             anyhow!("cannot configure --storage; check its scheme, endpoint, bucket, and root")
         })

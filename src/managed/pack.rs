@@ -24,22 +24,19 @@ use std::sync::Arc;
 use opendal::{ErrorKind, Operator};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::OnceCell;
 
 use super::{ManagedError, ManagedErrorKind};
 use crate::filesystem::OperationId;
 use crate::managed::namespace::ContentRef;
 use crate::managed::section::{self, Record as SectionRecord, Reference as SectionReference};
 
-const PACK_ROOT: &str = ".ofs/managed/extensions/data-pack/v1/packs/sha256";
-const INDEX_ROOT: &str = ".ofs/managed/indexes/data-pack/v1";
+const PACK_ROOT: &str = ".ofs/managed/indexes/data-pack/v1/packs/sha256";
 const INDEX_SECTION_ROOT: &str = ".ofs/managed/indexes/data-pack/v1/sections/sha256";
 const HEAD_KEY: &str = ".ofs/managed/indexes/data-pack/v1/head.ofs";
 const PACK_MAGIC: &[u8; 8] = b"OFSPACK1";
 const TRAILER_MAGIC: &[u8; 8] = b"OFSPTRL1";
 const FOOTER_MAGIC: &str = "ofs-pack-footer";
-const CHECKPOINT_MAGIC: &str = "ofs-pack-index-checkpoint";
-const REVISION_MAGIC: &str = "ofs-pack-index-revision";
 const HEAD_MAGIC: &str = "ofs-pack-index-head";
 const FORMAT_MAJOR: u16 = 1;
 const INDEX_SECTION: u8 = 32;
@@ -49,18 +46,12 @@ const TRAILER_LENGTH: u64 = 56;
 /// Identity of an immutable pack. It is the SHA-256 checksum in its trailer.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
-pub struct PackId([u8; 32]);
-
-impl PackId {
-    pub const fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-}
+pub(crate) struct PackId([u8; 32]);
 
 /// Physical range containing one content object.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct PackLocation {
+pub(crate) struct PackLocation {
     pub pack: PackId,
     pub offset: u64,
     pub stored_length: u64,
@@ -69,7 +60,7 @@ pub struct PackLocation {
 
 /// Result of sealing one immutable pack.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SealedPack {
+pub(crate) struct SealedPack {
     pub id: PackId,
     pub locations: BTreeMap<ContentRef, PackLocation>,
 }
@@ -89,29 +80,21 @@ impl VerifiedPack {
     }
 }
 
-type CachedPack = Arc<OnceCell<Result<Arc<SealedPack>, ManagedError>>>;
-
 /// Pack locations fixed for one materialization operation.
 #[derive(Clone, Debug)]
 pub(crate) struct PackReadSession {
-    enabled: bool,
     operator: Operator,
     store: PackStore,
     index: Arc<OnceCell<Result<Option<PackIndex>, ManagedError>>>,
-    packs: Arc<Mutex<BTreeMap<PackId, CachedPack>>>,
 }
 
 impl PackReadSession {
-    pub(crate) fn new(operator: Operator, enabled: bool) -> Result<Self, ManagedError> {
-        if enabled {
-            require_index_read_capabilities(&operator)?;
-        }
+    pub(crate) fn new(operator: Operator) -> Result<Self, ManagedError> {
+        require_index_read_capabilities(&operator)?;
         Ok(Self {
-            enabled,
             operator: operator.clone(),
             store: PackStore { operator },
             index: Arc::new(OnceCell::new()),
-            packs: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -120,9 +103,6 @@ impl PackReadSession {
         &self,
         content: ContentRef,
     ) -> Result<Vec<PackLocation>, ManagedError> {
-        if !self.enabled {
-            return Ok(Vec::new());
-        }
         let operator = self.operator.clone();
         let index = self
             .index
@@ -131,15 +111,12 @@ impl PackReadSession {
         match index {
             Ok(Some(index)) => Ok(index.locations(content).to_vec()),
             Ok(None) => Ok(Vec::new()),
-            Err(error) => Err(error.clone()),
+            Err(_) => Ok(Vec::new()),
         }
     }
 
     /// Download a complete pack without retaining it in this session.
     pub(crate) async fn read_full(&self, id: PackId) -> Result<VerifiedPack, ManagedError> {
-        if !self.enabled {
-            return Err(unsupported("data-pack/1 is not enabled for this volume"));
-        }
         self.store.read_complete(id).await
     }
 
@@ -152,31 +129,7 @@ impl PackReadSession {
 
         let mut failure = None;
         for location in locations {
-            let cell = {
-                let mut packs = self.packs.lock().await;
-                packs
-                    .entry(location.pack)
-                    .or_insert_with(|| Arc::new(OnceCell::new()))
-                    .clone()
-            };
-            let store = self.store.clone();
-            let pack = cell
-                .get_or_init(|| async move {
-                    store
-                        .inspect_inner(location.pack, false)
-                        .await
-                        .map(|(pack, _)| pack)
-                        .map(Arc::new)
-                })
-                .await;
-            let pack = match pack {
-                Ok(pack) => pack,
-                Err(error) => {
-                    failure = Some(error.clone());
-                    continue;
-                }
-            };
-            match self.store.read_verified(content, location, pack).await {
+            match self.store.read_range(content, location).await {
                 Ok(bytes) => return Ok(Some(bytes)),
                 Err(error) => failure = Some(error),
             }
@@ -184,33 +137,70 @@ impl PackReadSession {
         Err(failure
             .unwrap_or_else(|| corrupt("read Managed data", "pack locations cannot be resolved")))
     }
+
+    /// Fetch several indexed entries from one pack with OpenDAL's native range
+    /// merger. Content identities verify the derived index without separate
+    /// stat, trailer, or footer requests on the read path.
+    pub(crate) async fn read_ranges(
+        &self,
+        id: PackId,
+        entries: &[(ContentRef, PackLocation)],
+    ) -> Result<Vec<Vec<u8>>, ManagedError> {
+        let mut ranges = Vec::with_capacity(entries.len());
+        for (content, location) in entries {
+            validate_indexed_range(*content, *location, id)?;
+            ranges.push(location.offset..location.offset + location.stored_length);
+        }
+        let reader = self
+            .operator
+            .reader(&pack_key(id))
+            .await
+            .map_err(|_| unavailable("read pack content", "pack is unavailable"))?;
+        let buffers = reader
+            .fetch(ranges)
+            .await
+            .map_err(|_| unavailable("read pack content", "content ranges are unavailable"))?;
+        entries
+            .iter()
+            .zip(buffers)
+            .map(|((content, _), buffer)| {
+                let bytes = buffer.to_bytes().to_vec();
+                if content_ref(&bytes) != *content {
+                    return Err(corrupt(
+                        "read pack content",
+                        "content range fails validation",
+                    ));
+                }
+                Ok(bytes)
+            })
+            .collect()
+    }
 }
 
 /// Concrete pack storage backed by one OpenDAL operator.
 #[derive(Clone, Debug)]
-pub struct PackStore {
+pub(crate) struct PackStore {
     operator: Operator,
 }
 
 impl PackStore {
-    pub fn new(operator: Operator) -> Result<Self, ManagedError> {
+    pub(crate) fn new(operator: Operator) -> Result<Self, ManagedError> {
         let capability = operator.info().full_capability();
         if !capability.read
             || !capability.write
             || !capability.write_with_if_not_exists
             || !capability.stat
-            || !capability.list
         {
             return Err(unavailable(
                 "open pack store",
-                "pack storage requires read, write, stat, list, and create-only write",
+                "pack storage requires read, write, stat, and create-only write",
             ));
         }
         Ok(Self { operator })
     }
 
     /// Seal distinct, non-empty content objects into a format-v1 pack.
-    pub async fn seal(
+    pub(crate) async fn seal(
         &self,
         operation: OperationId,
         contents: impl IntoIterator<Item = Vec<u8>>,
@@ -250,7 +240,7 @@ impl PackStore {
             &Footer {
                 magic: FOOTER_MAGIC.to_owned(),
                 major: FORMAT_MAJOR,
-                entries: footer_entries,
+                entries: footer_entries.clone(),
             },
             "seal pack",
         )?;
@@ -264,17 +254,26 @@ impl PackStore {
         let id = PackId(checksum);
         let key = pack_key(id);
         create_immutable(&self.operator, &key, &encoded, "seal pack").await?;
-        self.inspect(id).await
-    }
-
-    /// Verify the complete pack and return its footer-derived locations.
-    pub async fn inspect(&self, id: PackId) -> Result<SealedPack, ManagedError> {
-        self.read_complete(id).await.map(|verified| verified.pack)
+        let locations = footer_entries
+            .into_iter()
+            .map(|entry| {
+                (
+                    entry.content,
+                    PackLocation {
+                        pack: id,
+                        offset: entry.offset,
+                        stored_length: entry.stored_length,
+                        logical_length: entry.content.logical_length,
+                    },
+                )
+            })
+            .collect();
+        Ok(SealedPack { id, locations })
     }
 
     /// Download and verify a complete pack for reading several entries.
     pub(crate) async fn read_complete(&self, id: PackId) -> Result<VerifiedPack, ManagedError> {
-        let (pack, bytes) = self.inspect_inner(id, true).await?;
+        let (pack, bytes) = self.inspect_inner(id, true, None).await?;
         Ok(VerifiedPack {
             pack,
             bytes: bytes.expect("complete inspection retains the downloaded pack"),
@@ -285,6 +284,7 @@ impl PackStore {
         &self,
         id: PackId,
         verify_checksum: bool,
+        length_hint: Option<u64>,
     ) -> Result<(SealedPack, Option<Vec<u8>>), ManagedError> {
         let key = pack_key(id);
         let complete = if verify_checksum {
@@ -301,12 +301,15 @@ impl PackStore {
         };
         let length = match &complete {
             Some(bytes) => bytes.len() as u64,
-            None => self
-                .operator
-                .stat(&key)
-                .await
-                .map_err(|_| unavailable("inspect pack", "pack metadata is unavailable"))?
-                .content_length(),
+            None => match length_hint {
+                Some(length) => length,
+                None => self
+                    .operator
+                    .stat(&key)
+                    .await
+                    .map_err(|_| unavailable("inspect pack", "pack metadata is unavailable"))?
+                    .content_length(),
+            },
         };
         if length < HEADER_LENGTH + TRAILER_LENGTH {
             return Err(corrupt("inspect pack", "pack is shorter than its envelope"));
@@ -318,6 +321,7 @@ impl PackStore {
                 .operator
                 .read_with(&key)
                 .range(length - TRAILER_LENGTH..length)
+                .content_length_hint(length)
                 .await
                 .map_err(|_| unavailable("inspect pack", "pack trailer is unavailable"))?
                 .to_bytes()
@@ -364,6 +368,7 @@ impl PackStore {
                 .operator
                 .read_with(&key)
                 .range(footer_offset..trailer_offset)
+                .content_length_hint(length)
                 .await
                 .map_err(|_| unavailable("inspect pack", "pack footer is unavailable"))?
                 .to_bytes()
@@ -412,16 +417,15 @@ impl PackStore {
         Ok((SealedPack { id, locations }, complete))
     }
 
-    pub(crate) async fn read_verified(
+    pub(crate) async fn read_range(
         &self,
         content: ContentRef,
         location: PackLocation,
-        pack: &SealedPack,
     ) -> Result<Vec<u8>, ManagedError> {
-        validate_location(content, location, pack)?;
+        validate_indexed_range(content, location, location.pack)?;
         let bytes = self
             .operator
-            .read_with(&pack_key(pack.id))
+            .read_with(&pack_key(location.pack))
             .range(location.offset..location.offset + location.stored_length)
             .await
             .map_err(|_| unavailable("read pack content", "content range is unavailable"))?
@@ -438,6 +442,12 @@ impl PackStore {
 
     /// Rebuild and publish the derived pack index from verified pack footers.
     pub(crate) async fn rebuild_index(&self) -> Result<usize, ManagedError> {
+        if !self.operator.info().full_capability().list {
+            return Err(unavailable(
+                "rebuild pack index",
+                "pack storage does not support list",
+            ));
+        }
         let mut locations: BTreeMap<ContentRef, Vec<PackLocation>> = BTreeMap::new();
         let entries = self
             .operator
@@ -449,18 +459,24 @@ impl PackStore {
             let Some(id) = pack_id_from_key(path) else {
                 continue;
             };
-            for (content, location) in self.inspect(id).await?.locations {
+            let length = entry.metadata().content_length();
+            let length_hint = (length > 0).then_some(length);
+            let pack = self
+                .inspect_inner(id, false, length_hint)
+                .await
+                .map(|(pack, _)| pack)?;
+            for (content, location) in pack.locations {
                 locations.entry(content).or_default().push(location);
             }
         }
         normalize_locations(&mut locations);
-        let (parent, head_etag) = read_head_state(&self.operator).await?;
+        let (published, head_etag) = read_head_etag(&self.operator).await?;
         let mut index = PackIndex {
             operator: self.operator.clone(),
             locations,
             sections: Vec::new(),
             dirty: BTreeSet::new(),
-            revision: parent,
+            published,
             head_etag,
         };
         index.dirty.extend(index.locations.keys().copied());
@@ -468,36 +484,24 @@ impl PackStore {
         index.persist().await?;
         Ok(content_count)
     }
-
-    pub(crate) async fn delete(&self, id: PackId) -> Result<(), ManagedError> {
-        if !self.operator.info().full_capability().delete {
-            return Err(unavailable(
-                "delete retired pack",
-                "pack storage does not support delete",
-            ));
-        }
-        self.operator
-            .delete(&pack_key(id))
-            .await
-            .map_err(|_| unavailable("delete retired pack", "retired pack cannot be deleted"))
-    }
 }
 
-fn validate_location(
+fn validate_indexed_range(
     content: ContentRef,
     location: PackLocation,
-    pack: &SealedPack,
+    pack: PackId,
 ) -> Result<(), ManagedError> {
-    if location.logical_length != content.logical_length {
+    if location.pack != pack
+        || location.logical_length != content.logical_length
+        || location.stored_length != content.logical_length
+        || location
+            .offset
+            .checked_add(location.stored_length)
+            .is_none()
+    {
         return Err(corrupt(
             "read pack content",
-            "index length disagrees with content",
-        ));
-    }
-    if pack.locations.get(&content) != Some(&location) {
-        return Err(corrupt(
-            "read pack content",
-            "index range disagrees with pack footer",
+            "indexed content range is invalid",
         ));
     }
     Ok(())
@@ -505,24 +509,24 @@ fn validate_location(
 
 /// Rebuildable mapping from logical content identities to pack ranges.
 #[derive(Clone, Debug)]
-pub struct PackIndex {
+pub(crate) struct PackIndex {
     operator: Operator,
     locations: BTreeMap<ContentRef, Vec<PackLocation>>,
     sections: Vec<StoredIndexSectionReference>,
     dirty: BTreeSet<ContentRef>,
-    revision: Option<[u8; 32]>,
+    published: bool,
     head_etag: Option<String>,
 }
 
 impl PackIndex {
-    pub fn locations(&self, content: ContentRef) -> &[PackLocation] {
+    pub(crate) fn locations(&self, content: ContentRef) -> &[PackLocation] {
         self.locations
             .get(&content)
             .map(Vec::as_slice)
             .unwrap_or(&[])
     }
 
-    pub fn add(&mut self, pack: &SealedPack) {
+    pub(crate) fn add(&mut self, pack: &SealedPack) {
         for (content, location) in &pack.locations {
             let locations = self.locations.entry(*content).or_default();
             if !locations.contains(location) {
@@ -533,43 +537,8 @@ impl PackIndex {
         }
     }
 
-    pub(crate) fn pack_ids(&self) -> BTreeSet<PackId> {
-        self.locations
-            .values()
-            .flatten()
-            .map(|location| location.pack)
-            .collect()
-    }
-
-    pub(crate) fn validate_pack(&self, pack: &SealedPack) -> Result<(), ManagedError> {
-        let valid = self.locations.iter().all(|(content, locations)| {
-            locations.iter().all(|location| {
-                location.pack != pack.id || pack.locations.get(content) == Some(location)
-            })
-        });
-        if valid {
-            Ok(())
-        } else {
-            Err(corrupt(
-                "repack content",
-                "pack index disagrees with a verified pack footer",
-            ))
-        }
-    }
-
-    pub(crate) fn remove_packs(&mut self, retired: &BTreeSet<PackId>) {
-        for (content, locations) in &mut self.locations {
-            let before = locations.len();
-            locations.retain(|location| !retired.contains(&location.pack));
-            if locations.len() != before {
-                self.dirty.insert(*content);
-            }
-        }
-        normalize_locations(&mut self.locations);
-    }
-
     pub(crate) fn require_update(&self) -> Result<(), ManagedError> {
-        if self.revision.is_some()
+        if self.published
             && (!self.operator.info().full_capability().write_with_if_match
                 || self.head_etag.is_none())
         {
@@ -583,49 +552,21 @@ impl PackIndex {
     }
 
     /// Open the published index. A missing head means no index exists yet.
-    pub async fn open(operator: Operator) -> Result<Option<Self>, ManagedError> {
+    pub(crate) async fn open(operator: Operator) -> Result<Option<Self>, ManagedError> {
         require_index_read_capabilities(&operator)?;
         let Some((head_bytes, etag)) = read_head(&operator).await? else {
             return Ok(None);
         };
         let head: IndexHead = decode(&head_bytes, "open pack index")?;
         validate_record(&head.magic, head.major, HEAD_MAGIC, "open pack index")?;
-        let revision_bytes =
-            read_required(&operator, &revision_key(head.revision), "open pack index").await?;
-        if digest(&revision_bytes) != head.revision {
-            return Err(corrupt("open pack index", "revision identity is invalid"));
-        }
-        let revision: IndexRevision = decode(&revision_bytes, "open pack index")?;
-        validate_record(
-            &revision.magic,
-            revision.major,
-            REVISION_MAGIC,
-            "open pack index",
-        )?;
-        let checkpoint_bytes = read_required(
-            &operator,
-            &checkpoint_key(revision.checkpoint),
-            "open pack index",
-        )
-        .await?;
-        if digest(&checkpoint_bytes) != revision.checkpoint {
-            return Err(corrupt("open pack index", "checkpoint identity is invalid"));
-        }
-        let checkpoint: IndexCheckpoint = decode(&checkpoint_bytes, "open pack index")?;
-        validate_record(
-            &checkpoint.magic,
-            checkpoint.major,
-            CHECKPOINT_MAGIC,
-            "open pack index",
-        )?;
-        let sections = checkpoint.sections.clone();
-        let locations = checkpoint.into_locations(&operator).await?;
+        let sections = head.sections.clone();
+        let locations = head.into_locations(&operator).await?;
         Ok(Some(Self {
             operator,
             locations,
             sections,
             dirty: BTreeSet::new(),
-            revision: Some(head.revision),
+            published: true,
             head_etag: etag,
         }))
     }
@@ -638,58 +579,21 @@ impl PackIndex {
                 locations: BTreeMap::new(),
                 sections: Vec::new(),
                 dirty: BTreeSet::new(),
-                revision: None,
+                published: false,
                 head_etag: None,
             }),
         }
     }
 
-    /// Publish current entries through immutable records and a conditional head update.
-    pub async fn persist(&mut self) -> Result<(), ManagedError> {
+    /// Publish immutable sections through one conditional head update.
+    pub(crate) async fn persist(&mut self) -> Result<(), ManagedError> {
         require_index_create_capabilities(&self.operator)?;
         self.require_update()?;
         normalize_locations(&mut self.locations);
-        let checkpoint = IndexCheckpoint::from_locations(
-            &self.operator,
-            &self.locations,
-            &self.sections,
-            &self.dirty,
-        )
-        .await?;
-        let checkpoint_bytes = encode(&checkpoint, "persist pack index")?;
-        let checkpoint_id = digest(&checkpoint_bytes);
-        create_immutable(
-            &self.operator,
-            &checkpoint_key(checkpoint_id),
-            &checkpoint_bytes,
-            "persist pack index",
-        )
-        .await?;
-
-        let revision = IndexRevision {
-            magic: REVISION_MAGIC.to_owned(),
-            major: FORMAT_MAJOR,
-            parent: self.revision,
-            checkpoint: checkpoint_id,
-        };
-        let revision_bytes = encode(&revision, "persist pack index")?;
-        let revision_id = digest(&revision_bytes);
-        create_immutable(
-            &self.operator,
-            &revision_key(revision_id),
-            &revision_bytes,
-            "persist pack index",
-        )
-        .await?;
-
-        let head_bytes = encode(
-            &IndexHead {
-                magic: HEAD_MAGIC.to_owned(),
-                major: FORMAT_MAJOR,
-                revision: revision_id,
-            },
-            "persist pack index",
-        )?;
+        let head =
+            IndexHead::from_locations(&self.operator, &self.locations, &self.sections, &self.dirty)
+                .await?;
+        let head_bytes = encode(&head, "persist pack index")?;
         let result = match &self.head_etag {
             Some(etag) => {
                 self.operator
@@ -704,8 +608,8 @@ impl PackIndex {
                     .await
             }
         };
-        match result {
-            Ok(_) => {}
+        let metadata = match result {
+            Ok(metadata) => metadata,
             Err(error)
                 if matches!(
                     error.kind(),
@@ -724,12 +628,19 @@ impl PackIndex {
                     "pack index head cannot be written",
                 ));
             }
-        }
-        let (_, etag) = read_head(&self.operator)
-            .await?
-            .ok_or_else(|| corrupt("persist pack index", "published head is missing"))?;
-        self.revision = Some(revision_id);
-        self.sections = checkpoint.sections;
+        };
+        let etag = match metadata.etag() {
+            Some(etag) => Some(etag.to_owned()),
+            None => self
+                .operator
+                .stat(HEAD_KEY)
+                .await
+                .map_err(|_| unavailable("persist pack index", "published head is unavailable"))?
+                .etag()
+                .map(str::to_owned),
+        };
+        self.published = true;
+        self.sections = head.sections;
         self.dirty.clear();
         self.head_etag = etag;
         Ok(())
@@ -761,7 +672,7 @@ enum Codec {
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct IndexCheckpoint {
+struct IndexHead {
     magic: String,
     major: u16,
     sections: Vec<StoredIndexSectionReference>,
@@ -805,9 +716,16 @@ impl StoredIndexSectionReference {
             encoded_bytes: self.encoded_bytes,
         }
     }
+
+    fn located(&self) -> section::Located {
+        section::Located {
+            reference: self.as_reference(),
+            offset: self.offset,
+        }
+    }
 }
 
-impl IndexCheckpoint {
+impl IndexHead {
     async fn from_locations(
         operator: &Operator,
         locations: &BTreeMap<ContentRef, Vec<PackLocation>>,
@@ -902,7 +820,7 @@ impl IndexCheckpoint {
         sections.sort_by(|left, right| left.first_key.cmp(&right.first_key));
         validate_index_sections(&sections, "persist pack index")?;
         Ok(Self {
-            magic: CHECKPOINT_MAGIC.to_owned(),
+            magic: HEAD_MAGIC.to_owned(),
             major: FORMAT_MAJOR,
             sections,
         })
@@ -928,7 +846,7 @@ impl IndexCheckpoint {
                         .iter()
                         .any(|location| location.logical_length != content.logical_length)
                 {
-                    return Err(corrupt("open pack index", "checkpoint entries are invalid"));
+                    return Err(corrupt("open pack index", "index entries are invalid"));
                 }
                 previous = Some(content);
                 output.insert(content, locations);
@@ -953,45 +871,20 @@ async fn read_index_sections(
     let mut decoded = Vec::with_capacity(stored.len());
     for (object, mut sections) in objects {
         sections.sort_by_key(|section| section.offset);
-        let first = sections
-            .first()
-            .expect("section object is non-empty")
-            .offset;
-        let end = sections.iter().try_fold(first, |end, section| {
-            section
-                .offset
-                .checked_add(section.encoded_bytes)
-                .map(|section_end| end.max(section_end))
-                .ok_or_else(|| corrupt(action, "index section range is invalid"))
-        })?;
-        let bytes = operator
-            .read_with(&index_section_key(object))
-            .range(first..end)
-            .await
-            .map_err(|error| {
-                if error.kind() == ErrorKind::NotFound {
-                    corrupt(action, "index section data object is missing")
-                } else {
-                    unavailable(action, "pack index storage is unavailable")
-                }
-            })?
-            .to_bytes();
-        for section in sections {
-            let start = usize::try_from(section.offset - first)
-                .map_err(|_| corrupt(action, "index section range is invalid"))?;
-            let length = usize::try_from(section.encoded_bytes)
-                .map_err(|_| corrupt(action, "index section range is invalid"))?;
-            let section_end = start
-                .checked_add(length)
-                .filter(|section_end| *section_end <= bytes.len())
-                .ok_or_else(|| corrupt(action, "index section range is invalid"))?;
-            let records = section::decode(
-                &section.as_reference(),
-                [0; 16],
-                &bytes[start..section_end],
-                action,
-            )?;
-            decoded.push((section, records));
+        let located = sections
+            .iter()
+            .map(StoredIndexSectionReference::located)
+            .collect();
+        let fetched = section::fetch(
+            operator,
+            &index_section_key(object),
+            [0; 16],
+            located,
+            action,
+        )
+        .await?;
+        for (stored, (_, records)) in sections.into_iter().zip(fetched) {
+            decoded.push((stored, records));
         }
     }
     decoded.sort_by(|(left, _), (right, _)| left.first_key.cmp(&right.first_key));
@@ -1054,23 +947,6 @@ async fn persist_index_sections(
         .collect())
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct IndexRevision {
-    magic: String,
-    major: u16,
-    parent: Option<[u8; 32]>,
-    checkpoint: [u8; 32],
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct IndexHead {
-    magic: String,
-    major: u16,
-    revision: [u8; 32],
-}
-
 async fn read_head(operator: &Operator) -> Result<Option<(Vec<u8>, Option<String>)>, ManagedError> {
     let reader = match operator.reader(HEAD_KEY).await {
         Ok(reader) => reader,
@@ -1089,35 +965,11 @@ async fn read_head(operator: &Operator) -> Result<Option<(Vec<u8>, Option<String
     Ok(Some((bytes, etag)))
 }
 
-async fn read_head_state(
-    operator: &Operator,
-) -> Result<(Option<[u8; 32]>, Option<String>), ManagedError> {
-    let Some((bytes, etag)) = read_head(operator).await? else {
-        return Ok((None, None));
-    };
-    let revision = decode::<IndexHead>(&bytes, "read pack index")
-        .ok()
-        .filter(|head| head.magic == HEAD_MAGIC && head.major == FORMAT_MAJOR)
-        .map(|head| head.revision);
-    Ok((revision, etag))
-}
-
-async fn read_required(
-    operator: &Operator,
-    key: &str,
-    action: &'static str,
-) -> Result<Vec<u8>, ManagedError> {
-    operator
-        .read(key)
-        .await
-        .map(|bytes| bytes.to_bytes().to_vec())
-        .map_err(|error| {
-            if error.kind() == ErrorKind::NotFound {
-                corrupt(action, "referenced index record is missing")
-            } else {
-                unavailable(action, "index record is unavailable")
-            }
-        })
+async fn read_head_etag(operator: &Operator) -> Result<(bool, Option<String>), ManagedError> {
+    Ok(match read_head(operator).await? {
+        Some((_, etag)) => (true, etag),
+        None => (false, None),
+    })
 }
 
 async fn create_immutable(
@@ -1204,10 +1056,6 @@ fn pack_key(id: PackId) -> String {
     format!("{PACK_ROOT}/{}.pack", hex(&id.0))
 }
 
-fn checkpoint_key(id: [u8; 32]) -> String {
-    format!("{INDEX_ROOT}/checkpoints/sha256/{}.ofs", hex(&id))
-}
-
 fn index_section_key(id: [u8; 32]) -> String {
     let encoded = hex(&id);
     format!("{INDEX_SECTION_ROOT}/{encoded}.ofs")
@@ -1228,10 +1076,6 @@ fn content_from_key(key: &[u8]) -> Option<ContentRef> {
         digest: key[..32].try_into().expect("fixed digest prefix"),
         logical_length: u64::from_be_bytes(key[32..].try_into().expect("fixed length suffix")),
     })
-}
-
-fn revision_key(id: [u8; 32]) -> String {
-    format!("{INDEX_ROOT}/revisions/sha256/{}.ofs", hex(&id))
 }
 
 fn pack_id_from_key(key: &str) -> Option<PackId> {
@@ -1323,14 +1167,6 @@ fn invalid(action: &'static str, message: &'static str) -> ManagedError {
     ManagedError::new(ManagedErrorKind::Invalid, action, message)
 }
 
-fn unsupported(message: &'static str) -> ManagedError {
-    ManagedError::new(
-        ManagedErrorKind::UnsupportedFormat,
-        "read Managed pack",
-        message,
-    )
-}
-
 fn corrupt(action: &'static str, message: &'static str) -> ManagedError {
     ManagedError::new(ManagedErrorKind::Corrupt, action, message)
 }
@@ -1390,14 +1226,10 @@ mod tests {
         let changed = *locations.keys().nth(40).unwrap();
         locations.get_mut(&changed).unwrap()[0].offset += 1;
 
-        let checkpoint = IndexCheckpoint::from_locations(
-            &operator,
-            &locations,
-            &previous,
-            &BTreeSet::from([changed]),
-        )
-        .await
-        .unwrap();
+        let checkpoint =
+            IndexHead::from_locations(&operator, &locations, &previous, &BTreeSet::from([changed]))
+                .await
+                .unwrap();
         let previous_ids = previous
             .iter()
             .map(|section| section.id)
@@ -1435,10 +1267,7 @@ mod tests {
         assert_eq!(sealed.locations.len(), 2);
         let alpha = content_ref(b"alpha");
         let location = sealed.locations[&alpha];
-        assert_eq!(
-            store.read_verified(alpha, location, &sealed).await.unwrap(),
-            b"alpha"
-        );
+        assert_eq!(store.read_range(alpha, location).await.unwrap(), b"alpha");
 
         assert_eq!(store.rebuild_index().await.unwrap(), 2);
         let rebuilt = PackIndex::open(operator.clone()).await.unwrap().unwrap();
@@ -1462,7 +1291,7 @@ mod tests {
         assert_eq!(complete.content(content_ref(b"missing")), None);
         assert_eq!(
             store
-                .read_verified(content, sealed.locations[&content], &sealed)
+                .read_range(content, sealed.locations[&content])
                 .await
                 .unwrap(),
             b"on disk"
@@ -1485,7 +1314,7 @@ mod tests {
         bytes[HEADER_LENGTH as usize] ^= 0xff;
         operator.write(&key, bytes).await.unwrap();
 
-        let error = store.inspect(sealed.id).await.unwrap_err();
+        let error = store.read_complete(sealed.id).await.unwrap_err();
         assert_eq!(error.kind(), ManagedErrorKind::Corrupt);
     }
 }

@@ -874,46 +874,20 @@ impl ObjectNamespace {
         let mut decoded = Vec::with_capacity(stored.len());
         for (object, mut sections) in objects {
             sections.sort_by_key(|section| section.offset);
-            let first = sections
-                .first()
-                .expect("section object is non-empty")
-                .offset;
-            let end = sections.iter().try_fold(first, |end, section| {
-                section
-                    .offset
-                    .checked_add(section.encoded_bytes)
-                    .map(|section_end| end.max(section_end))
-                    .ok_or_else(|| corrupt(action, "checkpoint section range is invalid"))
-            })?;
-            let bytes = self
-                .operator
-                .read_with(&section_key(&object))
-                .range(first..end)
-                .await
-                .map_err(|error| {
-                    if error.kind() == ErrorKind::NotFound {
-                        corrupt(action, "checkpoint section data object is missing")
-                    } else {
-                        unavailable(action)
-                    }
-                })?
-                .to_bytes();
-            for section in sections {
-                let start = usize::try_from(section.offset - first)
-                    .map_err(|_| corrupt(action, "checkpoint section range is invalid"))?;
-                let length = usize::try_from(section.encoded_bytes)
-                    .map_err(|_| corrupt(action, "checkpoint section range is invalid"))?;
-                let section_end = start
-                    .checked_add(length)
-                    .filter(|section_end| *section_end <= bytes.len())
-                    .ok_or_else(|| corrupt(action, "checkpoint section range is invalid"))?;
-                let records = section::decode(
-                    &section.as_reference(),
-                    *self.volume_id.as_bytes(),
-                    &bytes[start..section_end],
-                    action,
-                )?;
-                decoded.push((section, records));
+            let located = sections
+                .iter()
+                .map(StoredSectionReference::located)
+                .collect();
+            let fetched = section::fetch(
+                &self.operator,
+                &section_key(&object),
+                *self.volume_id.as_bytes(),
+                located,
+                action,
+            )
+            .await?;
+            for (stored, (_, records)) in sections.into_iter().zip(fetched) {
+                decoded.push((stored, records));
             }
         }
         decoded.sort_by(|(left, _), (right, _)| {
@@ -1552,6 +1526,13 @@ impl StoredSectionReference {
             last_key: self.last_key.clone(),
             records: self.records,
             encoded_bytes: self.encoded_bytes,
+        }
+    }
+
+    fn located(&self) -> section::Located {
+        section::Located {
+            reference: self.as_reference(),
+            offset: self.offset,
         }
     }
 }

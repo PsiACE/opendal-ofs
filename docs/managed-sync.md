@@ -182,7 +182,7 @@ ofs sync workspace worktree --state state/worktree.json --resolve path/to/file
 `--resolve` publishes the current local candidate for that path. Review the
 file before running the command. Sync never chooses a last writer silently.
 
-## Pack and reclaim data
+## Pack data
 
 Packing is explicit maintenance over a fixed namespace snapshot. It selects
 reachable, non-empty whole-file content no larger than 256 KiB. A pack contains
@@ -204,7 +204,8 @@ ofs volume pack workspace --rebuild-index
 ```
 
 Rebuilding lists pack objects and verifies every footer before publishing the
-replacement index. It does not change file versions or pack contents.
+replacement index. It does not change file versions, loose content, or pack
+contents.
 
 A cold full-tree materialization downloads and verifies each selected pack
 once, then writes all of its files from that verified body. Incremental Sync
@@ -212,22 +213,13 @@ keeps range reads because downloading a whole pack for one changed file would
 amplify data transfer. The choice belongs to the materialization operation and
 does not change the pack format or index.
 
-Use the optional maintenance controls when you intend to replace packs with
-dead entries or remove redundant loose copies:
-
-```shell
-ofs volume pack workspace --repack-grace-seconds 30
-ofs volume pack workspace --reclaim-loose-after-seconds 30
-```
-
-Repack publishes replacement locations before retiring an old pack. Loose
-reclamation removes content only when a verified pack location still serves
-the same `ContentRef`.
-
-Loose reclamation and garbage collection each read one recursive inventory of
-loose objects. Eligible keys are submitted through the OpenDAL deleter, which
-uses the provider's batch limits. Malformed loose keys remain untouched. A live
-digest stored with an unexpected object length fails closed before deletion. If
+Packs and their placement index are derived read caches under
+`.ofs/managed/indexes/data-pack/v1/`. Loose content remains authoritative.
+Deleting the whole pack index tree cannot make a committed file version
+unreadable. Garbage collection reads one recursive inventory of loose objects.
+Eligible keys are submitted through the OpenDAL deleter, which uses the
+provider's batch limits. Malformed loose keys remain untouched. A live digest
+stored with an unexpected object length fails closed before deletion. If
 deletion stops after some provider batches, rerun the command; the next
 inventory continues with the objects that remain.
 
@@ -287,16 +279,18 @@ command.
 ## OpenDAL boundary
 
 Managed data and colocated Object metadata use OpenDAL `Operator` directly for
-read, range read, create-only write, stat, recursive list, provider-batched
-deletion, and head compare-and-swap. Local Sync scanning and ordinary file I/O
-use the OpenDAL filesystem service. Native filesystem calls remain where object
-operations cannot express an atomic local state replacement, Unix link
-inspection, or permission handling.
+read, create-only write, stat, recursive list, provider-batched deletion, and
+head compare-and-swap. Section reads use OpenDAL `Reader::fetch`, which merges
+nearby byte ranges and returns zero-copy slices for the requested sections.
+Local Sync scanning and ordinary file I/O use the OpenDAL filesystem service.
+Native filesystem calls remain where object operations cannot express an
+atomic local state replacement, Unix link inspection, or permission handling.
 
 A custom OpenDAL layer is appropriate only when it preserves the object
 operation contract and can report its capabilities accurately. Retry,
 timeouts, telemetry, immutable caching, or a self-describing object codec can
 fit that boundary. Namespace transactions, `FileVersion` construction,
 packing, and Sync reconciliation do not. Each assembled storage operator uses
-OpenDAL's `ConcurrentLimitLayer` with the shared runtime concurrency value. OFS
-does not add a project-specific storage layer.
+OpenDAL's `ConcurrentLimitLayer` with the shared runtime concurrency value and
+its jittered `RetryLayer` for temporary provider failures. OFS does not add a
+project-specific storage layer.

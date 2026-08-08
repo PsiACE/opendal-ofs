@@ -21,13 +21,13 @@ mod data;
 mod error;
 mod format;
 mod metadata;
-pub mod namespace;
+pub(crate) mod namespace;
 pub(crate) mod pack;
 mod section;
 mod volume;
 
 pub(crate) use data::{AuthorityKnownContent, ManagedData};
-pub use data::{FileLayoutPolicy, LooseGcMaintenance, PackMaintenance, PackRetirement};
+pub use data::{FileLayoutPolicy, LooseGcMaintenance, PackMaintenance};
 pub use error::{ManagedError, ManagedErrorKind};
 pub use format::{ManagedExtension, ManagedFormat, MetadataPlacement, NamingPolicy};
 pub use metadata::{D1Config, D1Metadata, Metadata, ObjectMetadata};

@@ -130,19 +130,15 @@ chmod u+x "$replica_a/tools/run.sh"
 OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a"
 OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_b" --state "$state_b"
 printf '%s\n' 'acceptance: pack live small content and repeat idempotently'
-first_pack=$(OFS_CONFIG="$config" "$OFS_BIN" volume pack workspace \
-  --reclaim-loose-after-seconds 0)
+first_pack=$(OFS_CONFIG="$config" "$OFS_BIN" volume pack workspace)
 grep -Eq 'packs=[1-9][0-9]*' <<<"$first_pack" || fail 'first pack run produced no pack'
 grep -Eq 'content=[1-9][0-9]*' <<<"$first_pack" || fail 'first pack run indexed no content'
-grep -Eq 'reclaimed=[1-9][0-9]*' <<<"$first_pack" || fail 'verified loose content was not reclaimed'
 rebuilt_index=$(OFS_CONFIG="$config" "$OFS_BIN" volume pack workspace --rebuild-index)
 grep -Eq 'rebuilt_index_content=[1-9][0-9]*' <<<"$rebuilt_index" || \
   fail 'pack index rebuild did not recover verified content locations'
-second_pack=$(OFS_CONFIG="$config" "$OFS_BIN" volume pack workspace \
-  --reclaim-loose-after-seconds 0)
+second_pack=$(OFS_CONFIG="$config" "$OFS_BIN" volume pack workspace)
 grep -Fq 'packs=0 content=0 logical_bytes=0' <<<"$second_pack" || \
   fail 'second pack run was not idempotent'
-grep -Fq 'reclaimed=0' <<<"$second_pack" || fail 'second pack run reclaimed content twice'
 cp "$replica_a/first.txt" "$replica_a/reused-from-pack.txt"
 OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a"
 OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_b" --state "$state_b"
@@ -281,9 +277,6 @@ done
 OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_b" --state "$state_b"
 grep -Fxq 'history change 60' "$replica_b/checkpoint.txt" || \
   fail 'replica did not recover the fixed target after a long change history'
-repack=$(OFS_CONFIG="$config" "$OFS_BIN" volume pack workspace --repack-grace-seconds 0)
-grep -Eq 'retired=[1-9][0-9]*' <<<"$repack" || \
-  fail 'repack did not retire packs containing dead entries'
 garbage_collection=$(OFS_CONFIG="$config" "$OFS_BIN" volume gc workspace)
 grep -Eq 'deleted=[1-9][0-9]*' <<<"$garbage_collection" || \
   fail 'namespace-fenced collection removed no unreachable loose data'

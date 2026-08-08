@@ -31,7 +31,6 @@ use super::namespace::{
 use super::{
     AuthorityKnownContent, D1Metadata, FileLayoutPolicy, LooseGcMaintenance, ManagedData,
     ManagedError, ManagedErrorKind, ManagedFormat, MetadataPlacement, PackMaintenance,
-    PackRetirement,
 };
 use crate::filesystem::{CommitOutcome, OperationId, VolumeId};
 use crate::filesystem::{
@@ -93,6 +92,14 @@ impl ManagedMaterializer {
 
     pub(crate) async fn read_full_pack(&self, id: PackId) -> Result<VerifiedPack, ManagedError> {
         self.packs.read_full(id).await
+    }
+
+    pub(crate) async fn read_pack_ranges(
+        &self,
+        id: PackId,
+        entries: &[(ContentRef, PackLocation)],
+    ) -> Result<Vec<Vec<u8>>, ManagedError> {
+        self.packs.read_ranges(id, entries).await
     }
 }
 
@@ -208,22 +215,6 @@ impl ManagedVolume {
         }
     }
 
-    pub async fn seal_whole_file(
-        &self,
-        frozen: &Operator,
-        path: &str,
-    ) -> Result<FileVersionRecord, ManagedError> {
-        self.data.seal_whole_file(frozen, path).await
-    }
-
-    pub async fn seal_file(
-        &self,
-        frozen: &Operator,
-        path: &str,
-    ) -> Result<FileVersionRecord, ManagedError> {
-        self.data.seal_file(frozen, path).await
-    }
-
     pub(crate) async fn seal_file_with_known_content(
         &self,
         frozen: &Operator,
@@ -328,47 +319,6 @@ impl ManagedVolume {
     pub async fn rebuild_pack_index(&self) -> Result<usize, ManagedError> {
         self.data.rebuild_pack_index().await
     }
-
-    /// Repack mixed live/dead packs and publish replacement locations.
-    pub async fn repack_reachable_content(
-        &self,
-        observed: &ManagedObservation,
-        operation: OperationId,
-    ) -> Result<Option<PackRetirement>, ManagedError> {
-        self.data
-            .repack_reachable(observed.snapshot(), operation)
-            .await
-    }
-
-    /// End a process-local grace period and remove retired pack locations.
-    pub async fn finalize_pack_retirement(
-        &self,
-        current: &ManagedObservation,
-        retirement: PackRetirement,
-    ) -> Result<Vec<super::pack::PackId>, ManagedError> {
-        self.data
-            .finalize_repack(current.snapshot(), retirement)
-            .await
-    }
-
-    /// Remove live loose objects only after a packed location is verified.
-    pub async fn reclaim_packed_loose(
-        &self,
-        current: &ManagedObservation,
-    ) -> Result<usize, ManagedError> {
-        self.data.reclaim_packed_loose(current.snapshot()).await
-    }
-
-    pub async fn materialize(
-        &self,
-        version: &FileVersionRecord,
-        target: &Operator,
-        path: &str,
-    ) -> Result<(), ManagedError> {
-        self.materializer()?
-            .materialize(version, target, path)
-            .await
-    }
 }
 
 impl VolumeObservation for ManagedVolumeObservation {
@@ -385,12 +335,13 @@ impl VolumeReader for ManagedMaterializer {
         full_tree: bool,
         concurrency: NonZeroUsize,
     ) -> Result<(), VolumeError> {
-        let mut packed = BTreeMap::<PackId, Vec<(MaterializeRequest, ContentRef)>>::new();
+        let mut packed =
+            BTreeMap::<PackId, Vec<(MaterializeRequest, ContentRef, PackLocation)>>::new();
         let mut unpacked = Vec::new();
         for request in requests {
             let managed = decode_file_version(&request.version)?;
             let content = match &managed.layout {
-                FileVersionLayout::Whole { content } if full_tree && content.logical_length > 0 => {
+                FileVersionLayout::Whole { content } if content.logical_length > 0 => {
                     Some(*content)
                 }
                 _ => None,
@@ -407,7 +358,7 @@ impl VolumeReader for ManagedMaterializer {
                 (Some(content), Some(location)) => packed
                     .entry(location.pack)
                     .or_default()
-                    .push((request, content)),
+                    .push((request, content, location)),
                 _ => unpacked.push((request, managed)),
             }
         }
@@ -417,31 +368,44 @@ impl VolumeReader for ManagedMaterializer {
                 let reader = self.clone();
                 let target = target.clone();
                 async move {
-                    let pack = reader.read_full_pack(id).await;
-                    if let Ok(pack) = &pack
-                        && requests
+                    let contents = if full_tree {
+                        reader.read_full_pack(id).await.and_then(|pack| {
+                            requests
+                                .iter()
+                                .map(|(_, content, _)| {
+                                    pack.content(*content)
+                                        .map(ToOwned::to_owned)
+                                        .ok_or_else(|| {
+                                            ManagedError::new(
+                                                ManagedErrorKind::Corrupt,
+                                                "materialize Managed files",
+                                                "pack index disagrees with verified pack",
+                                            )
+                                        })
+                                })
+                                .collect()
+                        })
+                    } else {
+                        let entries = requests
                             .iter()
-                            .all(|(_, content)| pack.content(*content).is_some())
-                    {
-                        for (request, content) in requests {
-                            let bytes = pack
-                                .content(content)
-                                .expect("all selected pack entries were checked");
-                            target
-                                .write(&request.path, bytes.to_vec())
-                                .await
-                                .map_err(|_| {
-                                    VolumeError::new(
-                                        VolumeErrorKind::Unavailable,
-                                        format!(
-                                            "materialize file {:?}: target write failed",
-                                            request.path
-                                        ),
-                                    )
-                                })?;
+                            .map(|(_, content, location)| (*content, *location))
+                            .collect::<Vec<_>>();
+                        reader.read_pack_ranges(id, &entries).await
+                    };
+                    if let Ok(contents) = contents {
+                        for ((request, _, _), bytes) in requests.into_iter().zip(contents) {
+                            target.write(&request.path, bytes).await.map_err(|_| {
+                                VolumeError::new(
+                                    VolumeErrorKind::Unavailable,
+                                    format!(
+                                        "materialize file {:?}: target write failed",
+                                        request.path
+                                    ),
+                                )
+                            })?;
                         }
                     } else {
-                        for (request, _) in requests {
+                        for (request, _, _) in requests {
                             let version = decode_file_version(&request.version)?;
                             reader.materialize(&version, &target, &request.path).await?;
                         }

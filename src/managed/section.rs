@@ -17,6 +17,7 @@
 
 //! Ordered immutable sections shared by Managed metadata indexes.
 
+use opendal::{ErrorKind, Operator};
 use sha2::{Digest as _, Sha256};
 
 use super::{ManagedError, ManagedErrorKind};
@@ -98,6 +99,74 @@ pub(crate) fn concatenate(
         bytes,
         sections,
     }))
+}
+
+/// Fetch independently verifiable ranges through OpenDAL's native range
+/// merger. `gap` spans the selected object window so one object costs at most
+/// one request even when a newer checkpoint no longer references bytes between
+/// two retained sections.
+pub(crate) async fn fetch(
+    operator: &Operator,
+    key: &str,
+    scope: [u8; 16],
+    sections: Vec<Located>,
+    action: &'static str,
+) -> Result<Vec<(Located, Vec<Record>)>, ManagedError> {
+    if sections.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut ranges = Vec::with_capacity(sections.len());
+    let mut first = u64::MAX;
+    let mut last = 0_u64;
+    for section in &sections {
+        let end = section
+            .offset
+            .checked_add(section.reference.encoded_bytes)
+            .ok_or_else(|| invalid(action, "section range is invalid"))?;
+        first = first.min(section.offset);
+        last = last.max(end);
+        ranges.push(section.offset..end);
+    }
+    let gap = usize::try_from(last - first)
+        .map_err(|_| invalid(action, "section object span exceeds this platform"))?;
+    let reader = operator.reader_with(key).gap(gap).await.map_err(|error| {
+        if error.kind() == ErrorKind::NotFound {
+            ManagedError::new(
+                ManagedErrorKind::Corrupt,
+                action,
+                "referenced section data object is missing",
+            )
+        } else {
+            ManagedError::new(
+                ManagedErrorKind::Unavailable,
+                action,
+                "section data object is unavailable",
+            )
+        }
+    })?;
+    let buffers = reader.fetch(ranges).await.map_err(|error| {
+        if error.kind() == ErrorKind::NotFound {
+            ManagedError::new(
+                ManagedErrorKind::Corrupt,
+                action,
+                "referenced section data object is missing",
+            )
+        } else {
+            ManagedError::new(
+                ManagedErrorKind::Unavailable,
+                action,
+                "section data object is unavailable",
+            )
+        }
+    })?;
+    sections
+        .into_iter()
+        .zip(buffers)
+        .map(|(section, bytes)| {
+            let records = decode(&section.reference, scope, &bytes.to_bytes(), action)?;
+            Ok((section, records))
+        })
+        .collect()
 }
 
 pub(crate) fn encode(

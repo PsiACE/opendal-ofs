@@ -19,7 +19,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use fastcdc::v2020::{
     AVERAGE_MAX, AVERAGE_MIN, AsyncStreamCDC, MAXIMUM_MAX, MAXIMUM_MIN, MINIMUM_MAX, MINIMUM_MIN,
@@ -30,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::{ManagedError, ManagedErrorKind, ManagedExtension, ManagedFormat};
-use crate::filesystem::{ChangeCursor, NodeKind, OperationId};
+use crate::filesystem::{NodeKind, OperationId};
 use crate::managed::namespace::{
     ChunkSpan, ContentRef, FileVersionLayout, FileVersionRecord, NamespaceSnapshot,
 };
@@ -40,16 +39,23 @@ const READ_WINDOW: u64 = 4 * 1024 * 1024;
 const LOOSE_ROOT: &str = ".ofs/managed/data/v1/loose/sha256";
 const SMALL_CONTENT_LIMIT: u64 = 256 * 1024;
 const PACK_LOGICAL_LIMIT: u64 = 8 * 1024 * 1024;
-static PACK_RETIREMENT_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 /// Physical locations published by one explicit small whole-file maintenance run.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PackMaintenance {
-    pub packs: Vec<PackId>,
-    pub packed_content: Vec<ContentRef>,
+    pub(crate) packs: Vec<PackId>,
+    pub(crate) packed_content: Vec<ContentRef>,
     pub logical_bytes: u64,
-    /// Loose objects that have a verified, published pack location.
-    pub reclaimable_loose: Vec<ContentRef>,
+}
+
+impl PackMaintenance {
+    pub fn pack_count(&self) -> usize {
+        self.packs.len()
+    }
+
+    pub fn content_count(&self) -> usize {
+        self.packed_content.len()
+    }
 }
 
 /// Loose data removed by one namespace-fenced garbage-collection sweep.
@@ -71,34 +77,6 @@ impl AuthorityKnownContent {
 
     fn contains(&self, content: &ContentRef) -> bool {
         self.0.contains(content)
-    }
-}
-
-/// One process-local grace boundary after replacement locations are published.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PackRetirement {
-    epoch: u64,
-    fixed_at: ChangeCursor,
-    retired_packs: Vec<PackId>,
-    replacement_packs: Vec<PackId>,
-    protected_content: BTreeSet<ContentRef>,
-}
-
-impl PackRetirement {
-    pub const fn epoch(&self) -> u64 {
-        self.epoch
-    }
-
-    pub const fn fixed_at(&self) -> ChangeCursor {
-        self.fixed_at
-    }
-
-    pub fn retired_packs(&self) -> &[PackId] {
-        &self.retired_packs
-    }
-
-    pub fn replacement_packs(&self) -> &[PackId] {
-        &self.replacement_packs
     }
 }
 
@@ -152,7 +130,6 @@ pub(crate) struct ManagedData {
     operator: Operator,
     policy: FileLayoutPolicy,
     fastcdc_enabled: bool,
-    pack_enabled: bool,
 }
 
 impl ManagedData {
@@ -173,7 +150,6 @@ impl ManagedData {
             operator,
             policy: FileLayoutPolicy::Whole,
             fastcdc_enabled: format.extension_enabled(ManagedExtension::FastCdc),
-            pack_enabled: format.extension_enabled(ManagedExtension::Pack),
         })
     }
 
@@ -187,16 +163,7 @@ impl ManagedData {
     }
 
     pub(crate) fn read_session(&self) -> Result<PackReadSession, ManagedError> {
-        PackReadSession::new(self.operator.clone(), self.pack_enabled)
-    }
-
-    pub(crate) async fn seal_file(
-        &self,
-        local: &Operator,
-        frozen_path: &str,
-    ) -> Result<FileVersionRecord, ManagedError> {
-        self.seal_file_with_known_content(local, frozen_path, &AuthorityKnownContent::default())
-            .await
+        PackReadSession::new(self.operator.clone())
     }
 
     pub(crate) async fn seal_file_with_known_content(
@@ -232,20 +199,6 @@ impl ManagedData {
                 }
             }
         }
-    }
-
-    /// Seal one file that Sync has already frozen against local mutation.
-    pub(crate) async fn seal_whole_file(
-        &self,
-        local: &Operator,
-        frozen_path: &str,
-    ) -> Result<FileVersionRecord, ManagedError> {
-        self.seal_whole_file_with_known_content(
-            local,
-            frozen_path,
-            &AuthorityKnownContent::default(),
-        )
-        .await
     }
 
     pub(crate) async fn seal_whole_file_with_known_content(
@@ -362,7 +315,6 @@ impl ManagedData {
         snapshot: &NamespaceSnapshot,
         operation: OperationId,
     ) -> Result<PackMaintenance, ManagedError> {
-        self.require_pack_extension()?;
         self.validate_snapshot_extensions(snapshot)?;
         let contents = reachable_whole_content(snapshot, "pack reachable data")?;
 
@@ -401,257 +353,19 @@ impl ManagedData {
                 packs: Vec::new(),
                 packed_content: Vec::new(),
                 logical_bytes: 0,
-                reclaimable_loose: Vec::new(),
             });
         }
 
         index.persist().await?;
         Ok(PackMaintenance {
             packs: sealed.iter().map(|pack| pack.id).collect(),
-            reclaimable_loose: packed_content.clone(),
             packed_content,
             logical_bytes,
         })
     }
 
     pub(crate) async fn rebuild_pack_index(&self) -> Result<usize, ManagedError> {
-        self.require_pack_extension()?;
         PackStore::new(self.operator.clone())?.rebuild_index().await
-    }
-
-    pub(crate) async fn repack_reachable(
-        &self,
-        snapshot: &NamespaceSnapshot,
-        operation: OperationId,
-    ) -> Result<Option<PackRetirement>, ManagedError> {
-        self.require_pack_extension()?;
-        self.validate_snapshot_extensions(snapshot)?;
-        let live = reachable_content(snapshot, "repack content")?;
-        let Some(mut index) = PackIndex::open(self.operator.clone()).await? else {
-            return Ok(None);
-        };
-        let store = PackStore::new(self.operator.clone())?;
-        let mut retired = BTreeSet::new();
-        let mut protected = BTreeSet::new();
-        for id in index.pack_ids() {
-            let pack = store.inspect(id).await?;
-            index.validate_pack(&pack)?;
-            let pack_live = pack
-                .locations
-                .keys()
-                .filter(|content| live.contains(content))
-                .copied()
-                .collect::<BTreeSet<_>>();
-            if pack_live.len() < pack.locations.len() {
-                retired.insert(id);
-                protected.extend(pack_live);
-            }
-        }
-        if retired.is_empty() {
-            return Ok(None);
-        }
-        index.require_update()?;
-
-        let mut retiring_bodies = BTreeMap::new();
-        for id in &retired {
-            retiring_bodies.insert(*id, store.read_complete(*id).await?);
-        }
-
-        let mut batch = Vec::new();
-        let mut batch_bytes = 0_u64;
-        let mut replacements = Vec::new();
-        for content in &protected {
-            if !batch.is_empty() && batch_bytes + content.logical_length > PACK_LOGICAL_LIMIT {
-                let replacement = store.seal(operation, std::mem::take(&mut batch)).await?;
-                index.add(&replacement);
-                replacements.push(replacement.id);
-                batch_bytes = 0;
-            }
-            let bytes = index
-                .locations(*content)
-                .iter()
-                .find_map(|location| {
-                    retiring_bodies
-                        .get(&location.pack)
-                        .and_then(|pack| pack.content(*content))
-                })
-                .ok_or_else(|| corrupt("repack content", "live pack content cannot be resolved"))?;
-            batch.push(bytes.to_vec());
-            batch_bytes += content.logical_length;
-        }
-        if !batch.is_empty() {
-            let replacement = store.seal(operation, batch).await?;
-            index.add(&replacement);
-            replacements.push(replacement.id);
-        }
-        if !replacements.is_empty() {
-            index.persist().await?;
-        }
-
-        Ok(Some(PackRetirement {
-            epoch: PACK_RETIREMENT_EPOCH.fetch_add(1, Ordering::Relaxed),
-            fixed_at: snapshot.cursor,
-            retired_packs: retired.into_iter().collect(),
-            replacement_packs: replacements,
-            protected_content: protected,
-        }))
-    }
-
-    pub(crate) async fn finalize_repack(
-        &self,
-        current: &NamespaceSnapshot,
-        retirement: PackRetirement,
-    ) -> Result<Vec<PackId>, ManagedError> {
-        self.require_pack_extension()?;
-        self.validate_snapshot_extensions(current)?;
-        if current.cursor.sequence() < retirement.fixed_at.sequence() {
-            return Err(invalid(
-                "finalize repack",
-                "current namespace predates the repack recovery root",
-            ));
-        }
-        let current_live = reachable_content(current, "finalize repack")?;
-        let mut index = PackIndex::open(self.operator.clone())
-            .await?
-            .ok_or_else(|| corrupt("finalize repack", "pack index is missing"))?;
-        index.require_update()?;
-        let store = PackStore::new(self.operator.clone())?;
-        if !self.operator.info().full_capability().delete {
-            return Err(unavailable("finalize repack"));
-        }
-
-        let mut verified = BTreeSet::new();
-        let mut verified_packs = BTreeMap::new();
-        for id in &retirement.replacement_packs {
-            let pack = store.inspect(*id).await?;
-            verified.extend(pack.locations.keys().copied());
-            verified_packs.insert(*id, pack);
-        }
-        if !retirement.protected_content.is_subset(&verified) {
-            return Err(corrupt(
-                "finalize repack",
-                "replacement packs do not cover all retiring live content",
-            ));
-        }
-
-        let retired = retirement
-            .retired_packs
-            .iter()
-            .copied()
-            .collect::<BTreeSet<_>>();
-        let at_risk = current_live
-            .into_iter()
-            .filter(|content| {
-                index
-                    .locations(*content)
-                    .iter()
-                    .any(|location| retired.contains(&location.pack))
-            })
-            .collect::<Vec<_>>();
-        index.remove_packs(&retired);
-        for content in at_risk {
-            let mut verified_pack = false;
-            for location in index.locations(content) {
-                if !verified_packs.contains_key(&location.pack)
-                    && let Ok(pack) = store.inspect(location.pack).await
-                {
-                    verified_packs.insert(location.pack, pack);
-                }
-                if verified_packs
-                    .get(&location.pack)
-                    .is_some_and(|pack| pack.locations.get(&content) == Some(location))
-                {
-                    verified_pack = true;
-                    break;
-                }
-            }
-            if !verified_pack && self.read_loose_content(content).await.is_err() {
-                return Err(corrupt(
-                    "finalize repack",
-                    "retiring a pack would remove the last verified live location",
-                ));
-            }
-        }
-        index.persist().await?;
-        for id in &retirement.retired_packs {
-            store.delete(*id).await?;
-        }
-        Ok(retirement.retired_packs)
-    }
-
-    pub(crate) async fn reclaim_packed_loose(
-        &self,
-        snapshot: &NamespaceSnapshot,
-    ) -> Result<usize, ManagedError> {
-        self.require_pack_extension()?;
-        self.validate_snapshot_extensions(snapshot)?;
-        let capability = self.operator.info().full_capability();
-        if !capability.list || !capability.delete {
-            return Ok(0);
-        }
-        let contents = reachable_content(snapshot, "reclaim packed loose data")?;
-        let mut live_lengths = BTreeMap::<[u8; 32], BTreeSet<u64>>::new();
-        for content in &contents {
-            live_lengths
-                .entry(content.digest)
-                .or_default()
-                .insert(content.logical_length);
-        }
-        let Ok(Some(index)) = PackIndex::open(self.operator.clone()).await else {
-            return Ok(0);
-        };
-        let Ok(store) = PackStore::new(self.operator.clone()) else {
-            return Ok(0);
-        };
-        let candidate_packs = contents
-            .iter()
-            .flat_map(|content| index.locations(*content))
-            .map(|location| location.pack)
-            .collect::<BTreeSet<_>>();
-        let mut verified_packs = BTreeMap::new();
-        for id in candidate_packs {
-            if let Ok(pack) = store.inspect(id).await {
-                verified_packs.insert(id, pack);
-            }
-        }
-        let loose = list_loose_content(&self.operator, "reclaim packed loose data").await?;
-        for listed in &loose {
-            if live_lengths
-                .get(&listed.content.digest)
-                .is_some_and(|lengths| !lengths.contains(&listed.content.logical_length))
-            {
-                return Err(corrupt(
-                    "reclaim packed loose data",
-                    "live loose content has an unexpected length",
-                ));
-            }
-        }
-        let loose = loose
-            .into_iter()
-            .map(|listed| (listed.content, listed.path))
-            .collect::<BTreeMap<_, _>>();
-        let mut reclaimed = Vec::new();
-        for content in contents {
-            if content.logical_length == 0 || index.locations(content).is_empty() {
-                continue;
-            }
-            let verified = index.locations(content).iter().any(|location| {
-                verified_packs
-                    .get(&location.pack)
-                    .is_some_and(|pack| pack.locations.get(&content) == Some(location))
-            });
-            if !verified {
-                continue;
-            }
-            if let Some(path) = loose.get(&content) {
-                reclaimed.push(path.clone());
-            }
-        }
-        self.operator
-            .delete_iter(reclaimed.iter().map(String::as_str))
-            .await
-            .map_err(|_| unavailable("reclaim packed loose data"))?;
-        Ok(reclaimed.len())
     }
 
     pub(crate) async fn collect_unreachable_loose(
@@ -858,14 +572,6 @@ impl ManagedData {
             ));
         }
         Ok(())
-    }
-
-    fn require_pack_extension(&self) -> Result<(), ManagedError> {
-        if self.pack_enabled {
-            Ok(())
-        } else {
-            Err(unsupported("data-pack/1 is not enabled for this volume"))
-        }
     }
 
     fn validate_manifest_extension(&self, version: &FileVersionRecord) -> Result<(), ManagedError> {
@@ -1284,22 +990,26 @@ mod tests {
         let format = ManagedFormat::v1(
             VolumeId::from_bytes([42; 16]),
             crate::managed::MetadataPlacement::ColocatedObject,
-            [ManagedExtension::FastCdc, ManagedExtension::Pack],
+            [ManagedExtension::FastCdc],
         )
         .unwrap();
         ManagedData::new(operator, &format).unwrap()
     }
 
-    fn pack_test_storage() -> Operator {
-        let url = url::Url::parse(
-            &std::env::var("OFS_PACK_TEST_STORAGE")
-                .expect("set OFS_PACK_TEST_STORAGE to an isolated S3-compatible root"),
-        )
-        .unwrap();
-        let mut arguments = url.query_pairs().into_owned().collect::<Vec<_>>();
-        arguments.push(("bucket".to_owned(), url.host_str().unwrap().to_owned()));
-        arguments.push(("root".to_owned(), url.path().trim_matches('/').to_owned()));
-        Operator::via_iter(url.scheme(), arguments).unwrap()
+    async fn seal_file(data: &ManagedData, source: &Operator, path: &str) -> FileVersionRecord {
+        data.seal_file_with_known_content(source, path, &AuthorityKnownContent::default())
+            .await
+            .unwrap()
+    }
+
+    async fn seal_whole_file(
+        data: &ManagedData,
+        source: &Operator,
+        path: &str,
+    ) -> FileVersionRecord {
+        data.seal_whole_file_with_known_content(source, path, &AuthorityKnownContent::default())
+            .await
+            .unwrap()
     }
 
     fn snapshot_with_file(version: FileVersionRecord) -> NamespaceSnapshot {
@@ -1381,7 +1091,7 @@ mod tests {
             maximum_size: 1024,
         })
         .unwrap();
-        let below_threshold = data.seal_file(&source, "input").await.unwrap();
+        let below_threshold = seal_file(&data, &source, "input").await;
         assert!(matches!(
             below_threshold.layout,
             FileVersionLayout::Whole { .. }
@@ -1394,7 +1104,7 @@ mod tests {
             maximum_size: 1024,
         })
         .unwrap();
-        let cdc = data.seal_file(&source, "input").await.unwrap();
+        let cdc = seal_file(&data, &source, "input").await;
         assert!(matches!(cdc.layout, FileVersionLayout::FastCdc { .. }));
         data.read_to(&cdc, &target, "cdc").await.unwrap();
         assert_eq!(target.read("cdc").await.unwrap().to_bytes(), bytes);
@@ -1407,8 +1117,8 @@ mod tests {
         source.write("live", b"live".to_vec()).await.unwrap();
         source.write("orphan", b"orphan".to_vec()).await.unwrap();
         let data = managed_data(stored.clone());
-        let live = data.seal_whole_file(&source, "live").await.unwrap();
-        let orphan = data.seal_whole_file(&source, "orphan").await.unwrap();
+        let live = seal_whole_file(&data, &source, "live").await;
+        let orphan = seal_whole_file(&data, &source, "orphan").await;
         let snapshot = snapshot_with_file(live.clone());
         let FileVersionLayout::Whole {
             content: live_content,
@@ -1462,9 +1172,9 @@ mod tests {
             .unwrap();
         source.write("orphan", b"orphan".to_vec()).await.unwrap();
         let data = managed_data(stored.clone());
-        let small = data.seal_whole_file(&source, "small").await.unwrap();
-        let large = data.seal_whole_file(&source, "large").await.unwrap();
-        let orphan = data.seal_whole_file(&source, "orphan").await.unwrap();
+        let small = seal_whole_file(&data, &source, "small").await;
+        let large = seal_whole_file(&data, &source, "large").await;
+        let orphan = seal_whole_file(&data, &source, "orphan").await;
 
         let root = NodeId::from_bytes([1; 16]);
         let small_node = NodeId::from_bytes([2; 16]);
@@ -1536,8 +1246,6 @@ mod tests {
             ]),
         };
 
-        assert_eq!(data.reclaim_packed_loose(&snapshot).await.unwrap(), 0);
-
         let packed = data
             .pack_reachable(&snapshot, OperationId::from_bytes([5; 16]))
             .await
@@ -1551,22 +1259,22 @@ mod tests {
             _ => unreachable!(),
         };
         assert_eq!(packed.packed_content, vec![small_content]);
-        assert_eq!(packed.reclaimable_loose, vec![small_content]);
         assert_eq!(packed.logical_bytes, small_content.logical_length);
         let index = PackIndex::open(stored.clone()).await.unwrap().unwrap();
         assert!(index.locations(orphan_content).is_empty());
 
-        let pack_hex = packed.packs[0]
-            .as_bytes()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        let pack_key = format!(".ofs/managed/extensions/data-pack/v1/packs/sha256/{pack_hex}.pack");
+        let pack_key = stored
+            .list(".ofs/managed/indexes/data-pack/v1/packs/sha256/")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.path().to_owned())
+            .find(|path| path.ends_with(".pack"))
+            .unwrap();
         let original = stored.read(&pack_key).await.unwrap().to_bytes();
         let mut corrupt_pack = original.to_vec();
         corrupt_pack[26] ^= 0xff;
         stored.write(&pack_key, corrupt_pack).await.unwrap();
-        assert_eq!(data.reclaim_packed_loose(&snapshot).await.unwrap(), 0);
         assert!(stored.stat(&loose_key(&small_content)).await.is_ok());
         data.read_to(&small, &target, "loose-fallback")
             .await
@@ -1577,8 +1285,7 @@ mod tests {
         );
 
         stored.write(&pack_key, original).await.unwrap();
-        assert_eq!(data.reclaim_packed_loose(&snapshot).await.unwrap(), 1);
-        assert!(stored.stat(&loose_key(&small_content)).await.is_err());
+        assert!(stored.stat(&loose_key(&small_content)).await.is_ok());
         assert!(stored.stat(&loose_key(&orphan_content)).await.is_ok());
         data.read_to(&small, &target, "restored").await.unwrap();
         assert_eq!(
@@ -1597,7 +1304,7 @@ mod tests {
         source.write("chunked", b"abcdefgh".to_vec()).await.unwrap();
 
         let mut data = managed_data(stored.clone());
-        let whole = data.seal_whole_file(&source, "whole").await.unwrap();
+        let whole = seal_whole_file(&data, &source, "whole").await;
         data.set_policy(FileLayoutPolicy::FastCdcV2020 {
             minimum_file_size: 0,
             minimum_size: 64,
@@ -1605,7 +1312,7 @@ mod tests {
             maximum_size: 1024,
         })
         .unwrap();
-        let chunked = data.seal_file(&source, "chunked").await.unwrap();
+        let chunked = seal_file(&data, &source, "chunked").await;
         let snapshot =
             snapshot_with_files([("whole", whole.clone()), ("chunked", chunked.clone())]);
 
@@ -1627,134 +1334,10 @@ mod tests {
                 .iter()
                 .all(|chunk| index.locations(chunk.content).is_empty())
         );
-        assert_eq!(data.reclaim_packed_loose(&snapshot).await.unwrap(), 1);
         data.read_to(&chunked, &target, "chunked").await.unwrap();
         assert_eq!(
             target.read("chunked").await.unwrap().to_bytes(),
             b"abcdefgh".as_slice()
-        );
-    }
-
-    #[tokio::test]
-    #[ignore = "requires OFS_PACK_TEST_STORAGE pointing at an isolated MinIO root"]
-    async fn repack_keeps_live_content_until_old_pack_retirement() {
-        let stored = pack_test_storage();
-        let target = memory();
-        let data = managed_data(stored.clone());
-        let live_bytes = b"live after repack".to_vec();
-        let dead_bytes = b"dead before repack".to_vec();
-        let live_content = ContentRef {
-            digest: Sha256::digest(&live_bytes).into(),
-            logical_length: live_bytes.len() as u64,
-        };
-        let dead_content = ContentRef {
-            digest: Sha256::digest(&dead_bytes).into(),
-            logical_length: dead_bytes.len() as u64,
-        };
-        let version = whole_file_version(
-            live_content.logical_length,
-            Digest::from_bytes(live_content.digest),
-        );
-        let snapshot = snapshot_with_file(version.clone());
-        let unchanged = snapshot.clone();
-        let dead_version = whole_file_version(
-            dead_content.logical_length,
-            Digest::from_bytes(dead_content.digest),
-        );
-
-        let store = PackStore::new(stored.clone()).unwrap();
-        let old = store
-            .seal(OperationId::from_bytes([25; 16]), [live_bytes, dead_bytes])
-            .await
-            .unwrap();
-        let mut index = PackIndex::open_or_empty(stored.clone()).await.unwrap();
-        index.add(&old);
-        index.persist().await.unwrap();
-
-        let retirement = data
-            .repack_reachable(&snapshot, OperationId::from_bytes([26; 16]))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(snapshot, unchanged);
-        assert_eq!(retirement.retired_packs(), &[old.id]);
-        assert_eq!(retirement.replacement_packs().len(), 1);
-        let replacement = store
-            .inspect(retirement.replacement_packs()[0])
-            .await
-            .unwrap();
-        assert!(replacement.locations.contains_key(&live_content));
-        assert!(!replacement.locations.contains_key(&dead_content));
-
-        let dual = PackIndex::open(stored.clone()).await.unwrap().unwrap();
-        assert_eq!(dual.locations(live_content).len(), 2);
-        assert_eq!(
-            dual.locations(dead_content),
-            &[old.locations[&dead_content]]
-        );
-        data.read_to(&version, &target, "before-finalize")
-            .await
-            .unwrap();
-
-        let mut current = snapshot.clone();
-        let dead_node = NodeId::from_bytes([27; 16]);
-        current.cursor = ChangeCursor::at(
-            NonZeroU64::new(2).unwrap(),
-            OperationId::from_bytes([28; 16]),
-        );
-        current.nodes.insert(
-            dead_node,
-            NodeRecord {
-                id: dead_node,
-                generation: Generation::from_bytes(vec![1]),
-                kind: NodeKind::RegularFile,
-                attributes: NodeAttributes::default(),
-                file_version: Some(dead_version.id),
-            },
-        );
-        current
-            .directories
-            .get_mut(&current.root)
-            .unwrap()
-            .entries
-            .insert(
-                "reintroduced".to_owned(),
-                DirectoryEntry {
-                    node: dead_node,
-                    kind: NodeKind::RegularFile,
-                },
-            );
-        current
-            .file_versions
-            .insert(dead_version.id, dead_version.clone());
-        let error = data
-            .finalize_repack(&current, retirement.clone())
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind(), ManagedErrorKind::Corrupt);
-        assert!(store.inspect(old.id).await.is_ok());
-
-        stored
-            .write(&loose_key(&dead_content), b"dead before repack".to_vec())
-            .await
-            .unwrap();
-        assert_eq!(
-            data.finalize_repack(&current, retirement).await.unwrap(),
-            vec![old.id]
-        );
-        assert!(store.inspect(old.id).await.is_err());
-        let finalized = PackIndex::open(stored).await.unwrap().unwrap();
-        assert_eq!(finalized.locations(live_content).len(), 1);
-        assert!(finalized.locations(dead_content).is_empty());
-        data.read_to(&version, &target, "after-finalize")
-            .await
-            .unwrap();
-        data.read_to(&dead_version, &target, "reintroduced")
-            .await
-            .unwrap();
-        assert_eq!(
-            target.read("after-finalize").await.unwrap().to_bytes(),
-            b"live after repack".as_slice()
         );
     }
 
@@ -1772,7 +1355,7 @@ mod tests {
             maximum_size: 1024,
         })
         .unwrap();
-        let version = data.seal_file(&source, "input").await.unwrap();
+        let version = seal_file(&data, &source, "input").await;
         let FileVersionLayout::FastCdc { chunks, .. } = &version.layout else {
             panic!("FastCDC policy returned another layout")
         };

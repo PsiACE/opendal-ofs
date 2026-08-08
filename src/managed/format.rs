@@ -27,8 +27,7 @@ pub(crate) const SUPERBLOCK_KEY: &str = ".ofs/managed/volume.json";
 const MAGIC: &str = "ofs-managed-volume";
 const FORMAT: u16 = 1;
 const FASTCDC_EXTENSION: &str = "data-fastcdc/1";
-const PACK_EXTENSION: &str = "data-pack/1";
-const SUPPORTED_EXTENSIONS: &[&str] = &[FASTCDC_EXTENSION, PACK_EXTENSION];
+const SUPPORTED_EXTENSIONS: &[&str] = &[FASTCDC_EXTENSION];
 
 /// Naming rules fixed by the Managed volume format.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -47,14 +46,12 @@ pub enum MetadataPlacement {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ManagedExtension {
     FastCdc,
-    Pack,
 }
 
 impl ManagedExtension {
     const fn id(self) -> &'static str {
         match self {
             Self::FastCdc => FASTCDC_EXTENSION,
-            Self::Pack => PACK_EXTENSION,
         }
     }
 }
@@ -283,7 +280,7 @@ mod tests {
         ManagedFormat::v1(
             VolumeId::from_bytes([1; 16]),
             MetadataPlacement::ColocatedObject,
-            [ManagedExtension::FastCdc, ManagedExtension::Pack],
+            [ManagedExtension::FastCdc],
         )
         .unwrap()
     }
@@ -295,7 +292,7 @@ mod tests {
         assert_eq!(ManagedFormat::decode(&encoded).unwrap(), format);
         assert_eq!(
             std::str::from_utf8(&encoded).unwrap(),
-            r#"{"magic":"ofs-managed-volume","format":1,"volume_id":"01010101010101010101010101010101","naming_policy":"portable-utf8/1","metadata_layout":"object/1","data_layout":"content-addressed/1","extensions":["data-fastcdc/1","data-pack/1"]}"#
+            r#"{"magic":"ofs-managed-volume","format":1,"volume_id":"01010101010101010101010101010101","naming_policy":"portable-utf8/1","metadata_layout":"object/1","data_layout":"content-addressed/1","extensions":["data-fastcdc/1"]}"#
         );
     }
 
@@ -319,7 +316,7 @@ mod tests {
 
     #[test]
     fn duplicate_extensions_are_rejected() {
-        let bytes = br#"{"magic":"ofs-managed-volume","format":1,"volume_id":"01010101010101010101010101010101","naming_policy":"portable-utf8/1","metadata_layout":"object/1","data_layout":"content-addressed/1","extensions":["data-pack/1","data-pack/1"]}"#;
+        let bytes = br#"{"magic":"ofs-managed-volume","format":1,"volume_id":"01010101010101010101010101010101","naming_policy":"portable-utf8/1","metadata_layout":"object/1","data_layout":"content-addressed/1","extensions":["data-fastcdc/1","data-fastcdc/1"]}"#;
         assert_eq!(
             ManagedFormat::decode(bytes).unwrap_err().kind(),
             ManagedErrorKind::Corrupt
