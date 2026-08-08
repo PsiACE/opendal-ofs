@@ -24,6 +24,8 @@ mod records;
 mod stored;
 mod validation;
 
+#[cfg(feature = "managed-branch")]
+pub(crate) use change::NamespaceChange;
 pub(crate) use d1::{D1Namespace, D1NamespaceObservation};
 pub(crate) use object::{NamespaceObservation, ObjectNamespace};
 pub use records::NamespaceGcSweep;
@@ -32,3 +34,5 @@ pub(crate) use records::{
     NamespaceSnapshot, NodePrecondition, NodeRecord, managed_generation, managed_generation_number,
     next_managed_generation,
 };
+#[cfg(feature = "managed-branch")]
+pub(crate) use validation::{validate_publication, validate_snapshot};

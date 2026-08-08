@@ -25,7 +25,7 @@ use super::records::{
 use crate::filesystem::{ChangeCursor, FileVersionId, NodeAttributes, NodeId, NodeKind};
 use crate::managed::{ManagedError, ManagedErrorKind};
 
-pub(super) fn validate_publication(
+pub(crate) fn validate_publication(
     publication: &NamespacePublication,
     base: Option<&NamespaceSnapshot>,
 ) -> Result<bool, ManagedError> {

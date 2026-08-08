@@ -61,7 +61,8 @@ libc = "0.2.154"
 nix = { version = "0.30.1", features = ["user"] }
 
 [features]
-default = ["services-fs", "services-s3"]
+default = ["managed-branch", "services-fs", "services-s3"]
+managed-branch = []
 services-fs = ["opendal/services-fs"]
 services-s3 = ["opendal/services-s3"]
 

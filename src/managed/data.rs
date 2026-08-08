@@ -449,11 +449,24 @@ impl ManagedData {
         &self,
         snapshot: &NamespaceSnapshot,
     ) -> Result<SegmentGcMaintenance, ManagedError> {
+        self.collect_unreachable_segments_from([snapshot]).await
+    }
+
+    pub(crate) async fn collect_unreachable_segments_from<'a>(
+        &self,
+        snapshots: impl IntoIterator<Item = &'a NamespaceSnapshot>,
+    ) -> Result<SegmentGcMaintenance, ManagedError> {
         let capability = self.operator.info().full_capability();
         if !capability.list || !capability.delete {
             return Err(unavailable("collect unreachable data segments"));
         }
-        let live = reachable_segments(snapshot, "collect unreachable data segments")?;
+        let mut live = BTreeSet::new();
+        for snapshot in snapshots {
+            live.extend(reachable_segments(
+                snapshot,
+                "collect unreachable data segments",
+            )?);
+        }
         let mut result = SegmentGcMaintenance::default();
         let entries = self
             .operator

@@ -42,13 +42,34 @@ fixed_identity!(
     16
 );
 
+fixed_identity!(
+    /// Stable identity of one Managed branch incarnation.
+    BranchId,
+    16
+);
+
 impl VolumeId {
     pub fn generate() -> Self {
         Self::from_bytes(*uuid::Uuid::new_v4().as_bytes())
     }
 }
 
+impl BranchId {
+    pub fn generate() -> Self {
+        Self::from_bytes(*uuid::Uuid::new_v4().as_bytes())
+    }
+}
+
 impl fmt::Display for VolumeId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.as_bytes() {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for BranchId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         for byte in self.as_bytes() {
             write!(formatter, "{byte:02x}")?;

@@ -25,24 +25,24 @@ use super::{
 use crate::filesystem::{ChangeCursor, FileVersionId, NodeId, OperationId, VolumeId};
 use crate::managed::{ManagedError, ManagedErrorKind};
 
-pub(super) struct NamespaceChange {
-    pub(super) volume_id: VolumeId,
-    pub(super) operation: OperationId,
-    pub(super) parent: ChangeCursor,
-    pub(super) cursor: ChangeCursor,
-    pub(super) root: NodeId,
-    pub(super) expected_nodes: Vec<NodePrecondition>,
-    pub(super) expected_directories: Vec<DirectoryPrecondition>,
-    pub(super) put_nodes: Vec<NodeRecord>,
-    pub(super) remove_nodes: Vec<NodeId>,
-    pub(super) put_directories: Vec<DirectoryRecord>,
-    pub(super) remove_directories: Vec<NodeId>,
-    pub(super) put_file_versions: Vec<FileVersionRecord>,
-    pub(super) remove_file_versions: Vec<FileVersionId>,
+pub(crate) struct NamespaceChange {
+    pub(crate) volume_id: VolumeId,
+    pub(crate) operation: OperationId,
+    pub(crate) parent: ChangeCursor,
+    pub(crate) cursor: ChangeCursor,
+    pub(crate) root: NodeId,
+    pub(crate) expected_nodes: Vec<NodePrecondition>,
+    pub(crate) expected_directories: Vec<DirectoryPrecondition>,
+    pub(crate) put_nodes: Vec<NodeRecord>,
+    pub(crate) remove_nodes: Vec<NodeId>,
+    pub(crate) put_directories: Vec<DirectoryRecord>,
+    pub(crate) remove_directories: Vec<NodeId>,
+    pub(crate) put_file_versions: Vec<FileVersionRecord>,
+    pub(crate) remove_file_versions: Vec<FileVersionId>,
 }
 
 impl NamespaceChange {
-    pub(super) fn from_publication(
+    pub(crate) fn from_publication(
         publication: &NamespacePublication,
         base: Option<&NamespaceSnapshot>,
     ) -> Self {
@@ -102,7 +102,7 @@ impl NamespaceChange {
         }
     }
 
-    pub(super) fn apply(
+    pub(crate) fn apply(
         self,
         base: Option<NamespaceSnapshot>,
     ) -> Result<NamespaceSnapshot, ManagedError> {

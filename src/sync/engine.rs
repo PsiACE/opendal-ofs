@@ -61,15 +61,19 @@ impl<V: Volume> SyncEngine<V> {
     ) -> Result<SyncResult> {
         let replica_path = replica_path.as_ref();
         let state_path = state_path.as_ref();
-        tokio::fs::create_dir_all(replica_path)
-            .await
-            .context("create local replica")?;
         let volume_id = self.volume.id();
-        let mut state =
-            ReplicaState::load(state_path)?.unwrap_or_else(|| ReplicaState::empty(volume_id));
+        let authority_identity = self.volume.authority();
+        let mut state = ReplicaState::load(state_path)?
+            .unwrap_or_else(|| ReplicaState::empty_for(authority_identity.clone()));
         if state.volume != volume_id {
             bail!("replica state belongs to another volume");
         }
+        if state.authority_identity() != authority_identity {
+            bail!("replica state belongs to another branch incarnation");
+        }
+        tokio::fs::create_dir_all(replica_path)
+            .await
+            .context("create local replica")?;
 
         let prior_staging = if let Some(pending) = state.pending.clone() {
             match self.volume.resolve(pending.operation).await? {
@@ -107,7 +111,8 @@ impl<V: Volume> SyncEngine<V> {
                         .await?;
                     }
                     state =
-                        advance_common_base(observed.snapshot(), replica_path, state_path).await?;
+                        advance_common_base(observed.snapshot(), replica_path, state_path, &state)
+                            .await?;
                     remove_tree(&pending.staging)?;
                     return Ok(result(&state, true));
                 }
@@ -272,7 +277,7 @@ impl<V: Volume> SyncEngine<V> {
                         install_staged_changes(replica_path, &staged, &frozen_input)?;
                     }
                 }
-                state = state_from_snapshot(remote, replica_path).await?;
+                state = state_from_snapshot(remote, replica_path, &state).await?;
             } else {
                 state.pending = None;
             }
@@ -355,7 +360,8 @@ impl<V: Volume> SyncEngine<V> {
                 if materialized {
                     install_staged_changes(replica_path, &staged, &frozen_input)?;
                 }
-                state = advance_common_base(&publication.target, replica_path, state_path).await?;
+                state = advance_common_base(&publication.target, replica_path, state_path, &state)
+                    .await?;
                 remove_tree(&staging_path)?;
                 Ok(result(&state, true))
             }
@@ -373,8 +379,9 @@ async fn advance_common_base(
     snapshot: &VolumeSnapshot,
     replica: &Path,
     state_path: &Path,
+    previous: &ReplicaState,
 ) -> Result<ReplicaState> {
-    let state = state_from_snapshot(snapshot, replica).await?;
+    let state = state_from_snapshot(snapshot, replica, previous).await?;
     state.install(state_path)?;
     Ok(state)
 }
@@ -602,9 +609,14 @@ async fn delete_absent_directories(
     Ok(())
 }
 
-async fn state_from_snapshot(snapshot: &VolumeSnapshot, replica: &Path) -> Result<ReplicaState> {
+async fn state_from_snapshot(
+    snapshot: &VolumeSnapshot,
+    replica: &Path,
+    previous: &ReplicaState,
+) -> Result<ReplicaState> {
     let local = LocalTree::scan(replica).await?;
     let mut state = ReplicaState::empty(snapshot.volume_id);
+    state.branch = previous.branch.clone();
     state.common = snapshot.cursor;
     state.authority = Some(snapshot.clone());
     for (path, node) in snapshot_paths(snapshot)? {

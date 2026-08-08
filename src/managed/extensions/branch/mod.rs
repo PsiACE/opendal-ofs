@@ -15,29 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod d1;
-pub(crate) mod namespace;
+//! Durable named branches for Managed metadata.
+
+mod d1;
 mod object;
-mod superblock;
+pub(crate) mod records;
 
-pub use d1::{D1Config, D1Metadata};
-pub use namespace::NamespaceGcSweep;
-pub use object::ObjectMetadata;
-pub use superblock::{ManagedExtension, ManagedFormat, MetadataFormat};
+pub use d1::{D1BoundNamespace, D1BranchObservation, D1BranchStore};
+pub use object::{ObjectBoundNamespace, ObjectBranchObservation, ObjectBranchStore};
+pub use records::{BranchInfo, BranchLifecycle, ForkPoint};
 
-use super::ManagedError;
-
-fn require_same_format(
-    desired: &ManagedFormat,
-    observed: ManagedFormat,
-) -> Result<ManagedFormat, ManagedError> {
-    if &observed == desired {
-        Ok(observed)
-    } else {
-        Err(ManagedError::new(
-            super::ManagedErrorKind::Conflict,
-            "create Managed format",
-            "metadata is bound to another Managed volume",
-        ))
-    }
-}
+/// Required Managed superblock extension implemented by this module.
+pub const IDENTIFIER: &str = "branch/v1";

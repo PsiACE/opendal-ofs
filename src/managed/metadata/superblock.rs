@@ -34,6 +34,30 @@ pub enum MetadataFormat {
     TransactionalV1,
 }
 
+/// A required Managed format capability understood by this build.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ManagedExtension {
+    #[cfg(feature = "managed-branch")]
+    BranchV1,
+}
+
+impl ManagedExtension {
+    pub const fn identifier(self) -> &'static str {
+        match self {
+            #[cfg(feature = "managed-branch")]
+            Self::BranchV1 => "branch/v1",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, ManagedError> {
+        match value {
+            #[cfg(feature = "managed-branch")]
+            "branch/v1" => Ok(Self::BranchV1),
+            _ => Err(unsupported("superblock requires an unsupported extension")),
+        }
+    }
+}
+
 impl MetadataFormat {
     const fn identifier(self) -> &'static str {
         match self {
@@ -56,14 +80,24 @@ impl MetadataFormat {
 pub struct ManagedFormat {
     volume_id: VolumeId,
     metadata_format: MetadataFormat,
+    required_extensions: Vec<ManagedExtension>,
 }
 
 impl ManagedFormat {
-    pub const fn v1(volume_id: VolumeId, metadata_format: MetadataFormat) -> Self {
+    pub fn v1(volume_id: VolumeId, metadata_format: MetadataFormat) -> Self {
         Self {
             volume_id,
             metadata_format,
+            required_extensions: Vec::new(),
         }
+    }
+
+    pub fn with_extension(mut self, extension: ManagedExtension) -> Self {
+        match self.required_extensions.binary_search(&extension) {
+            Ok(_) => {}
+            Err(index) => self.required_extensions.insert(index, extension),
+        }
+        self
     }
 
     pub const fn volume_id(&self) -> VolumeId {
@@ -72,6 +106,14 @@ impl ManagedFormat {
 
     pub const fn metadata_format(&self) -> MetadataFormat {
         self.metadata_format
+    }
+
+    pub fn required_extensions(&self) -> &[ManagedExtension] {
+        &self.required_extensions
+    }
+
+    pub fn requires_extension(&self, extension: ManagedExtension) -> bool {
+        self.required_extensions.binary_search(&extension).is_ok()
     }
 
     pub(crate) fn encode(&self) -> Result<Vec<u8>, ManagedError> {
@@ -108,12 +150,15 @@ impl ManagedFormat {
         if wire.data_format != DATA_FORMAT {
             return Err(unsupported("data format is unsupported"));
         }
-        if !wire.required_extensions.is_empty() {
-            return Err(unsupported("superblock requires an unsupported extension"));
-        }
+        let required_extensions = wire
+            .required_extensions
+            .iter()
+            .map(|value| ManagedExtension::parse(value))
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             volume_id: decode_volume_id(&wire.volume_id)?,
             metadata_format: MetadataFormat::parse(&wire.metadata_format)?,
+            required_extensions,
         })
     }
 }
@@ -155,7 +200,11 @@ impl From<&ManagedFormat> for SuperblockWire {
             metadata_format: format.metadata_format.identifier().to_owned(),
             file_version_format: FILE_VERSION_FORMAT.to_owned(),
             data_format: DATA_FORMAT.to_owned(),
-            required_extensions: Vec::new(),
+            required_extensions: format
+                .required_extensions
+                .iter()
+                .map(|extension| extension.identifier().to_owned())
+                .collect(),
         }
     }
 }

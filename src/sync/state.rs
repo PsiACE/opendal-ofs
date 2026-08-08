@@ -17,13 +17,14 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::filesystem::{
-    ChangeCursor, DirectoryEntry, DirectoryRecord, FileVersion, FileVersionId, Generation,
-    NodeAttributes, NodeId, NodeKind, NodeRecord, OperationId, VolumeId, VolumeSnapshot,
+    AuthorityIdentity, BranchBinding, BranchId, BranchName, ChangeCursor, DirectoryEntry,
+    DirectoryRecord, FileVersion, FileVersionId, Generation, NodeAttributes, NodeId, NodeKind,
+    NodeRecord, OperationId, VolumeId, VolumeSnapshot,
 };
 use crate::sync::local::NativeIdentity;
 
 const STATE_FORMAT: &str = "ofs-sync-replica";
-const STATE_MAJOR: u16 = 3;
+const STATE_MAJOR: u16 = 4;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -55,6 +56,7 @@ pub struct ConflictRecord {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReplicaState {
     pub volume: VolumeId,
+    pub branch: Option<BranchBinding>,
     pub common: ChangeCursor,
     pub(crate) authority: Option<VolumeSnapshot>,
     pub(crate) base: BTreeMap<String, BaseEntry>,
@@ -66,11 +68,31 @@ impl ReplicaState {
     pub fn empty(volume: VolumeId) -> Self {
         Self {
             volume,
+            branch: None,
             common: ChangeCursor::Genesis,
             authority: None,
             base: BTreeMap::new(),
             pending: None,
             conflicts: Vec::new(),
+        }
+    }
+
+    pub fn empty_for(authority: AuthorityIdentity) -> Self {
+        Self {
+            volume: authority.volume,
+            branch: authority.branch,
+            common: ChangeCursor::Genesis,
+            authority: None,
+            base: BTreeMap::new(),
+            pending: None,
+            conflicts: Vec::new(),
+        }
+    }
+
+    pub fn authority_identity(&self) -> AuthorityIdentity {
+        AuthorityIdentity {
+            volume: self.volume,
+            branch: self.branch.clone(),
         }
     }
 
@@ -124,11 +146,20 @@ struct StateWire {
     format: String,
     major: u16,
     volume: [u8; 16],
+    #[serde(default)]
+    branch: Option<BranchWire>,
     common: CursorWire,
     authority: Option<SnapshotWire>,
     base: BTreeMap<String, BaseWire>,
     pending: Option<IntentWire>,
     conflicts: Vec<ConflictWire>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BranchWire {
+    name: BranchName,
+    id: [u8; 16],
 }
 
 #[derive(Deserialize, Serialize)]
@@ -231,6 +262,10 @@ impl From<&ReplicaState> for StateWire {
             format: STATE_FORMAT.into(),
             major: STATE_MAJOR,
             volume: *state.volume.as_bytes(),
+            branch: state.branch.as_ref().map(|branch| BranchWire {
+                name: branch.name.clone(),
+                id: *branch.id.as_bytes(),
+            }),
             common: CursorWire::from(state.common),
             authority: state.authority.as_ref().map(SnapshotWire::from),
             base: state
@@ -282,7 +317,10 @@ impl TryFrom<StateWire> for ReplicaState {
     type Error = anyhow::Error;
 
     fn try_from(wire: StateWire) -> Result<Self> {
-        if wire.format != STATE_FORMAT || wire.major != STATE_MAJOR {
+        if wire.format != STATE_FORMAT || !matches!(wire.major, 3 | STATE_MAJOR) {
+            bail!("replica state format is unsupported");
+        }
+        if wire.major == 3 && wire.branch.is_some() {
             bail!("replica state format is unsupported");
         }
         let base = wire
@@ -336,6 +374,10 @@ impl TryFrom<StateWire> for ReplicaState {
         }
         Ok(Self {
             volume,
+            branch: wire.branch.map(|branch| BranchBinding {
+                name: branch.name,
+                id: BranchId::from_bytes(branch.id),
+            }),
             common,
             authority,
             base,

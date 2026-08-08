@@ -20,12 +20,15 @@
 //! This module defines semantic values only. It does not prescribe a volume
 //! implementation, an access frontend, or a durable representation.
 
+mod branch;
 mod identity;
 mod model;
 mod namespace;
 mod publication;
 mod volume;
 
+pub use branch::{AuthorityIdentity, BranchBinding, BranchName, InvalidBranchName};
+pub use identity::BranchId;
 pub use identity::{ChangeCursor, FileVersionId, Generation, NodeId, OperationId, VolumeId};
 pub use model::VolumeModel;
 pub use namespace::{DirectoryEntry, NodeAttributes, NodeKind};
