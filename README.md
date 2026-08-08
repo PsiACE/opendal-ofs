@@ -29,8 +29,8 @@ while Sync reconciles an ordinary local directory only when explicitly invoked.
 Managed Sync uses a local directory as the working filesystem and publishes
 explicitly to a format v1 Managed volume. Namespace metadata can use colocated
 objects or D1, while immutable data is accessed through OpenDAL. See the
-[Managed Sync guide](docs/managed-sync.md) for setup, recovery, maintenance,
-and local acceptance commands.
+[Managed Sync documentation](docs/managed-sync.md) for the workflow,
+architecture, and storage format.
 
 ## How to use `ofs`
 
@@ -97,9 +97,8 @@ the selected backend and frontend can enforce generation-checked publication.
 
 Managed Sync keeps the working tree on the native local filesystem and
 publishes only during an explicit `ofs sync`. See the
-[Managed Sync guide](docs/managed-sync.md) for Object and D1 setup, conflict
-handling, recovery, maintenance, and the current-versus-baseline comparison
-entry point.
+[Managed Sync workflow](docs/managed-sync-workflow.md) for Object and D1 setup,
+conflict handling, recovery, and maintenance.
 
 ## Branding
 
