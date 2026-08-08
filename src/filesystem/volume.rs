@@ -161,18 +161,6 @@ pub trait VolumeObservation: Clone + Send + Sync {
     fn snapshot(&self) -> &VolumeSnapshot;
 }
 
-/// A read session shared by one materialization operation.
-#[allow(async_fn_in_trait)]
-pub trait VolumeReader: Clone + Send + Sync {
-    async fn materialize(
-        &self,
-        target: &Operator,
-        requests: Vec<MaterializeRequest>,
-        full_tree: bool,
-        concurrency: NonZeroUsize,
-    ) -> Result<(), VolumeError>;
-}
-
 /// Authoritative filesystem operations shared by Mount and Sync access.
 ///
 /// Implementations may use an existing object namespace (Direct) or a durable
@@ -181,15 +169,12 @@ pub trait VolumeReader: Clone + Send + Sync {
 #[allow(async_fn_in_trait)]
 pub trait Volume: Clone + Send + Sync {
     type Observation: VolumeObservation;
-    type Reader: VolumeReader;
 
     fn id(&self) -> VolumeId;
 
     fn initial_generation(&self) -> Generation;
 
     fn next_generation(&self, generation: &Generation) -> Result<Generation, VolumeError>;
-
-    async fn observe(&self) -> Result<Option<Self::Observation>, VolumeError>;
 
     async fn observe_from(
         &self,
@@ -212,5 +197,11 @@ pub trait Volume: Clone + Send + Sync {
 
     async fn resolve(&self, operation: OperationId) -> Result<CommitOutcome, VolumeError>;
 
-    fn reader(&self) -> Result<Self::Reader, VolumeError>;
+    async fn materialize(
+        &self,
+        target: &Operator,
+        requests: Vec<MaterializeRequest>,
+        full_tree: bool,
+        concurrency: NonZeroUsize,
+    ) -> Result<(), VolumeError>;
 }

@@ -19,11 +19,11 @@ use opendal::{Operator, services};
 use super::local::{NativeIdentity, fs_operator, set_executable};
 use super::{
     BaseEntry, ConflictRecord, LocalKind, LocalTree, PendingIntent, ReconcileAction, ReplicaState,
-    StagedTree, build_publication, reconcile,
+    StagedTree, build_publication, reconcile, snapshot_paths,
 };
 use crate::filesystem::{
-    ChangeCursor, CommitOutcome, FileVersion, MaterializeRequest, NodeId, NodeKind, OperationId,
-    Volume, VolumeId, VolumeObservation, VolumeReader, VolumeSnapshot,
+    ChangeCursor, CommitOutcome, FileVersion, MaterializeRequest, NodeKind, OperationId, Volume,
+    VolumeObservation, VolumeSnapshot,
 };
 
 #[derive(Clone, Debug)]
@@ -36,7 +36,6 @@ pub struct SyncResult {
 
 #[derive(Clone)]
 pub struct SyncEngine<V> {
-    volume_id: VolumeId,
     volume: V,
     transfer_concurrency: NonZeroUsize,
 }
@@ -44,7 +43,6 @@ pub struct SyncEngine<V> {
 impl<V: Volume> SyncEngine<V> {
     pub fn new(volume: V) -> Self {
         Self {
-            volume_id: volume.id(),
             volume,
             transfer_concurrency: NonZeroUsize::new(4).expect("default concurrency is non-zero"),
         }
@@ -66,9 +64,10 @@ impl<V: Volume> SyncEngine<V> {
         tokio::fs::create_dir_all(replica_path)
             .await
             .context("create local replica")?;
+        let volume_id = self.volume.id();
         let mut state =
-            ReplicaState::load(state_path)?.unwrap_or_else(|| ReplicaState::empty(self.volume_id));
-        if state.volume != self.volume_id {
+            ReplicaState::load(state_path)?.unwrap_or_else(|| ReplicaState::empty(volume_id));
+        if state.volume != volume_id {
             bail!("replica state belongs to another volume");
         }
 
@@ -77,7 +76,7 @@ impl<V: Volume> SyncEngine<V> {
                 CommitOutcome::Committed(committed) => {
                     let observed = self
                         .volume
-                        .observe()
+                        .observe_from(None)
                         .await?
                         .context("committed publication has no authoritative namespace")?;
                     if !pending.staging.is_dir() {
@@ -224,11 +223,10 @@ impl<V: Volume> SyncEngine<V> {
                     }
                 }
             }
-            let reader = self.volume.reader()?;
             let full_tree = state.base.is_empty() && local.entries().is_empty();
             staged_full_tree = full_tree;
             let installed = materialize_files(
-                &reader,
+                &self.volume,
                 &target,
                 staged.root(),
                 installs,
@@ -340,7 +338,7 @@ impl<V: Volume> SyncEngine<V> {
         publication_state.common = remote.map_or(ChangeCursor::Genesis, |snapshot| snapshot.cursor);
         let publication = build_publication(
             &self.volume,
-            self.volume_id,
+            volume_id,
             operation,
             remote,
             &publication_state,
@@ -740,8 +738,8 @@ fn install_staged_changes(replica: &Path, staged: &StagedTree, before: &FrozenTr
     Ok(())
 }
 
-async fn materialize_files<R: VolumeReader>(
-    reader: &R,
+async fn materialize_files<V: Volume>(
+    volume: &V,
     target: &Operator,
     root: &Path,
     files: Vec<(String, FileVersion, [u8; 32], bool)>,
@@ -755,7 +753,7 @@ async fn materialize_files<R: VolumeReader>(
             version: version.clone(),
         })
         .collect();
-    reader
+    volume
         .materialize(target, requests, full_tree, transfer_concurrency)
         .await?;
     for (path, _, _, executable) in &files {
@@ -780,7 +778,6 @@ async fn materialize_tree<V: Volume>(
         .to_str()
         .context("materialization path is not valid Unicode")?;
     let target = Operator::new(services::Fs::default().root(root))?.finish();
-    let reader = volume.reader()?;
     let result = async {
         let mut files = Vec::new();
         for (path, node) in snapshot_paths(snapshot)? {
@@ -801,7 +798,7 @@ async fn materialize_tree<V: Volume>(
             }
         }
         materialize_files(
-            &reader,
+            volume,
             &target,
             &staging,
             files
@@ -861,33 +858,6 @@ fn snapshot_files(snapshot: &VolumeSnapshot) -> Result<BTreeMap<String, FileVers
                 .context("file version is missing")
         })
         .collect()
-}
-
-fn snapshot_paths(snapshot: &VolumeSnapshot) -> Result<BTreeMap<String, NodeId>> {
-    let mut paths = BTreeMap::new();
-    let mut pending = vec![(String::new(), snapshot.root)];
-    while let Some((path, node)) = pending.pop() {
-        if !path.is_empty() {
-            paths.insert(path.clone(), node);
-        }
-        let record = snapshot.nodes.get(&node).context("node is missing")?;
-        if record.kind != NodeKind::Directory {
-            continue;
-        }
-        let directory = snapshot
-            .directories
-            .get(&node)
-            .context("directory record is missing")?;
-        for (name, entry) in directory.entries.iter().rev() {
-            let child = if path.is_empty() {
-                name.clone()
-            } else {
-                format!("{path}/{name}")
-            };
-            pending.push((child, entry.node));
-        }
-    }
-    Ok(paths)
 }
 
 fn fresh_sibling(path: &Path, purpose: &str) -> PathBuf {

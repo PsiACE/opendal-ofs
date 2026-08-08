@@ -29,16 +29,16 @@ use super::namespace::{
     ObjectNamespace,
 };
 use super::{
-    AuthorityKnownContent, D1Metadata, FileLayoutPolicy, LooseGcMaintenance, ManagedData,
-    ManagedError, ManagedErrorKind, ManagedFormat, MetadataPlacement, PackMaintenance,
+    AuthorityKnownContent, D1Metadata, LooseGcMaintenance, ManagedData, ManagedError,
+    ManagedErrorKind, ManagedFormat, MetadataPlacement, PackMaintenance,
 };
 use crate::filesystem::{CommitOutcome, OperationId, VolumeId};
 use crate::filesystem::{
     DirectoryRecord as FsDirectoryRecord, FileVersion, MaterializeRequest,
     NodeRecord as FsNodeRecord, Volume, VolumeError, VolumeErrorKind, VolumeObservation,
-    VolumePublication, VolumeReader, VolumeSnapshot,
+    VolumePublication, VolumeSnapshot,
 };
-use crate::managed::pack::{PackId, PackLocation, PackReadSession, VerifiedPack};
+use crate::managed::pack::{PackId, PackLocation};
 
 #[derive(Clone)]
 pub struct ManagedVolume {
@@ -56,48 +56,7 @@ enum NamespaceAuthority {
 #[derive(Clone, Debug)]
 pub struct ManagedObservation {
     authority: AuthorityObservation,
-}
-
-#[derive(Clone, Debug)]
-pub struct ManagedVolumeObservation {
-    inner: ManagedObservation,
-    snapshot: VolumeSnapshot,
-}
-
-/// Reader state shared by one Sync materialization operation.
-#[derive(Clone)]
-pub struct ManagedMaterializer {
-    data: ManagedData,
-    packs: PackReadSession,
-}
-
-impl ManagedMaterializer {
-    pub(crate) async fn materialize(
-        &self,
-        version: &FileVersionRecord,
-        target: &Operator,
-        path: &str,
-    ) -> Result<(), ManagedError> {
-        self.data
-            .read_to_with(version, target, path, &self.packs)
-            .await
-    }
-
-    pub(crate) async fn pack_locations(&self, content: ContentRef) -> Vec<PackLocation> {
-        self.packs.locations(content).await
-    }
-
-    pub(crate) async fn read_full_pack(&self, id: PackId) -> Result<VerifiedPack, ManagedError> {
-        self.packs.read_full(id).await
-    }
-
-    pub(crate) async fn read_pack_ranges(
-        &self,
-        id: PackId,
-        entries: &[(ContentRef, PackLocation)],
-    ) -> Result<Vec<Vec<u8>>, ManagedError> {
-        self.packs.read_ranges(id, entries).await
-    }
+    filesystem_snapshot: VolumeSnapshot,
 }
 
 #[derive(Clone, Debug)]
@@ -138,7 +97,7 @@ impl ManagedVolume {
                 volume_id,
                 data_operator.clone(),
             )?),
-            data: ManagedData::new(data_operator, &format)?,
+            data: ManagedData::new(data_operator)?,
         })
     }
 
@@ -158,40 +117,22 @@ impl ManagedVolume {
         Ok(Self {
             volume_id,
             namespace: NamespaceAuthority::D1(D1Namespace::new(volume_id, metadata.session())),
-            data: ManagedData::new(data_operator, &format)?,
-        })
-    }
-
-    pub fn with_file_layout(mut self, policy: FileLayoutPolicy) -> Result<Self, ManagedError> {
-        self.data.set_policy(policy)?;
-        Ok(self)
-    }
-
-    pub(crate) fn materializer(&self) -> Result<ManagedMaterializer, ManagedError> {
-        Ok(ManagedMaterializer {
-            data: self.data.clone(),
-            packs: self.data.read_session()?,
+            data: ManagedData::new(data_operator)?,
         })
     }
 
     pub async fn observe(&self) -> Result<Option<ManagedObservation>, ManagedError> {
         match &self.namespace {
-            NamespaceAuthority::Object(namespace) => {
-                Ok(namespace
-                    .observe()
-                    .await?
-                    .map(|observed| ManagedObservation {
-                        authority: AuthorityObservation::Object(observed),
-                    }))
-            }
-            NamespaceAuthority::D1(namespace) => {
-                Ok(namespace
-                    .observe()
-                    .await?
-                    .map(|observed| ManagedObservation {
-                        authority: AuthorityObservation::D1(observed),
-                    }))
-            }
+            NamespaceAuthority::Object(namespace) => namespace
+                .observe()
+                .await?
+                .map(|observed| managed_observation(AuthorityObservation::Object(observed)))
+                .transpose(),
+            NamespaceAuthority::D1(namespace) => namespace
+                .observe()
+                .await?
+                .map(|observed| managed_observation(AuthorityObservation::D1(observed)))
+                .transpose(),
         }
     }
 
@@ -201,13 +142,11 @@ impl ManagedVolume {
         base: Option<&NamespaceSnapshot>,
     ) -> Result<Option<ManagedObservation>, ManagedError> {
         match (&self.namespace, base) {
-            (NamespaceAuthority::Object(namespace), Some(base)) => {
-                namespace.observe_from(base).await.map(|observed| {
-                    observed.map(|observed| ManagedObservation {
-                        authority: AuthorityObservation::Object(observed),
-                    })
-                })
-            }
+            (NamespaceAuthority::Object(namespace), Some(base)) => namespace
+                .observe_from(base)
+                .await?
+                .map(|observed| managed_observation(AuthorityObservation::Object(observed)))
+                .transpose(),
             _ => self.observe().await,
         }
     }
@@ -317,125 +256,120 @@ impl ManagedVolume {
     }
 }
 
-impl VolumeObservation for ManagedVolumeObservation {
+impl VolumeObservation for ManagedObservation {
     fn snapshot(&self) -> &VolumeSnapshot {
-        &self.snapshot
+        &self.filesystem_snapshot
     }
 }
 
-impl VolumeReader for ManagedMaterializer {
-    async fn materialize(
-        &self,
-        target: &Operator,
-        requests: Vec<MaterializeRequest>,
-        full_tree: bool,
-        concurrency: NonZeroUsize,
-    ) -> Result<(), VolumeError> {
-        let mut packed =
-            BTreeMap::<PackId, Vec<(MaterializeRequest, ContentRef, PackLocation)>>::new();
-        let mut unpacked = Vec::new();
-        for request in requests {
-            let managed = decode_file_version(&request.version)?;
-            let content = match &managed.layout {
-                FileVersionLayout::Whole { content } if content.logical_length > 0 => {
-                    Some(*content)
-                }
-                _ => None,
-            };
-            let location = match content {
-                Some(content) => self.pack_locations(content).await.into_iter().next(),
-                None => None,
-            };
-            match (content, location) {
-                (Some(content), Some(location)) => packed
-                    .entry(location.pack)
-                    .or_default()
-                    .push((request, content, location)),
-                _ => unpacked.push((request, managed)),
-            }
+async fn materialize_managed_files(
+    volume: &ManagedVolume,
+    target: &Operator,
+    requests: Vec<MaterializeRequest>,
+    full_tree: bool,
+    concurrency: NonZeroUsize,
+) -> Result<(), VolumeError> {
+    let data = volume.data.clone();
+    let packs = data.read_session()?;
+    let mut packed = BTreeMap::<PackId, Vec<(MaterializeRequest, ContentRef, PackLocation)>>::new();
+    let mut unpacked = Vec::new();
+    for request in requests {
+        let managed = decode_file_version(&request.version)?;
+        let content = match &managed.layout {
+            FileVersionLayout::Whole { content } if content.logical_length > 0 => Some(*content),
+            _ => None,
+        };
+        let location = match content {
+            Some(content) => packs.locations(content).await.into_iter().next(),
+            None => None,
+        };
+        match (content, location) {
+            (Some(content), Some(location)) => packed
+                .entry(location.pack)
+                .or_default()
+                .push((request, content, location)),
+            _ => unpacked.push((request, managed)),
         }
-
-        let packed_results = stream::iter(packed)
-            .map(|(id, requests)| {
-                let reader = self.clone();
-                let target = target.clone();
-                async move {
-                    let contents = if full_tree {
-                        reader.read_full_pack(id).await.and_then(|pack| {
-                            requests
-                                .iter()
-                                .map(|(_, content, _)| {
-                                    pack.content(*content)
-                                        .map(ToOwned::to_owned)
-                                        .ok_or_else(|| {
-                                            ManagedError::new(
-                                                ManagedErrorKind::Corrupt,
-                                                "materialize Managed files",
-                                                "pack index disagrees with verified pack",
-                                            )
-                                        })
-                                })
-                                .collect()
-                        })
-                    } else {
-                        let entries = requests
-                            .iter()
-                            .map(|(_, content, location)| (*content, *location))
-                            .collect::<Vec<_>>();
-                        reader.read_pack_ranges(id, &entries).await
-                    };
-                    if let Ok(contents) = contents {
-                        for ((request, _, _), bytes) in requests.into_iter().zip(contents) {
-                            target.write(&request.path, bytes).await.map_err(|_| {
-                                VolumeError::new(
-                                    VolumeErrorKind::Unavailable,
-                                    format!(
-                                        "materialize file {:?}: target write failed",
-                                        request.path
-                                    ),
-                                )
-                            })?;
-                        }
-                    } else {
-                        for (request, _, _) in requests {
-                            let version = decode_file_version(&request.version)?;
-                            reader.materialize(&version, &target, &request.path).await?;
-                        }
-                    }
-                    Ok::<_, VolumeError>(())
-                }
-            })
-            .buffer_unordered(concurrency.get())
-            .collect::<Vec<_>>()
-            .await;
-        for result in packed_results {
-            result?;
-        }
-
-        let unpacked_results = stream::iter(unpacked)
-            .map(|(request, version)| {
-                let reader = self.clone();
-                let target = target.clone();
-                async move {
-                    reader
-                        .materialize(&version, &target, &request.path)
-                        .await
-                        .map_err(VolumeError::from)
-                }
-            })
-            .buffer_unordered(concurrency.get())
-            .collect::<Vec<_>>()
-            .await;
-        for result in unpacked_results {
-            result?;
-        }
-        Ok(())
     }
+
+    let packed_results = stream::iter(packed)
+        .map(|(id, requests)| {
+            let data = data.clone();
+            let packs = packs.clone();
+            let target = target.clone();
+            async move {
+                let contents = if full_tree {
+                    packs.read_full(id).await.and_then(|pack| {
+                        requests
+                            .iter()
+                            .map(|(_, content, _)| {
+                                pack.content(*content)
+                                    .map(ToOwned::to_owned)
+                                    .ok_or_else(|| {
+                                        ManagedError::new(
+                                            ManagedErrorKind::Corrupt,
+                                            "materialize Managed files",
+                                            "pack index disagrees with verified pack",
+                                        )
+                                    })
+                            })
+                            .collect()
+                    })
+                } else {
+                    let entries = requests
+                        .iter()
+                        .map(|(_, content, location)| (*content, *location))
+                        .collect::<Vec<_>>();
+                    packs.read_ranges(id, &entries).await
+                };
+                if let Ok(contents) = contents {
+                    for ((request, _, _), bytes) in requests.into_iter().zip(contents) {
+                        target.write(&request.path, bytes).await.map_err(|_| {
+                            VolumeError::new(
+                                VolumeErrorKind::Unavailable,
+                                format!("materialize file {:?}: target write failed", request.path),
+                            )
+                        })?;
+                    }
+                } else {
+                    for (request, _, _) in requests {
+                        let version = decode_file_version(&request.version)?;
+                        data.read_to_with(&version, &target, &request.path, &packs)
+                            .await?;
+                    }
+                }
+                Ok::<_, VolumeError>(())
+            }
+        })
+        .buffer_unordered(concurrency.get())
+        .collect::<Vec<_>>()
+        .await;
+    for result in packed_results {
+        result?;
+    }
+
+    let unpacked_results = stream::iter(unpacked)
+        .map(|(request, version)| {
+            let data = data.clone();
+            let packs = packs.clone();
+            let target = target.clone();
+            async move {
+                data.read_to_with(&version, &target, &request.path, &packs)
+                    .await
+                    .map_err(VolumeError::from)
+            }
+        })
+        .buffer_unordered(concurrency.get())
+        .collect::<Vec<_>>()
+        .await;
+    for result in unpacked_results {
+        result?;
+    }
+    Ok(())
 }
 
 impl Volume for ManagedVolume {
-    type Observation = ManagedVolumeObservation;
-    type Reader = ManagedMaterializer;
+    type Observation = ManagedObservation;
 
     fn id(&self) -> VolumeId {
         self.volume_id
@@ -457,18 +391,14 @@ impl Volume for ManagedVolume {
         })
     }
 
-    async fn observe(&self) -> Result<Option<Self::Observation>, VolumeError> {
-        let observed = ManagedVolume::observe(self).await?;
-        observed.map(volume_observation).transpose()
-    }
-
     async fn observe_from(
         &self,
         base: Option<&VolumeSnapshot>,
     ) -> Result<Option<Self::Observation>, VolumeError> {
         let base = base.map(to_managed_snapshot).transpose()?;
-        let observed = ManagedVolume::observe_from(self, base.as_ref()).await?;
-        observed.map(volume_observation).transpose()
+        ManagedVolume::observe_from(self, base.as_ref())
+            .await
+            .map_err(Into::into)
     }
 
     async fn stage_files(
@@ -509,13 +439,9 @@ impl Volume for ManagedVolume {
         publication: &VolumePublication,
     ) -> Result<CommitOutcome, VolumeError> {
         let publication = to_managed_publication(publication)?;
-        ManagedVolume::publish(
-            self,
-            observed.map(|observation| &observation.inner),
-            &publication,
-        )
-        .await
-        .map_err(Into::into)
+        ManagedVolume::publish(self, observed, &publication)
+            .await
+            .map_err(Into::into)
     }
 
     async fn resolve(&self, operation: OperationId) -> Result<CommitOutcome, VolumeError> {
@@ -524,27 +450,38 @@ impl Volume for ManagedVolume {
             .map_err(Into::into)
     }
 
-    fn reader(&self) -> Result<Self::Reader, VolumeError> {
-        self.materializer().map_err(Into::into)
+    async fn materialize(
+        &self,
+        target: &Operator,
+        requests: Vec<MaterializeRequest>,
+        full_tree: bool,
+        concurrency: NonZeroUsize,
+    ) -> Result<(), VolumeError> {
+        materialize_managed_files(self, target, requests, full_tree, concurrency).await
     }
 }
 
-fn volume_observation(
-    observed: ManagedObservation,
-) -> Result<ManagedVolumeObservation, VolumeError> {
-    let snapshot = to_volume_snapshot(observed.snapshot())?;
-    Ok(ManagedVolumeObservation {
-        inner: observed,
-        snapshot,
+fn managed_observation(
+    authority: AuthorityObservation,
+) -> Result<ManagedObservation, ManagedError> {
+    let snapshot = match &authority {
+        AuthorityObservation::Object(observed) => &observed.snapshot,
+        AuthorityObservation::D1(observed) => &observed.snapshot,
+    };
+    let filesystem_snapshot = to_volume_snapshot(snapshot)?;
+    Ok(ManagedObservation {
+        authority,
+        filesystem_snapshot,
     })
 }
 
-fn encode_file_version(version: &FileVersionRecord) -> Result<FileVersion, VolumeError> {
+fn encode_file_version(version: &FileVersionRecord) -> Result<FileVersion, ManagedError> {
     let mut descriptor = Vec::new();
     ciborium::into_writer(&version.layout, &mut descriptor).map_err(|error| {
-        VolumeError::new(
-            VolumeErrorKind::Invalid,
-            format!("encode Managed file version: {error}"),
+        ManagedError::new(
+            ManagedErrorKind::Invalid,
+            "encode Managed file version",
+            error.to_string(),
         )
     })?;
     Ok(FileVersion::from_parts(
@@ -578,7 +515,7 @@ fn decode_file_version(version: &FileVersion) -> Result<FileVersionRecord, Volum
     Ok(decoded)
 }
 
-fn to_volume_snapshot(snapshot: &NamespaceSnapshot) -> Result<VolumeSnapshot, VolumeError> {
+fn to_volume_snapshot(snapshot: &NamespaceSnapshot) -> Result<VolumeSnapshot, ManagedError> {
     Ok(VolumeSnapshot {
         volume_id: snapshot.volume_id,
         cursor: snapshot.cursor,
@@ -617,7 +554,7 @@ fn to_volume_snapshot(snapshot: &NamespaceSnapshot) -> Result<VolumeSnapshot, Vo
             .file_versions
             .iter()
             .map(|(id, version)| Ok((*id, encode_file_version(version)?)))
-            .collect::<Result<_, VolumeError>>()?,
+            .collect::<Result<_, ManagedError>>()?,
     })
 }
 

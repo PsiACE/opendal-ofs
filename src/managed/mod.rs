@@ -27,11 +27,9 @@ mod section;
 mod volume;
 
 pub(crate) use data::{AuthorityKnownContent, ManagedData};
-pub use data::{FileLayoutPolicy, LooseGcMaintenance, PackMaintenance};
+pub use data::{LooseGcMaintenance, PackMaintenance};
 pub use error::{ManagedError, ManagedErrorKind};
-pub use format::{ManagedExtension, ManagedFormat, MetadataPlacement};
+pub use format::{ManagedFormat, MetadataPlacement};
 pub use metadata::{D1Config, D1Metadata, ObjectMetadata};
 pub use namespace::NamespaceGcSweep;
-pub use volume::{
-    ManagedMaterializer, ManagedObservation, ManagedVolume, ManagedVolumeObservation,
-};
+pub use volume::{ManagedObservation, ManagedVolume};

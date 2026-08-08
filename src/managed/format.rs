@@ -42,20 +42,6 @@ pub enum MetadataPlacement {
     ExternalD1,
 }
 
-/// Required persistent semantics enabled for a Managed volume.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub enum ManagedExtension {
-    FastCdc,
-}
-
-impl ManagedExtension {
-    const fn id(self) -> &'static str {
-        match self {
-            Self::FastCdc => FASTCDC_EXTENSION,
-        }
-    }
-}
-
 /// The single portable superblock shared by metadata and file-data storage.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManagedFormat {
@@ -69,16 +55,12 @@ impl ManagedFormat {
     pub fn v1(
         volume_id: VolumeId,
         metadata_placement: MetadataPlacement,
-        extensions: impl IntoIterator<Item = ManagedExtension>,
     ) -> Result<Self, ManagedError> {
         let format = Self {
             volume_id,
             metadata_placement,
             naming_policy: NamingPolicy::PortableUtf8V1,
-            extensions: extensions
-                .into_iter()
-                .map(|extension| extension.id().to_owned())
-                .collect(),
+            extensions: BTreeSet::from([FASTCDC_EXTENSION.to_owned()]),
         };
         format.validate_for_write()?;
         Ok(format)
@@ -92,10 +74,6 @@ impl ManagedFormat {
         self.metadata_placement
     }
 
-    pub(crate) fn extension_enabled(&self, extension: ManagedExtension) -> bool {
-        self.extensions.contains(extension.id())
-    }
-
     pub(crate) fn validate_for_read(&self) -> Result<(), ManagedError> {
         if self
             .extensions
@@ -103,6 +81,11 @@ impl ManagedFormat {
             .any(|extension| !SUPPORTED_EXTENSIONS.contains(&extension.as_str()))
         {
             return Err(unsupported("superblock requires an unsupported extension"));
+        }
+        if !self.extensions.contains(FASTCDC_EXTENSION) {
+            return Err(unsupported(
+                "superblock omits the required data-fastcdc/1 extension",
+            ));
         }
         Ok(())
     }
@@ -268,7 +251,6 @@ mod tests {
         ManagedFormat::v1(
             VolumeId::from_bytes([1; 16]),
             MetadataPlacement::ColocatedObject,
-            [ManagedExtension::FastCdc],
         )
         .unwrap()
     }

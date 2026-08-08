@@ -32,12 +32,14 @@ the Managed volume format.
 
 ## Runtime storage concurrency
 
-Remote commands accept `--transfer-concurrency N`; `OFS_TRANSFER_CONCURRENCY`
-provides the same setting. The default is four, and the value must be greater
-than zero. The assembled OpenDAL operator uses it as its operation limit, and
-Sync uses it to bound publication and materialization work. `status` does not
-open storage and therefore does not accept the option. This is runtime
-configuration, not part of a Volume Model, Access Model, or durable format.
+Sync, Mount, pack, reindex, and garbage collection accept
+`--transfer-concurrency N`; `OFS_TRANSFER_CONCURRENCY` provides the same
+setting. The default is four, and the value must be greater than zero. The
+assembled OpenDAL operator uses it as its operation limit, and Sync also uses
+it to bound publication and materialization work. Volume creation and `status`
+do not perform parallel transfers and therefore do not accept the option. This
+is runtime configuration, not part of a Volume Model, Access Model, or durable
+format.
 
 ## Managed volumes in Sync
 
@@ -46,10 +48,9 @@ does not interpret metadata checkpoints, file manifests, packs, or secondary
 indexes. The volume validates its storage format and required extensions before
 Sync scans or publishes anything.
 
-The CLI exposes `whole` and `fastcdc` writer policies, with whole-file writes as
-the default. FastCDC uses its fixed format-v1 policy at or above 1 MiB, so
-smaller files remain whole. Packing is explicit maintenance and does not change
-the filesystem-visible file version, node generation, or change cursor.
+Format v1 uses FastCDC at or above 1 MiB and whole-file content below that
+threshold. Packing is explicit maintenance and does not change the
+filesystem-visible file version, node generation, or change cursor.
 
 Data is written and verified before metadata can reference it. If publication
 fails after that write, the result may be an unreachable loose object. The
@@ -85,31 +86,16 @@ volume and leaves its identity unchanged.
 Use a different storage root for each volume. The root is private Managed
 storage, not an object namespace for other tools to edit.
 
-## Configure large-file chunking
-
-Select FastCDC when creating or reopening a volume:
-
-```shell
-ofs volume create workspace \
-  --model managed \
-  --storage "$OFS_STORAGE_URL" \
-  --file-layout fastcdc
-```
+## Large-file chunking
 
 Format v1 uses FastCDC v2020 for files of at least 1 MiB, with 64 KiB minimum,
-256 KiB target, and 1 MiB maximum chunks. These interpretation parameters are
-fixed rather than stored as per-client tuning. `OFS_FILE_LAYOUT` selects
-`whole` or `fastcdc`.
+256 KiB target, and 1 MiB maximum chunks. These writer values are fixed. Each
+file-version manifest stores the values needed to interpret its chunks, so a
+reader does not depend on local configuration.
 
-The catalog keeps the selected policy. Reopening an existing catalog without
-layout options preserves its current policy. Supplying a layout updates future
-writes without rewriting existing file versions. When rebuilding a lost catalog,
-pass the intended policy again because the remote format record does not choose a
-writer policy.
-
-Small files remain whole when FastCDC is enabled. Run `ofs volume pack` when you
-want to aggregate their physical content. Packing does not change the configured
-file layout or any published `FileVersion`.
+Smaller files remain whole. Run `ofs volume pack` to aggregate their physical
+content into a derived read index; packing does not change any published
+`FileVersion`.
 
 ## Create a D1 metadata volume with MinIO data
 

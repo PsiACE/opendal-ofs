@@ -33,5 +33,5 @@ pub use publication::CommitOutcome;
 pub use volume::{
     DirectoryPrecondition, DirectoryRecord, FileVersion, MaterializeRequest, NodePrecondition,
     NodeRecord, Volume, VolumeError, VolumeErrorKind, VolumeObservation, VolumePublication,
-    VolumeReader, VolumeSnapshot,
+    VolumeSnapshot,
 };

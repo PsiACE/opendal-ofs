@@ -27,9 +27,8 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::filesystem::{VolumeId, VolumeModel};
-use crate::managed::FileLayoutPolicy;
 
-const SCHEMA_MAJOR: u16 = 3;
+const SCHEMA_MAJOR: u16 = 4;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VolumeDefinition {
@@ -47,7 +46,6 @@ pub enum VolumeSettings {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManagedVolumeSettings {
     pub metadata: Option<Url>,
-    pub file_layout: FileLayoutPolicy,
 }
 
 impl VolumeDefinition {
@@ -59,12 +57,7 @@ impl VolumeDefinition {
             settings: VolumeSettings::Direct,
         })
     }
-    pub fn managed(
-        volume_id: VolumeId,
-        storage: Url,
-        metadata: Option<Url>,
-        file_layout: FileLayoutPolicy,
-    ) -> Result<Self> {
+    pub fn managed(volume_id: VolumeId, storage: Url, metadata: Option<Url>) -> Result<Self> {
         require_credential_free("storage", &storage)?;
         if let Some(metadata) = &metadata {
             require_credential_free("metadata", metadata)?;
@@ -72,10 +65,7 @@ impl VolumeDefinition {
         Ok(Self {
             volume_id,
             storage,
-            settings: VolumeSettings::Managed(ManagedVolumeSettings {
-                metadata,
-                file_layout,
-            }),
+            settings: VolumeSettings::Managed(ManagedVolumeSettings { metadata }),
         })
     }
 
@@ -212,8 +202,6 @@ struct StoredVolume {
     storage: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     metadata: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    file_layout: Option<FileLayoutPolicy>,
 }
 
 impl From<&Catalog> for StoredCatalog {
@@ -232,12 +220,11 @@ impl From<&Catalog> for StoredCatalog {
 
 impl From<&VolumeDefinition> for StoredVolume {
     fn from(volume: &VolumeDefinition) -> Self {
-        let (metadata, file_layout) = match &volume.settings {
-            VolumeSettings::Direct => (None, None),
-            VolumeSettings::Managed(settings) => (
-                settings.metadata.as_ref().map(ToString::to_string),
-                Some(settings.file_layout),
-            ),
+        let metadata = match &volume.settings {
+            VolumeSettings::Direct => None,
+            VolumeSettings::Managed(settings) => {
+                settings.metadata.as_ref().map(ToString::to_string)
+            }
         };
         Self {
             volume_id: *volume.volume_id.as_bytes(),
@@ -248,7 +235,6 @@ impl From<&VolumeDefinition> for StoredVolume {
             .into(),
             storage: volume.storage.to_string(),
             metadata,
-            file_layout,
         }
     }
 }
@@ -270,17 +256,12 @@ impl TryFrom<StoredVolume> for VolumeDefinition {
             .transpose()?;
         match model {
             VolumeModel::Direct => {
-                if metadata.is_some() || volume.file_layout.is_some() {
+                if metadata.is_some() {
                     bail!("Direct volume contains Managed-only catalog settings");
                 }
                 Self::direct(volume_id, storage)
             }
-            VolumeModel::Managed => {
-                let file_layout = volume
-                    .file_layout
-                    .context("Managed volume is missing its file layout policy")?;
-                Self::managed(volume_id, storage, metadata, file_layout)
-            }
+            VolumeModel::Managed => Self::managed(volume_id, storage, metadata),
         }
     }
 }

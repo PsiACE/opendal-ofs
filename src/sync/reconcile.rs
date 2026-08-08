@@ -10,9 +10,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, bail};
 
-use super::{ConflictRecord, ReplicaState, StagedTree};
+use super::{ConflictRecord, ReplicaState, StagedTree, snapshot_paths};
 use crate::filesystem::NodeKind;
-use crate::filesystem::{FileVersion, FileVersionId, Generation, NodeId, VolumeSnapshot};
+use crate::filesystem::{FileVersionId, Generation, NodeId, VolumeSnapshot};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ReconcilePlan {
@@ -481,9 +481,7 @@ impl RemotePath {
 
 fn remote_paths(snapshot: &VolumeSnapshot) -> Result<BTreeMap<String, RemotePath>> {
     let mut paths = BTreeMap::new();
-    let mut pending = vec![(String::new(), snapshot.root)];
-    let mut expanded = BTreeSet::new();
-    while let Some((path, node)) = pending.pop() {
+    for (path, node) in snapshot_paths(snapshot)? {
         let record = snapshot
             .nodes
             .get(&node)
@@ -493,48 +491,33 @@ fn remote_paths(snapshot: &VolumeSnapshot) -> Result<BTreeMap<String, RemotePath
                 let version_id = record
                     .file_version
                     .context("remote file has no file version")?;
-                let version: &FileVersion = snapshot
+                let version = snapshot
                     .file_versions
                     .get(&version_id)
                     .context("remote file version is missing")?;
-                if !path.is_empty() {
-                    paths.insert(
-                        path,
-                        RemotePath::File(RemoteFile {
-                            node,
-                            generation: record.generation.clone(),
-                            version: version_id,
-                            digest: version.logical_digest,
-                        }),
-                    );
-                }
+                paths.insert(
+                    path,
+                    RemotePath::File(RemoteFile {
+                        node,
+                        generation: record.generation.clone(),
+                        version: version_id,
+                        digest: version.logical_digest,
+                    }),
+                );
             }
             NodeKind::Directory => {
-                if !expanded.insert(node) {
-                    bail!("remote namespace is not a directory tree");
-                }
                 let directory = snapshot
                     .directories
                     .get(&node)
                     .context("remote directory record is missing")?;
-                if !path.is_empty() {
-                    paths.insert(
-                        path.clone(),
-                        RemotePath::Directory(RemoteDirectory {
-                            node,
-                            generation: record.generation.clone(),
-                            directory_generation: directory.generation.clone(),
-                        }),
-                    );
-                }
-                for (name, entry) in directory.entries.iter().rev() {
-                    let child = if path.is_empty() {
-                        name.clone()
-                    } else {
-                        format!("{path}/{name}")
-                    };
-                    pending.push((child, entry.node));
-                }
+                paths.insert(
+                    path,
+                    RemotePath::Directory(RemoteDirectory {
+                        node,
+                        generation: record.generation.clone(),
+                        directory_generation: directory.generation.clone(),
+                    }),
+                );
             }
         }
     }

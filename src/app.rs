@@ -15,8 +15,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use ofs::catalog::{Catalog, VolumeDefinition};
 use ofs::filesystem::{OperationId, VolumeId, VolumeModel};
 use ofs::managed::{
-    D1Config, D1Metadata, FileLayoutPolicy, ManagedErrorKind, ManagedExtension, ManagedFormat,
-    ManagedVolume, MetadataPlacement, ObjectMetadata,
+    D1Config, D1Metadata, ManagedErrorKind, ManagedFormat, ManagedVolume, MetadataPlacement,
+    ObjectMetadata,
 };
 use ofs::sync::{ReplicaState, SyncEngine};
 use opendal::Operator;
@@ -24,8 +24,8 @@ use opendal::layers::{ConcurrentLimitLayer, RetryLayer};
 use url::Url;
 
 use crate::cli::{
-    Cli, Command, FileLayoutArg, MountArgs, StatusArgs, SyncArgs, VolumeCommand, VolumeCreateArgs,
-    VolumeGcArgs, VolumePackArgs, VolumeReindexArgs,
+    Cli, Command, MountArgs, StatusArgs, SyncArgs, VolumeCommand, VolumeCreateArgs, VolumeGcArgs,
+    VolumePackArgs, VolumeReindexArgs,
 };
 
 pub(crate) async fn run(cli: Cli) -> Result<()> {
@@ -110,7 +110,7 @@ async fn open_managed_volume(
         .clone();
     let settings = definition
         .managed_settings()
-        .context("Managed volume maintenance requires a Managed volume")?;
+        .context("this operation requires a Managed volume")?;
     let data = open_operator(&definition.storage, transfer_concurrency)?;
     let d1 = open_d1_metadata(settings.metadata.as_ref())?;
     let placement = if settings.metadata.is_some() {
@@ -131,13 +131,11 @@ async fn open_managed_volume(
     match d1 {
         None => ManagedVolume::object(expected, data),
         Some(metadata) => ManagedVolume::d1(expected, data, metadata),
-    }?
-    .with_file_layout(settings.file_layout)
+    }
     .map_err(Into::into)
 }
 
 async fn create_volume(config: &Path, mut args: VolumeCreateArgs) -> Result<()> {
-    let transfer_concurrency = args.runtime.transfer_concurrency;
     if args.model == VolumeModel::Managed && args.metadata.is_none() {
         args.metadata = env::var_os("OFS_METADATA_URL")
             .filter(|value| !value.is_empty())
@@ -154,26 +152,15 @@ async fn create_volume(config: &Path, mut args: VolumeCreateArgs) -> Result<()> 
     let mut catalog = Catalog::load(config).context("cannot open the writable volume catalog")?;
     let configured = catalog.get(&args.alias).cloned();
     if args.model == VolumeModel::Direct {
-        return create_direct_volume(catalog, configured.as_ref(), args, transfer_concurrency);
+        return create_direct_volume(catalog, configured.as_ref(), args);
     }
 
-    let file_layout = requested_file_layout(
-        &args,
-        configured
-            .as_ref()
-            .and_then(VolumeDefinition::managed_settings)
-            .map(|settings| settings.file_layout),
-    );
     let provisional_id = configured
         .as_ref()
         .map(|definition| definition.volume_id)
         .unwrap_or_else(VolumeId::generate);
-    let provisional = VolumeDefinition::managed(
-        provisional_id,
-        args.storage.clone(),
-        args.metadata.clone(),
-        file_layout,
-    )
+    let provisional =
+        VolumeDefinition::managed(provisional_id, args.storage.clone(), args.metadata.clone())
     .context("volume URLs must be credential-free; supply credentials through provider environment variables")?;
     if configured
         .as_ref()
@@ -189,7 +176,7 @@ async fn create_volume(config: &Path, mut args: VolumeCreateArgs) -> Result<()> 
     } else {
         MetadataPlacement::ColocatedObject
     };
-    let data = open_operator(&args.storage, transfer_concurrency)?;
+    let data = open_operator(&args.storage, NonZeroUsize::MIN)?;
     let d1 = open_d1_metadata(args.metadata.as_ref())?;
     let desired = managed_format(provisional_id, placement)?;
     let data_metadata = ObjectMetadata::new(data);
@@ -208,8 +195,7 @@ async fn create_volume(config: &Path, mut args: VolumeCreateArgs) -> Result<()> 
     if let Some(metadata) = &d1 {
         metadata.create_format(&format).await?;
     }
-    let definition =
-        VolumeDefinition::managed(format.volume_id(), args.storage, args.metadata, file_layout)?;
+    let definition = VolumeDefinition::managed(format.volume_id(), args.storage, args.metadata)?;
     let created = catalog.create(&args.alias, definition)?;
 
     catalog
@@ -225,19 +211,14 @@ fn create_direct_volume(
     mut catalog: Catalog,
     configured: Option<&VolumeDefinition>,
     args: VolumeCreateArgs,
-    transfer_concurrency: NonZeroUsize,
 ) -> Result<()> {
     if args.metadata.is_some() {
         bail!("--metadata is only valid with --model managed");
     }
-    if args.file_layout.is_some() {
-        bail!("file layout options are only valid with --model managed");
-    }
-
     let volume_id = configured
         .map(|definition| definition.volume_id)
         .unwrap_or_else(VolumeId::generate);
-    open_operator(&args.storage, transfer_concurrency)
+    open_operator(&args.storage, NonZeroUsize::MIN)
         .context("cannot configure the Direct volume storage")?;
     let definition = VolumeDefinition::direct(volume_id, args.storage)
         .context("volume URLs must be credential-free; supply credentials through provider environment variables")?;
@@ -251,17 +232,6 @@ fn create_direct_volume(
     Ok(())
 }
 
-fn requested_file_layout(
-    args: &VolumeCreateArgs,
-    configured: Option<FileLayoutPolicy>,
-) -> FileLayoutPolicy {
-    match args.file_layout {
-        None => configured.unwrap_or_default(),
-        Some(FileLayoutArg::Whole) => FileLayoutPolicy::Whole,
-        Some(FileLayoutArg::FastCdc) => FileLayoutPolicy::FastCdcV2020,
-    }
-}
-
 fn open_d1_metadata(metadata: Option<&Url>) -> Result<Option<D1Metadata>> {
     match metadata {
         None => Ok(None),
@@ -271,7 +241,7 @@ fn open_d1_metadata(metadata: Option<&Url>) -> Result<Option<D1Metadata>> {
 }
 
 fn managed_format(volume_id: VolumeId, placement: MetadataPlacement) -> Result<ManagedFormat> {
-    ManagedFormat::v1(volume_id, placement, [ManagedExtension::FastCdc]).map_err(Into::into)
+    ManagedFormat::v1(volume_id, placement).map_err(Into::into)
 }
 
 async fn sync_volume(config: &Path, args: SyncArgs) -> Result<()> {
@@ -400,6 +370,10 @@ async fn mount_volume(config: &Path, args: MountArgs) -> Result<()> {
     }
     let operator = open_operator(&definition.storage, args.runtime.transfer_concurrency)
         .context("cannot open the Direct volume storage configured in the catalog")?;
+    let capability = operator.info().full_capability();
+    if !capability.read || !capability.stat || !capability.list {
+        bail!("Direct Mount requires storage read, stat, and list capabilities");
+    }
     mount(&args.mount_path, operator).await
 }
 

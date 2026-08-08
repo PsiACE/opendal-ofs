@@ -9,7 +9,7 @@
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand};
 use ofs::filesystem::VolumeModel;
 use url::Url;
 
@@ -26,7 +26,7 @@ pub(crate) struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
-    /// Create or inspect a named volume.
+    /// Create or reopen a named volume.
     Volume {
         #[command(subcommand)]
         command: VolumeCommand,
@@ -105,20 +105,6 @@ pub(crate) struct VolumeCreateArgs {
     /// Credential-free D1 metadata URL. Managed volumes also read OFS_METADATA_URL.
     #[arg(long, value_name = "URL")]
     pub metadata: Option<Url>,
-
-    /// Foreground file layout. Existing volumes keep their configured value when omitted.
-    #[arg(long, env = "OFS_FILE_LAYOUT", value_enum, value_name = "LAYOUT")]
-    pub file_layout: Option<FileLayoutArg>,
-
-    #[command(flatten)]
-    pub runtime: StorageOptions,
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-pub(crate) enum FileLayoutArg {
-    Whole,
-    #[value(name = "fastcdc")]
-    FastCdc,
 }
 
 #[derive(Debug, Args)]

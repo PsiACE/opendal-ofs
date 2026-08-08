@@ -23,10 +23,9 @@ use std::ops::Range;
 use fastcdc::v2020::AsyncStreamCDC;
 use futures::StreamExt;
 use opendal::{ErrorKind, Operator, Writer};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use super::{ManagedError, ManagedErrorKind, ManagedExtension, ManagedFormat};
+use super::{ManagedError, ManagedErrorKind};
 use crate::filesystem::{NodeKind, OperationId};
 use crate::managed::namespace::{
     ChunkSpan, ContentRef, FileVersionLayout, FileVersionRecord, NamespaceSnapshot,
@@ -82,15 +81,6 @@ impl AuthorityKnownContent {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum FileLayoutPolicy {
-    #[default]
-    Whole,
-    #[serde(rename = "fastcdc_v2020")]
-    FastCdcV2020,
-}
-
 #[derive(Clone, Copy)]
 struct FastCdcSizes {
     minimum: u32,
@@ -119,12 +109,10 @@ impl Digest {
 #[derive(Clone)]
 pub(crate) struct ManagedData {
     operator: Operator,
-    policy: FileLayoutPolicy,
-    fastcdc_enabled: bool,
 }
 
 impl ManagedData {
-    pub(crate) fn new(operator: Operator, format: &ManagedFormat) -> Result<Self, ManagedError> {
+    pub(crate) fn new(operator: Operator) -> Result<Self, ManagedError> {
         let capability = operator.info().full_capability();
         if !capability.stat
             || !capability.read
@@ -137,19 +125,7 @@ impl ManagedData {
                 "data storage requires stat, read, empty write, and create-only write",
             ));
         }
-        Ok(Self {
-            operator,
-            policy: FileLayoutPolicy::Whole,
-            fastcdc_enabled: format.extension_enabled(ManagedExtension::FastCdc),
-        })
-    }
-
-    pub(crate) fn set_policy(&mut self, policy: FileLayoutPolicy) -> Result<(), ManagedError> {
-        if policy == FileLayoutPolicy::FastCdcV2020 && !self.fastcdc_enabled {
-            return Err(unsupported("data-fastcdc/1 is not enabled for this volume"));
-        }
-        self.policy = policy;
-        Ok(())
+        Ok(Self { operator })
     }
 
     pub(crate) fn read_session(&self) -> Result<PackReadSession, ManagedError> {
@@ -162,31 +138,23 @@ impl ManagedData {
         frozen_path: &str,
         known: &AuthorityKnownContent,
     ) -> Result<FileVersionRecord, ManagedError> {
-        match self.policy {
-            FileLayoutPolicy::Whole => {
-                self.seal_whole_file_with_known_content(local, frozen_path, known)
-                    .await
-            }
-            FileLayoutPolicy::FastCdcV2020 => {
-                let size = frozen_size(local, frozen_path).await?;
-                if size < FASTCDC_MINIMUM_FILE_SIZE {
-                    self.seal_whole_file_with_known_content(local, frozen_path, known)
-                        .await
-                } else {
-                    self.seal_fastcdc(
-                        local,
-                        frozen_path,
-                        size,
-                        FastCdcSizes {
-                            minimum: FASTCDC_MINIMUM_SIZE,
-                            target: FASTCDC_TARGET_SIZE,
-                            maximum: FASTCDC_MAXIMUM_SIZE,
-                        },
-                        known,
-                    )
-                    .await
-                }
-            }
+        let size = frozen_size(local, frozen_path).await?;
+        if size < FASTCDC_MINIMUM_FILE_SIZE {
+            self.seal_whole_file_with_known_content(local, frozen_path, known)
+                .await
+        } else {
+            self.seal_fastcdc(
+                local,
+                frozen_path,
+                size,
+                FastCdcSizes {
+                    minimum: FASTCDC_MINIMUM_SIZE,
+                    target: FASTCDC_TARGET_SIZE,
+                    maximum: FASTCDC_MAXIMUM_SIZE,
+                },
+                known,
+            )
+            .await
         }
     }
 
@@ -308,7 +276,6 @@ impl ManagedData {
         snapshot: &NamespaceSnapshot,
         operation: OperationId,
     ) -> Result<PackMaintenance, ManagedError> {
-        self.validate_snapshot_extensions(snapshot)?;
         let contents = reachable_whole_content(snapshot, "pack reachable data")?;
 
         let mut index = PackIndex::open_or_empty(self.operator.clone()).await?;
@@ -531,7 +498,6 @@ impl ManagedData {
         mut target: Option<&mut Writer>,
         packs: Option<&PackReadSession>,
     ) -> Result<(), ManagedError> {
-        self.validate_manifest_extension(version)?;
         let mut logical = Sha256::new();
         match &version.layout {
             FileVersionLayout::Whole { content } => {
@@ -563,26 +529,6 @@ impl ManagedData {
                 "read loose data",
                 "logical content digest does not match the file version",
             ));
-        }
-        Ok(())
-    }
-
-    fn validate_manifest_extension(&self, version: &FileVersionRecord) -> Result<(), ManagedError> {
-        if matches!(version.layout, FileVersionLayout::FastCdc { .. }) && !self.fastcdc_enabled {
-            Err(unsupported(
-                "file manifest requires the disabled data-fastcdc/1 extension",
-            ))
-        } else {
-            Ok(())
-        }
-    }
-
-    fn validate_snapshot_extensions(
-        &self,
-        snapshot: &NamespaceSnapshot,
-    ) -> Result<(), ManagedError> {
-        for version in snapshot.file_versions.values() {
-            self.validate_manifest_extension(version)?;
         }
         Ok(())
     }
@@ -910,14 +856,6 @@ fn invalid(action: &'static str, message: &'static str) -> ManagedError {
     ManagedError::new(ManagedErrorKind::Invalid, action, message)
 }
 
-fn unsupported(message: &'static str) -> ManagedError {
-    ManagedError::new(
-        ManagedErrorKind::UnsupportedFormat,
-        "use Managed data",
-        message,
-    )
-}
-
 fn corrupt(action: &'static str, message: &'static str) -> ManagedError {
     ManagedError::new(ManagedErrorKind::Corrupt, action, message)
 }
@@ -956,13 +894,7 @@ mod tests {
     }
 
     fn managed_data(operator: Operator) -> ManagedData {
-        let format = ManagedFormat::v1(
-            VolumeId::from_bytes([42; 16]),
-            crate::managed::MetadataPlacement::ColocatedObject,
-            [ManagedExtension::FastCdc],
-        )
-        .unwrap();
-        ManagedData::new(operator, &format).unwrap()
+        ManagedData::new(operator).unwrap()
     }
 
     async fn seal_file(data: &ManagedData, source: &Operator, path: &str) -> FileVersionRecord {
@@ -1055,8 +987,7 @@ mod tests {
         source.write("small", small).await.unwrap();
         source.write("input", bytes.clone()).await.unwrap();
 
-        let mut data = managed_data(stored);
-        data.set_policy(FileLayoutPolicy::FastCdcV2020).unwrap();
+        let data = managed_data(stored);
         let below_threshold = seal_file(&data, &source, "small").await;
         assert!(matches!(
             below_threshold.layout,
@@ -1266,9 +1197,8 @@ mod tests {
             .await
             .unwrap();
 
-        let mut data = managed_data(stored.clone());
+        let data = managed_data(stored.clone());
         let whole = seal_whole_file(&data, &source, "whole").await;
-        data.set_policy(FileLayoutPolicy::FastCdcV2020).unwrap();
         let chunked = seal_file(&data, &source, "chunked").await;
         let snapshot =
             snapshot_with_files([("whole", whole.clone()), ("chunked", chunked.clone())]);
@@ -1307,8 +1237,7 @@ mod tests {
             .write("input", vec![7; 2 * 1024 * 1024])
             .await
             .unwrap();
-        let mut data = managed_data(stored.clone());
-        data.set_policy(FileLayoutPolicy::FastCdcV2020).unwrap();
+        let data = managed_data(stored.clone());
         let version = seal_file(&data, &source, "input").await;
         let FileVersionLayout::FastCdc { chunks, .. } = &version.layout else {
             panic!("FastCDC policy returned another layout")
