@@ -38,12 +38,11 @@ use crate::managed::{ManagedError, ManagedErrorKind};
 const HEADS: &str = "ofs_managed_v1_heads";
 const NODES: &str = "ofs_managed_v1_nodes";
 const DIRECTORIES: &str = "ofs_managed_v1_directories";
-const FILE_VERSIONS: &str = "ofs_managed_v1_file_versions";
 const TRANSACTIONS: &str = "ofs_managed_v1_change_transactions";
 const RESULTS: &str = "ofs_managed_v1_operation_results";
 const CHECKPOINTS: &str = "ofs_managed_v1_checkpoints";
 const CHECKPOINT_INTERVAL: u64 = 64;
-const SCHEMA_RESULTS: usize = 7;
+const SCHEMA_RESULTS: usize = 6;
 
 #[derive(Clone, Debug)]
 pub(crate) struct D1NamespaceObservation {
@@ -155,7 +154,7 @@ impl D1Namespace {
                 observed: base.map_or(ChangeCursor::Genesis, |state| state.cursor),
             });
         }
-        let delta = PublicationDelta::new(publication, base)?;
+        let delta = PublicationDelta::new(publication, base);
         let payload = encode(&delta.change, "publish Managed namespace")?;
         let operation = hex(publication.operation.as_bytes());
         let target_sequence = sqlite_integer(publication.target.cursor.sequence())?;
@@ -244,15 +243,6 @@ impl D1Namespace {
                 &guard,
                 guarded(),
             )?,
-            delete_records(
-                FILE_VERSIONS,
-                "file_version_id",
-                self.store_key(),
-                &delta.deleted_file_versions,
-                &guard,
-                guarded(),
-            )?,
-            put_file_versions(self.store_key(), &delta.file_versions, &guard, guarded())?,
         ]);
         batch.push(match observed {
             Some(observed) => statement(
@@ -596,19 +586,13 @@ fn schema_statements() -> Vec<D1Statement> {
         ),
         statement(
             format!(
-                "CREATE TABLE IF NOT EXISTS {NODES} (store_key TEXT NOT NULL, node_id TEXT NOT NULL, generation INTEGER NOT NULL, record_json TEXT NOT NULL, PRIMARY KEY (store_key, node_id))"
+                "CREATE TABLE IF NOT EXISTS {NODES} (store_key TEXT NOT NULL, node_id TEXT NOT NULL, generation INTEGER NOT NULL, PRIMARY KEY (store_key, node_id))"
             ),
             Vec::new(),
         ),
         statement(
             format!(
-                "CREATE TABLE IF NOT EXISTS {DIRECTORIES} (store_key TEXT NOT NULL, node_id TEXT NOT NULL, generation INTEGER NOT NULL, record_json TEXT NOT NULL, PRIMARY KEY (store_key, node_id))"
-            ),
-            Vec::new(),
-        ),
-        statement(
-            format!(
-                "CREATE TABLE IF NOT EXISTS {FILE_VERSIONS} (store_key TEXT NOT NULL, file_version_id TEXT NOT NULL, record_json TEXT NOT NULL, PRIMARY KEY (store_key, file_version_id))"
+                "CREATE TABLE IF NOT EXISTS {DIRECTORIES} (store_key TEXT NOT NULL, node_id TEXT NOT NULL, generation INTEGER NOT NULL, PRIMARY KEY (store_key, node_id))"
             ),
             Vec::new(),
         ),
@@ -736,28 +720,7 @@ fn put_records(
     );
     Ok(statement(
         format!(
-            "INSERT INTO {table} (store_key, {key}, generation, record_json) SELECT ?, json_extract(value, '$.key'), json_extract(value, '$.generation'), json_extract(value, '$.record') FROM json_each(?) WHERE {guard} ON CONFLICT(store_key, {key}) DO UPDATE SET generation = excluded.generation, record_json = excluded.record_json"
-        ),
-        params,
-    ))
-}
-
-fn put_file_versions(
-    store_key: String,
-    records: &[FileVersionRow],
-    guard: &str,
-    guard_params: Vec<Value>,
-) -> Result<D1Statement, ManagedError> {
-    let params = guarded_params(
-        vec![
-            store_key.into(),
-            encode(&records, "publish Managed namespace")?.into(),
-        ],
-        guard_params,
-    );
-    Ok(statement(
-        format!(
-            "INSERT OR IGNORE INTO {FILE_VERSIONS} (store_key, file_version_id, record_json) SELECT ?, json_extract(value, '$.key'), json_extract(value, '$.record') FROM json_each(?) WHERE {guard}"
+            "INSERT INTO {table} (store_key, {key}, generation) SELECT ?, json_extract(value, '$.key'), json_extract(value, '$.generation') FROM json_each(?) WHERE {guard} ON CONFLICT(store_key, {key}) DO UPDATE SET generation = excluded.generation"
         ),
         params,
     ))
@@ -1077,13 +1040,6 @@ fn conflict(action: &'static str, message: &'static str) -> ManagedError {
 struct RecordRow {
     key: String,
     generation: u64,
-    record: String,
-}
-
-#[derive(Serialize)]
-struct FileVersionRow {
-    key: String,
-    record: String,
 }
 
 struct PublicationDelta {
@@ -1092,29 +1048,20 @@ struct PublicationDelta {
     deleted_nodes: Vec<String>,
     directories: Vec<RecordRow>,
     deleted_directories: Vec<String>,
-    file_versions: Vec<FileVersionRow>,
-    deleted_file_versions: Vec<String>,
 }
 
 impl PublicationDelta {
-    fn new(
-        publication: &NamespacePublication,
-        base: Option<&NamespaceSnapshot>,
-    ) -> Result<Self, ManagedError> {
+    fn new(publication: &NamespacePublication, base: Option<&NamespaceSnapshot>) -> Self {
         let change = NamespaceChange::from_publication(publication, base);
         let nodes = change
             .put_nodes
             .iter()
-            .map(|node| {
-                let stored = StoredNode::from(node);
-                Ok(RecordRow {
-                    key: hex(node.id.as_bytes()),
-                    generation: managed_generation_number(&node.generation)
-                        .expect("validated Managed node generation"),
-                    record: encode(&stored, "publish Managed namespace")?,
-                })
+            .map(|node| RecordRow {
+                key: hex(node.id.as_bytes()),
+                generation: managed_generation_number(&node.generation)
+                    .expect("validated Managed node generation"),
             })
-            .collect::<Result<Vec<_>, ManagedError>>()?;
+            .collect();
         let deleted_nodes = change
             .remove_nodes
             .iter()
@@ -1123,34 +1070,14 @@ impl PublicationDelta {
         let directories = change
             .put_directories
             .iter()
-            .map(|directory| {
-                let stored = StoredDirectory::from(directory);
-                Ok(RecordRow {
-                    key: hex(directory.node.as_bytes()),
-                    generation: managed_generation_number(&directory.generation)
-                        .expect("validated Managed directory generation"),
-                    record: encode(&stored, "publish Managed namespace")?,
-                })
+            .map(|directory| RecordRow {
+                key: hex(directory.node.as_bytes()),
+                generation: managed_generation_number(&directory.generation)
+                    .expect("validated Managed directory generation"),
             })
-            .collect::<Result<Vec<_>, ManagedError>>()?;
+            .collect();
         let deleted_directories = change
             .remove_directories
-            .iter()
-            .map(|id| hex(id.as_bytes()))
-            .collect();
-        let file_versions = change
-            .put_file_versions
-            .iter()
-            .map(|version| {
-                let stored = StoredFileVersion::from(version);
-                Ok(FileVersionRow {
-                    key: hex(version.id.as_bytes()),
-                    record: encode(&stored, "publish Managed namespace")?,
-                })
-            })
-            .collect::<Result<Vec<_>, ManagedError>>()?;
-        let deleted_file_versions = change
-            .remove_file_versions
             .iter()
             .map(|id| hex(id.as_bytes()))
             .collect();
@@ -1206,15 +1133,13 @@ impl PublicationDelta {
                 .collect(),
             effects,
         };
-        Ok(Self {
+        Self {
             change: stored_change,
             nodes,
             deleted_nodes,
             directories,
             deleted_directories,
-            file_versions,
-            deleted_file_versions,
-        })
+        }
     }
 }
 
@@ -1774,9 +1699,7 @@ mod tests {
             target: target.clone(),
         };
         let payload = encode(
-            &PublicationDelta::new(&publication, Some(&checkpoint))
-                .unwrap()
-                .change,
+            &PublicationDelta::new(&publication, Some(&checkpoint)).change,
             "test D1 replay",
         )
         .unwrap();
