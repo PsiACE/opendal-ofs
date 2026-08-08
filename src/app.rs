@@ -13,7 +13,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 use ofs::catalog::{Catalog, VolumeDefinition};
-use ofs::filesystem::{OperationId, VolumeId, VolumeModel};
+use ofs::filesystem::{VolumeId, VolumeModel};
 use ofs::managed::{
     D1Config, D1Metadata, ManagedErrorKind, ManagedFormat, ManagedVolume, MetadataFormat,
     ObjectMetadata,
@@ -25,7 +25,6 @@ use url::Url;
 
 use crate::cli::{
     Cli, Command, MountArgs, StatusArgs, SyncArgs, VolumeCommand, VolumeCreateArgs, VolumeGcArgs,
-    VolumePackArgs, VolumeReindexArgs,
 };
 
 enum MetadataAuthority {
@@ -77,12 +76,6 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
             command: VolumeCommand::Create(args),
         } => create_volume(&config, args).await,
         Command::Volume {
-            command: VolumeCommand::Pack(args),
-        } => pack_volume(&config, args).await,
-        Command::Volume {
-            command: VolumeCommand::Reindex(args),
-        } => reindex_volume(&config, args).await,
-        Command::Volume {
             command: VolumeCommand::Gc(args),
         } => gc_volume(&config, args).await,
         Command::Mount(args) => mount_volume(&config, args).await,
@@ -103,40 +96,12 @@ async fn gc_volume(config: &Path, args: VolumeGcArgs) -> Result<()> {
         .observe()
         .await?
         .context("Managed namespace disappeared after starting collection")?;
-    let collected = volume.collect_unreachable_loose(&fixed, sweep).await?;
+    let collected = volume.collect_unreachable_segments(&fixed, sweep).await?;
     volume.finish_gc(sweep).await?;
     println!(
         "garbage collected {:?}: scanned={} deleted={} bytes={}",
         args.alias, collected.scanned, collected.deleted, collected.deleted_bytes,
     );
-    Ok(())
-}
-
-async fn pack_volume(config: &Path, args: VolumePackArgs) -> Result<()> {
-    let volume =
-        open_managed_volume(config, &args.alias, args.runtime.transfer_concurrency).await?;
-    let observed = volume
-        .observe()
-        .await?
-        .context("Managed volume has no published namespace to pack")?;
-    let packed = volume
-        .pack_reachable_content(&observed, OperationId::generate())
-        .await?;
-    println!(
-        "packed {:?}: packs={} content={} logical_bytes={}",
-        args.alias,
-        packed.pack_count(),
-        packed.content_count(),
-        packed.logical_bytes,
-    );
-    Ok(())
-}
-
-async fn reindex_volume(config: &Path, args: VolumeReindexArgs) -> Result<()> {
-    let volume =
-        open_managed_volume(config, &args.alias, args.runtime.transfer_concurrency).await?;
-    let content = volume.rebuild_pack_index().await?;
-    println!("rebuilt pack index {:?}: content={content}", args.alias);
     Ok(())
 }
 

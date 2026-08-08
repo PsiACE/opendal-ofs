@@ -15,68 +15,75 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! File manifests backed by immutable loose objects and whole-file packs.
+//! Immutable data segments and file extent materialization.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Cursor;
+use std::num::NonZeroUsize;
 use std::ops::Range;
 
 use fastcdc::v2020::AsyncStreamCDC;
-use futures::StreamExt;
-use opendal::{ErrorKind, Operator, Writer};
+use futures::{StreamExt, stream};
+use opendal::{ErrorKind, Operator};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::{ManagedError, ManagedErrorKind};
-use crate::filesystem::{NodeKind, OperationId};
-use crate::managed::format::{ContentRef, Extent, ExtentMap};
-use crate::managed::index::{PackId, PackIndex, PackReadSession, PackStore};
+use crate::filesystem::NodeKind;
+use crate::managed::format::{ContentRef, Extent, ExtentMap, SegmentRef};
 use crate::managed::metadata::namespace::{FileVersionRecord, NamespaceSnapshot};
 
-const READ_WINDOW: u64 = 4 * 1024 * 1024;
-const LOOSE_ROOT: &str = ".ofs/managed/data/v1/loose/sha256";
-const SMALL_CONTENT_LIMIT: u64 = 256 * 1024;
-const PACK_LOGICAL_LIMIT: u64 = 8 * 1024 * 1024;
+const SEGMENT_ROOT: &str = ".ofs/managed/data/v1/segments/sha256";
+const SEGMENT_MAGIC: &[u8; 8] = b"OFSSEG01";
+const TRAILER_MAGIC: &[u8; 8] = b"OFSSEGTR";
+const FOOTER_MAGIC: &str = "ofs-data-segment-footer";
+const FORMAT_MAJOR: u16 = 1;
+const HEADER_LENGTH: u64 = 10;
+const TRAILER_LENGTH: u64 = 56;
+const REQUEST_EQUIVALENT_BYTES: u64 = 4 * 1024;
+const RANGE_COALESCE_GAP: usize = REQUEST_EQUIVALENT_BYTES as usize;
+
+// Placement policy. These values are not part of the durable format.
+const TARGET_SEGMENT_SIZE: u64 = 16 * 1024 * 1024;
 const FASTCDC_MINIMUM_FILE_SIZE: u64 = 1024 * 1024;
 const FASTCDC_MINIMUM_SIZE: u32 = 64 * 1024;
 const FASTCDC_TARGET_SIZE: u32 = 256 * 1024;
 const FASTCDC_MAXIMUM_SIZE: u32 = 1024 * 1024;
 
-/// Physical locations published by one explicit small whole-file maintenance run.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PackMaintenance {
-    pub(crate) packs: Vec<PackId>,
-    pub(crate) packed_content: Vec<ContentRef>,
-    pub logical_bytes: u64,
-}
-
-impl PackMaintenance {
-    pub fn pack_count(&self) -> usize {
-        self.packs.len()
-    }
-
-    pub fn content_count(&self) -> usize {
-        self.packed_content.len()
-    }
-}
-
-/// Loose data removed by one namespace-fenced garbage-collection sweep.
+/// Data segments removed by one namespace-fenced garbage-collection sweep.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct LooseGcMaintenance {
+pub struct SegmentGcMaintenance {
     pub scanned: usize,
     pub deleted: usize,
     pub deleted_bytes: u64,
 }
 
-/// Content identities already referenced by one fixed authority snapshot.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct StoredContent {
+    segment: SegmentRef,
+    offset: u64,
+}
+
+/// Physical locations already referenced by one fixed authority snapshot.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct AuthorityKnownContent(BTreeSet<ContentRef>);
+pub(crate) struct AuthorityKnownContent(BTreeMap<ContentRef, StoredContent>);
 
 impl AuthorityKnownContent {
     pub(crate) fn from_snapshot(snapshot: &NamespaceSnapshot) -> Result<Self, ManagedError> {
-        reachable_content(snapshot, "derive authority-known content").map(Self)
+        let mut known = BTreeMap::new();
+        visit_reachable_file_versions(snapshot, "derive authority-known content", |version| {
+            for extent in &version.extent_map.extents {
+                known.entry(extent.content).or_insert(StoredContent {
+                    segment: extent.segment,
+                    offset: extent.segment_offset,
+                });
+            }
+        })?;
+        Ok(Self(known))
     }
 
-    fn contains(&self, content: &ContentRef) -> bool {
-        self.0.contains(content)
+    fn get(&self, content: &ContentRef) -> Option<StoredContent> {
+        self.0.get(content).copied()
     }
 }
 
@@ -87,24 +94,61 @@ struct FastCdcSizes {
     maximum: u32,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct Digest([u8; 32]);
-
-impl Digest {
-    const fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-
-    const fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-
-    fn hex(self) -> String {
-        self.0.iter().map(|byte| format!("{byte:02x}")).collect()
-    }
+#[derive(Debug)]
+struct PreparedFile {
+    path: String,
+    logical_size: u64,
+    logical_digest: [u8; 32],
+    extents: Vec<PreparedExtent>,
 }
 
-/// The concrete Managed v1 data plane.
+#[derive(Debug)]
+struct PreparedExtent {
+    logical_offset: u64,
+    content: ContentRef,
+    bytes: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Codec {
+    Raw,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Footer {
+    magic: String,
+    major: u16,
+    entries: Vec<FooterEntry>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct FooterEntry {
+    content: ContentRef,
+    offset: u64,
+    stored_length: u64,
+    codec: Codec,
+}
+
+#[derive(Debug)]
+struct SealedSegment {
+    reference: SegmentRef,
+    bytes: Vec<u8>,
+    locations: BTreeMap<ContentRef, StoredContent>,
+}
+
+#[derive(Debug)]
+struct MaterializedFile {
+    path: String,
+    version: FileVersionRecord,
+    bytes: Vec<u8>,
+}
+
+type SegmentDemand = BTreeMap<(u64, u64, ContentRef), Vec<(usize, u64)>>;
+
+/// The Managed v1 data plane.
 #[derive(Clone)]
 pub(crate) struct ManagedData {
     operator: Operator,
@@ -113,251 +157,351 @@ pub(crate) struct ManagedData {
 impl ManagedData {
     pub(crate) fn new(operator: Operator) -> Result<Self, ManagedError> {
         let capability = operator.info().full_capability();
-        if !capability.stat
-            || !capability.read
+        if !capability.read
             || !capability.write
             || !capability.write_can_empty
             || !capability.write_with_if_not_exists
         {
             return Err(invalid(
                 "open Managed data",
-                "data storage requires stat, read, empty write, and create-only write",
+                "data storage requires read, empty write, and create-only write",
             ));
         }
         Ok(Self { operator })
     }
 
-    pub(crate) fn read_session(&self) -> Result<PackReadSession, ManagedError> {
-        PackReadSession::new(self.operator.clone())
-    }
-
-    pub(crate) async fn seal_file_with_known_content(
+    /// Freeze a set of files into as few immutable segments as placement policy permits.
+    pub(crate) async fn stage_files(
         &self,
-        local: &Operator,
-        frozen_path: &str,
+        source: &Operator,
+        paths: Vec<String>,
         known: &AuthorityKnownContent,
-    ) -> Result<FileVersionRecord, ManagedError> {
-        let size = frozen_size(local, frozen_path).await?;
-        if size < FASTCDC_MINIMUM_FILE_SIZE {
-            self.seal_whole_file_with_known_content(local, frozen_path, known)
-                .await
-        } else {
-            self.seal_fastcdc(
-                local,
-                frozen_path,
-                size,
-                FastCdcSizes {
-                    minimum: FASTCDC_MINIMUM_SIZE,
-                    target: FASTCDC_TARGET_SIZE,
-                    maximum: FASTCDC_MAXIMUM_SIZE,
-                },
-                known,
-            )
+        concurrency: NonZeroUsize,
+    ) -> Result<BTreeMap<String, FileVersionRecord>, ManagedError> {
+        let prepared = stream::iter(paths)
+            .map(|path| {
+                let source = source.clone();
+                async move { prepare_file(&source, path).await }
+            })
+            .buffer_unordered(concurrency.get())
+            .collect::<Vec<_>>()
             .await
-        }
-    }
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
 
-    async fn seal_whole_file_with_known_content(
-        &self,
-        local: &Operator,
-        frozen_path: &str,
-        known: &AuthorityKnownContent,
-    ) -> Result<FileVersionRecord, ManagedError> {
-        let metadata = local
-            .stat(frozen_path)
-            .await
-            .map_err(|_| unavailable("read frozen file"))?;
-        if !metadata.is_file() {
-            return Err(invalid("read frozen file", "input is not a regular file"));
-        }
-        let size = metadata.content_length();
-        let digest = digest_and_copy(local, frozen_path, size, None)
-            .await
-            .map_err(|_| unavailable("read frozen file"))?;
-        let version = whole_file_version(size, digest);
-        if size == 0 {
-            return Ok(version);
-        }
-        let content = version
-            .whole_content()
-            .expect("non-empty whole-file sealing creates one extent");
-        if known.contains(&content) {
-            return Ok(version);
-        }
-        let key = loose_key(&content);
-
-        let created = match self.operator.writer_with(&key).if_not_exists(true).await {
-            Err(error) if already_exists(&error) => false,
-            Err(_) => return Err(unavailable("create loose data")),
-            Ok(mut writer) => {
-                let observed =
-                    match digest_and_copy(local, frozen_path, size, Some(&mut writer)).await {
-                        Ok(observed) => observed,
-                        Err(error) if already_exists(&error) => {
-                            let _ = writer.abort().await;
-                            self.verify(&version).await?;
-                            return Ok(version);
+        let mut new_content = BTreeMap::<ContentRef, Vec<u8>>::new();
+        for file in &prepared {
+            for extent in &file.extents {
+                if known.get(&extent.content).is_none() {
+                    match new_content.entry(extent.content) {
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert(extent.bytes.clone());
                         }
-                        Err(_) => {
-                            let _ = writer.abort().await;
-                            return Err(unavailable("write loose data"));
+                        std::collections::btree_map::Entry::Occupied(entry)
+                            if entry.get() != &extent.bytes =>
+                        {
+                            return Err(corrupt(
+                                "stage Managed files",
+                                "equal content references contain different bytes",
+                            ));
                         }
-                    };
-                if observed != digest {
-                    let _ = writer.abort().await;
-                    return Err(invalid(
-                        "write loose data",
-                        "frozen input changed while it was being sealed",
-                    ));
-                }
-                match writer.close().await {
-                    Ok(_) => true,
-                    Err(error) if already_exists(&error) => false,
-                    Err(_) => return Err(unavailable("commit loose data")),
+                        std::collections::btree_map::Entry::Occupied(_) => {}
+                    }
                 }
             }
-        };
-
-        if !created {
-            self.verify(&version).await?;
         }
-        Ok(version)
+
+        let mut created = BTreeMap::new();
+        for segment in seal_segments(new_content)? {
+            self.create_segment(&segment).await?;
+            created.extend(segment.locations);
+        }
+
+        prepared
+            .into_iter()
+            .map(|file| {
+                let extent_map = ExtentMap {
+                    extents: file
+                        .extents
+                        .into_iter()
+                        .map(|extent| {
+                            let stored = known
+                                .get(&extent.content)
+                                .or_else(|| created.get(&extent.content).copied())
+                                .ok_or_else(|| {
+                                    corrupt(
+                                        "stage Managed files",
+                                        "prepared content has no segment location",
+                                    )
+                                })?;
+                            Ok(Extent {
+                                logical_offset: extent.logical_offset,
+                                content: extent.content,
+                                segment: stored.segment,
+                                segment_offset: stored.offset,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, ManagedError>>()?,
+                };
+                let version = FileVersionRecord::from_extents(
+                    file.logical_size,
+                    file.logical_digest,
+                    extent_map,
+                )
+                .ok_or_else(|| {
+                    invalid(
+                        "stage Managed files",
+                        "generated file extent map is invalid",
+                    )
+                })?;
+                Ok((file.path, version))
+            })
+            .collect()
     }
 
-    async fn seal_fastcdc(
-        &self,
-        local: &Operator,
-        path: &str,
-        size: u64,
-        sizes: FastCdcSizes,
-        known: &AuthorityKnownContent,
-    ) -> Result<FileVersionRecord, ManagedError> {
-        if size == 0 {
-            return Ok(FileVersionRecord::whole(0, Sha256::digest([]).into()));
-        }
-        let reader = local
-            .reader(path)
+    async fn create_segment(&self, segment: &SealedSegment) -> Result<(), ManagedError> {
+        let key = segment_key(segment.reference);
+        match self
+            .operator
+            .write_with(&key, segment.bytes.clone())
+            .if_not_exists(true)
             .await
-            .map_err(|_| unavailable("read frozen file"))?
-            .into_futures_async_read(..)
-            .await
-            .map_err(|_| unavailable("read frozen file"))?;
-        let mut chunker = AsyncStreamCDC::new(reader, sizes.minimum, sizes.target, sizes.maximum);
-        let chunks = chunker.as_stream();
-        futures::pin_mut!(chunks);
-        let mut logical = Sha256::new();
-        let mut extents = Vec::new();
-        while let Some(chunk) = chunks.next().await {
-            let chunk = chunk.map_err(|_| unavailable("chunk frozen file"))?;
-            logical.update(&chunk.data);
-            let content = self.persist_bytes(&chunk.data, known).await?;
-            extents.push(Extent {
-                logical_offset: chunk.offset,
-                content,
-            });
+        {
+            Ok(_) => Ok(()),
+            Err(error) if already_exists(&error) => {
+                let existing = self
+                    .operator
+                    .read(&key)
+                    .await
+                    .map_err(|_| unavailable("verify existing data segment"))?
+                    .to_bytes()
+                    .to_vec();
+                verify_complete_segment(segment.reference, &existing).map(|_| ())
+            }
+            Err(_) => Err(unavailable("create data segment")),
         }
-        build_version(size, logical.finalize().into(), ExtentMap { extents })
     }
 
-    pub(crate) async fn pack_reachable(
+    pub(crate) async fn materialize(
         &self,
-        snapshot: &NamespaceSnapshot,
-        operation: OperationId,
-    ) -> Result<PackMaintenance, ManagedError> {
-        let contents = reachable_whole_content(snapshot, "pack reachable data")?;
-
-        let mut index = PackIndex::open_or_empty(self.operator.clone()).await?;
-        let store = PackStore::new(self.operator.clone())?;
-        let mut batch = Vec::new();
-        let mut batch_bytes = 0_u64;
-        let mut sealed = Vec::new();
-        let mut packed_content = Vec::new();
-        let mut logical_bytes = 0_u64;
-        for content in contents {
-            if content.length == 0
-                || content.length > SMALL_CONTENT_LIMIT
-                || !index.locations(content).is_empty()
-            {
-                continue;
-            }
-            if batch_bytes + content.length > PACK_LOGICAL_LIMIT {
-                let pack = store.seal(operation, std::mem::take(&mut batch)).await?;
-                index.add(&pack);
-                sealed.push(pack);
-                batch_bytes = 0;
-            }
-            batch.push(self.read_loose_content(content).await?);
-            batch_bytes += content.length;
-            logical_bytes += content.length;
-            packed_content.push(content);
-        }
-        if !batch.is_empty() {
-            let pack = store.seal(operation, batch).await?;
-            index.add(&pack);
-            sealed.push(pack);
-        }
-        if sealed.is_empty() {
-            return Ok(PackMaintenance {
-                packs: Vec::new(),
-                packed_content: Vec::new(),
-                logical_bytes: 0,
-            });
-        }
-
-        index.persist().await?;
-        Ok(PackMaintenance {
-            packs: sealed.iter().map(|pack| pack.id).collect(),
-            packed_content,
-            logical_bytes,
-        })
-    }
-
-    pub(crate) async fn rebuild_pack_index(&self) -> Result<usize, ManagedError> {
-        PackStore::new(self.operator.clone())?.rebuild_index().await
-    }
-
-    pub(crate) async fn collect_unreachable_loose(
-        &self,
-        snapshot: &NamespaceSnapshot,
-    ) -> Result<LooseGcMaintenance, ManagedError> {
-        let capability = self.operator.info().full_capability();
-        if !capability.list || !capability.delete {
-            return Err(unavailable("collect unreachable loose data"));
-        }
-        let live = reachable_content(snapshot, "collect unreachable loose data")?;
-        let mut live_lengths = BTreeMap::<[u8; 32], BTreeSet<u64>>::new();
-        for content in &live {
-            live_lengths
-                .entry(content.digest)
-                .or_default()
-                .insert(content.length);
-        }
-        let mut result = LooseGcMaintenance::default();
-        let loose = list_loose_content(&self.operator, "collect unreachable loose data").await?;
-        let mut deleted = Vec::new();
-        for listed in loose {
-            let content = listed.content;
-            result.scanned += 1;
-            if live.contains(&content) {
-                continue;
-            }
-            if live_lengths
-                .get(&content.digest)
-                .is_some_and(|lengths| !lengths.contains(&content.length))
-            {
+        target: &Operator,
+        requests: Vec<(String, FileVersionRecord)>,
+        full_tree: bool,
+        concurrency: NonZeroUsize,
+    ) -> Result<(), ManagedError> {
+        let mut files = Vec::with_capacity(requests.len());
+        let mut segments = BTreeMap::<SegmentRef, SegmentDemand>::new();
+        for (file_index, (path, version)) in requests.into_iter().enumerate() {
+            if !version.is_valid() {
                 return Err(corrupt(
-                    "collect unreachable loose data",
-                    "live loose content has an unexpected length",
+                    "materialize Managed files",
+                    "file version identity is invalid",
                 ));
             }
-            deleted.push(listed.path);
+            let length = usize::try_from(version.logical_size).map_err(|_| {
+                invalid(
+                    "materialize Managed files",
+                    "file is too large for this process",
+                )
+            })?;
+            for extent in &version.extent_map.extents {
+                validate_extent(extent)?;
+                segments
+                    .entry(extent.segment)
+                    .or_default()
+                    .entry((extent.segment_offset, extent.content.length, extent.content))
+                    .or_default()
+                    .push((file_index, extent.logical_offset));
+            }
+            files.push(MaterializedFile {
+                path,
+                version,
+                bytes: vec![0; length],
+            });
+        }
+
+        let fetched = stream::iter(segments)
+            .map(|(segment, demands)| {
+                let data = self.clone();
+                async move {
+                    data.read_segment_ranges(segment, demands, full_tree, concurrency.get())
+                        .await
+                }
+            })
+            .buffer_unordered(concurrency.get())
+            .collect::<Vec<_>>()
+            .await;
+        for result in fetched {
+            for (file_index, logical_offset, bytes) in result? {
+                let file = files.get_mut(file_index).ok_or_else(|| {
+                    corrupt(
+                        "materialize Managed files",
+                        "extent references an unknown file",
+                    )
+                })?;
+                let start = usize::try_from(logical_offset).map_err(|_| {
+                    corrupt(
+                        "materialize Managed files",
+                        "extent offset exceeds this process",
+                    )
+                })?;
+                let end = start.checked_add(bytes.len()).ok_or_else(|| {
+                    corrupt("materialize Managed files", "extent range overflows")
+                })?;
+                let output = file.bytes.get_mut(start..end).ok_or_else(|| {
+                    corrupt(
+                        "materialize Managed files",
+                        "extent exceeds logical file size",
+                    )
+                })?;
+                output.copy_from_slice(&bytes);
+            }
+        }
+
+        let writes = stream::iter(files)
+            .map(|file| {
+                let target = target.clone();
+                async move {
+                    if <[u8; 32]>::from(Sha256::digest(&file.bytes)) != file.version.logical_digest
+                    {
+                        return Err(corrupt(
+                            "materialize Managed files",
+                            "logical digest does not match the file version",
+                        ));
+                    }
+                    target
+                        .write(&file.path, file.bytes)
+                        .await
+                        .map_err(|_| unavailable("write materialized file"))?;
+                    Ok(())
+                }
+            })
+            .buffer_unordered(concurrency.get())
+            .collect::<Vec<_>>()
+            .await;
+        writes.into_iter().collect()
+    }
+
+    async fn read_segment_ranges(
+        &self,
+        segment: SegmentRef,
+        demands: SegmentDemand,
+        full_tree: bool,
+        range_concurrency: usize,
+    ) -> Result<Vec<(usize, u64, Vec<u8>)>, ManagedError> {
+        let key = segment_key(segment);
+        let contents = if prefer_complete_segment(segment, &demands, full_tree) {
+            let bytes = self
+                .operator
+                .read(&key)
+                .await
+                .map_err(|error| referenced_segment_error("read data segment", error))?
+                .to_bytes()
+                .to_vec();
+            let entries = verify_complete_segment(segment, &bytes)?;
+            demands
+                .keys()
+                .map(|(offset, length, content)| {
+                    let range = entries.get(content).filter(|range| {
+                        range.start as u64 == *offset && (range.end - range.start) as u64 == *length
+                    });
+                    let range = range.ok_or_else(|| {
+                        corrupt(
+                            "read data segment",
+                            "file extent disagrees with the segment footer",
+                        )
+                    })?;
+                    Ok(bytes[range.clone()].to_vec())
+                })
+                .collect::<Result<Vec<_>, ManagedError>>()?
+        } else {
+            let ranges = demands
+                .keys()
+                .map(|(offset, length, _)| *offset..*offset + *length)
+                .collect::<Vec<_>>();
+            let reader = self
+                .operator
+                .reader_with(&key)
+                .content_length_hint(segment.length)
+                .gap(RANGE_COALESCE_GAP)
+                .concurrent(range_concurrency)
+                .await
+                .map_err(|error| referenced_segment_error("read data segment", error))?;
+            reader
+                .fetch(ranges)
+                .await
+                .map_err(|error| referenced_segment_error("read data segment", error))?
+                .into_iter()
+                .map(|buffer| buffer.to_bytes().to_vec())
+                .collect()
+        };
+
+        let mut output = Vec::new();
+        for (((_, length, content), targets), bytes) in demands.into_iter().zip(contents) {
+            if bytes.len() as u64 != length
+                || <[u8; 32]>::from(Sha256::digest(&bytes)) != content.digest
+            {
+                return Err(corrupt(
+                    "read data segment",
+                    "extent bytes do not match their content reference",
+                ));
+            }
+            output.extend(
+                targets
+                    .into_iter()
+                    .map(|(file, logical)| (file, logical, bytes.clone())),
+            );
+        }
+        Ok(output)
+    }
+
+    pub(crate) async fn collect_unreachable_segments(
+        &self,
+        snapshot: &NamespaceSnapshot,
+    ) -> Result<SegmentGcMaintenance, ManagedError> {
+        let capability = self.operator.info().full_capability();
+        if !capability.list || !capability.delete {
+            return Err(unavailable("collect unreachable data segments"));
+        }
+        let live = reachable_segments(snapshot, "collect unreachable data segments")?;
+        let mut result = SegmentGcMaintenance::default();
+        let entries = self
+            .operator
+            .list_with(&format!("{SEGMENT_ROOT}/"))
+            .recursive(true)
+            .await
+            .map_err(|_| unavailable("list data segments"))?;
+        let mut deleted = Vec::new();
+        for entry in entries {
+            if !entry.metadata().is_file() {
+                continue;
+            }
+            let Some(reference) =
+                segment_ref_from_key(entry.path(), entry.metadata().content_length())
+            else {
+                continue;
+            };
+            result.scanned += 1;
+            if live.contains(&reference) {
+                continue;
+            }
+            if live
+                .iter()
+                .any(|candidate| candidate.digest == reference.digest)
+            {
+                return Err(corrupt(
+                    "collect unreachable data segments",
+                    "live segment has an unexpected physical length",
+                ));
+            }
+            deleted.push(entry.path().to_owned());
             result.deleted += 1;
             result.deleted_bytes = result
                 .deleted_bytes
-                .checked_add(content.length)
+                .checked_add(reference.length)
                 .ok_or_else(|| {
                     corrupt(
-                        "collect unreachable loose data",
+                        "collect unreachable data segments",
                         "deleted byte count exceeds format v1",
                     )
                 })?;
@@ -365,293 +509,335 @@ impl ManagedData {
         self.operator
             .delete_iter(deleted.iter().map(String::as_str))
             .await
-            .map_err(|_| unavailable("collect unreachable loose data"))?;
+            .map_err(|_| unavailable("delete unreachable data segments"))?;
         Ok(result)
-    }
-
-    async fn read_loose_content(&self, content: ContentRef) -> Result<Vec<u8>, ManagedError> {
-        let key = loose_key(&content);
-        let bytes = self
-            .operator
-            .read(&key)
-            .await
-            .map_err(|error| referenced_data_error("pack loose data", error))?
-            .to_bytes()
-            .to_vec();
-        if bytes.len() as u64 != content.length
-            || <[u8; 32]>::from(Sha256::digest(&bytes)) != content.digest
-        {
-            return Err(corrupt(
-                "pack loose data",
-                "loose content does not match its reference",
-            ));
-        }
-        Ok(bytes)
-    }
-
-    async fn persist_bytes(
-        &self,
-        bytes: &[u8],
-        known: &AuthorityKnownContent,
-    ) -> Result<ContentRef, ManagedError> {
-        let content = ContentRef {
-            digest: Sha256::digest(bytes).into(),
-            length: u64::try_from(bytes.len())
-                .map_err(|_| invalid("write loose data", "content length exceeds format v1"))?,
-        };
-        if content.length == 0 || known.contains(&content) {
-            return Ok(content);
-        }
-        let key = loose_key(&content);
-        match self
-            .operator
-            .write_with(&key, bytes.to_vec())
-            .if_not_exists(true)
-            .await
-        {
-            Ok(_) => return Ok(content),
-            Err(error) if already_exists(&error) => {}
-            Err(_) => return Err(unavailable("write loose data")),
-        }
-        let mut digest = Sha256::new();
-        self.copy_content(&content, 0..content.length, None, &mut digest, None)
-            .await?;
-        Ok(content)
-    }
-
-    /// Stream verified content into a caller-owned materialization path.
-    #[cfg(test)]
-    pub(crate) async fn read_to(
-        &self,
-        version: &FileVersionRecord,
-        target: &Operator,
-        target_path: &str,
-    ) -> Result<(), ManagedError> {
-        let packs = self.read_session()?;
-        self.read_to_with(version, target, target_path, &packs)
-            .await
-    }
-
-    pub(crate) async fn read_to_with(
-        &self,
-        version: &FileVersionRecord,
-        target: &Operator,
-        target_path: &str,
-        packs: &PackReadSession,
-    ) -> Result<(), ManagedError> {
-        if !version.is_valid() {
-            return Err(corrupt(
-                "read loose data",
-                "file manifest identity is invalid",
-            ));
-        }
-        if version.logical_size == 0 {
-            target
-                .write(target_path, Vec::<u8>::new())
-                .await
-                .map_err(|_| unavailable("create materialized file"))?;
-            return Ok(());
-        }
-        let mut writer = target
-            .writer(target_path)
-            .await
-            .map_err(|_| unavailable("create materialized file"))?;
-        if let Err(error) = self
-            .copy_version(version, Some(&mut writer), Some(packs))
-            .await
-        {
-            let _ = writer.abort().await;
-            return Err(error);
-        }
-        writer
-            .close()
-            .await
-            .map_err(|_| unavailable("commit materialized file"))?;
-        Ok(())
-    }
-
-    async fn verify(&self, version: &FileVersionRecord) -> Result<(), ManagedError> {
-        if !version.is_valid() {
-            return Err(corrupt(
-                "verify loose data",
-                "file manifest identity is invalid",
-            ));
-        }
-        self.copy_version(version, None, None).await
-    }
-
-    async fn copy_version(
-        &self,
-        version: &FileVersionRecord,
-        mut target: Option<&mut Writer>,
-        packs: Option<&PackReadSession>,
-    ) -> Result<(), ManagedError> {
-        let mut logical = Sha256::new();
-        for extent in &version.extent_map.extents {
-            self.copy_content(
-                &extent.content,
-                0..extent.content.length,
-                target.as_deref_mut(),
-                &mut logical,
-                packs,
-            )
-            .await?;
-        }
-        let observed: [u8; 32] = logical.finalize().into();
-        if observed != version.logical_digest {
-            return Err(corrupt(
-                "read loose data",
-                "logical content digest does not match the file version",
-            ));
-        }
-        Ok(())
-    }
-
-    async fn copy_content(
-        &self,
-        content: &ContentRef,
-        selected: Range<u64>,
-        mut target: Option<&mut Writer>,
-        logical: &mut Sha256,
-        packs: Option<&PackReadSession>,
-    ) -> Result<(), ManagedError> {
-        if selected.start > selected.end || selected.end > content.length {
-            return Err(corrupt("read loose data", "content range is invalid"));
-        }
-        let mut pack_failure = None;
-        if let Some(packs) = packs {
-            match packs.read(*content).await {
-                Ok(Some(bytes)) => {
-                    return write_packed_range(&bytes, selected, target, logical).await;
-                }
-                Ok(None) => {}
-                Err(error) => pack_failure = Some(error),
-            }
-        }
-
-        let key = loose_key(content);
-        let reader = match self.operator.reader(&key).await {
-            Ok(reader) => reader,
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                return Err(pack_failure.unwrap_or_else(|| {
-                    corrupt(
-                        "read Managed data",
-                        "file version references missing content",
-                    )
-                }));
-            }
-            Err(error) => return Err(referenced_data_error("read loose data", error)),
-        };
-        let mut stream = match reader.into_stream(..).await {
-            Ok(stream) => stream,
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                return Err(pack_failure.unwrap_or_else(|| {
-                    corrupt(
-                        "read Managed data",
-                        "file version references missing content",
-                    )
-                }));
-            }
-            Err(error) => return Err(referenced_data_error("read loose data", error)),
-        };
-        let mut content_digest = Sha256::new();
-        let mut offset = 0_u64;
-        while let Some(buffer) = stream.next().await {
-            let buffer = match buffer {
-                Ok(buffer) => buffer,
-                Err(error) if error.kind() == ErrorKind::NotFound && offset == 0 => {
-                    return Err(pack_failure.unwrap_or_else(|| {
-                        corrupt(
-                            "read Managed data",
-                            "file version references missing content",
-                        )
-                    }));
-                }
-                Err(error) => return Err(referenced_data_error("read loose data", error)),
-            };
-            for bytes in buffer {
-                let end = offset
-                    .checked_add(bytes.len() as u64)
-                    .filter(|end| *end <= content.length)
-                    .ok_or_else(|| {
-                        corrupt("read loose data", "content is longer than its reference")
-                    })?;
-                content_digest.update(&bytes);
-                let start = offset.max(selected.start);
-                let selected_end = end.min(selected.end);
-                if start < selected_end {
-                    let value =
-                        bytes.slice((start - offset) as usize..(selected_end - offset) as usize);
-                    logical.update(&value);
-                    if let Some(writer) = target.as_deref_mut() {
-                        writer
-                            .write(value)
-                            .await
-                            .map_err(|_| unavailable("write materialized file"))?;
-                    }
-                }
-                offset = end;
-            }
-        }
-        if offset != content.length {
-            return Err(corrupt("read loose data", "content returned a short range"));
-        }
-        let observed: [u8; 32] = content_digest.finalize().into();
-        if observed != content.digest {
-            return Err(corrupt(
-                "read loose data",
-                "content digest does not match its reference",
-            ));
-        }
-        Ok(())
     }
 }
 
-async fn write_packed_range(
-    bytes: &[u8],
-    selected: Range<u64>,
-    target: Option<&mut Writer>,
-    logical: &mut Sha256,
-) -> Result<(), ManagedError> {
-    let value = &bytes[selected.start as usize..selected.end as usize];
-    logical.update(value);
-    if let Some(writer) = target {
-        writer
-            .write(value.to_vec())
+fn prefer_complete_segment(segment: SegmentRef, demands: &SegmentDemand, full_tree: bool) -> bool {
+    let mut requests = 0_u64;
+    let mut transferred = 0_u64;
+    let mut span: Option<Range<u64>> = None;
+    for (offset, length, _) in demands.keys() {
+        let range = *offset..*offset + *length;
+        match span.as_mut() {
+            Some(current)
+                if range.start.saturating_sub(current.end) <= RANGE_COALESCE_GAP as u64 =>
+            {
+                current.end = current.end.max(range.end);
+            }
+            Some(current) => {
+                requests += 1;
+                transferred = transferred.saturating_add(current.end - current.start);
+                *current = range;
+            }
+            None => span = Some(range),
+        }
+    }
+    if let Some(current) = span {
+        requests += 1;
+        transferred = transferred.saturating_add(current.end - current.start);
+    }
+    if requests <= 1 {
+        return false;
+    }
+
+    // Read policy may trade a small transfer for fewer HTTP requests without
+    // changing the segment or extent formats.
+    let saved_requests = requests - 1;
+    let byte_budget = REQUEST_EQUIVALENT_BYTES * if full_tree { 4 } else { 1 };
+    segment.length.saturating_sub(transferred) <= saved_requests.saturating_mul(byte_budget)
+}
+
+async fn prepare_file(source: &Operator, path: String) -> Result<PreparedFile, ManagedError> {
+    let metadata = source
+        .stat(&path)
+        .await
+        .map_err(|_| unavailable("read frozen file"))?;
+    if !metadata.is_file() {
+        return Err(invalid("read frozen file", "input is not a regular file"));
+    }
+    let size = metadata.content_length();
+    if size == 0 {
+        return Ok(PreparedFile {
+            path,
+            logical_size: 0,
+            logical_digest: Sha256::digest([]).into(),
+            extents: Vec::new(),
+        });
+    }
+    if size < FASTCDC_MINIMUM_FILE_SIZE {
+        let bytes = source
+            .read(&path)
             .await
-            .map_err(|_| unavailable("write materialized file"))?;
+            .map_err(|_| unavailable("read frozen file"))?
+            .to_bytes()
+            .to_vec();
+        if bytes.len() as u64 != size {
+            return Err(invalid(
+                "read frozen file",
+                "frozen input changed while it was being staged",
+            ));
+        }
+        let content = content_ref(&bytes);
+        return Ok(PreparedFile {
+            path,
+            logical_size: size,
+            logical_digest: content.digest,
+            extents: vec![PreparedExtent {
+                logical_offset: 0,
+                content,
+                bytes,
+            }],
+        });
+    }
+
+    prepare_fastcdc(
+        source,
+        path,
+        size,
+        FastCdcSizes {
+            minimum: FASTCDC_MINIMUM_SIZE,
+            target: FASTCDC_TARGET_SIZE,
+            maximum: FASTCDC_MAXIMUM_SIZE,
+        },
+    )
+    .await
+}
+
+async fn prepare_fastcdc(
+    source: &Operator,
+    path: String,
+    size: u64,
+    sizes: FastCdcSizes,
+) -> Result<PreparedFile, ManagedError> {
+    let reader = source
+        .reader(&path)
+        .await
+        .map_err(|_| unavailable("read frozen file"))?
+        .into_futures_async_read(..)
+        .await
+        .map_err(|_| unavailable("read frozen file"))?;
+    let mut chunker = AsyncStreamCDC::new(reader, sizes.minimum, sizes.target, sizes.maximum);
+    let chunks = chunker.as_stream();
+    futures::pin_mut!(chunks);
+    let mut logical = Sha256::new();
+    let mut extents = Vec::new();
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk.map_err(|_| unavailable("chunk frozen file"))?;
+        logical.update(&chunk.data);
+        extents.push(PreparedExtent {
+            logical_offset: chunk.offset,
+            content: content_ref(&chunk.data),
+            bytes: chunk.data,
+        });
+    }
+    let prepared = PreparedFile {
+        path,
+        logical_size: size,
+        logical_digest: logical.finalize().into(),
+        extents,
+    };
+    let observed = prepared.extents.iter().try_fold(0_u64, |end, extent| {
+        (extent.logical_offset == end)
+            .then(|| end.checked_add(extent.content.length))
+            .flatten()
+    });
+    if observed != Some(size) {
+        return Err(invalid(
+            "read frozen file",
+            "frozen input changed while it was being staged",
+        ));
+    }
+    Ok(prepared)
+}
+
+fn seal_segments(
+    contents: BTreeMap<ContentRef, Vec<u8>>,
+) -> Result<Vec<SealedSegment>, ManagedError> {
+    let mut segments = Vec::new();
+    let mut batch = BTreeMap::new();
+    let mut batch_size = 0_u64;
+    for (content, bytes) in contents {
+        if !batch.is_empty() && batch_size.saturating_add(content.length) > TARGET_SEGMENT_SIZE {
+            segments.push(seal_segment(std::mem::take(&mut batch))?);
+            batch_size = 0;
+        }
+        batch_size = batch_size
+            .checked_add(content.length)
+            .ok_or_else(|| invalid("seal data segment", "segment content length overflows"))?;
+        batch.insert(content, bytes);
+    }
+    if !batch.is_empty() {
+        segments.push(seal_segment(batch)?);
+    }
+    Ok(segments)
+}
+
+fn seal_segment(contents: BTreeMap<ContentRef, Vec<u8>>) -> Result<SealedSegment, ManagedError> {
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(SEGMENT_MAGIC);
+    encoded.extend_from_slice(&FORMAT_MAJOR.to_be_bytes());
+    let mut entries = Vec::with_capacity(contents.len());
+    for (content, bytes) in contents {
+        if content.length == 0 || content_ref(&bytes) != content {
+            return Err(invalid(
+                "seal data segment",
+                "segment entry does not match its content reference",
+            ));
+        }
+        let offset = encoded.len() as u64;
+        encoded.extend_from_slice(&bytes);
+        entries.push(FooterEntry {
+            content,
+            offset,
+            stored_length: content.length,
+            codec: Codec::Raw,
+        });
+    }
+    if entries.is_empty() {
+        return Err(invalid(
+            "seal data segment",
+            "a segment must contain non-empty content",
+        ));
+    }
+    let footer_offset = encoded.len() as u64;
+    let footer = encode(&Footer {
+        magic: FOOTER_MAGIC.to_owned(),
+        major: FORMAT_MAJOR,
+        entries: entries.clone(),
+    })?;
+    encoded.extend_from_slice(&footer);
+    encoded.extend_from_slice(TRAILER_MAGIC);
+    encoded.extend_from_slice(&footer_offset.to_be_bytes());
+    encoded.extend_from_slice(&(footer.len() as u64).to_be_bytes());
+    let digest: [u8; 32] = Sha256::digest(&encoded).into();
+    encoded.extend_from_slice(&digest);
+    let reference = SegmentRef {
+        digest,
+        length: encoded.len() as u64,
+    };
+    let locations = entries
+        .into_iter()
+        .map(|entry| {
+            (
+                entry.content,
+                StoredContent {
+                    segment: reference,
+                    offset: entry.offset,
+                },
+            )
+        })
+        .collect();
+    Ok(SealedSegment {
+        reference,
+        bytes: encoded,
+        locations,
+    })
+}
+
+fn verify_complete_segment(
+    reference: SegmentRef,
+    bytes: &[u8],
+) -> Result<BTreeMap<ContentRef, Range<usize>>, ManagedError> {
+    if bytes.len() as u64 != reference.length || reference.length < HEADER_LENGTH + TRAILER_LENGTH {
+        return Err(corrupt(
+            "read data segment",
+            "segment length does not match its reference",
+        ));
+    }
+    let trailer_offset = bytes.len() - TRAILER_LENGTH as usize;
+    let trailer = &bytes[trailer_offset..];
+    if &trailer[..8] != TRAILER_MAGIC {
+        return Err(corrupt("read data segment", "segment trailer is invalid"));
+    }
+    let footer_offset = u64_at(trailer, 8);
+    let footer_length = u64_at(trailer, 16);
+    let digest: [u8; 32] = trailer[24..56]
+        .try_into()
+        .expect("segment trailer digest has fixed length");
+    if digest != reference.digest
+        || footer_offset < HEADER_LENGTH
+        || footer_offset.checked_add(footer_length) != Some(trailer_offset as u64)
+        || <[u8; 32]>::from(Sha256::digest(&bytes[..bytes.len() - 32])) != digest
+        || &bytes[..8] != SEGMENT_MAGIC
+        || u16_at(bytes, 8) != FORMAT_MAJOR
+    {
+        return Err(corrupt(
+            "read data segment",
+            "segment envelope does not match its reference",
+        ));
+    }
+    let footer: Footer = decode(&bytes[footer_offset as usize..trailer_offset])?;
+    if footer.magic != FOOTER_MAGIC || footer.major != FORMAT_MAJOR {
+        return Err(corrupt("read data segment", "segment footer is invalid"));
+    }
+    let mut locations = BTreeMap::new();
+    let mut previous_content = None;
+    let mut previous_end = HEADER_LENGTH;
+    for entry in footer.entries {
+        let end = entry.offset.checked_add(entry.stored_length);
+        if previous_content.is_some_and(|content| content >= entry.content)
+            || entry.codec != Codec::Raw
+            || entry.stored_length != entry.content.length
+            || entry.offset != previous_end
+            || end.is_none_or(|end| end > footer_offset)
+        {
+            return Err(corrupt(
+                "read data segment",
+                "segment footer entry is invalid",
+            ));
+        }
+        let end = end.expect("checked above");
+        let range = entry.offset as usize..end as usize;
+        if content_ref(&bytes[range.clone()]) != entry.content {
+            return Err(corrupt(
+                "read data segment",
+                "segment entry fails content validation",
+            ));
+        }
+        previous_content = Some(entry.content);
+        previous_end = end;
+        locations.insert(entry.content, range);
+    }
+    if previous_end != footer_offset {
+        return Err(corrupt(
+            "read data segment",
+            "segment data region is not fully described",
+        ));
+    }
+    Ok(locations)
+}
+
+fn validate_extent(extent: &Extent) -> Result<(), ManagedError> {
+    let end = extent
+        .segment_offset
+        .checked_add(extent.content.length)
+        .filter(|end| *end <= extent.segment.length.saturating_sub(TRAILER_LENGTH));
+    if extent.content.length == 0 || extent.segment_offset < HEADER_LENGTH || end.is_none() {
+        return Err(corrupt(
+            "read data segment",
+            "file extent has an invalid segment range",
+        ));
     }
     Ok(())
 }
 
-fn reachable_content(
+fn reachable_segments(
     snapshot: &NamespaceSnapshot,
     action: &'static str,
-) -> Result<BTreeSet<ContentRef>, ManagedError> {
-    let mut contents = BTreeSet::new();
+) -> Result<BTreeSet<SegmentRef>, ManagedError> {
+    let mut segments = BTreeSet::new();
     visit_reachable_file_versions(snapshot, action, |version| {
-        contents.extend(
+        segments.extend(
             version
                 .extent_map
                 .extents
                 .iter()
-                .map(|extent| extent.content),
+                .map(|extent| extent.segment),
         );
     })?;
-    Ok(contents)
-}
-
-fn reachable_whole_content(
-    snapshot: &NamespaceSnapshot,
-    action: &'static str,
-) -> Result<BTreeSet<ContentRef>, ManagedError> {
-    let mut contents = BTreeSet::new();
-    visit_reachable_file_versions(snapshot, action, |version| {
-        if let Some(content) = version.whole_content() {
-            contents.insert(content);
-        }
-    })?;
-    Ok(contents)
+    Ok(segments)
 }
 
 fn visit_reachable_file_versions(
@@ -697,121 +883,94 @@ fn visit_reachable_file_versions(
     Ok(())
 }
 
-async fn frozen_size(source: &Operator, path: &str) -> Result<u64, ManagedError> {
-    let metadata = source
-        .stat(path)
-        .await
-        .map_err(|_| unavailable("read frozen file"))?;
-    if !metadata.is_file() {
-        return Err(invalid("read frozen file", "input is not a regular file"));
+fn content_ref(bytes: &[u8]) -> ContentRef {
+    ContentRef {
+        digest: Sha256::digest(bytes).into(),
+        length: bytes.len() as u64,
     }
-    Ok(metadata.content_length())
 }
 
-fn build_version(
-    size: u64,
-    digest: [u8; 32],
-    extent_map: ExtentMap,
-) -> Result<FileVersionRecord, ManagedError> {
-    FileVersionRecord::from_extents(size, digest, extent_map)
-        .ok_or_else(|| invalid("seal Managed data", "generated file manifest is invalid"))
+fn segment_key(reference: SegmentRef) -> String {
+    let digest = hex(&reference.digest);
+    format!("{SEGMENT_ROOT}/{}/{}.seg", &digest[..2], digest)
 }
 
-async fn digest_and_copy(
-    source: &Operator,
-    path: &str,
-    size: u64,
-    mut target: Option<&mut Writer>,
-) -> opendal::Result<Digest> {
-    let reader = source.reader(path).await?;
-    let mut hash = Sha256::new();
-    let mut offset = 0;
-    while offset < size {
-        let end = (offset + READ_WINDOW).min(size);
-        let buffer = reader.read(offset..end).await?;
-        if buffer.len() as u64 != end - offset {
-            return Err(opendal::Error::new(
-                ErrorKind::Unexpected,
-                "source returned a short range",
-            ));
-        }
-        for bytes in buffer.clone() {
-            hash.update(&bytes);
-        }
-        if let Some(writer) = target.as_deref_mut() {
-            writer.write(buffer).await?;
-        }
-        offset = end;
-    }
-    Ok(Digest::from_bytes(hash.finalize().into()))
-}
-
-fn whole_file_version(size: u64, digest: Digest) -> FileVersionRecord {
-    FileVersionRecord::whole(size, *digest.as_bytes())
-}
-
-fn loose_key(content: &ContentRef) -> String {
-    let digest = Digest::from_bytes(content.digest).hex();
-    format!("{LOOSE_ROOT}/{}/{digest}", &digest[..2])
-}
-
-struct ListedLooseContent {
-    path: String,
-    content: ContentRef,
-}
-
-async fn list_loose_content(
-    operator: &Operator,
-    action: &'static str,
-) -> Result<Vec<ListedLooseContent>, ManagedError> {
-    let entries = operator
-        .list_with(&format!("{LOOSE_ROOT}/"))
-        .recursive(true)
-        .await
-        .map_err(|_| unavailable(action))?;
-    Ok(entries
-        .into_iter()
-        .filter_map(|entry| {
-            if !entry.metadata().is_file() {
-                return None;
-            }
-            let digest = parse_loose_key(entry.path())?;
-            Some(ListedLooseContent {
-                path: entry.path().to_owned(),
-                content: ContentRef {
-                    digest,
-                    length: entry.metadata().content_length(),
-                },
-            })
-        })
-        .collect())
-}
-
-fn parse_loose_key(path: &str) -> Option<[u8; 32]> {
-    let relative = path.strip_prefix(&format!("{LOOSE_ROOT}/"))?;
+fn segment_ref_from_key(path: &str, length: u64) -> Option<SegmentRef> {
+    let relative = path.strip_prefix(&format!("{SEGMENT_ROOT}/"))?;
     let (partition, encoded) = relative.split_once('/')?;
-    if partition.len() != 2
-        || encoded.len() != 64
-        || encoded.contains('/')
-        || partition != &encoded[..2]
-    {
+    let encoded = encoded.strip_suffix(".seg")?;
+    if partition.len() != 2 || encoded.len() != 64 || partition != &encoded[..2] {
         return None;
     }
-    let mut digest = [0_u8; 32];
-    for (output, pair) in digest.iter_mut().zip(encoded.as_bytes().chunks_exact(2)) {
-        let high = decode_lower_hex(pair[0])?;
-        let low = decode_lower_hex(pair[1])?;
-        *output = high << 4 | low;
-    }
-    Some(digest)
+    Some(SegmentRef {
+        digest: parse_hex(encoded)?,
+        length,
+    })
 }
 
-const fn decode_lower_hex(value: u8) -> Option<u8> {
+fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(DIGITS[(byte >> 4) as usize] as char);
+        output.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+fn parse_hex(value: &str) -> Option<[u8; 32]> {
+    if value.len() != 64 {
+        return None;
+    }
+    let mut output = [0; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        output[index] = (hex_digit(pair[0])? << 4) | hex_digit(pair[1])?;
+    }
+    Some(output)
+}
+
+fn hex_digit(value: u8) -> Option<u8> {
     match value {
         b'0'..=b'9' => Some(value - b'0'),
         b'a'..=b'f' => Some(value - b'a' + 10),
         _ => None,
     }
+}
+
+fn encode(value: &impl Serialize) -> Result<Vec<u8>, ManagedError> {
+    let mut bytes = Vec::new();
+    ciborium::ser::into_writer(value, &mut bytes)
+        .map_err(|_| invalid("seal data segment", "segment footer cannot be encoded"))?;
+    Ok(bytes)
+}
+
+fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, ManagedError> {
+    let mut cursor = Cursor::new(bytes);
+    let value = ciborium::de::from_reader(&mut cursor)
+        .map_err(|_| corrupt("read data segment", "segment footer is not valid CBOR"))?;
+    if cursor.position() != bytes.len() as u64 {
+        return Err(corrupt(
+            "read data segment",
+            "segment footer has trailing bytes",
+        ));
+    }
+    Ok(value)
+}
+
+fn u16_at(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_be_bytes(
+        bytes[offset..offset + 2]
+            .try_into()
+            .expect("checked segment envelope"),
+    )
+}
+
+fn u64_at(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_be_bytes(
+        bytes[offset..offset + 8]
+            .try_into()
+            .expect("checked segment envelope"),
+    )
 }
 
 fn already_exists(error: &opendal::Error) -> bool {
@@ -821,20 +980,20 @@ fn already_exists(error: &opendal::Error) -> bool {
     )
 }
 
+fn referenced_segment_error(action: &'static str, error: opendal::Error) -> ManagedError {
+    if error.kind() == ErrorKind::NotFound {
+        corrupt(action, "file version references a missing data segment")
+    } else {
+        unavailable(action)
+    }
+}
+
 fn invalid(action: &'static str, message: &'static str) -> ManagedError {
     ManagedError::new(ManagedErrorKind::Invalid, action, message)
 }
 
 fn corrupt(action: &'static str, message: &'static str) -> ManagedError {
     ManagedError::new(ManagedErrorKind::Corrupt, action, message)
-}
-
-fn referenced_data_error(action: &'static str, error: opendal::Error) -> ManagedError {
-    if error.kind() == ErrorKind::NotFound {
-        corrupt(action, "file version references missing content")
-    } else {
-        unavailable(action)
-    }
 }
 
 fn unavailable(action: &'static str) -> ManagedError {
@@ -847,356 +1006,55 @@ fn unavailable(action: &'static str) -> ManagedError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-    use std::num::NonZeroU64;
-
-    use opendal::services;
-
     use super::*;
-    use crate::filesystem::{
-        ChangeCursor, DirectoryEntry, Generation, NodeAttributes, NodeId, NodeKind, VolumeId,
-    };
-    use crate::managed::metadata::namespace::{DirectoryRecord, NodeRecord};
+    use opendal::services;
 
     fn memory() -> Operator {
         Operator::new(services::Memory::default()).unwrap().finish()
     }
 
-    fn managed_data(operator: Operator) -> ManagedData {
-        ManagedData::new(operator).unwrap()
-    }
-
-    async fn seal_file(data: &ManagedData, source: &Operator, path: &str) -> FileVersionRecord {
-        data.seal_file_with_known_content(source, path, &AuthorityKnownContent::default())
-            .await
-            .unwrap()
-    }
-
-    async fn seal_whole_file(
-        data: &ManagedData,
-        source: &Operator,
-        path: &str,
-    ) -> FileVersionRecord {
-        data.seal_whole_file_with_known_content(source, path, &AuthorityKnownContent::default())
-            .await
-            .unwrap()
-    }
-
-    fn snapshot_with_file(version: FileVersionRecord) -> NamespaceSnapshot {
-        snapshot_with_files([("live", version)])
-    }
-
-    fn snapshot_with_files<const N: usize>(
-        files: [(&str, FileVersionRecord); N],
-    ) -> NamespaceSnapshot {
-        let root = NodeId::from_bytes([21; 16]);
-        let generation = Generation::from_bytes(vec![1]);
-        let mut nodes = BTreeMap::from([(
-            root,
-            NodeRecord {
-                id: root,
-                generation: generation.clone(),
-                kind: NodeKind::Directory,
-                attributes: NodeAttributes::default(),
-                file_version: None,
-            },
-        )]);
-        let mut entries = BTreeMap::new();
-        let mut file_versions = BTreeMap::new();
-        for (index, (path, version)) in files.into_iter().enumerate() {
-            let file = NodeId::from_bytes([22 + index as u8; 16]);
-            nodes.insert(
-                file,
-                NodeRecord {
-                    id: file,
-                    generation: generation.clone(),
-                    kind: NodeKind::RegularFile,
-                    attributes: NodeAttributes::default(),
-                    file_version: Some(version.id),
-                },
-            );
-            entries.insert(
-                path.to_owned(),
-                DirectoryEntry {
-                    node: file,
-                    kind: NodeKind::RegularFile,
-                },
-            );
-            file_versions.insert(version.id, version);
-        }
-        NamespaceSnapshot {
-            volume_id: VolumeId::from_bytes([23; 16]),
-            cursor: ChangeCursor::at(
-                NonZeroU64::new(1).unwrap(),
-                OperationId::from_bytes([24; 16]),
-            ),
-            root,
-            nodes,
-            directories: BTreeMap::from([(
-                root,
-                DirectoryRecord {
-                    node: root,
-                    generation,
-                    entries,
-                },
-            )]),
-            file_versions,
-        }
-    }
-
     #[tokio::test]
-    async fn small_and_large_files_round_trip() {
+    async fn stages_and_materializes_whole_and_chunked_files() {
         let source = memory();
-        let stored = memory();
+        let storage = memory();
         let target = memory();
-        let small = vec![7; 8192];
-        let bytes: Vec<u8> = (0..2 * 1024 * 1024)
-            .map(|index| (index * 31) as u8)
-            .collect();
-        source.write("small", small).await.unwrap();
-        source.write("input", bytes.clone()).await.unwrap();
-        source.write("empty", Vec::<u8>::new()).await.unwrap();
+        let small = b"portable segment".to_vec();
+        let large = (0..2 * 1024 * 1024)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        source.write("small", small.clone()).await.unwrap();
+        source.write("large", large.clone()).await.unwrap();
+        let data = ManagedData::new(storage).unwrap();
 
-        let data = managed_data(stored);
-        let small_version = seal_file(&data, &source, "small").await;
-        let large_version = seal_file(&data, &source, "input").await;
-        let empty_version = seal_file(&data, &source, "empty").await;
-        data.read_to(&small_version, &target, "small")
+        let staged = data
+            .stage_files(
+                &source,
+                vec!["small".to_owned(), "large".to_owned()],
+                &AuthorityKnownContent::default(),
+                NonZeroUsize::new(2).unwrap(),
+            )
             .await
             .unwrap();
-        data.read_to(&large_version, &target, "large")
-            .await
-            .unwrap();
-        data.read_to(&empty_version, &target, "empty")
-            .await
-            .unwrap();
-        assert_eq!(
-            target.read("small").await.unwrap().to_bytes(),
-            vec![7; 8192]
-        );
-        assert_eq!(target.read("large").await.unwrap().to_bytes(), bytes);
-        assert!(target.read("empty").await.unwrap().is_empty());
+        data.materialize(
+            &target,
+            staged.into_iter().collect(),
+            false,
+            NonZeroUsize::new(2).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(target.read("small").await.unwrap().to_bytes(), small);
+        assert_eq!(target.read("large").await.unwrap().to_bytes(), large);
     }
 
-    #[tokio::test]
-    async fn loose_gc_retains_unknown_keys_and_fails_before_deleting_on_live_mismatch() {
-        let source = memory();
-        let stored = memory();
-        source.write("live", b"live".to_vec()).await.unwrap();
-        source.write("orphan", b"orphan".to_vec()).await.unwrap();
-        let data = managed_data(stored.clone());
-        let live = seal_whole_file(&data, &source, "live").await;
-        let orphan = seal_whole_file(&data, &source, "orphan").await;
-        let snapshot = snapshot_with_file(live.clone());
-        let live_content = live.whole_content().unwrap();
-        let orphan_content = orphan.whole_content().unwrap();
-        let unknown = format!("{LOOSE_ROOT}/unknown");
-        stored.write(&unknown, b"keep".to_vec()).await.unwrap();
-
-        let collected = data.collect_unreachable_loose(&snapshot).await.unwrap();
-        assert_eq!(collected.scanned, 2);
-        assert_eq!(collected.deleted, 1);
-        assert_eq!(collected.deleted_bytes, orphan_content.length);
-        assert!(stored.stat(&loose_key(&live_content)).await.is_ok());
-        assert!(stored.stat(&loose_key(&orphan_content)).await.is_err());
-        assert!(stored.stat(&unknown).await.is_ok());
-
-        stored
-            .write(&loose_key(&live_content), b"wrong length".to_vec())
-            .await
-            .unwrap();
-        let later = ContentRef {
-            digest: Sha256::digest(b"later orphan").into(),
-            length: b"later orphan".len() as u64,
-        };
-        stored
-            .write(&loose_key(&later), b"later orphan".to_vec())
-            .await
-            .unwrap();
-        let error = data.collect_unreachable_loose(&snapshot).await.unwrap_err();
-        assert_eq!(error.kind(), ManagedErrorKind::Corrupt);
-        assert!(stored.stat(&loose_key(&later)).await.is_ok());
-    }
-
-    #[tokio::test]
-    async fn reachable_small_content_falls_back_to_a_published_pack() {
-        let source = memory();
-        let stored = memory();
-        let target = memory();
-        source.write("small", b"small file".to_vec()).await.unwrap();
-        source
-            .write("large", vec![7; SMALL_CONTENT_LIMIT as usize + 1])
-            .await
-            .unwrap();
-        source.write("orphan", b"orphan".to_vec()).await.unwrap();
-        let data = managed_data(stored.clone());
-        let small = seal_whole_file(&data, &source, "small").await;
-        let large = seal_whole_file(&data, &source, "large").await;
-        let orphan = seal_whole_file(&data, &source, "orphan").await;
-
-        let root = NodeId::from_bytes([1; 16]);
-        let small_node = NodeId::from_bytes([2; 16]);
-        let large_node = NodeId::from_bytes([3; 16]);
-        let generation = Generation::from_bytes(vec![1]);
-        let snapshot = NamespaceSnapshot {
-            volume_id: VolumeId::from_bytes([4; 16]),
-            cursor: ChangeCursor::Genesis,
-            root,
-            nodes: BTreeMap::from([
-                (
-                    root,
-                    NodeRecord {
-                        id: root,
-                        generation: generation.clone(),
-                        kind: NodeKind::Directory,
-                        attributes: NodeAttributes::default(),
-                        file_version: None,
-                    },
-                ),
-                (
-                    small_node,
-                    NodeRecord {
-                        id: small_node,
-                        generation: generation.clone(),
-                        kind: NodeKind::RegularFile,
-                        attributes: NodeAttributes::default(),
-                        file_version: Some(small.id),
-                    },
-                ),
-                (
-                    large_node,
-                    NodeRecord {
-                        id: large_node,
-                        generation,
-                        kind: NodeKind::RegularFile,
-                        attributes: NodeAttributes::default(),
-                        file_version: Some(large.id),
-                    },
-                ),
-            ]),
-            directories: BTreeMap::from([(
-                root,
-                DirectoryRecord {
-                    node: root,
-                    generation: Generation::from_bytes(vec![1]),
-                    entries: BTreeMap::from([
-                        (
-                            "large".to_owned(),
-                            DirectoryEntry {
-                                node: large_node,
-                                kind: NodeKind::RegularFile,
-                            },
-                        ),
-                        (
-                            "small".to_owned(),
-                            DirectoryEntry {
-                                node: small_node,
-                                kind: NodeKind::RegularFile,
-                            },
-                        ),
-                    ]),
-                },
-            )]),
-            file_versions: BTreeMap::from([
-                (small.id, small.clone()),
-                (large.id, large.clone()),
-                (orphan.id, orphan.clone()),
-            ]),
-        };
-
-        let packed = data
-            .pack_reachable(&snapshot, OperationId::from_bytes([5; 16]))
-            .await
-            .unwrap();
-        let small_content = small.whole_content().unwrap();
-        let orphan_content = orphan.whole_content().unwrap();
-        assert_eq!(packed.packed_content, vec![small_content]);
-        assert_eq!(packed.logical_bytes, small_content.length);
-        let index = PackIndex::open(stored.clone()).await.unwrap().unwrap();
-        assert!(index.locations(orphan_content).is_empty());
-
-        let pack_key = stored
-            .list(".ofs/managed/indexes/data-pack/v1/packs/sha256/")
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|entry| entry.path().to_owned())
-            .find(|path| path.ends_with(".pack"))
-            .unwrap();
-        let original = stored.read(&pack_key).await.unwrap().to_bytes();
-        let mut corrupt_pack = original.to_vec();
-        corrupt_pack[26] ^= 0xff;
-        stored.write(&pack_key, corrupt_pack).await.unwrap();
-        assert!(stored.stat(&loose_key(&small_content)).await.is_ok());
-        data.read_to(&small, &target, "loose-fallback")
-            .await
-            .unwrap();
-        assert_eq!(
-            target.read("loose-fallback").await.unwrap().to_bytes(),
-            b"small file".as_slice()
-        );
-
-        stored.write(&pack_key, original).await.unwrap();
-        assert!(stored.stat(&loose_key(&small_content)).await.is_ok());
-        assert!(stored.stat(&loose_key(&orphan_content)).await.is_ok());
-        data.read_to(&small, &target, "restored").await.unwrap();
-        assert_eq!(
-            target.read("restored").await.unwrap().to_bytes(),
-            b"small file".as_slice()
-        );
-        data.read_to(&large, &target, "large").await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn pack_maintenance_preserves_large_file_reads() {
-        let source = memory();
-        let stored = memory();
-        let target = memory();
-        source.write("whole", b"whole file".to_vec()).await.unwrap();
-        let chunked_bytes = vec![11; 2 * 1024 * 1024];
-        source
-            .write("chunked", chunked_bytes.clone())
-            .await
-            .unwrap();
-
-        let data = managed_data(stored.clone());
-        let whole = seal_whole_file(&data, &source, "whole").await;
-        let chunked = seal_file(&data, &source, "chunked").await;
-        let snapshot =
-            snapshot_with_files([("whole", whole.clone()), ("chunked", chunked.clone())]);
-
-        let packed = data
-            .pack_reachable(&snapshot, OperationId::from_bytes([31; 16]))
-            .await
-            .unwrap();
-        let whole_ref = whole.whole_content().unwrap();
-        assert_eq!(packed.packed_content, vec![whole_ref]);
-
-        data.read_to(&chunked, &target, "chunked").await.unwrap();
-        assert_eq!(
-            target.read("chunked").await.unwrap().to_bytes(),
-            chunked_bytes
-        );
-    }
-
-    #[tokio::test]
-    async fn referenced_extent_corruption_fails_closed() {
-        let source = memory();
-        let stored = memory();
-        let target = memory();
-        source
-            .write("input", vec![7; 2 * 1024 * 1024])
-            .await
-            .unwrap();
-        let data = managed_data(stored.clone());
-        let version = seal_file(&data, &source, "input").await;
-        let content = version.extent_map.extents[0].content;
-        stored
-            .write(&loose_key(&content), b"bad".to_vec())
-            .await
-            .unwrap();
-
-        let error = data.read_to(&version, &target, "output").await.unwrap_err();
-        assert_eq!(error.kind(), ManagedErrorKind::Corrupt);
+    #[test]
+    fn complete_segment_rejects_corruption() {
+        let content = content_ref(b"verified bytes");
+        let mut segment =
+            seal_segment(BTreeMap::from([(content, b"verified bytes".to_vec())])).unwrap();
+        assert!(verify_complete_segment(segment.reference, &segment.bytes).is_ok());
+        segment.bytes[HEADER_LENGTH as usize] ^= 1;
+        assert!(verify_complete_segment(segment.reference, &segment.bytes).is_err());
     }
 }

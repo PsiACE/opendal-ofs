@@ -23,7 +23,7 @@ use crate::filesystem::{
     ChangeCursor, DirectoryEntry, FileVersionId, Generation, NodeAttributes, NodeId, NodeKind,
     OperationId, VolumeId,
 };
-use crate::managed::format::{ContentRef, Extent, ExtentMap};
+use crate::managed::format::{ContentRef, ExtentMap};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NodeRecord {
@@ -50,28 +50,6 @@ pub struct FileVersionRecord {
 }
 
 impl FileVersionRecord {
-    pub(crate) fn whole(logical_size: u64, logical_digest: [u8; 32]) -> Self {
-        let extent_map = ExtentMap {
-            extents: (logical_size != 0)
-                .then_some(Extent {
-                    logical_offset: 0,
-                    content: ContentRef {
-                        digest: logical_digest,
-                        length: logical_size,
-                    },
-                })
-                .into_iter()
-                .collect(),
-        };
-        Self {
-            id: canonical_file_version_id(logical_size, &logical_digest, &extent_map)
-                .expect("one whole-file entry fits format v1"),
-            logical_size,
-            logical_digest,
-            extent_map,
-        }
-    }
-
     pub(crate) fn from_extents(
         logical_size: u64,
         logical_digest: [u8; 32],
@@ -93,17 +71,6 @@ impl FileVersionRecord {
             && canonical_file_version_id(self.logical_size, &self.logical_digest, &self.extent_map)
                 == Some(self.id)
     }
-
-    pub(crate) fn whole_content(&self) -> Option<ContentRef> {
-        match self.extent_map.extents.as_slice() {
-            [extent]
-                if extent.logical_offset == 0 && extent.content.length == self.logical_size =>
-            {
-                Some(extent.content)
-            }
-            _ => None,
-        }
-    }
 }
 
 fn extent_map_valid(size: u64, digest: &[u8; 32], extent_map: &ExtentMap) -> bool {
@@ -121,7 +88,12 @@ fn extent_map_valid(size: u64, digest: &[u8; 32], extent_map: &ExtentMap) -> boo
     contiguous(
         size,
         extent_map.extents.iter().map(|extent| {
-            (extent.content.length != 0).then_some((extent.logical_offset, extent.content.length))
+            (extent.content.length != 0
+                && extent
+                    .segment_offset
+                    .checked_add(extent.content.length)
+                    .is_some_and(|end| end <= extent.segment.length))
+            .then_some((extent.logical_offset, extent.content.length))
         }),
     )
 }
@@ -156,6 +128,9 @@ fn canonical_file_version_id(
     for extent in &extent_map.extents {
         encoded.extend_from_slice(&extent.logical_offset.to_be_bytes());
         encode_content(&mut encoded, &extent.content);
+        encoded.extend_from_slice(&extent.segment.digest);
+        encoded.extend_from_slice(&extent.segment.length.to_be_bytes());
+        encoded.extend_from_slice(&extent.segment_offset.to_be_bytes());
     }
     Some(FileVersionId::from_bytes(Sha256::digest(encoded).into()))
 }

@@ -25,7 +25,7 @@ pub(crate) const SUPERBLOCK_KEY: &str = ".ofs/managed/metadata/v1/superblock.jso
 const SPECIFICATION: &str = "managed/1";
 const NAMING_POLICY: &str = "portable-utf8/1";
 const FILE_VERSION_FORMAT: &str = "extent-map/1";
-const BLOB_FORMAT: &str = "raw-sha256/1";
+const DATA_FORMAT: &str = "segment/1";
 
 /// Physical format of the authoritative Managed metadata store.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -105,8 +105,8 @@ impl ManagedFormat {
         if wire.file_version_format != FILE_VERSION_FORMAT {
             return Err(unsupported("file version format is unsupported"));
         }
-        if wire.blob_format != BLOB_FORMAT {
-            return Err(unsupported("blob format is unsupported"));
+        if wire.data_format != DATA_FORMAT {
+            return Err(unsupported("data format is unsupported"));
         }
         if !wire.required_extensions.is_empty() {
             return Err(unsupported("superblock requires an unsupported extension"));
@@ -142,7 +142,7 @@ struct SuperblockWire {
     naming_policy: String,
     metadata_format: String,
     file_version_format: String,
-    blob_format: String,
+    data_format: String,
     required_extensions: Vec<String>,
 }
 
@@ -154,7 +154,7 @@ impl From<&ManagedFormat> for SuperblockWire {
             naming_policy: NAMING_POLICY.to_owned(),
             metadata_format: format.metadata_format.identifier().to_owned(),
             file_version_format: FILE_VERSION_FORMAT.to_owned(),
-            blob_format: BLOB_FORMAT.to_owned(),
+            data_format: DATA_FORMAT.to_owned(),
             required_extensions: Vec::new(),
         }
     }
@@ -195,7 +195,7 @@ mod tests {
         assert_eq!(ManagedFormat::decode(&encoded).unwrap(), format);
         assert_eq!(
             std::str::from_utf8(&encoded).unwrap(),
-            r#"{"specification":"managed/1","volume_id":"01010101010101010101010101010101","naming_policy":"portable-utf8/1","metadata_format":"object/1","file_version_format":"extent-map/1","blob_format":"raw-sha256/1","required_extensions":[]}"#
+            r#"{"specification":"managed/1","volume_id":"01010101010101010101010101010101","naming_policy":"portable-utf8/1","metadata_format":"object/1","file_version_format":"extent-map/1","data_format":"segment/1","required_extensions":[]}"#
         );
     }
 
@@ -216,7 +216,7 @@ mod tests {
 
     #[test]
     fn unknown_required_extension_is_rejected_before_open() {
-        let unknown = br#"{"specification":"managed/1","volume_id":"01010101010101010101010101010101","naming_policy":"portable-utf8/1","metadata_format":"object/1","file_version_format":"extent-map/1","blob_format":"raw-sha256/1","required_extensions":["future/1"]}"#;
+        let unknown = br#"{"specification":"managed/1","volume_id":"01010101010101010101010101010101","naming_policy":"portable-utf8/1","metadata_format":"object/1","file_version_format":"extent-map/1","data_format":"segment/1","required_extensions":["future/1"]}"#;
         assert_eq!(
             ManagedFormat::decode(unknown).unwrap_err().kind(),
             ManagedErrorKind::UnsupportedFormat
@@ -225,7 +225,7 @@ mod tests {
 
     #[test]
     fn required_extensions_must_be_strictly_ordered() {
-        let duplicate = br#"{"specification":"managed/1","volume_id":"01010101010101010101010101010101","naming_policy":"portable-utf8/1","metadata_format":"object/1","file_version_format":"extent-map/1","blob_format":"raw-sha256/1","required_extensions":["future/1","future/1"]}"#;
+        let duplicate = br#"{"specification":"managed/1","volume_id":"01010101010101010101010101010101","naming_policy":"portable-utf8/1","metadata_format":"object/1","file_version_format":"extent-map/1","data_format":"segment/1","required_extensions":["future/1","future/1"]}"#;
         assert_eq!(
             ManagedFormat::decode(duplicate).unwrap_err().kind(),
             ManagedErrorKind::Corrupt
@@ -234,7 +234,7 @@ mod tests {
 
     #[test]
     fn unknown_superblock_field_is_rejected() {
-        let unknown = br#"{"specification":"managed/1","volume_id":"01010101010101010101010101010101","naming_policy":"portable-utf8/1","metadata_format":"object/1","file_version_format":"extent-map/1","blob_format":"raw-sha256/1","required_extensions":[],"policy":"fastcdc"}"#;
+        let unknown = br#"{"specification":"managed/1","volume_id":"01010101010101010101010101010101","naming_policy":"portable-utf8/1","metadata_format":"object/1","file_version_format":"extent-map/1","data_format":"segment/1","required_extensions":[],"policy":"fastcdc"}"#;
         assert_eq!(
             ManagedFormat::decode(unknown).unwrap_err().kind(),
             ManagedErrorKind::Corrupt
@@ -243,7 +243,7 @@ mod tests {
 
     #[test]
     fn uppercase_volume_identity_is_rejected() {
-        let bytes = br#"{"specification":"managed/1","volume_id":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","naming_policy":"portable-utf8/1","metadata_format":"object/1","file_version_format":"extent-map/1","blob_format":"raw-sha256/1","required_extensions":[]}"#;
+        let bytes = br#"{"specification":"managed/1","volume_id":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","naming_policy":"portable-utf8/1","metadata_format":"object/1","file_version_format":"extent-map/1","data_format":"segment/1","required_extensions":[]}"#;
         assert_eq!(
             ManagedFormat::decode(bytes).unwrap_err().kind(),
             ManagedErrorKind::Corrupt

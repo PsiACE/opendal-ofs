@@ -272,6 +272,7 @@ mod tests {
 
     use super::*;
     use crate::filesystem::{DirectoryEntry, OperationId, VolumeId};
+    use crate::managed::format::{ContentRef, Extent, ExtentMap, SegmentRef};
     use crate::managed::metadata::namespace::FileVersionRecord;
 
     const ROOT: NodeId = NodeId::from_bytes([1; 16]);
@@ -285,8 +286,30 @@ mod tests {
         ChangeCursor::at(NonZeroU64::new(sequence).unwrap(), operation(byte))
     }
 
+    fn file_version(size: u64, digest: [u8; 32]) -> FileVersionRecord {
+        FileVersionRecord::from_extents(
+            size,
+            digest,
+            ExtentMap {
+                extents: vec![Extent {
+                    logical_offset: 0,
+                    content: ContentRef {
+                        digest,
+                        length: size,
+                    },
+                    segment: SegmentRef {
+                        digest: [9; 32],
+                        length: size + 66,
+                    },
+                    segment_offset: 10,
+                }],
+            },
+        )
+        .unwrap()
+    }
+
     fn base_snapshot() -> NamespaceSnapshot {
-        let version = FileVersionRecord::whole(3, [3; 32]);
+        let version = file_version(3, [3; 32]);
         NamespaceSnapshot {
             volume_id: VolumeId::from_bytes([7; 16]),
             cursor: cursor(1, 1),
@@ -374,7 +397,7 @@ mod tests {
         let base = base_snapshot();
         let mut content_changed = base.clone();
         content_changed.cursor = cursor(2, 2);
-        let version = FileVersionRecord::whole(4, [4; 32]);
+        let version = file_version(4, [4; 32]);
         content_changed.nodes.get_mut(&FILE).unwrap().file_version = Some(version.id);
         content_changed.file_versions = BTreeMap::from([(version.id, version)]);
 

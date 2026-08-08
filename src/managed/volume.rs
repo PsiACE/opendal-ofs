@@ -20,17 +20,16 @@
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 
-use futures::{StreamExt as _, stream};
 use opendal::Operator;
 
-use super::format::{ContentRef, ExtentMap};
+use super::format::ExtentMap;
 use super::metadata::namespace::{
     D1Namespace, D1NamespaceObservation, FileVersionRecord, NamespaceGcSweep, NamespaceObservation,
     NamespacePublication, NamespaceSnapshot, ObjectNamespace,
 };
 use super::{
-    AuthorityKnownContent, D1Metadata, LooseGcMaintenance, ManagedData, ManagedError,
-    ManagedErrorKind, ManagedFormat, MetadataFormat, PackMaintenance,
+    AuthorityKnownContent, D1Metadata, ManagedData, ManagedError, ManagedErrorKind, ManagedFormat,
+    MetadataFormat, SegmentGcMaintenance,
 };
 use crate::filesystem::{CommitOutcome, OperationId, VolumeId};
 use crate::filesystem::{
@@ -38,7 +37,6 @@ use crate::filesystem::{
     NodeRecord as FsNodeRecord, Volume, VolumeError, VolumeErrorKind, VolumeObservation,
     VolumePublication, VolumeSnapshot,
 };
-use crate::managed::index::{PackId, PackLocation};
 
 #[derive(Clone)]
 pub struct ManagedVolume {
@@ -151,17 +149,6 @@ impl ManagedVolume {
         }
     }
 
-    pub(crate) async fn seal_file_with_known_content(
-        &self,
-        frozen: &Operator,
-        path: &str,
-        known: &AuthorityKnownContent,
-    ) -> Result<FileVersionRecord, ManagedError> {
-        self.data
-            .seal_file_with_known_content(frozen, path, known)
-            .await
-    }
-
     pub async fn publish(
         &self,
         observed: Option<&ManagedObservation>,
@@ -221,38 +208,23 @@ impl ManagedVolume {
         }
     }
 
-    /// Delete loose objects unreachable from the snapshot fixed by this sweep.
-    pub async fn collect_unreachable_loose(
+    /// Delete data segments unreachable from the snapshot fixed by this sweep.
+    pub async fn collect_unreachable_segments(
         &self,
         observed: &ManagedObservation,
         sweep: NamespaceGcSweep,
-    ) -> Result<LooseGcMaintenance, ManagedError> {
+    ) -> Result<SegmentGcMaintenance, ManagedError> {
         if observed.gc_sweep() != Some(sweep) || observed.snapshot().cursor != sweep.fixed_cursor()
         {
             return Err(ManagedError::new(
                 ManagedErrorKind::Invalid,
-                "collect unreachable loose data",
+                "collect unreachable data segments",
                 "observation does not hold this active GC sweep",
             ));
         }
         self.data
-            .collect_unreachable_loose(observed.snapshot())
+            .collect_unreachable_segments(observed.snapshot())
             .await
-    }
-
-    /// Pack small whole-file content reachable from one fixed namespace observation.
-    pub async fn pack_reachable_content(
-        &self,
-        observed: &ManagedObservation,
-        operation: OperationId,
-    ) -> Result<PackMaintenance, ManagedError> {
-        self.data
-            .pack_reachable(observed.snapshot(), operation)
-            .await
-    }
-
-    pub async fn rebuild_pack_index(&self) -> Result<usize, ManagedError> {
-        self.data.rebuild_pack_index().await
     }
 }
 
@@ -269,100 +241,15 @@ async fn materialize_managed_files(
     full_tree: bool,
     concurrency: NonZeroUsize,
 ) -> Result<(), VolumeError> {
-    let data = volume.data.clone();
-    let packs = data.read_session()?;
-    let mut packed = BTreeMap::<PackId, Vec<(MaterializeRequest, ContentRef, PackLocation)>>::new();
-    let mut unpacked = Vec::new();
-    for request in requests {
-        let managed = decode_file_version(&request.version)?;
-        let content = managed.whole_content().filter(|content| content.length > 0);
-        let location = match content {
-            Some(content) => packs.locations(content).await.into_iter().next(),
-            None => None,
-        };
-        match (content, location) {
-            (Some(content), Some(location)) => packed
-                .entry(location.pack)
-                .or_default()
-                .push((request, content, location)),
-            _ => unpacked.push((request, managed)),
-        }
-    }
-
-    let packed_results = stream::iter(packed)
-        .map(|(id, requests)| {
-            let data = data.clone();
-            let packs = packs.clone();
-            let target = target.clone();
-            async move {
-                let contents = if full_tree {
-                    packs.read_full(id).await.and_then(|pack| {
-                        requests
-                            .iter()
-                            .map(|(_, content, _)| {
-                                pack.content(*content)
-                                    .map(ToOwned::to_owned)
-                                    .ok_or_else(|| {
-                                        ManagedError::new(
-                                            ManagedErrorKind::Corrupt,
-                                            "materialize Managed files",
-                                            "pack index disagrees with verified pack",
-                                        )
-                                    })
-                            })
-                            .collect()
-                    })
-                } else {
-                    let entries = requests
-                        .iter()
-                        .map(|(_, content, location)| (*content, *location))
-                        .collect::<Vec<_>>();
-                    packs.read_ranges(id, &entries).await
-                };
-                if let Ok(contents) = contents {
-                    for ((request, _, _), bytes) in requests.into_iter().zip(contents) {
-                        target.write(&request.path, bytes).await.map_err(|_| {
-                            VolumeError::new(
-                                VolumeErrorKind::Unavailable,
-                                format!("materialize file {:?}: target write failed", request.path),
-                            )
-                        })?;
-                    }
-                } else {
-                    for (request, _, _) in requests {
-                        let version = decode_file_version(&request.version)?;
-                        data.read_to_with(&version, &target, &request.path, &packs)
-                            .await?;
-                    }
-                }
-                Ok::<_, VolumeError>(())
-            }
-        })
-        .buffer_unordered(concurrency.get())
-        .collect::<Vec<_>>()
-        .await;
-    for result in packed_results {
-        result?;
-    }
-
-    let unpacked_results = stream::iter(unpacked)
-        .map(|(request, version)| {
-            let data = data.clone();
-            let packs = packs.clone();
-            let target = target.clone();
-            async move {
-                data.read_to_with(&version, &target, &request.path, &packs)
-                    .await
-                    .map_err(VolumeError::from)
-            }
-        })
-        .buffer_unordered(concurrency.get())
-        .collect::<Vec<_>>()
-        .await;
-    for result in unpacked_results {
-        result?;
-    }
-    Ok(())
+    let decoded = requests
+        .into_iter()
+        .map(|request| Ok((request.path, decode_file_version(&request.version)?)))
+        .collect::<Result<Vec<_>, VolumeError>>()?;
+    volume
+        .data
+        .materialize(target, decoded, full_tree, concurrency)
+        .await
+        .map_err(Into::into)
 }
 
 impl Volume for ManagedVolume {
@@ -412,22 +299,12 @@ impl Volume for ManagedVolume {
             .map(AuthorityKnownContent::from_snapshot)
             .transpose()?
             .unwrap_or_default();
-        let staged = stream::iter(paths)
-            .map(|path| {
-                let volume = self.clone();
-                let source = source.clone();
-                let known = &known;
-                async move {
-                    let version = volume
-                        .seal_file_with_known_content(&source, &path, known)
-                        .await?;
-                    Ok::<_, VolumeError>((path, encode_file_version(&version)?))
-                }
-            })
-            .buffer_unordered(concurrency.get())
-            .collect::<Vec<_>>()
-            .await;
-        staged.into_iter().collect()
+        self.data
+            .stage_files(source, paths, &known, concurrency)
+            .await?
+            .into_iter()
+            .map(|(path, version)| Ok((path, encode_file_version(&version)?)))
+            .collect()
     }
 
     async fn publish(
@@ -645,7 +522,7 @@ mod tests {
     use sha2::{Digest as _, Sha256};
 
     use super::*;
-    use crate::managed::format::Extent;
+    use crate::managed::format::{ContentRef, Extent, SegmentRef};
 
     #[test]
     fn filesystem_descriptor_round_trips_a_multi_extent_file() {
@@ -663,6 +540,11 @@ mod tests {
                             digest: Sha256::digest(first).into(),
                             length: first.len() as u64,
                         },
+                        segment: SegmentRef {
+                            digest: [1; 32],
+                            length: 128,
+                        },
+                        segment_offset: 10,
                     },
                     Extent {
                         logical_offset: first.len() as u64,
@@ -670,6 +552,11 @@ mod tests {
                             digest: Sha256::digest(second).into(),
                             length: second.len() as u64,
                         },
+                        segment: SegmentRef {
+                            digest: [1; 32],
+                            length: 128,
+                        },
+                        segment_offset: 16,
                     },
                 ],
             },

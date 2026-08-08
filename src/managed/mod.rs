@@ -20,12 +20,11 @@
 mod data;
 mod error;
 mod format;
-pub(crate) mod index;
 mod metadata;
 mod volume;
 
+pub use data::SegmentGcMaintenance;
 pub(crate) use data::{AuthorityKnownContent, ManagedData};
-pub use data::{LooseGcMaintenance, PackMaintenance};
 pub use error::{ManagedError, ManagedErrorKind};
 pub use metadata::{
     D1Config, D1Metadata, ManagedFormat, MetadataFormat, NamespaceGcSweep, ObjectMetadata,

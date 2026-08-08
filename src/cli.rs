@@ -55,34 +55,12 @@ pub(crate) struct MountArgs {
 pub(crate) enum VolumeCommand {
     /// Create or reopen a volume and save its credential-free binding.
     Create(VolumeCreateArgs),
-    /// Pack live small whole files through the current Managed namespace root.
-    Pack(VolumePackArgs),
-    /// Rebuild the derived pack index from immutable pack footers.
-    Reindex(VolumeReindexArgs),
-    /// Remove loose data unreachable from the current Managed namespace root.
+    /// Remove data segments unreachable from the current Managed namespace root.
     Gc(VolumeGcArgs),
 }
 
 #[derive(Debug, Args)]
 pub(crate) struct VolumeGcArgs {
-    /// Named Managed volume from the local catalog.
-    pub alias: String,
-
-    #[command(flatten)]
-    pub runtime: StorageOptions,
-}
-
-#[derive(Debug, Args)]
-pub(crate) struct VolumePackArgs {
-    /// Named Managed volume from the local catalog.
-    pub alias: String,
-
-    #[command(flatten)]
-    pub runtime: StorageOptions,
-}
-
-#[derive(Debug, Args)]
-pub(crate) struct VolumeReindexArgs {
     /// Named Managed volume from the local catalog.
     pub alias: String,
 

@@ -28,6 +28,14 @@ pub struct ContentRef {
     pub length: u64,
 }
 
+/// Identity and physical length of one immutable data segment.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SegmentRef {
+    pub digest: [u8; 32],
+    pub length: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExtentMap {
@@ -39,4 +47,6 @@ pub struct ExtentMap {
 pub struct Extent {
     pub logical_offset: u64,
     pub content: ContentRef,
+    pub segment: SegmentRef,
+    pub segment_offset: u64,
 }
