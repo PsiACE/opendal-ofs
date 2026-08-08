@@ -20,6 +20,7 @@ use std::num::NonZeroU64;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 
 use super::change::NamespaceChange;
 use super::validation::{validate_publication, validate_snapshot};
@@ -156,6 +157,7 @@ impl D1Namespace {
         }
         let delta = PublicationDelta::new(publication, base);
         let payload = encode(&delta.change, "publish Managed namespace")?;
+        let request_digest = hex(&Sha256::digest(payload.as_bytes()));
         let operation = hex(publication.operation.as_bytes());
         let target_sequence = sqlite_integer(publication.target.cursor.sequence())?;
         let parent_sequence = sqlite_integer(publication.parent.sequence())?;
@@ -175,11 +177,12 @@ impl D1Namespace {
         batch.extend([
             statement(
                 format!(
-                    "INSERT OR IGNORE INTO {TRANSACTIONS} (store_key, operation_id, payload_json, parent_sequence, parent_operation, target_sequence, status, eligible) SELECT ?, ?, ?, ?, ?, ?, 'pending', 0 WHERE NOT EXISTS (SELECT 1 FROM {RESULTS} WHERE store_key = ? AND operation_id = ?)"
+                    "INSERT OR IGNORE INTO {TRANSACTIONS} (store_key, operation_id, request_digest, payload_json, parent_sequence, parent_operation, target_sequence, status, eligible) SELECT ?, ?, ?, ?, ?, ?, ?, 'pending', 0 WHERE NOT EXISTS (SELECT 1 FROM {RESULTS} WHERE store_key = ? AND operation_id = ?)"
                 ),
                 vec![
                     self.store_key().into(),
                     operation.clone().into(),
+                    request_digest.clone().into(),
                     payload.clone().into(),
                     parent_sequence.into(),
                     option_text(parent_operation.clone()),
@@ -190,7 +193,7 @@ impl D1Namespace {
             ),
             statement(
                 format!(
-                    "SELECT payload_json FROM {RESULTS} WHERE store_key = ? AND operation_id = ? UNION ALL SELECT payload_json FROM {TRANSACTIONS} WHERE store_key = ? AND operation_id = ? AND NOT EXISTS (SELECT 1 FROM {RESULTS} WHERE store_key = ? AND operation_id = ?)"
+                    "SELECT request_digest FROM {RESULTS} WHERE store_key = ? AND operation_id = ? UNION ALL SELECT request_digest FROM {TRANSACTIONS} WHERE store_key = ? AND operation_id = ? AND NOT EXISTS (SELECT 1 FROM {RESULTS} WHERE store_key = ? AND operation_id = ?)"
                 ),
                 vec![
                     self.store_key().into(), operation.clone().into(),
@@ -278,14 +281,13 @@ impl D1Namespace {
         batch.extend([
             statement(
                 format!(
-                    "INSERT OR IGNORE INTO {RESULTS} (store_key, operation_id, payload_json, outcome, target_sequence, target_operation) SELECT ?, ?, ?, 'committed', ?, ? FROM {HEADS} WHERE store_key = ? AND volume_id = ? AND target_sequence = ? AND target_operation = ?"
+                    "INSERT OR IGNORE INTO {RESULTS} (store_key, operation_id, request_digest, target_sequence) SELECT ?, ?, ?, ? FROM {HEADS} WHERE store_key = ? AND volume_id = ? AND target_sequence = ? AND target_operation = ?"
                 ),
                 vec![
                     self.store_key().into(),
                     operation.clone().into(),
-                    payload.clone().into(),
+                    request_digest.clone().into(),
                     target_sequence.into(),
-                    operation.clone().into(),
                     self.store_key().into(),
                     self.volume().into(),
                     target_sequence.into(),
@@ -293,27 +295,26 @@ impl D1Namespace {
                 ],
             ),
             statement(
-                format!("UPDATE {TRANSACTIONS} SET status = CASE WHEN EXISTS (SELECT 1 FROM {RESULTS} WHERE store_key = ? AND operation_id = ? AND payload_json = ? AND outcome = 'committed') THEN 'committed' ELSE 'rejected' END WHERE store_key = ? AND operation_id = ? AND status = 'pending'"),
+                format!("UPDATE {TRANSACTIONS} SET status = 'committed' WHERE store_key = ? AND operation_id = ? AND status = 'pending' AND EXISTS (SELECT 1 FROM {RESULTS} WHERE store_key = ? AND operation_id = ? AND request_digest = ?)"),
                 vec![
-                    self.store_key().into(), operation.clone().into(), payload.clone().into(),
                     self.store_key().into(), operation.clone().into(),
+                    self.store_key().into(), operation.clone().into(), request_digest.clone().into(),
                 ],
             ),
             statement(
                 format!(
-                    "INSERT OR IGNORE INTO {RESULTS} (store_key, operation_id, payload_json, outcome, target_sequence, target_operation) SELECT t.store_key, t.operation_id, t.payload_json, 'conflict', COALESCE(h.target_sequence, 0), h.target_operation FROM {TRANSACTIONS} t LEFT JOIN {HEADS} h ON h.store_key = t.store_key WHERE t.store_key = ? AND t.operation_id = ? AND t.payload_json = ? AND t.status = 'rejected'"
+                    "DELETE FROM {TRANSACTIONS} WHERE store_key = ? AND operation_id = ? AND status = 'pending'"
                 ),
                 vec![
                     self.store_key().into(),
                     operation.clone().into(),
-                    payload.clone().into(),
                 ],
             ),
             put_checkpoint(
                 checkpoint.as_deref(),
                 target_sequence,
                 &operation,
-                &payload,
+                &request_digest,
                 self.store_key(),
             )?,
             statement(
@@ -328,12 +329,12 @@ impl D1Namespace {
                 vec![self.store_key().into(), self.store_key().into()],
             ),
             statement(
-                format!("DELETE FROM {TRANSACTIONS} WHERE store_key = ? AND (status = 'rejected' OR (status = 'committed' AND target_sequence <= COALESCE((SELECT checkpoint_sequence FROM {HEADS} WHERE store_key = ?), 0)))"),
+                format!("DELETE FROM {TRANSACTIONS} WHERE store_key = ? AND status = 'committed' AND target_sequence <= COALESCE((SELECT checkpoint_sequence FROM {HEADS} WHERE store_key = ?), 0)"),
                 vec![self.store_key().into(), self.store_key().into()],
             ),
             statement(
                 format!(
-                    "SELECT outcome, target_sequence, target_operation FROM {RESULTS} WHERE store_key = ? AND operation_id = ?"
+                    "SELECT target_sequence FROM {RESULTS} WHERE store_key = ? AND operation_id = ?"
                 ),
                 vec![self.store_key().into(), operation.into()],
             ),
@@ -360,7 +361,7 @@ impl D1Namespace {
                 "D1 omitted the transaction",
             ));
         };
-        validate_operation_payload(transaction, &payload)?;
+        validate_request_digest(transaction, &request_digest)?;
         let result = rows(&results, results.len() - 1, "publish Managed namespace")?;
         if let [result] = result {
             return operation_result(result, publication.operation, "publish Managed namespace");
@@ -381,7 +382,7 @@ impl D1Namespace {
         let mut batch = schema_statements();
         batch.push(statement(
             format!(
-                "SELECT outcome, target_sequence, target_operation FROM {RESULTS} WHERE store_key = ? AND operation_id = ?"
+                "SELECT target_sequence FROM {RESULTS} WHERE store_key = ? AND operation_id = ?"
             ),
             vec![self.store_key().into(), hex(operation.as_bytes()).into()],
         ));
@@ -602,13 +603,13 @@ fn schema_statements() -> Vec<D1Statement> {
         ),
         statement(
             format!(
-                "CREATE TABLE IF NOT EXISTS {TRANSACTIONS} (store_key TEXT NOT NULL, operation_id TEXT NOT NULL, payload_json TEXT NOT NULL, parent_sequence INTEGER NOT NULL, parent_operation TEXT, target_sequence INTEGER NOT NULL, status TEXT NOT NULL, eligible INTEGER NOT NULL, PRIMARY KEY (store_key, operation_id))"
+                "CREATE TABLE IF NOT EXISTS {TRANSACTIONS} (store_key TEXT NOT NULL, operation_id TEXT NOT NULL, request_digest TEXT NOT NULL, payload_json TEXT NOT NULL, parent_sequence INTEGER NOT NULL, parent_operation TEXT, target_sequence INTEGER NOT NULL, status TEXT NOT NULL CHECK (status IN ('pending', 'committed')), eligible INTEGER NOT NULL, PRIMARY KEY (store_key, operation_id))"
             ),
             Vec::new(),
         ),
         statement(
             format!(
-                "CREATE TABLE IF NOT EXISTS {RESULTS} (store_key TEXT NOT NULL, operation_id TEXT NOT NULL, payload_json TEXT NOT NULL, outcome TEXT NOT NULL CHECK (outcome IN ('committed', 'conflict')), target_sequence INTEGER NOT NULL, target_operation TEXT, PRIMARY KEY (store_key, operation_id))"
+                "CREATE TABLE IF NOT EXISTS {RESULTS} (store_key TEXT NOT NULL, operation_id TEXT NOT NULL, request_digest TEXT NOT NULL, target_sequence INTEGER NOT NULL, PRIMARY KEY (store_key, operation_id))"
             ),
             Vec::new(),
         ),
@@ -734,13 +735,13 @@ fn put_checkpoint(
     checkpoint: Option<&str>,
     target_sequence: i64,
     operation: &str,
-    payload: &str,
+    request_digest: &str,
     store_key: String,
 ) -> Result<D1Statement, ManagedError> {
     let checkpoint = checkpoint.map_or(Value::Null, |value| value.to_owned().into());
     Ok(statement(
         format!(
-            "INSERT OR IGNORE INTO {CHECKPOINTS} (store_key, target_sequence, snapshot_json) SELECT ?, ?, ? WHERE ? IS NOT NULL AND EXISTS (SELECT 1 FROM {RESULTS} WHERE store_key = ? AND operation_id = ? AND payload_json = ? AND outcome = 'committed')"
+            "INSERT OR IGNORE INTO {CHECKPOINTS} (store_key, target_sequence, snapshot_json) SELECT ?, ?, ? WHERE ? IS NOT NULL AND EXISTS (SELECT 1 FROM {RESULTS} WHERE store_key = ? AND operation_id = ? AND request_digest = ?)"
         ),
         vec![
             store_key.clone().into(),
@@ -749,7 +750,7 @@ fn put_checkpoint(
             checkpoint,
             store_key.into(),
             operation.to_owned().into(),
-            payload.to_owned().into(),
+            request_digest.to_owned().into(),
         ],
     ))
 }
@@ -955,21 +956,12 @@ fn operation_result(
     operation: OperationId,
     action: &'static str,
 ) -> Result<CommitOutcome, ManagedError> {
-    let cursor = stored_cursor(
-        integer(row, "target_sequence", action)?,
-        nullable_text(row, "target_operation", action)?,
-    )?;
-    match text(row, "outcome", action)? {
-        "committed" if cursor.operation() == Some(operation) => {
-            Ok(CommitOutcome::Committed(cursor))
-        }
-        "committed" => Err(corrupt(
-            action,
-            "committed result identifies another operation",
-        )),
-        "conflict" => Ok(CommitOutcome::Conflict { observed: cursor }),
-        _ => Err(corrupt(action, "operation result outcome is invalid")),
-    }
+    let sequence = integer(row, "target_sequence", action)?;
+    let sequence = NonZeroU64::new(sequence)
+        .ok_or_else(|| corrupt(action, "committed result sequence is invalid"))?;
+    Ok(CommitOutcome::Committed(ChangeCursor::at(
+        sequence, operation,
+    )))
 }
 
 fn resolve_operation_rows(
@@ -984,8 +976,8 @@ fn resolve_operation_rows(
     }
 }
 
-fn validate_operation_payload(row: &Value, payload: &str) -> Result<(), ManagedError> {
-    if text(row, "payload_json", "publish Managed namespace")? == payload {
+fn validate_request_digest(row: &Value, request_digest: &str) -> Result<(), ManagedError> {
+    if text(row, "request_digest", "publish Managed namespace")? == request_digest {
         return Ok(());
     }
     Err(ManagedError::new(
@@ -1720,39 +1712,25 @@ mod tests {
     }
 
     #[test]
-    fn operation_results_preserve_committed_and_conflict_outcomes() {
+    fn operation_results_resolve_only_committed_operations() {
         assert_eq!(
             resolve_operation_rows(&[], operation(2), "test operation result").unwrap(),
             CommitOutcome::Absent
         );
         let committed = serde_json::json!({
-            "outcome": "committed",
             "target_sequence": 2,
-            "target_operation": hex(operation(2).as_bytes()),
         });
         assert_eq!(
             operation_result(&committed, operation(2), "test operation result").unwrap(),
             CommitOutcome::Committed(cursor(2, 2))
         );
-
-        let conflict = serde_json::json!({
-            "outcome": "conflict",
-            "target_sequence": 1,
-            "target_operation": hex(operation(1).as_bytes()),
-        });
-        assert_eq!(
-            operation_result(&conflict, operation(2), "test operation result").unwrap(),
-            CommitOutcome::Conflict {
-                observed: cursor(1, 1)
-            }
-        );
     }
 
     #[test]
     fn operation_identity_rejects_another_payload() {
-        let result = serde_json::json!({"payload_json": "first"});
+        let result = serde_json::json!({"request_digest": "first"});
         assert_eq!(
-            validate_operation_payload(&result, "second")
+            validate_request_digest(&result, "second")
                 .unwrap_err()
                 .kind(),
             ManagedErrorKind::Conflict
