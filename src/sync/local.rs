@@ -46,7 +46,7 @@ pub(crate) struct LocalTree {
 }
 
 impl LocalTree {
-    pub async fn scan(root: impl AsRef<Path>) -> Result<Self> {
+    pub(crate) async fn scan(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
         let operator = fs_operator(root)?;
         let listed = operator
@@ -111,11 +111,11 @@ impl LocalTree {
         })
     }
 
-    pub fn root(&self) -> &Path {
+    pub(crate) fn root(&self) -> &Path {
         &self.root
     }
 
-    pub fn entries(&self) -> &BTreeMap<String, LocalEntry> {
+    pub(crate) fn entries(&self) -> &BTreeMap<String, LocalEntry> {
         &self.entries
     }
 

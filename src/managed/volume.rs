@@ -64,14 +64,14 @@ enum AuthorityObservation {
 }
 
 impl ManagedObservation {
-    pub fn snapshot(&self) -> &NamespaceSnapshot {
+    fn snapshot(&self) -> &NamespaceSnapshot {
         match &self.authority {
             AuthorityObservation::Object(observed) => &observed.snapshot,
             AuthorityObservation::D1(observed) => &observed.snapshot,
         }
     }
 
-    pub fn gc_sweep(&self) -> Option<NamespaceGcSweep> {
+    fn gc_sweep(&self) -> Option<NamespaceGcSweep> {
         match &self.authority {
             AuthorityObservation::Object(observed) => observed.gc_sweep(),
             AuthorityObservation::D1(observed) => observed.gc_sweep(),
@@ -135,7 +135,7 @@ impl ManagedVolume {
     }
 
     /// Observe the authority, reusing an already verified Sync common base when it is current.
-    pub async fn observe_from(
+    async fn observe_from(
         &self,
         base: Option<&NamespaceSnapshot>,
     ) -> Result<Option<ManagedObservation>, ManagedError> {
@@ -149,7 +149,7 @@ impl ManagedVolume {
         }
     }
 
-    pub async fn publish(
+    async fn publish(
         &self,
         observed: Option<&ManagedObservation>,
         publication: &NamespacePublication,
@@ -173,7 +173,7 @@ impl ManagedVolume {
         }
     }
 
-    pub async fn resolve(&self, operation: OperationId) -> Result<CommitOutcome, ManagedError> {
+    async fn resolve(&self, operation: OperationId) -> Result<CommitOutcome, ManagedError> {
         match &self.namespace {
             NamespaceAuthority::Object(namespace) => namespace.resolve(operation).await,
             NamespaceAuthority::D1(namespace) => namespace.resolve(operation).await,

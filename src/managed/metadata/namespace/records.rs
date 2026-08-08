@@ -26,27 +26,27 @@ use crate::filesystem::{
 use crate::managed::format::{ContentRef, ExtentMap};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NodeRecord {
-    pub id: NodeId,
-    pub generation: Generation,
-    pub kind: NodeKind,
-    pub attributes: NodeAttributes,
-    pub file_version: Option<FileVersionId>,
+pub(crate) struct NodeRecord {
+    pub(crate) id: NodeId,
+    pub(crate) generation: Generation,
+    pub(crate) kind: NodeKind,
+    pub(crate) attributes: NodeAttributes,
+    pub(crate) file_version: Option<FileVersionId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DirectoryRecord {
-    pub node: NodeId,
-    pub generation: Generation,
-    pub entries: BTreeMap<String, DirectoryEntry>,
+pub(crate) struct DirectoryRecord {
+    pub(crate) node: NodeId,
+    pub(crate) generation: Generation,
+    pub(crate) entries: BTreeMap<String, DirectoryEntry>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FileVersionRecord {
-    pub id: FileVersionId,
-    pub logical_size: u64,
-    pub logical_digest: [u8; 32],
-    pub extent_map: ExtentMap,
+pub(crate) struct FileVersionRecord {
+    pub(crate) id: FileVersionId,
+    pub(crate) logical_size: u64,
+    pub(crate) logical_digest: [u8; 32],
+    pub(crate) extent_map: ExtentMap,
 }
 
 impl FileVersionRecord {
@@ -141,34 +141,34 @@ fn encode_content(encoded: &mut Vec<u8>, content: &ContentRef) {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NamespaceSnapshot {
-    pub volume_id: VolumeId,
-    pub cursor: ChangeCursor,
-    pub root: NodeId,
-    pub nodes: BTreeMap<NodeId, NodeRecord>,
-    pub directories: BTreeMap<NodeId, DirectoryRecord>,
-    pub file_versions: BTreeMap<FileVersionId, FileVersionRecord>,
+pub(crate) struct NamespaceSnapshot {
+    pub(crate) volume_id: VolumeId,
+    pub(crate) cursor: ChangeCursor,
+    pub(crate) root: NodeId,
+    pub(crate) nodes: BTreeMap<NodeId, NodeRecord>,
+    pub(crate) directories: BTreeMap<NodeId, DirectoryRecord>,
+    pub(crate) file_versions: BTreeMap<FileVersionId, FileVersionRecord>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NodePrecondition {
-    pub node: NodeId,
-    pub expected_generation: Option<Generation>,
+pub(crate) struct NodePrecondition {
+    pub(crate) node: NodeId,
+    pub(crate) expected_generation: Option<Generation>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DirectoryPrecondition {
-    pub directory: NodeId,
-    pub expected_generation: Option<Generation>,
+pub(crate) struct DirectoryPrecondition {
+    pub(crate) directory: NodeId,
+    pub(crate) expected_generation: Option<Generation>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NamespacePublication {
-    pub operation: OperationId,
-    pub parent: ChangeCursor,
-    pub expected_nodes: Vec<NodePrecondition>,
-    pub expected_directories: Vec<DirectoryPrecondition>,
-    pub target: NamespaceSnapshot,
+pub(crate) struct NamespacePublication {
+    pub(crate) operation: OperationId,
+    pub(crate) parent: ChangeCursor,
+    pub(crate) expected_nodes: Vec<NodePrecondition>,
+    pub(crate) expected_directories: Vec<DirectoryPrecondition>,
+    pub(crate) target: NamespaceSnapshot,
 }
 
 /// Durable identity of one namespace garbage-collection sweep.

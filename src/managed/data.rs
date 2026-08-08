@@ -36,7 +36,6 @@ use crate::managed::metadata::namespace::{FileVersionRecord, NamespaceSnapshot};
 const SEGMENT_ROOT: &str = ".ofs/managed/data/v1/segments/sha256";
 const SEGMENT_MAGIC: &[u8; 8] = b"OFSSEG01";
 const TRAILER_MAGIC: &[u8; 8] = b"OFSSEGTR";
-const FOOTER_MAGIC: &str = "ofs-data-segment-footer";
 const FORMAT_MAJOR: u16 = 1;
 const HEADER_LENGTH: u64 = 10;
 const TRAILER_LENGTH: u64 = 56;
@@ -109,16 +108,9 @@ struct PreparedExtent {
     bytes: Vec<u8>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum Codec {
-    Raw,
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Footer {
-    magic: String,
     major: u16,
     entries: Vec<FooterEntry>,
 }
@@ -128,8 +120,6 @@ struct Footer {
 struct FooterEntry {
     content: ContentRef,
     offset: u64,
-    stored_length: u64,
-    codec: Codec,
 }
 
 #[derive(Debug)]
@@ -688,12 +678,7 @@ fn seal_segment(contents: BTreeMap<ContentRef, Vec<u8>>) -> Result<SealedSegment
         }
         let offset = encoded.len() as u64;
         encoded.extend_from_slice(&bytes);
-        entries.push(FooterEntry {
-            content,
-            offset,
-            stored_length: content.length,
-            codec: Codec::Raw,
-        });
+        entries.push(FooterEntry { content, offset });
     }
     if entries.is_empty() {
         return Err(invalid(
@@ -703,7 +688,6 @@ fn seal_segment(contents: BTreeMap<ContentRef, Vec<u8>>) -> Result<SealedSegment
     }
     let footer_offset = encoded.len() as u64;
     let footer = encode(&Footer {
-        magic: FOOTER_MAGIC.to_owned(),
         major: FORMAT_MAJOR,
         entries: entries.clone(),
     })?;
@@ -769,17 +753,15 @@ fn verify_complete_segment(
         ));
     }
     let footer: Footer = decode(&bytes[footer_offset as usize..trailer_offset])?;
-    if footer.magic != FOOTER_MAGIC || footer.major != FORMAT_MAJOR {
+    if footer.major != FORMAT_MAJOR {
         return Err(corrupt("read data segment", "segment footer is invalid"));
     }
     let mut locations = BTreeMap::new();
     let mut previous_content = None;
     let mut previous_end = HEADER_LENGTH;
     for entry in footer.entries {
-        let end = entry.offset.checked_add(entry.stored_length);
+        let end = entry.offset.checked_add(entry.content.length);
         if previous_content.is_some_and(|content| content >= entry.content)
-            || entry.codec != Codec::Raw
-            || entry.stored_length != entry.content.length
             || entry.offset != previous_end
             || end.is_none_or(|end| end > footer_offset)
         {

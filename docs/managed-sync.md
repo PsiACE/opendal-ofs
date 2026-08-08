@@ -8,8 +8,19 @@ publishes each accepted namespace change atomically.
 RFC 016 defines two independent axes: Direct or Managed is the volume model;
 Mount or Sync is the access model. Sync is a frontend over the common Volume
 interface. Object and transactional metadata are implementations of the same
-Managed namespace contract. The data format is shared by Managed Mount and
-Managed Sync.
+Managed namespace contract. The Managed data format is designed for both Mount
+and Sync without introducing access-model variants.
+
+The current command surface implements two RFC 016 cells:
+
+| Volume model | Mount | Sync |
+| --- | --- | --- |
+| Direct | Read-only | Not implemented |
+| Managed | Not implemented | Read-write |
+
+The common `Volume` interface, namespace contract, and extent-based data format
+are the reuse boundary for the remaining cells. An unimplemented cell has no
+compatibility command, hidden fallback, or alternate storage layout.
 
 ## Commands
 
@@ -74,7 +85,7 @@ Object metadata uses these objects:
 ```
 
 `head.ofs` is the sole mutable commit point. It has a fixed format marker,
-decoded-length field, zstd-compressed canonical CBOR body, and SHA-256 checksum.
+decoded-length field, zstd-compressed named-field CBOR body, and SHA-256 checksum.
 A conditional PUT replaces it.
 It names an immutable checkpoint and contains a bounded ordered tail of
 committed namespace changes. A reader fetches HEAD once, reads the manifest and
@@ -97,7 +108,7 @@ File data uses immutable content-addressed segments:
 .ofs/managed/data/v1/segments/sha256/<first-two-hex>/<digest>.seg
 ```
 
-Each segment contains a fixed header, raw content regions, a canonical footer,
+Each segment contains a fixed header, raw content regions, a named-field CBOR footer,
 and a fixed trailer with the footer range and segment checksum. A `FileVersion`
 stores its logical size, whole-file digest, and extent map. Every extent stores
 its logical offset, `ContentRef`, `SegmentRef`, and byte offset in that segment.
@@ -141,7 +152,7 @@ reference.
 ## Validation and failure behavior
 
 Readers fail closed on unknown format identifiers, required extensions, fields,
-record kinds, codecs, invalid ranges, overflow, checksums, or filesystem
+record kinds, invalid ranges, overflow, checksums, or filesystem
 invariants. Immutable object collisions are accepted only when the existing
 object validates against the same identity. A missing referenced segment or
 checkpoint is corruption, not an empty file or absent namespace.

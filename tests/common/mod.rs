@@ -30,11 +30,10 @@ static INIT_LOGGER: OnceLock<()> = OnceLock::new();
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-pub struct OfsTestContext {
+pub(crate) struct OfsTestContext {
     pub mount_point: TempDir,
-    // Keep backend root alive for the fs-based fallback backend.
-    #[allow(dead_code)]
-    backend_root: Option<TempDir>,
+    // Keep the temporary backend root alive when no test service is configured.
+    _backend_root: Option<TempDir>,
     // This is a false positive, the field is used in the test.
     #[allow(dead_code)]
     pub capability: Capability,
@@ -52,7 +51,7 @@ impl TestContext for OfsTestContext {
                 let root_path = tmp_root.path().to_string_lossy().to_string();
                 let fs = services::Fs::default().root(&root_path);
                 let backend = Operator::new(fs)
-                    .expect("build fallback fs operator")
+                    .expect("build temporary fs operator")
                     .finish();
                 backend_root = Some(tmp_root);
                 backend
@@ -89,7 +88,7 @@ impl TestContext for OfsTestContext {
 
         OfsTestContext {
             mount_point,
-            backend_root,
+            _backend_root: backend_root,
             capability,
             mount_handle,
         }

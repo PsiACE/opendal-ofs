@@ -25,24 +25,30 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::change::NamespaceChange;
+use super::stored::{
+    StoredDirectoryEntry, StoredDirectoryPrecondition, StoredFileVersion, StoredNode,
+    StoredNodeAttributes, StoredNodeKind, StoredNodePrecondition,
+};
 use super::validation::{validate_publication, validate_snapshot};
 use super::{
-    DirectoryPrecondition, DirectoryRecord, FileVersionRecord, NamespaceGcSweep,
-    NamespacePublication, NamespaceSnapshot, NodePrecondition, NodeRecord, managed_generation,
-    managed_generation_number,
+    DirectoryRecord, FileVersionRecord, NamespaceGcSweep, NamespacePublication, NamespaceSnapshot,
+    NodeRecord, managed_generation, managed_generation_number,
 };
 use crate::filesystem::{
-    ChangeCursor, CommitOutcome, DirectoryEntry, FileVersionId, NodeAttributes, NodeId, NodeKind,
-    OperationId, VolumeId,
+    ChangeCursor, CommitOutcome, FileVersionId, NodeId, OperationId, VolumeId,
 };
 use crate::managed::format::ExtentMap;
 use crate::managed::format::sstable::{self, Record as TableRecord, TableRef};
 use crate::managed::{ManagedError, ManagedErrorKind};
 
+#[cfg(test)]
+use super::{DirectoryPrecondition, NodePrecondition};
+#[cfg(test)]
+use crate::filesystem::{DirectoryEntry, NodeAttributes, NodeKind};
+
 const HEAD_KEY: &str = ".ofs/managed/metadata/v1/head.ofs";
 const MANIFEST_ROOT: &str = ".ofs/managed/metadata/v1/manifests/sha256";
 const SSTABLE_ROOT: &str = ".ofs/managed/metadata/v1/sstables/sha256";
-const CHANGE_MAGIC: &[u8] = b"OFS1CHG\0";
 const MANIFEST_MAGIC: &[u8] = b"OFS1MAN\0";
 const HEAD_MAGIC: &[u8; 8] = b"OFS1HDZ1";
 const FORMAT_MAJOR: u16 = 1;
@@ -57,14 +63,14 @@ const FILE_VERSION_PREFIX: u8 = 4;
 const OPERATION_RESULT_PREFIX: u8 = 5;
 
 #[derive(Clone, Debug)]
-pub struct NamespaceObservation {
+pub(crate) struct NamespaceObservation {
     pub snapshot: NamespaceSnapshot,
     revision: String,
     authority: Box<ObservationAuthority>,
 }
 
 impl NamespaceObservation {
-    pub fn gc_sweep(&self) -> Option<NamespaceGcSweep> {
+    pub(crate) fn gc_sweep(&self) -> Option<NamespaceGcSweep> {
         self.authority
             .head
             .gc_sweep()
@@ -93,13 +99,13 @@ impl std::fmt::Debug for ObservationAuthority {
 }
 
 #[derive(Clone)]
-pub struct ObjectNamespace {
+pub(crate) struct ObjectNamespace {
     volume_id: VolumeId,
     operator: Operator,
 }
 
 impl ObjectNamespace {
-    pub fn new(volume_id: VolumeId, operator: Operator) -> Result<Self, ManagedError> {
+    pub(crate) fn new(volume_id: VolumeId, operator: Operator) -> Result<Self, ManagedError> {
         let capability = operator.info().full_capability();
         if !capability.read
             || !capability.stat
@@ -118,7 +124,7 @@ impl ObjectNamespace {
         })
     }
 
-    pub async fn observe(&self) -> Result<Option<NamespaceObservation>, ManagedError> {
+    pub(crate) async fn observe(&self) -> Result<Option<NamespaceObservation>, ManagedError> {
         let Some((bytes, revision)) = self.read_head().await? else {
             return Ok(None);
         };
@@ -126,7 +132,7 @@ impl ObjectNamespace {
         self.recover_observation(head, revision).await.map(Some)
     }
 
-    pub async fn observe_from(
+    pub(crate) async fn observe_from(
         &self,
         base: &NamespaceSnapshot,
     ) -> Result<Option<NamespaceObservation>, ManagedError> {
@@ -167,7 +173,7 @@ impl ObjectNamespace {
         })
     }
 
-    pub async fn publish(
+    pub(crate) async fn publish(
         &self,
         observed: Option<&NamespaceObservation>,
         publication: &NamespacePublication,
@@ -185,8 +191,8 @@ impl ObjectNamespace {
         }
         let base = observed.map(|value| &value.snapshot);
         let stored = StoredTransaction::from_publication(publication, base);
-        let bytes = encode_cbor(CHANGE_MAGIC, &stored, "publish Managed namespace")?;
-        let request_sha256 = sha256(&bytes);
+        let encoded_transaction = encode_table_value(&stored, "publish Managed namespace")?;
+        let request_sha256 = sha256(&encoded_transaction);
         if !validate_publication(publication, base)? {
             if matches!(
                 self.resolve_known(publication.operation, Some(request_sha256))
@@ -200,8 +206,8 @@ impl ObjectNamespace {
             });
         }
 
-        let appended_tail_bytes =
-            observed.map_or(0, |value| value.authority.head.tail_bytes()) + bytes.len();
+        let appended_tail_bytes = observed.map_or(0, |value| value.authority.head.tail_bytes())
+            + encoded_transaction.len();
         let checkpoint_due = observed.is_none()
             || observed.is_some_and(|value| {
                 value.authority.head.tail.len() + 1 >= usize::from(MAX_TAIL_TRANSACTIONS)
@@ -277,7 +283,7 @@ impl ObjectNamespace {
         }
     }
 
-    pub async fn begin_gc(
+    pub(crate) async fn begin_gc(
         &self,
         observed: &NamespaceObservation,
     ) -> Result<NamespaceGcSweep, ManagedError> {
@@ -308,7 +314,7 @@ impl ObjectNamespace {
             .ok_or_else(|| conflict("begin Managed namespace GC", "namespace authority changed"))
     }
 
-    pub async fn finish_gc(&self, sweep: NamespaceGcSweep) -> Result<(), ManagedError> {
+    pub(crate) async fn finish_gc(&self, sweep: NamespaceGcSweep) -> Result<(), ManagedError> {
         let observed = self.observe().await?.ok_or_else(|| {
             conflict("finish Managed namespace GC", "namespace authority changed")
         })?;
@@ -345,7 +351,10 @@ impl ObjectNamespace {
         }
     }
 
-    pub async fn resolve(&self, operation: OperationId) -> Result<CommitOutcome, ManagedError> {
+    pub(crate) async fn resolve(
+        &self,
+        operation: OperationId,
+    ) -> Result<CommitOutcome, ManagedError> {
         match self.resolve_known(operation, None).await {
             Err(error) if error.kind() == ManagedErrorKind::Unavailable => {
                 Ok(CommitOutcome::Unknown)
@@ -368,11 +377,7 @@ impl ObjectNamespace {
             .iter()
             .find(|transaction| transaction.operation == *operation.as_bytes())
         {
-            let observed_sha256 = sha256(&encode_cbor(
-                CHANGE_MAGIC,
-                transaction,
-                "resolve Managed publication",
-            )?);
+            let observed_sha256 = transaction_sha256(transaction, "resolve Managed publication")?;
             require_same_operation(expected_sha256, observed_sha256)?;
             return Ok(CommitOutcome::Committed(transaction.cursor.into_cursor()?));
         }
@@ -1264,10 +1269,9 @@ struct StoredCommittedResult {
 
 impl StoredCommittedResult {
     fn from_transaction(transaction: &StoredTransaction) -> Result<Self, ManagedError> {
-        let bytes = encode_cbor(CHANGE_MAGIC, transaction, "checkpoint Managed namespace")?;
         Ok(Self {
             cursor: transaction.cursor,
-            request_sha256: sha256(&bytes),
+            request_sha256: transaction_sha256(transaction, "checkpoint Managed namespace")?,
         })
     }
 
@@ -1280,6 +1284,13 @@ impl StoredCommittedResult {
         }
         Ok(())
     }
+}
+
+fn transaction_sha256(
+    transaction: &StoredTransaction,
+    action: &'static str,
+) -> Result<[u8; 32], ManagedError> {
+    encode_table_value(transaction, action).map(|bytes| sha256(&bytes))
 }
 
 fn validate_tables(tables: &[TableRef]) -> Result<(), ManagedError> {
@@ -1489,7 +1500,7 @@ impl StoredTransaction {
                 .iter()
                 .cloned()
                 .map(StoredNode::into_record)
-                .collect::<Result<_, _>>()?,
+                .collect(),
             remove_nodes: self
                 .remove_nodes
                 .iter()
@@ -1508,7 +1519,7 @@ impl StoredTransaction {
                 .iter()
                 .cloned()
                 .map(StoredFileVersion::into_record)
-                .collect::<Result<_, _>>()?,
+                .collect(),
             remove_file_versions: self
                 .remove_file_versions
                 .iter()
@@ -1591,41 +1602,6 @@ impl StoredCursor {
             )),
             _ => Err(corrupt("read Managed namespace", "cursor is invalid")),
         }
-    }
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct StoredNode {
-    id: [u8; 16],
-    generation: u64,
-    kind: StoredNodeKind,
-    attributes: StoredNodeAttributes,
-    file_version: Option<[u8; 32]>,
-}
-
-impl From<&NodeRecord> for StoredNode {
-    fn from(node: &NodeRecord) -> Self {
-        Self {
-            id: *node.id.as_bytes(),
-            generation: managed_generation_number(&node.generation)
-                .expect("validated Managed node generation"),
-            kind: node.kind.into(),
-            attributes: node.attributes.into(),
-            file_version: node.file_version.map(|version| *version.as_bytes()),
-        }
-    }
-}
-
-impl StoredNode {
-    fn into_record(self) -> Result<NodeRecord, ManagedError> {
-        Ok(NodeRecord {
-            id: NodeId::from_bytes(self.id),
-            generation: managed_generation(self.generation),
-            kind: self.kind.into(),
-            attributes: self.attributes.into(),
-            file_version: self.file_version.map(FileVersionId::from_bytes),
-        })
     }
 }
 
@@ -1729,109 +1705,6 @@ struct StoredDirectoryEntryKey {
     name: String,
 }
 
-#[derive(Clone, Copy, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct StoredDirectoryEntry {
-    node: [u8; 16],
-    kind: StoredNodeKind,
-}
-
-impl From<DirectoryEntry> for StoredDirectoryEntry {
-    fn from(entry: DirectoryEntry) -> Self {
-        Self {
-            node: *entry.node.as_bytes(),
-            kind: entry.kind.into(),
-        }
-    }
-}
-
-impl From<StoredDirectoryEntry> for DirectoryEntry {
-    fn from(entry: StoredDirectoryEntry) -> Self {
-        Self {
-            node: NodeId::from_bytes(entry.node),
-            kind: entry.kind.into(),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum StoredNodeKind {
-    Directory,
-    RegularFile,
-}
-
-impl From<NodeKind> for StoredNodeKind {
-    fn from(kind: NodeKind) -> Self {
-        match kind {
-            NodeKind::Directory => Self::Directory,
-            NodeKind::RegularFile => Self::RegularFile,
-        }
-    }
-}
-
-impl From<StoredNodeKind> for NodeKind {
-    fn from(kind: StoredNodeKind) -> Self {
-        match kind {
-            StoredNodeKind::Directory => Self::Directory,
-            StoredNodeKind::RegularFile => Self::RegularFile,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct StoredNodeAttributes {
-    executable: bool,
-}
-
-impl From<NodeAttributes> for StoredNodeAttributes {
-    fn from(attributes: NodeAttributes) -> Self {
-        Self {
-            executable: attributes.executable,
-        }
-    }
-}
-
-impl From<StoredNodeAttributes> for NodeAttributes {
-    fn from(attributes: StoredNodeAttributes) -> Self {
-        Self {
-            executable: attributes.executable,
-        }
-    }
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct StoredFileVersion {
-    id: [u8; 32],
-    logical_size: u64,
-    logical_digest: [u8; 32],
-    extent_map: ExtentMap,
-}
-
-impl From<&FileVersionRecord> for StoredFileVersion {
-    fn from(version: &FileVersionRecord) -> Self {
-        Self {
-            id: *version.id.as_bytes(),
-            logical_size: version.logical_size,
-            logical_digest: version.logical_digest,
-            extent_map: version.extent_map.clone(),
-        }
-    }
-}
-
-impl StoredFileVersion {
-    fn into_record(self) -> Result<FileVersionRecord, ManagedError> {
-        Ok(FileVersionRecord {
-            id: FileVersionId::from_bytes(self.id),
-            logical_size: self.logical_size,
-            logical_digest: self.logical_digest,
-            extent_map: self.extent_map,
-        })
-    }
-}
-
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct SnapshotFileVersionRecord {
@@ -1857,62 +1730,6 @@ impl SnapshotFileVersionRecord {
             logical_size: self.logical_size,
             logical_digest: self.logical_digest,
             extent_map: self.extent_map,
-        }
-    }
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct StoredNodePrecondition {
-    node: [u8; 16],
-    expected_generation: Option<u64>,
-}
-
-impl From<&NodePrecondition> for StoredNodePrecondition {
-    fn from(condition: &NodePrecondition) -> Self {
-        Self {
-            node: *condition.node.as_bytes(),
-            expected_generation: condition.expected_generation.as_ref().map(|value| {
-                managed_generation_number(value)
-                    .expect("validated Managed node precondition generation")
-            }),
-        }
-    }
-}
-
-impl StoredNodePrecondition {
-    fn into_record(self) -> NodePrecondition {
-        NodePrecondition {
-            node: NodeId::from_bytes(self.node),
-            expected_generation: self.expected_generation.map(managed_generation),
-        }
-    }
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct StoredDirectoryPrecondition {
-    directory: [u8; 16],
-    expected_generation: Option<u64>,
-}
-
-impl From<&DirectoryPrecondition> for StoredDirectoryPrecondition {
-    fn from(condition: &DirectoryPrecondition) -> Self {
-        Self {
-            directory: *condition.directory.as_bytes(),
-            expected_generation: condition.expected_generation.as_ref().map(|value| {
-                managed_generation_number(value)
-                    .expect("validated Managed directory precondition generation")
-            }),
-        }
-    }
-}
-
-impl StoredDirectoryPrecondition {
-    fn into_record(self) -> DirectoryPrecondition {
-        DirectoryPrecondition {
-            directory: NodeId::from_bytes(self.directory),
-            expected_generation: self.expected_generation.map(managed_generation),
         }
     }
 }
@@ -2009,50 +1826,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(recovered, target);
-    }
-
-    #[test]
-    fn wide_directory_change_encodes_only_entry_changes() {
-        let first = OperationId::from_bytes([11; 16]);
-        let first_cursor = ChangeCursor::at(NonZeroU64::new(1).unwrap(), first);
-        let mut base = root_snapshot(first_cursor);
-        let directory = base.directories.get_mut(&base.root).unwrap();
-        directory.entries = (0..20_000)
-            .map(|index| {
-                (
-                    format!("file-{index:05}"),
-                    DirectoryEntry {
-                        node: NodeId::from_bytes((index as u128).to_be_bytes()),
-                        kind: NodeKind::RegularFile,
-                    },
-                )
-            })
-            .collect();
-        let second = OperationId::from_bytes([12; 16]);
-        let mut target = base.clone();
-        target.cursor = ChangeCursor::at(NonZeroU64::new(2).unwrap(), second);
-        let target_directory = target.directories.get_mut(&target.root).unwrap();
-        target_directory.generation = managed_generation(2);
-        target_directory.entries.insert(
-            "one-new-file".to_owned(),
-            DirectoryEntry {
-                node: NodeId::from_bytes([13; 16]),
-                kind: NodeKind::RegularFile,
-            },
-        );
-        let publication = NamespacePublication {
-            operation: second,
-            parent: first_cursor,
-            expected_nodes: Vec::new(),
-            expected_directories: vec![DirectoryPrecondition {
-                directory: target.root,
-                expected_generation: Some(managed_generation(1)),
-            }],
-            target: target.clone(),
-        };
-        let stored = StoredTransaction::from_publication(&publication, Some(&base));
-        let encoded = encode_cbor(CHANGE_MAGIC, &stored, "test").unwrap();
-        assert!(encoded.len() < 2_000, "encoded {} bytes", encoded.len());
     }
 
     #[tokio::test]

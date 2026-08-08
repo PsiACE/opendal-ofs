@@ -21,10 +21,11 @@ mod change;
 mod d1;
 mod object;
 mod records;
+mod stored;
 mod validation;
 
 pub(crate) use d1::{D1Namespace, D1NamespaceObservation};
-pub use object::{NamespaceObservation, ObjectNamespace};
+pub(crate) use object::{NamespaceObservation, ObjectNamespace};
 pub use records::NamespaceGcSweep;
 pub(crate) use records::{
     DirectoryPrecondition, DirectoryRecord, FileVersionRecord, NamespacePublication,

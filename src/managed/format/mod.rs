@@ -23,30 +23,30 @@ pub(crate) mod sstable;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct ContentRef {
-    pub digest: [u8; 32],
-    pub length: u64,
+pub(crate) struct ContentRef {
+    pub(crate) digest: [u8; 32],
+    pub(crate) length: u64,
 }
 
 /// Identity and physical length of one immutable data segment.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct SegmentRef {
-    pub digest: [u8; 32],
-    pub length: u64,
+pub(crate) struct SegmentRef {
+    pub(crate) digest: [u8; 32],
+    pub(crate) length: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct ExtentMap {
-    pub extents: Vec<Extent>,
+pub(crate) struct ExtentMap {
+    pub(crate) extents: Vec<Extent>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct Extent {
-    pub logical_offset: u64,
-    pub content: ContentRef,
-    pub segment: SegmentRef,
-    pub segment_offset: u64,
+pub(crate) struct Extent {
+    pub(crate) logical_offset: u64,
+    pub(crate) content: ContentRef,
+    pub(crate) segment: SegmentRef,
+    pub(crate) segment_offset: u64,
 }

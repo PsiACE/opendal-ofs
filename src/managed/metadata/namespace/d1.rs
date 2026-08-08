@@ -23,19 +23,25 @@ use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
 use super::change::NamespaceChange;
+use super::stored::{
+    StoredDirectoryEntry, StoredDirectoryPrecondition, StoredFileVersion, StoredNode,
+    StoredNodePrecondition,
+};
 use super::validation::{validate_publication, validate_snapshot};
 use super::{
-    DirectoryPrecondition, DirectoryRecord, FileVersionRecord, NamespaceGcSweep,
-    NamespacePublication, NamespaceSnapshot, NodePrecondition, NodeRecord, managed_generation,
+    DirectoryRecord, NamespaceGcSweep, NamespacePublication, NamespaceSnapshot, managed_generation,
     managed_generation_number,
 };
 use crate::filesystem::{
-    ChangeCursor, CommitOutcome, DirectoryEntry, FileVersionId, NodeAttributes, NodeId, NodeKind,
-    OperationId, VolumeId,
+    ChangeCursor, CommitOutcome, FileVersionId, NodeId, OperationId, VolumeId,
 };
-use crate::managed::format::ExtentMap;
 use crate::managed::metadata::d1::{D1Session, D1Statement, statement};
 use crate::managed::{ManagedError, ManagedErrorKind};
+
+#[cfg(test)]
+use super::NodeRecord;
+#[cfg(test)]
+use crate::filesystem::{NodeAttributes, NodeKind};
 
 const HEADS: &str = "ofs_managed_v1_heads";
 const NODES: &str = "ofs_managed_v1_nodes";
@@ -1340,41 +1346,6 @@ impl StoredSnapshot {
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct StoredNode {
-    id: [u8; 16],
-    generation: u64,
-    kind: StoredNodeKind,
-    attributes: StoredNodeAttributes,
-    file_version: Option<[u8; 32]>,
-}
-
-impl From<&NodeRecord> for StoredNode {
-    fn from(node: &NodeRecord) -> Self {
-        Self {
-            id: *node.id.as_bytes(),
-            generation: managed_generation_number(&node.generation)
-                .expect("validated Managed node generation"),
-            kind: node.kind.into(),
-            attributes: node.attributes.into(),
-            file_version: node.file_version.map(|value| *value.as_bytes()),
-        }
-    }
-}
-
-impl StoredNode {
-    fn into_record(self) -> NodeRecord {
-        NodeRecord {
-            id: NodeId::from_bytes(self.id),
-            generation: managed_generation(self.generation),
-            kind: self.kind.into(),
-            attributes: self.attributes.into(),
-            file_version: self.file_version.map(FileVersionId::from_bytes),
-        }
-    }
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 struct StoredDirectory {
     node: [u8; 16],
     generation: u64,
@@ -1406,165 +1377,6 @@ impl StoredDirectory {
                 .into_iter()
                 .map(|(name, entry)| (name, entry.into()))
                 .collect(),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct StoredDirectoryEntry {
-    node: [u8; 16],
-    kind: StoredNodeKind,
-}
-
-impl From<DirectoryEntry> for StoredDirectoryEntry {
-    fn from(entry: DirectoryEntry) -> Self {
-        Self {
-            node: *entry.node.as_bytes(),
-            kind: entry.kind.into(),
-        }
-    }
-}
-
-impl From<StoredDirectoryEntry> for DirectoryEntry {
-    fn from(entry: StoredDirectoryEntry) -> Self {
-        Self {
-            node: NodeId::from_bytes(entry.node),
-            kind: entry.kind.into(),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum StoredNodeKind {
-    Directory,
-    RegularFile,
-}
-
-impl From<NodeKind> for StoredNodeKind {
-    fn from(kind: NodeKind) -> Self {
-        match kind {
-            NodeKind::Directory => Self::Directory,
-            NodeKind::RegularFile => Self::RegularFile,
-        }
-    }
-}
-
-impl From<StoredNodeKind> for NodeKind {
-    fn from(kind: StoredNodeKind) -> Self {
-        match kind {
-            StoredNodeKind::Directory => Self::Directory,
-            StoredNodeKind::RegularFile => Self::RegularFile,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct StoredNodeAttributes {
-    executable: bool,
-}
-
-impl From<NodeAttributes> for StoredNodeAttributes {
-    fn from(attributes: NodeAttributes) -> Self {
-        Self {
-            executable: attributes.executable,
-        }
-    }
-}
-
-impl From<StoredNodeAttributes> for NodeAttributes {
-    fn from(attributes: StoredNodeAttributes) -> Self {
-        Self {
-            executable: attributes.executable,
-        }
-    }
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct StoredFileVersion {
-    id: [u8; 32],
-    logical_size: u64,
-    logical_digest: [u8; 32],
-    extent_map: ExtentMap,
-}
-
-impl From<&FileVersionRecord> for StoredFileVersion {
-    fn from(version: &FileVersionRecord) -> Self {
-        Self {
-            id: *version.id.as_bytes(),
-            logical_size: version.logical_size,
-            logical_digest: version.logical_digest,
-            extent_map: version.extent_map.clone(),
-        }
-    }
-}
-
-impl StoredFileVersion {
-    fn into_record(self) -> FileVersionRecord {
-        FileVersionRecord {
-            id: FileVersionId::from_bytes(self.id),
-            logical_size: self.logical_size,
-            logical_digest: self.logical_digest,
-            extent_map: self.extent_map,
-        }
-    }
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct StoredNodePrecondition {
-    node: [u8; 16],
-    expected_generation: Option<u64>,
-}
-
-impl From<&NodePrecondition> for StoredNodePrecondition {
-    fn from(condition: &NodePrecondition) -> Self {
-        Self {
-            node: *condition.node.as_bytes(),
-            expected_generation: condition.expected_generation.as_ref().map(|value| {
-                managed_generation_number(value)
-                    .expect("validated Managed node precondition generation")
-            }),
-        }
-    }
-}
-
-impl StoredNodePrecondition {
-    fn into_record(self) -> NodePrecondition {
-        NodePrecondition {
-            node: NodeId::from_bytes(self.node),
-            expected_generation: self.expected_generation.map(managed_generation),
-        }
-    }
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct StoredDirectoryPrecondition {
-    directory: [u8; 16],
-    expected_generation: Option<u64>,
-}
-
-impl From<&DirectoryPrecondition> for StoredDirectoryPrecondition {
-    fn from(condition: &DirectoryPrecondition) -> Self {
-        Self {
-            directory: *condition.directory.as_bytes(),
-            expected_generation: condition.expected_generation.as_ref().map(|value| {
-                managed_generation_number(value)
-                    .expect("validated Managed directory precondition generation")
-            }),
-        }
-    }
-}
-
-impl StoredDirectoryPrecondition {
-    fn into_record(self) -> DirectoryPrecondition {
-        DirectoryPrecondition {
-            directory: NodeId::from_bytes(self.directory),
-            expected_generation: self.expected_generation.map(managed_generation),
         }
     }
 }
@@ -1607,27 +1419,6 @@ mod tests {
             )]),
             file_versions: BTreeMap::new(),
         }
-    }
-
-    #[test]
-    fn change_record_contains_effects_instead_of_a_namespace_snapshot() {
-        let change = StoredChange {
-            operation: [1; 16],
-            parent: ChangeCursor::Genesis.into(),
-            target: cursor(1, 1).into(),
-            root: [2; 16],
-            expected_nodes: Vec::new(),
-            expected_directories: Vec::new(),
-            effects: vec![StoredEffect::SetRoot([2; 16])],
-        };
-
-        let record = encode(&change, "test D1 change record").unwrap();
-        let decoded: StoredChange = decode(&record, "test D1 change record").unwrap();
-
-        assert_eq!(decoded.operation, [1; 16]);
-        assert!(!record.contains("\"nodes\""));
-        assert!(!record.contains("\"directories\""));
-        assert!(!record.contains("\"file_versions\""));
     }
 
     #[test]

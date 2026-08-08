@@ -44,11 +44,11 @@ pub(crate) struct StagedTree {
 }
 
 impl StagedTree {
-    pub async fn prepare(tree: &LocalTree, root: impl AsRef<Path>) -> Result<Self> {
+    pub(crate) async fn prepare(tree: &LocalTree, root: impl AsRef<Path>) -> Result<Self> {
         Self::prepare_known(tree, root, &BTreeMap::new()).await
     }
 
-    pub async fn prepare_known(
+    pub(crate) async fn prepare_known(
         tree: &LocalTree,
         root: impl AsRef<Path>,
         known_digests: &BTreeMap<String, [u8; 32]>,
@@ -118,7 +118,7 @@ impl StagedTree {
         Ok(staged)
     }
 
-    pub fn load(root: impl AsRef<Path>) -> Result<Self> {
+    pub(crate) fn load(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
         let path = Self::manifest_path(root);
         let bytes = match fs::read(&path) {
@@ -143,27 +143,27 @@ impl StagedTree {
         Ok(staged)
     }
 
-    pub fn root(&self) -> &Path {
+    pub(crate) fn root(&self) -> &Path {
         &self.root
     }
 
-    pub fn files(&self) -> &BTreeMap<String, StagedFile> {
+    pub(crate) fn files(&self) -> &BTreeMap<String, StagedFile> {
         &self.files
     }
 
-    pub fn logical(&self) -> &LocalTree {
+    pub(crate) fn logical(&self) -> &LocalTree {
         &self.logical
     }
 
-    pub fn has_content(&self, path: &str) -> bool {
+    pub(crate) fn has_content(&self, path: &str) -> bool {
         self.content_paths.contains(path)
     }
 
-    pub fn content_path(&self, path: &str) -> Option<PathBuf> {
+    pub(crate) fn content_path(&self, path: &str) -> Option<PathBuf> {
         self.has_content(path).then(|| self.root.join(path))
     }
 
-    pub fn manifest_path(root: &Path) -> PathBuf {
+    pub(crate) fn manifest_path(root: &Path) -> PathBuf {
         let parent = root
             .parent()
             .filter(|path| !path.as_os_str().is_empty())
@@ -175,7 +175,7 @@ impl StagedTree {
         parent.join(format!(".{name}.ofs-staged-tree.json"))
     }
 
-    pub fn save_manifest(&self) -> Result<()> {
+    pub(crate) fn save_manifest(&self) -> Result<()> {
         self.validate()?;
         let path = Self::manifest_path(&self.root);
         let parent = path.parent().unwrap_or(Path::new("."));
@@ -205,7 +205,7 @@ impl StagedTree {
         result.context("install staged tree manifest")
     }
 
-    pub fn remove_manifest(root: &Path) -> Result<()> {
+    pub(crate) fn remove_manifest(root: &Path) -> Result<()> {
         let path = Self::manifest_path(root);
         match fs::remove_file(&path) {
             Ok(()) => sync_directory(path.parent().unwrap_or(Path::new("."))),
@@ -214,7 +214,7 @@ impl StagedTree {
         }
     }
 
-    pub async fn record_materialized_file(
+    pub(crate) async fn record_materialized_file(
         &mut self,
         path: impl Into<String>,
         digest: [u8; 32],
@@ -237,7 +237,10 @@ impl StagedTree {
         Ok(())
     }
 
-    pub async fn record_materialized_directory(&mut self, path: impl Into<String>) -> Result<()> {
+    pub(crate) async fn record_materialized_directory(
+        &mut self,
+        path: impl Into<String>,
+    ) -> Result<()> {
         let path = path.into();
         let entry = entry_at(&self.root, &path).await?;
         if entry.kind != LocalKind::Directory {
@@ -249,14 +252,14 @@ impl StagedTree {
         Ok(())
     }
 
-    pub fn remove_logical_path(&mut self, path: &str) {
+    pub(crate) fn remove_logical_path(&mut self, path: &str) {
         self.logical.remove(path);
         self.files.remove(path);
         self.content_paths.remove(path);
         self.remove_descendants(path);
     }
 
-    pub fn matches_source_observation(&self, observed: &LocalTree) -> bool {
+    pub(crate) fn matches_source_observation(&self, observed: &LocalTree) -> bool {
         self.logical.entries() == observed.entries()
     }
 
