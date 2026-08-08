@@ -18,23 +18,20 @@
 //! Managed volume authority and its durable format.
 
 mod data;
-mod data_format;
 mod error;
 mod format;
 mod metadata;
 pub mod namespace;
-pub mod pack;
+pub(crate) mod pack;
 mod section;
 mod volume;
 
 pub(crate) use data::{AuthorityKnownContent, ManagedData};
-pub use data::{
-    FileLayoutPolicy, LooseGcMaintenance, PackMaintenance, PackRetirement, SparseExtent,
-};
-pub use data_format::{DigestAlgorithm, ManagedDataFormat};
+pub use data::{FileLayoutPolicy, LooseGcMaintenance, PackMaintenance, PackRetirement};
 pub use error::{ManagedError, ManagedErrorKind};
-pub use format::{ManagedFormat, MetadataPlacement, NamingPolicy};
+pub use format::{ManagedExtension, ManagedFormat, MetadataPlacement, NamingPolicy};
 pub use metadata::{D1Config, D1Metadata, Metadata, ObjectMetadata};
 pub use namespace::NamespaceGcSweep;
-pub(crate) use volume::ManagedMaterializer;
-pub use volume::{ManagedObservation, ManagedVolume};
+pub use volume::{
+    ManagedMaterializer, ManagedObservation, ManagedVolume, ManagedVolumeObservation,
+};

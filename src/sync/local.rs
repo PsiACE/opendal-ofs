@@ -82,7 +82,7 @@ impl LocalTree {
                         .with_context(|| format!("inspect local links for {path:?}"))?;
                     if metadata.nlink() > 1 {
                         bail!(
-                            "local path {path:?} is a hard link; Managed Sync does not publish hard-linked files"
+                            "local path {path:?} is a hard link; Sync does not publish hard-linked files"
                         );
                     }
                 }
@@ -90,7 +90,7 @@ impl LocalTree {
                     && let Some(other) = file_identities.insert(identity, path.to_owned())
                 {
                     bail!(
-                        "local paths {other:?} and {path:?} are hard links; Managed Sync does not publish hard-linked files"
+                        "local paths {other:?} and {path:?} are hard links; Sync does not publish hard-linked files"
                     );
                 }
             }

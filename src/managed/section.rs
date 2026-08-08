@@ -15,9 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Content-defined immutable sections shared by Managed metadata indexes.
+//! Ordered immutable sections shared by Managed metadata indexes.
 
-use fastcdc::v2020::FastCDC;
 use sha2::{Digest as _, Sha256};
 
 use super::{ManagedError, ManagedErrorKind};
@@ -28,7 +27,7 @@ const FORMAT_MAJOR: u16 = 1;
 const HEADER_LENGTH: usize = 8 + 2 + 1 + 1 + 16 + 4;
 const TRAILER_LENGTH: usize = 8 + 32;
 
-pub(crate) const MIN_SECTION_BYTES: u32 = 2 * 1024 * 1024;
+pub(crate) const MIN_SECTION_BYTES: u32 = 1024 * 1024;
 pub(crate) const TARGET_SECTION_BYTES: u32 = 4 * 1024 * 1024;
 pub(crate) const MAX_SECTION_BYTES: u32 = 8 * 1024 * 1024;
 
@@ -80,6 +79,16 @@ fn encode_with_sizes(
     maximum: u32,
     action: &'static str,
 ) -> Result<Vec<Encoded>, ManagedError> {
+    let envelope_bytes =
+        u32::try_from(HEADER_LENGTH + TRAILER_LENGTH).expect("section envelope length fits u32");
+    if minimum <= envelope_bytes
+        || minimum > target
+        || target > maximum
+        || target <= envelope_bytes
+        || maximum <= envelope_bytes
+    {
+        return Err(invalid(action, "section size policy is invalid"));
+    }
     if records.is_empty() {
         return Ok(Vec::new());
     }
@@ -87,50 +96,70 @@ fn encode_with_sizes(
         return Err(invalid(action, "section records are not strictly ordered"));
     }
 
-    let frames = records
-        .iter()
-        .map(encode_record)
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut stream = Vec::new();
-    let mut record_ends = Vec::with_capacity(frames.len());
-    for frame in &frames {
-        stream.extend_from_slice(frame);
-        record_ends.push(stream.len());
+    let minimum_payload = minimum - envelope_bytes;
+    let target_payload = target - envelope_bytes;
+    let maximum_payload = maximum - envelope_bytes;
+    let mut output = Vec::new();
+    let mut previous: Option<PendingSection> = None;
+    let mut current = PendingSection::default();
+    for record in records {
+        let frame = encode_record(&record)?;
+        let next_bytes = current.payload_bytes.saturating_add(frame.len());
+        if !current.records.is_empty()
+            && (next_bytes > maximum_payload as usize
+                || current.payload_bytes >= minimum_payload as usize
+                    && next_bytes > target_payload as usize)
+        {
+            if let Some(ready) = previous.replace(current) {
+                output.push(ready.encode(scope, kind)?);
+            }
+            current = PendingSection::default();
+        }
+        current.payload_bytes = current.payload_bytes.saturating_add(frame.len());
+        current.records.push(record);
+        current.frames.push(frame);
     }
-
-    let boundaries = if stream.len() <= maximum as usize {
-        vec![records.len()]
+    if let Some(mut previous) = previous {
+        if current.payload_bytes < minimum_payload as usize
+            && previous.payload_bytes.saturating_add(current.payload_bytes)
+                <= maximum_payload as usize
+        {
+            previous.records.append(&mut current.records);
+            previous.frames.append(&mut current.frames);
+            output.push(previous.encode(scope, kind)?);
+        } else {
+            output.push(previous.encode(scope, kind)?);
+            output.push(current.encode(scope, kind)?);
+        }
     } else {
-        let chunks = FastCDC::new(&stream, minimum, target, maximum);
-        let mut boundaries = Vec::new();
-        for chunk in chunks {
-            let desired = chunk.offset + chunk.length;
-            let record = record_ends.partition_point(|end| *end < desired);
-            boundaries.push((record + 1).min(records.len()));
-        }
-        boundaries.sort_unstable();
-        boundaries.dedup();
-        if boundaries.last().copied() != Some(records.len()) {
-            boundaries.push(records.len());
-        }
-        boundaries
-    };
-
-    let mut output = Vec::with_capacity(boundaries.len());
-    let mut start = 0;
-    for end in boundaries {
-        if end <= start {
-            continue;
-        }
-        output.push(encode_one(
-            scope,
-            kind,
-            &records[start..end],
-            &frames[start..end],
-        )?);
-        start = end;
+        output.push(current.encode(scope, kind)?);
     }
     Ok(output)
+}
+
+#[derive(Default)]
+struct PendingSection {
+    records: Vec<Record>,
+    frames: Vec<Vec<u8>>,
+    payload_bytes: usize,
+}
+
+impl PendingSection {
+    fn encode(self, scope: [u8; 16], kind: u8) -> Result<Encoded, ManagedError> {
+        encode_one(scope, kind, &self.records, &self.frames)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn encode_for_test(
+    scope: [u8; 16],
+    kind: u8,
+    records: Vec<Record>,
+    minimum: u32,
+    target: u32,
+    maximum: u32,
+) -> Result<Vec<Encoded>, ManagedError> {
+    encode_with_sizes(scope, kind, records, minimum, target, maximum, "test")
 }
 
 fn encode_record(record: &Record) -> Result<Vec<u8>, ManagedError> {
@@ -250,9 +279,12 @@ fn corrupt(action: &'static str, message: &'static str) -> ManagedError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-
     use super::*;
+
+    #[test]
+    fn default_size_policy_is_valid() {
+        assert!(encode([0; 16], 1, Vec::new(), "test").is_ok());
+    }
 
     #[test]
     fn sections_round_trip_and_preserve_ranges() {
@@ -262,7 +294,7 @@ mod tests {
                 value: vec![index as u8; 32],
             })
             .collect();
-        let encoded = encode_with_sizes([7; 16], 3, records, 256, 512, 1024, "test").unwrap();
+        let encoded = encode_with_sizes([7; 16], 3, records, 256, 512, 2048, "test").unwrap();
         assert!(encoded.len() > 1);
         let mut previous = None;
         let mut count = 0;
@@ -286,9 +318,9 @@ mod tests {
                 key: b"a".to_vec(),
                 value: b"value".to_vec(),
             }],
-            32,
-            64,
-            128,
+            256,
+            512,
+            2048,
             "test",
         )
         .unwrap()
@@ -298,27 +330,46 @@ mod tests {
     }
 
     #[test]
-    fn content_defined_boundaries_reuse_unchanged_sections() {
+    fn deterministic_boundaries_follow_record_sizes() {
         let records = (0_u32..600)
             .map(|index| Record {
                 key: index.to_be_bytes().to_vec(),
                 value: vec![(index % 251) as u8; 64],
             })
             .collect::<Vec<_>>();
-        let before =
-            encode_with_sizes([2; 16], 5, records.clone(), 256, 512, 1024, "test").unwrap();
-        let mut changed = records;
-        changed[300].value[0] ^= 1;
-        let after = encode_with_sizes([2; 16], 5, changed, 256, 512, 1024, "test").unwrap();
-        let before_ids = before
-            .iter()
-            .map(|section| section.reference.id)
-            .collect::<BTreeSet<_>>();
-        let reused = after
-            .iter()
-            .filter(|section| before_ids.contains(&section.reference.id))
-            .count();
-        assert!(reused > 0);
-        assert!(reused < after.len());
+        let first = encode_with_sizes([2; 16], 5, records.clone(), 256, 512, 2048, "test").unwrap();
+        let second = encode_with_sizes([2; 16], 5, records, 256, 512, 2048, "test").unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .map(|section| &section.reference)
+                .collect::<Vec<_>>(),
+            second
+                .iter()
+                .map(|section| &section.reference)
+                .collect::<Vec<_>>()
+        );
+        assert!(first.len() > 1);
+    }
+
+    #[test]
+    fn record_alignment_does_not_merge_records_past_the_maximum() {
+        let records = vec![
+            Record {
+                key: b"a".to_vec(),
+                value: vec![1; 1400],
+            },
+            Record {
+                key: b"b".to_vec(),
+                value: vec![2; 1400],
+            },
+        ];
+        let encoded = encode_with_sizes([3; 16], 6, records, 256, 512, 2048, "test").unwrap();
+        assert_eq!(encoded.len(), 2);
+        assert!(
+            encoded
+                .iter()
+                .all(|section| section.reference.encoded_bytes <= 2048)
+        );
     }
 }

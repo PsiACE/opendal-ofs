@@ -22,52 +22,66 @@ use serde::{Deserialize, Serialize};
 use super::{ManagedError, ManagedErrorKind};
 use crate::filesystem::{VolumeId, VolumeModel};
 
+pub(crate) const SUPERBLOCK_KEY: &str = ".ofs/managed/volume.json";
+
 const MAGIC: &str = "ofs-managed-volume";
-const MAJOR: u16 = 1;
-const MINOR: u16 = 0;
-const SUPPORTED_FEATURES: &[&str] = &["file-version-layouts-v1", "object-sections-v1"];
+const FORMAT: u16 = 1;
+const FASTCDC_EXTENSION: &str = "data-fastcdc/1";
+const PACK_EXTENSION: &str = "data-pack/1";
+const SUPPORTED_EXTENSIONS: &[&str] = &[FASTCDC_EXTENSION, PACK_EXTENSION];
 
 /// Naming rules fixed by the Managed volume format.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NamingPolicy {
-    PortableUtf8,
+    PortableUtf8V1,
 }
 
-/// Location of the authoritative Managed namespace metadata.
+/// Physical layout of the authoritative Managed metadata store.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MetadataPlacement {
     ColocatedObject,
     ExternalD1,
 }
 
-/// Logical Managed volume format shared by all metadata placements.
+/// Required persistent semantics enabled for a Managed volume.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ManagedExtension {
+    FastCdc,
+    Pack,
+}
+
+impl ManagedExtension {
+    const fn id(self) -> &'static str {
+        match self {
+            Self::FastCdc => FASTCDC_EXTENSION,
+            Self::Pack => PACK_EXTENSION,
+        }
+    }
+}
+
+/// The single portable superblock shared by metadata and file-data storage.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManagedFormat {
     volume_id: VolumeId,
     metadata_placement: MetadataPlacement,
-    data_root_binding: String,
     naming_policy: NamingPolicy,
-    required_reader_features: BTreeSet<String>,
-    required_writer_features: BTreeSet<String>,
+    extensions: BTreeSet<String>,
 }
 
 impl ManagedFormat {
     pub fn v1(
         volume_id: VolumeId,
         metadata_placement: MetadataPlacement,
-        data_root_binding: impl Into<String>,
+        extensions: impl IntoIterator<Item = ManagedExtension>,
     ) -> Result<Self, ManagedError> {
-        let mut required_features = BTreeSet::from(["file-version-layouts-v1".to_owned()]);
-        if metadata_placement == MetadataPlacement::ColocatedObject {
-            required_features.insert("object-sections-v1".to_owned());
-        }
         let format = Self {
             volume_id,
             metadata_placement,
-            data_root_binding: data_root_binding.into(),
-            naming_policy: NamingPolicy::PortableUtf8,
-            required_reader_features: required_features.clone(),
-            required_writer_features: required_features,
+            naming_policy: NamingPolicy::PortableUtf8V1,
+            extensions: extensions
+                .into_iter()
+                .map(|extension| extension.id().to_owned())
+                .collect(),
         };
         format.validate_for_write()?;
         Ok(format)
@@ -85,164 +99,142 @@ impl ManagedFormat {
         self.metadata_placement
     }
 
-    pub fn data_root_binding(&self) -> &str {
-        &self.data_root_binding
-    }
-
     pub const fn naming_policy(&self) -> NamingPolicy {
         self.naming_policy
     }
 
-    pub fn required_reader_features(&self) -> &BTreeSet<String> {
-        &self.required_reader_features
+    pub fn extensions(&self) -> &BTreeSet<String> {
+        &self.extensions
     }
 
-    pub fn required_writer_features(&self) -> &BTreeSet<String> {
-        &self.required_writer_features
+    pub fn extension_enabled(&self, extension: ManagedExtension) -> bool {
+        self.extensions.contains(extension.id())
     }
 
     pub fn validate_for_read(&self) -> Result<(), ManagedError> {
-        validate_features(&self.required_reader_features)?;
-        self.validate_placement_features(&self.required_reader_features)
+        if self
+            .extensions
+            .iter()
+            .any(|extension| !SUPPORTED_EXTENSIONS.contains(&extension.as_str()))
+        {
+            return Err(unsupported("superblock requires an unsupported extension"));
+        }
+        Ok(())
     }
 
     pub fn validate_for_write(&self) -> Result<(), ManagedError> {
-        if self.data_root_binding.is_empty() {
-            return Err(invalid(
-                "activate Managed volume",
-                "data root binding is empty",
-            ));
-        }
-        self.validate_for_read()?;
-        validate_features(&self.required_writer_features)?;
-        self.validate_placement_features(&self.required_writer_features)
+        self.validate_for_read()
     }
 
     pub(crate) fn encode(&self) -> Result<Vec<u8>, ManagedError> {
         self.validate_for_write()?;
-        serde_json::to_vec(&FormatWire::from(self)).map_err(|_| {
+        serde_json::to_vec(&SuperblockWire::from(self)).map_err(|_| {
             ManagedError::new(
                 ManagedErrorKind::Invalid,
-                "create Managed format",
-                "format cannot be encoded",
+                "create Managed volume",
+                "superblock cannot be encoded",
             )
         })
     }
 
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, ManagedError> {
-        let wire: FormatWire = serde_json::from_slice(bytes).map_err(|_| {
-            ManagedError::new(
-                ManagedErrorKind::Corrupt,
-                "read Managed format",
-                "format record is not valid JSON",
-            )
-        })?;
-        if wire.magic != MAGIC || wire.major != MAJOR || wire.minor != MINOR {
-            return Err(invalid(
-                "read Managed format",
-                "format version is unsupported",
+        let wire: SuperblockWire = serde_json::from_slice(bytes)
+            .map_err(|_| corrupt("superblock is not strict UTF-8 JSON"))?;
+        if wire.magic != MAGIC || wire.format != FORMAT {
+            return Err(unsupported("superblock format is unsupported"));
+        }
+        if wire.extensions.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(corrupt(
+                "extensions are not strictly ordered or contain duplicates",
             ));
         }
         let format = Self {
             volume_id: decode_volume_id(&wire.volume_id)?,
-            metadata_placement: wire.metadata_placement.into(),
-            data_root_binding: wire.data_root_binding,
+            metadata_placement: wire.metadata_layout.into(),
             naming_policy: wire.naming_policy.into(),
-            required_reader_features: wire.required_reader_features,
-            required_writer_features: wire.required_writer_features,
+            extensions: wire.extensions.into_iter().collect(),
         };
         format.validate_for_read()?;
         Ok(format)
     }
-
-    fn validate_placement_features(&self, features: &BTreeSet<String>) -> Result<(), ManagedError> {
-        let object_sections = features.contains("object-sections-v1");
-        if !features.contains("file-version-layouts-v1")
-            || object_sections != (self.metadata_placement == MetadataPlacement::ColocatedObject)
-        {
-            return Err(invalid(
-                "activate Managed volume",
-                "format does not identify its v1 metadata placement",
-            ));
-        }
-        Ok(())
-    }
 }
 
-fn validate_features(features: &BTreeSet<String>) -> Result<(), ManagedError> {
-    if features
-        .iter()
-        .any(|feature| !SUPPORTED_FEATURES.contains(&feature.as_str()))
-    {
-        return Err(invalid(
-            "activate Managed volume",
-            "format requires an unsupported feature",
-        ));
-    }
-    Ok(())
+fn unsupported(message: &'static str) -> ManagedError {
+    ManagedError::new(
+        ManagedErrorKind::UnsupportedFormat,
+        "open Managed volume",
+        message,
+    )
 }
 
-fn invalid(action: &'static str, message: &'static str) -> ManagedError {
-    ManagedError::new(ManagedErrorKind::Invalid, action, message)
+fn corrupt(message: &'static str) -> ManagedError {
+    ManagedError::new(
+        ManagedErrorKind::Corrupt,
+        "read Managed superblock",
+        message,
+    )
 }
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct FormatWire {
+struct SuperblockWire {
     magic: String,
-    major: u16,
-    minor: u16,
+    format: u16,
     volume_id: String,
-    metadata_placement: MetadataPlacementWire,
-    data_root_binding: String,
     naming_policy: NamingPolicyWire,
-    required_reader_features: BTreeSet<String>,
-    required_writer_features: BTreeSet<String>,
+    metadata_layout: MetadataLayoutWire,
+    data_layout: DataLayoutWire,
+    extensions: Vec<String>,
 }
 
-impl From<&ManagedFormat> for FormatWire {
+impl From<&ManagedFormat> for SuperblockWire {
     fn from(format: &ManagedFormat) -> Self {
         Self {
             magic: MAGIC.to_owned(),
-            major: MAJOR,
-            minor: MINOR,
+            format: FORMAT,
             volume_id: encode_hex(format.volume_id.as_bytes()),
-            metadata_placement: format.metadata_placement.into(),
-            data_root_binding: format.data_root_binding.clone(),
             naming_policy: format.naming_policy.into(),
-            required_reader_features: format.required_reader_features.clone(),
-            required_writer_features: format.required_writer_features.clone(),
+            metadata_layout: format.metadata_placement.into(),
+            data_layout: DataLayoutWire::ContentAddressedV1,
+            extensions: format.extensions.iter().cloned().collect(),
         }
     }
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
 enum NamingPolicyWire {
-    PortableUtf8,
+    #[serde(rename = "portable-utf8/1")]
+    PortableUtf8V1,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum MetadataPlacementWire {
-    ColocatedObject,
-    ExternalD1,
+enum MetadataLayoutWire {
+    #[serde(rename = "object/1")]
+    ObjectV1,
+    #[serde(rename = "transactional/1")]
+    TransactionalV1,
 }
 
-impl From<MetadataPlacement> for MetadataPlacementWire {
+#[derive(Clone, Copy, Deserialize, Serialize)]
+enum DataLayoutWire {
+    #[serde(rename = "content-addressed/1")]
+    ContentAddressedV1,
+}
+
+impl From<MetadataPlacement> for MetadataLayoutWire {
     fn from(value: MetadataPlacement) -> Self {
         match value {
-            MetadataPlacement::ColocatedObject => Self::ColocatedObject,
-            MetadataPlacement::ExternalD1 => Self::ExternalD1,
+            MetadataPlacement::ColocatedObject => Self::ObjectV1,
+            MetadataPlacement::ExternalD1 => Self::TransactionalV1,
         }
     }
 }
 
-impl From<MetadataPlacementWire> for MetadataPlacement {
-    fn from(value: MetadataPlacementWire) -> Self {
+impl From<MetadataLayoutWire> for MetadataPlacement {
+    fn from(value: MetadataLayoutWire) -> Self {
         match value {
-            MetadataPlacementWire::ColocatedObject => Self::ColocatedObject,
-            MetadataPlacementWire::ExternalD1 => Self::ExternalD1,
+            MetadataLayoutWire::ObjectV1 => Self::ColocatedObject,
+            MetadataLayoutWire::TransactionalV1 => Self::ExternalD1,
         }
     }
 }
@@ -250,7 +242,7 @@ impl From<MetadataPlacementWire> for MetadataPlacement {
 impl From<NamingPolicy> for NamingPolicyWire {
     fn from(value: NamingPolicy) -> Self {
         match value {
-            NamingPolicy::PortableUtf8 => Self::PortableUtf8,
+            NamingPolicy::PortableUtf8V1 => Self::PortableUtf8V1,
         }
     }
 }
@@ -258,7 +250,7 @@ impl From<NamingPolicy> for NamingPolicyWire {
 impl From<NamingPolicyWire> for NamingPolicy {
     fn from(value: NamingPolicyWire) -> Self {
         match value {
-            NamingPolicyWire::PortableUtf8 => Self::PortableUtf8,
+            NamingPolicyWire::PortableUtf8V1 => Self::PortableUtf8V1,
         }
     }
 }
@@ -268,66 +260,69 @@ fn encode_hex(bytes: &[u8]) -> String {
 }
 
 fn decode_volume_id(value: &str) -> Result<VolumeId, ManagedError> {
-    if value.len() != 32 {
-        return Err(corrupt_volume_id());
+    if value.len() != 32
+        || value
+            .bytes()
+            .any(|byte| !byte.is_ascii_digit() && !(b'a'..=b'f').contains(&byte))
+    {
+        return Err(corrupt("volume identity is not 16-byte lowercase hex"));
     }
     let mut bytes = [0; 16];
     for (index, byte) in bytes.iter_mut().enumerate() {
         *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
-            .map_err(|_| corrupt_volume_id())?;
+            .map_err(|_| corrupt("volume identity is not 16-byte lowercase hex"))?;
     }
     Ok(VolumeId::from_bytes(bytes))
-}
-
-fn corrupt_volume_id() -> ManagedError {
-    ManagedError::new(
-        ManagedErrorKind::Corrupt,
-        "read Managed format",
-        "volume identity is invalid",
-    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn v1_features_identify_the_physical_metadata_placement() {
-        let object = ManagedFormat::v1(
+    fn object_format() -> ManagedFormat {
+        ManagedFormat::v1(
             VolumeId::from_bytes([1; 16]),
             MetadataPlacement::ColocatedObject,
-            "s3://bucket/prefix",
+            [ManagedExtension::FastCdc, ManagedExtension::Pack],
         )
-        .unwrap();
-        assert!(
-            object
-                .required_reader_features()
-                .contains("object-sections-v1")
-        );
-
-        let d1 = ManagedFormat::v1(
-            VolumeId::from_bytes([2; 16]),
-            MetadataPlacement::ExternalD1,
-            "s3://bucket/prefix",
-        )
-        .unwrap();
-        assert!(!d1.required_reader_features().contains("object-sections-v1"));
+        .unwrap()
     }
 
     #[test]
-    fn pre_section_object_v1_is_not_silently_reinterpreted() {
-        let bytes = br#"{
-            "magic":"ofs-managed-volume",
-            "major":1,
-            "minor":0,
-            "volume_id":"01010101010101010101010101010101",
-            "metadata_placement":"colocated_object",
-            "data_root_binding":"s3://bucket/prefix",
-            "naming_policy":"portable_utf8",
-            "required_reader_features":["file-version-layouts-v1"],
-            "required_writer_features":["file-version-layouts-v1"]
-        }"#;
-        let error = ManagedFormat::decode(bytes).unwrap_err();
-        assert_eq!(error.kind(), ManagedErrorKind::Invalid);
+    fn superblock_round_trips_the_required_layout_and_extensions() {
+        let format = object_format();
+        let encoded = format.encode().unwrap();
+        assert_eq!(ManagedFormat::decode(&encoded).unwrap(), format);
+        assert_eq!(
+            std::str::from_utf8(&encoded).unwrap(),
+            r#"{"magic":"ofs-managed-volume","format":1,"volume_id":"01010101010101010101010101010101","naming_policy":"portable-utf8/1","metadata_layout":"object/1","data_layout":"content-addressed/1","extensions":["data-fastcdc/1","data-pack/1"]}"#
+        );
+    }
+
+    #[test]
+    fn unknown_extension_is_rejected_before_open() {
+        let unknown = br#"{"magic":"ofs-managed-volume","format":1,"volume_id":"01010101010101010101010101010101","naming_policy":"portable-utf8/1","metadata_layout":"object/1","data_layout":"content-addressed/1","extensions":["data-future/1"]}"#;
+        assert_eq!(
+            ManagedFormat::decode(unknown).unwrap_err().kind(),
+            ManagedErrorKind::UnsupportedFormat
+        );
+    }
+
+    #[test]
+    fn uppercase_volume_identity_is_rejected() {
+        let bytes = br#"{"magic":"ofs-managed-volume","format":1,"volume_id":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","naming_policy":"portable-utf8/1","metadata_layout":"object/1","data_layout":"content-addressed/1","extensions":[]}"#;
+        assert_eq!(
+            ManagedFormat::decode(bytes).unwrap_err().kind(),
+            ManagedErrorKind::Corrupt
+        );
+    }
+
+    #[test]
+    fn duplicate_extensions_are_rejected() {
+        let bytes = br#"{"magic":"ofs-managed-volume","format":1,"volume_id":"01010101010101010101010101010101","naming_policy":"portable-utf8/1","metadata_layout":"object/1","data_layout":"content-addressed/1","extensions":["data-pack/1","data-pack/1"]}"#;
+        assert_eq!(
+            ManagedFormat::decode(bytes).unwrap_err().kind(),
+            ManagedErrorKind::Corrupt
+        );
     }
 }

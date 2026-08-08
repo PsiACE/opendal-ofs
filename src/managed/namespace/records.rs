@@ -54,29 +54,13 @@ pub enum FileVersionLayout {
     Whole {
         content: ContentRef,
     },
-    Chunked {
-        chunking: ChunkingSpec,
+    FastCdc {
+        revision: u32,
+        minimum_size: u64,
+        target_size: u64,
+        maximum_size: u64,
         chunks: Vec<ChunkSpan>,
     },
-    Extents {
-        extents: Vec<FileExtent>,
-    },
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ChunkingSpec {
-    pub algorithm: ChunkingAlgorithm,
-    pub minimum_size: u64,
-    pub target_size: u64,
-    pub maximum_size: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "snake_case", tag = "name")]
-pub enum ChunkingAlgorithm {
-    Fixed,
-    FastCdcV2020 { revision: u32 },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -84,27 +68,6 @@ pub enum ChunkingAlgorithm {
 pub struct ChunkSpan {
     pub logical_offset: u64,
     pub logical_length: u64,
-    pub content: ContentRef,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "snake_case", tag = "kind")]
-pub enum FileExtent {
-    Hole {
-        logical_offset: u64,
-        logical_length: u64,
-    },
-    Data {
-        extent: DataExtent,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct DataExtent {
-    pub logical_offset: u64,
-    pub logical_length: u64,
-    pub data_offset: u64,
     pub content: ContentRef,
 }
 
@@ -170,9 +133,15 @@ fn layout_valid(size: u64, digest: &[u8; 32], layout: &FileVersionLayout) -> boo
         FileVersionLayout::Whole { content } => {
             content.logical_length == size && content.digest == *digest
         }
-        FileVersionLayout::Chunked { chunking, chunks } => {
-            chunking_valid(chunking)
-                && chunk_sizes_valid(chunking, chunks)
+        FileVersionLayout::FastCdc {
+            revision,
+            minimum_size,
+            target_size,
+            maximum_size,
+            chunks,
+        } => {
+            fastcdc_valid(*revision, *minimum_size, *target_size, *maximum_size)
+                && chunk_sizes_valid(*minimum_size, *maximum_size, chunks)
                 && contiguous(
                     size,
                     chunks.iter().map(|chunk| {
@@ -181,44 +150,18 @@ fn layout_valid(size: u64, digest: &[u8; 32], layout: &FileVersionLayout) -> boo
                     }),
                 )
         }
-        FileVersionLayout::Extents { extents } => contiguous(
-            size,
-            extents.iter().map(|extent| match extent {
-                FileExtent::Hole {
-                    logical_offset,
-                    logical_length,
-                } => Some((*logical_offset, *logical_length)),
-                FileExtent::Data { extent: data } => data
-                    .data_offset
-                    .checked_add(data.logical_length)
-                    .filter(|end| *end <= data.content.logical_length)
-                    .map(|_| (data.logical_offset, data.logical_length)),
-            }),
-        ),
     }
 }
 
-fn chunking_valid(spec: &ChunkingSpec) -> bool {
-    spec.minimum_size > 0
-        && spec.minimum_size <= spec.target_size
-        && spec.target_size <= spec.maximum_size
-        && match spec.algorithm {
-            ChunkingAlgorithm::Fixed => {
-                spec.minimum_size == spec.target_size && spec.target_size == spec.maximum_size
-            }
-            ChunkingAlgorithm::FastCdcV2020 { revision } => revision == 1,
-        }
+fn fastcdc_valid(revision: u32, minimum: u64, target: u64, maximum: u64) -> bool {
+    revision == 1 && minimum > 0 && minimum <= target && target <= maximum
 }
 
-fn chunk_sizes_valid(spec: &ChunkingSpec, chunks: &[ChunkSpan]) -> bool {
+fn chunk_sizes_valid(minimum: u64, maximum: u64, chunks: &[ChunkSpan]) -> bool {
     !chunks.is_empty()
         && chunks.iter().enumerate().all(|(index, chunk)| {
             let last = index + 1 == chunks.len();
-            chunk.logical_length <= spec.maximum_size
-                && (last || chunk.logical_length >= spec.minimum_size)
-                && (!matches!(spec.algorithm, ChunkingAlgorithm::Fixed)
-                    || chunk.logical_length == spec.target_size
-                    || last && chunk.logical_length < spec.target_size)
+            chunk.logical_length <= maximum && (last || chunk.logical_length >= minimum)
         })
 }
 
@@ -253,46 +196,23 @@ fn canonical_file_version_id(
             encoded.push(0);
             encode_content(&mut encoded, content);
         }
-        FileVersionLayout::Chunked { chunking, chunks } => {
+        FileVersionLayout::FastCdc {
+            revision,
+            minimum_size,
+            target_size,
+            maximum_size,
+            chunks,
+        } => {
             encoded.push(1);
-            match chunking.algorithm {
-                ChunkingAlgorithm::Fixed => encoded.push(0),
-                ChunkingAlgorithm::FastCdcV2020 { revision } => {
-                    encoded.push(1);
-                    encoded.extend_from_slice(&revision.to_be_bytes());
-                }
-            }
-            encoded.extend_from_slice(&chunking.minimum_size.to_be_bytes());
-            encoded.extend_from_slice(&chunking.target_size.to_be_bytes());
-            encoded.extend_from_slice(&chunking.maximum_size.to_be_bytes());
+            encoded.extend_from_slice(&revision.to_be_bytes());
+            encoded.extend_from_slice(&minimum_size.to_be_bytes());
+            encoded.extend_from_slice(&target_size.to_be_bytes());
+            encoded.extend_from_slice(&maximum_size.to_be_bytes());
             encoded.extend_from_slice(&u64::try_from(chunks.len()).ok()?.to_be_bytes());
             for chunk in chunks {
                 encoded.extend_from_slice(&chunk.logical_offset.to_be_bytes());
                 encoded.extend_from_slice(&chunk.logical_length.to_be_bytes());
                 encode_content(&mut encoded, &chunk.content);
-            }
-        }
-        FileVersionLayout::Extents { extents } => {
-            encoded.push(2);
-            encoded.extend_from_slice(&u64::try_from(extents.len()).ok()?.to_be_bytes());
-            for extent in extents {
-                match extent {
-                    FileExtent::Hole {
-                        logical_offset,
-                        logical_length,
-                    } => {
-                        encoded.push(0);
-                        encoded.extend_from_slice(&logical_offset.to_be_bytes());
-                        encoded.extend_from_slice(&logical_length.to_be_bytes());
-                    }
-                    FileExtent::Data { extent: data } => {
-                        encoded.push(1);
-                        encoded.extend_from_slice(&data.logical_offset.to_be_bytes());
-                        encoded.extend_from_slice(&data.logical_length.to_be_bytes());
-                        encoded.extend_from_slice(&data.data_offset.to_be_bytes());
-                        encode_content(&mut encoded, &data.content);
-                    }
-                }
             }
         }
     }
@@ -403,13 +323,11 @@ mod tests {
         let chunked = version(
             4,
             logical_digest,
-            FileVersionLayout::Chunked {
-                chunking: ChunkingSpec {
-                    algorithm: ChunkingAlgorithm::Fixed,
-                    minimum_size: 2,
-                    target_size: 2,
-                    maximum_size: 2,
-                },
+            FileVersionLayout::FastCdc {
+                revision: 1,
+                minimum_size: 2,
+                target_size: 2,
+                maximum_size: 4,
                 chunks: vec![
                     ChunkSpan {
                         logical_offset: 0,
@@ -444,35 +362,14 @@ mod tests {
         let empty_chunked = version(
             0,
             empty_digest,
-            FileVersionLayout::Chunked {
-                chunking: ChunkingSpec {
-                    algorithm: ChunkingAlgorithm::Fixed,
-                    minimum_size: 1,
-                    target_size: 1,
-                    maximum_size: 1,
-                },
+            FileVersionLayout::FastCdc {
+                revision: 1,
+                minimum_size: 1,
+                target_size: 1,
+                maximum_size: 1,
                 chunks: Vec::new(),
             },
         );
         assert!(!empty_chunked.is_valid());
-
-        let invalid_extent = version(
-            2,
-            digest(b"ab"),
-            FileVersionLayout::Extents {
-                extents: vec![FileExtent::Data {
-                    extent: DataExtent {
-                        logical_offset: 0,
-                        logical_length: 2,
-                        data_offset: 1,
-                        content: ContentRef {
-                            digest: digest(b"ab"),
-                            logical_length: 2,
-                        },
-                    },
-                }],
-            },
-        );
-        assert!(!invalid_extent.is_valid());
     }
 }

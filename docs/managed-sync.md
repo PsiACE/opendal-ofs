@@ -40,53 +40,17 @@ Direct Mount, Managed Sync, and Managed maintenance therefore use one setting.
 This is runtime configuration, not part of a Volume Model, Access Model, or
 durable format.
 
-## Managed format v1
+## Managed volumes in Sync
 
-Managed volume format v1 keeps namespace identity separate from data
-placement. Metadata owns stable nodes, directory entries, object-scoped
-generations, immutable `FileVersion` manifests, and the ordered change log.
-Apache OpenDAL™ stores immutable content.
+Sync treats Managed metadata and file data as one remote Volume contract. It
+does not interpret metadata checkpoints, file manifests, packs, or secondary
+indexes. The volume validates its storage format and required extensions before
+Sync scans or publishes anything.
 
-The foreground write path stores loose content. The CLI exposes `whole` and
-`fastcdc` writer policies, with whole-file manifests as the default. FastCDC
-applies at or above its configured file-size threshold, so smaller files remain
-whole. Format v1 also defines fixed-chunk and sparse/extents manifest records.
-Packing changes only the physical location of a `ContentRef`; it does not change
-a file manifest, node generation, or change cursor.
-
-Metadata can be colocated with data as immutable objects plus a compare-and-swap
-head, or stored in D1 as normalized rows and transactions. Both adapters apply
-the same logical namespace changes. The object placement stores its v1 authority
-under `.ofs/managed-sync/`; D1 remains a separate physical authority. Unknown
-major formats and unknown required features fail before a mutation.
-
-Object checkpoints are small descriptors over immutable, content-addressed
-binary sections. Nodes, directory headers, directory entries, and file versions
-are separate ordered record streams. FastCDC cuts each stream at content-defined
-record boundaries with 2 MiB minimum, 4 MiB target, and 8 MiB maximum encoded
-section sizes. A single record can exceed the maximum. Each section carries its
-kind, volume scope, key range, record count, encoded length, and SHA-256 identity,
-so it is independently verifiable and does not depend on an object listing or a
-root-only schema interpretation. Checkpoints reuse unchanged section identities.
-
-Object transactions encode directory entries as entry-level effects instead of
-copying a whole directory record. Recovery normally reads a checkpoint descriptor,
-its referenced sections, and a bounded transaction tail. If a descriptor or
-section is missing or corrupt, the retained committed transaction ancestry can
-reconstruct the namespace from genesis. The compare-and-swap head is still the
-commit authority: deleting it cannot be repaired unambiguously from concurrent
-winning and losing transaction objects.
-
-The derived pack index uses the same section envelope and can also be rebuilt by
-scanning verified pack footers. These metadata sections are independent of the
-`whole` and `fastcdc` file-content policies and of whether loose content has been
-packed. Consequently whole, CDC, whole-plus-pack, and CDC-plus-pack remain valid
-and directly comparable data layouts.
-
-This is an in-place redefinition of the unreleased v1 object format, not a
-migration path. Colocated v1 volumes lacking the `object-sections-v1` feature and
-data roots lacking `sectioned-pack-index-v1` are rejected instead of being
-silently reinterpreted. D1 volumes require neither object metadata feature.
+The CLI exposes `whole` and `fastcdc` writer policies, with whole-file writes as
+the default. FastCDC applies at or above its configured file-size threshold, so
+smaller files remain whole. Packing is explicit maintenance and does not change
+the filesystem-visible file version, node generation, or change cursor.
 
 Data is written and verified before metadata can reference it. If publication
 fails after that write, the result may be an unreachable loose object. The
@@ -97,7 +61,7 @@ During an update, the fixed parent snapshot is also proof that its reachable
 `ContentRef` values are durable. Sync still reads and hashes changed local
 input, but it does not probe or download matching content again. New content
 keeps the same create-only write and read-back verification. This applies to
-whole files, chunks, and sparse data extents without changing format v1.
+whole files and FastCDC chunks without changing Sync semantics.
 
 ## Create an Object metadata volume on MinIO
 
@@ -231,6 +195,16 @@ ofs volume pack workspace
 
 Running the same command again is safe. Content that already has a verified
 pack location is not packed again.
+
+The placement index is derived from pack footers. Rebuild it explicitly after
+an index loss or integrity failure:
+
+```shell
+ofs volume pack workspace --rebuild-index
+```
+
+Rebuilding lists pack objects and verifies every footer before publishing the
+replacement index. It does not change file versions or pack contents.
 
 A cold full-tree materialization downloads and verifies each selected pack
 once, then writes all of its files from that verified body. Incremental Sync

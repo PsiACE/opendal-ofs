@@ -18,9 +18,8 @@
 use opendal::{ErrorKind, Operator};
 
 use super::require_same_format;
+use crate::managed::format::SUPERBLOCK_KEY;
 use crate::managed::{ManagedError, ManagedErrorKind, ManagedFormat};
-
-const FORMAT_KEY: &str = ".ofs/managed-sync/format.json";
 
 /// Managed metadata stored beside data through OpenDAL.
 #[derive(Clone)]
@@ -53,7 +52,7 @@ impl ObjectMetadata {
         let encoded = desired.encode()?;
         match self
             .operator
-            .write_with(FORMAT_KEY, encoded)
+            .write_with(SUPERBLOCK_KEY, encoded)
             .if_not_exists(true)
             .await
         {
@@ -71,7 +70,7 @@ impl ObjectMetadata {
     pub async fn read_format(&self) -> Result<ManagedFormat, ManagedError> {
         let bytes = self
             .operator
-            .read(FORMAT_KEY)
+            .read(SUPERBLOCK_KEY)
             .await
             .map_err(|_| unavailable("read Managed format"))?;
         ManagedFormat::decode(&bytes.to_bytes())
@@ -84,47 +83,4 @@ fn unavailable(action: &'static str) -> ManagedError {
         action,
         "object metadata is unavailable",
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use opendal::services::Memory;
-
-    use super::*;
-    use crate::filesystem::VolumeId;
-    use crate::managed::MetadataPlacement;
-
-    #[tokio::test]
-    async fn pre_section_object_v1_is_rejected_at_the_stable_marker() {
-        let operator = Operator::new(Memory::default()).unwrap().finish();
-        operator
-            .write(
-                FORMAT_KEY,
-                br#"{
-                    "magic":"ofs-managed-volume",
-                    "major":1,
-                    "minor":0,
-                    "volume_id":"01010101010101010101010101010101",
-                    "metadata_placement":"colocated_object",
-                    "data_root_binding":"memory://root",
-                    "naming_policy":"portable_utf8",
-                    "required_reader_features":["file-version-layouts-v1"],
-                    "required_writer_features":["file-version-layouts-v1"]
-                }"#
-                .to_vec(),
-            )
-            .await
-            .unwrap();
-        let desired = ManagedFormat::v1(
-            VolumeId::from_bytes([1; 16]),
-            MetadataPlacement::ColocatedObject,
-            "memory://root",
-        )
-        .unwrap();
-        let error = ObjectMetadata::new(operator)
-            .create_format(&desired)
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind(), ManagedErrorKind::Invalid);
-    }
 }

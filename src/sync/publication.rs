@@ -13,25 +13,24 @@ use anyhow::{Context, Result, bail};
 
 use super::{LocalKind, LocalTree, ReplicaState};
 use crate::filesystem::{
-    ChangeCursor, DirectoryEntry, NodeAttributes, NodeId, NodeKind, OperationId, VolumeId,
-};
-use crate::managed::namespace::{
-    DirectoryPrecondition, DirectoryRecord, FileVersionRecord, NamespacePublication,
-    NamespaceSnapshot, NodePrecondition, NodeRecord, managed_generation, next_managed_generation,
+    ChangeCursor, DirectoryEntry, DirectoryPrecondition, DirectoryRecord, FileVersion,
+    NodeAttributes, NodeId, NodeKind, NodePrecondition, NodeRecord, OperationId, Volume, VolumeId,
+    VolumePublication, VolumeSnapshot,
 };
 
-/// Build one complete Managed namespace target from a stable local observation.
+/// Build one complete volume namespace target from a stable local observation.
 ///
 /// Rename identity belongs to reconciliation. This builder preserves identity
 /// at an unchanged path, but never treats equal content as proof of a rename.
-pub fn build_publication(
+pub fn build_publication<V: Volume>(
+    volume_api: &V,
     volume: VolumeId,
     operation: OperationId,
-    authoritative: Option<&NamespaceSnapshot>,
+    authoritative: Option<&VolumeSnapshot>,
     replica: &ReplicaState,
     local: &LocalTree,
-    prepared: &BTreeMap<String, FileVersionRecord>,
-) -> Result<NamespacePublication> {
+    prepared: &BTreeMap<String, FileVersion>,
+) -> Result<VolumePublication> {
     let parent = authoritative.map_or(ChangeCursor::Genesis, |state| state.cursor);
     validate_ancestry(volume, parent, authoritative, replica)?;
 
@@ -101,7 +100,7 @@ pub fn build_publication(
                 executable: entry.executable,
             });
         let body = (*kind, attributes, file_version);
-        let generation = next_node_generation(id, body, old_nodes)?;
+        let generation = next_node_generation(volume_api, id, body, old_nodes)?;
         nodes.insert(
             id,
             NodeRecord {
@@ -123,7 +122,7 @@ pub fn build_publication(
         }
         let node = identities[path];
         let current = entries.get(path).cloned().unwrap_or_default();
-        let generation = next_directory_generation(node, &current, old_directories)?;
+        let generation = next_directory_generation(volume_api, node, &current, old_directories)?;
         directories.insert(
             node,
             DirectoryRecord {
@@ -144,7 +143,7 @@ pub fn build_publication(
         .context("namespace cursor cannot be zero")?,
         operation,
     );
-    let target = NamespaceSnapshot {
+    let target = VolumeSnapshot {
         volume_id: volume,
         cursor,
         root,
@@ -152,7 +151,7 @@ pub fn build_publication(
         directories,
         file_versions,
     };
-    Ok(NamespacePublication {
+    Ok(VolumePublication {
         operation,
         parent,
         expected_nodes: node_preconditions(authoritative, &target),
@@ -164,7 +163,7 @@ pub fn build_publication(
 fn validate_ancestry(
     volume: VolumeId,
     parent: ChangeCursor,
-    authoritative: Option<&NamespaceSnapshot>,
+    authoritative: Option<&VolumeSnapshot>,
     replica: &ReplicaState,
 ) -> Result<()> {
     if authoritative.is_some_and(|state| state.volume_id != volume) || replica.volume != volume {
@@ -198,14 +197,10 @@ fn local_kinds(local: &LocalTree) -> Result<BTreeMap<String, NodeKind>> {
     Ok(kinds)
 }
 
-fn validate_prepared(
-    local: &LocalTree,
-    prepared: &BTreeMap<String, FileVersionRecord>,
-) -> Result<()> {
+fn validate_prepared(local: &LocalTree, prepared: &BTreeMap<String, FileVersion>) -> Result<()> {
     for (path, entry) in local.entries() {
         match (entry.kind, prepared.get(path)) {
-            (LocalKind::File, Some(version))
-                if version.logical_size == entry.size && version.is_valid() => {}
+            (LocalKind::File, Some(version)) if version.logical_size == entry.size => {}
             (LocalKind::File, Some(_)) => {
                 bail!("prepared file version for {path:?} does not match the local file")
             }
@@ -242,9 +237,9 @@ fn validate_replica_paths(
 fn reject_unresolved_renames(
     local: &BTreeMap<String, NodeKind>,
     old_paths: &BTreeMap<String, NodeId>,
-    authoritative: Option<&NamespaceSnapshot>,
+    authoritative: Option<&VolumeSnapshot>,
     replica: &ReplicaState,
-    prepared: &BTreeMap<String, FileVersionRecord>,
+    prepared: &BTreeMap<String, FileVersion>,
 ) -> Result<()> {
     let Some(authoritative) = authoritative else {
         return Ok(());
@@ -275,7 +270,7 @@ fn reject_unresolved_renames(
     Ok(())
 }
 
-fn snapshot_paths(snapshot: &NamespaceSnapshot) -> Result<BTreeMap<String, NodeId>> {
+fn snapshot_paths(snapshot: &VolumeSnapshot) -> Result<BTreeMap<String, NodeId>> {
     let mut paths = BTreeMap::new();
     let mut pending = vec![(String::new(), snapshot.root)];
     let mut expanded = BTreeSet::new();
@@ -354,7 +349,8 @@ fn fresh_node(used: &mut BTreeSet<NodeId>, old: Option<&BTreeMap<NodeId, NodeRec
     }
 }
 
-fn next_node_generation(
+fn next_node_generation<V: Volume>(
+    volume: &V,
     id: NodeId,
     body: (
         NodeKind,
@@ -364,33 +360,38 @@ fn next_node_generation(
     old: Option<&BTreeMap<NodeId, NodeRecord>>,
 ) -> Result<crate::filesystem::Generation> {
     let Some(previous) = old.and_then(|nodes| nodes.get(&id)) else {
-        return Ok(managed_generation(1));
+        return Ok(volume.initial_generation());
     };
     if (previous.kind, previous.attributes, previous.file_version) == body {
         Ok(previous.generation.clone())
     } else {
-        next_managed_generation(&previous.generation).context("node generation overflow")
+        volume
+            .next_generation(&previous.generation)
+            .context("node generation overflow")
     }
 }
 
-fn next_directory_generation(
+fn next_directory_generation<V: Volume>(
+    volume: &V,
     id: NodeId,
     entries: &BTreeMap<String, DirectoryEntry>,
     old: Option<&BTreeMap<NodeId, DirectoryRecord>>,
 ) -> Result<crate::filesystem::Generation> {
     let Some(previous) = old.and_then(|directories| directories.get(&id)) else {
-        return Ok(managed_generation(1));
+        return Ok(volume.initial_generation());
     };
     if previous.entries == *entries {
         Ok(previous.generation.clone())
     } else {
-        next_managed_generation(&previous.generation).context("directory generation overflow")
+        volume
+            .next_generation(&previous.generation)
+            .context("directory generation overflow")
     }
 }
 
 fn node_preconditions(
-    authoritative: Option<&NamespaceSnapshot>,
-    target: &NamespaceSnapshot,
+    authoritative: Option<&VolumeSnapshot>,
+    target: &VolumeSnapshot,
 ) -> Vec<NodePrecondition> {
     let empty = BTreeMap::new();
     let old = authoritative.map_or(&empty, |state| &state.nodes);
@@ -408,8 +409,8 @@ fn node_preconditions(
 }
 
 fn directory_preconditions(
-    authoritative: Option<&NamespaceSnapshot>,
-    target: &NamespaceSnapshot,
+    authoritative: Option<&VolumeSnapshot>,
+    target: &VolumeSnapshot,
 ) -> Vec<DirectoryPrecondition> {
     let empty = BTreeMap::new();
     let old = authoritative.map_or(&empty, |state| &state.directories);

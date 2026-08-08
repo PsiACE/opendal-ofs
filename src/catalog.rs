@@ -30,22 +30,40 @@ use url::Url;
 use crate::filesystem::{VolumeId, VolumeModel};
 use crate::managed::FileLayoutPolicy;
 
-const SCHEMA_MAJOR: u16 = 1;
+const SCHEMA_MAJOR: u16 = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VolumeDefinition {
     pub volume_id: VolumeId,
-    pub model: VolumeModel,
     pub storage: Url,
+    pub settings: VolumeSettings,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VolumeSettings {
+    Direct,
+    Managed(ManagedVolumeSettings),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedVolumeSettings {
     pub metadata: Option<Url>,
     pub file_layout: FileLayoutPolicy,
     pub format_major: u16,
 }
 
 impl VolumeDefinition {
-    pub fn new(
+    pub fn direct(volume_id: VolumeId, storage: Url) -> Result<Self> {
+        require_credential_free("storage", &storage)?;
+        Ok(Self {
+            volume_id,
+            storage,
+            settings: VolumeSettings::Direct,
+        })
+    }
+
+    pub fn managed(
         volume_id: VolumeId,
-        model: VolumeModel,
         storage: Url,
         metadata: Option<Url>,
         format_major: u16,
@@ -54,28 +72,53 @@ impl VolumeDefinition {
         if let Some(metadata) = &metadata {
             require_credential_free("metadata", metadata)?;
         }
+        if format_major == 0 {
+            bail!("Managed volume format major must be greater than zero");
+        }
         Ok(Self {
             volume_id,
-            model,
             storage,
-            metadata,
-            file_layout: FileLayoutPolicy::Whole,
-            format_major,
+            settings: VolumeSettings::Managed(ManagedVolumeSettings {
+                metadata,
+                file_layout: FileLayoutPolicy::Whole,
+                format_major,
+            }),
         })
     }
 
     pub fn with_file_layout(mut self, file_layout: FileLayoutPolicy) -> Result<Self> {
         file_layout.validate()?;
-        self.file_layout = file_layout;
+        let VolumeSettings::Managed(settings) = &mut self.settings else {
+            bail!("Direct volumes do not have a Managed file layout policy");
+        };
+        settings.file_layout = file_layout;
         Ok(self)
+    }
+
+    pub fn managed_settings(&self) -> Option<&ManagedVolumeSettings> {
+        match &self.settings {
+            VolumeSettings::Direct => None,
+            VolumeSettings::Managed(settings) => Some(settings),
+        }
+    }
+
+    pub const fn model(&self) -> VolumeModel {
+        match &self.settings {
+            VolumeSettings::Direct => VolumeModel::Direct,
+            VolumeSettings::Managed(_) => VolumeModel::Managed,
+        }
     }
 
     pub fn has_same_binding(&self, other: &Self) -> bool {
         self.volume_id == other.volume_id
-            && self.model == other.model
             && self.storage == other.storage
-            && self.metadata == other.metadata
-            && self.format_major == other.format_major
+            && match (&self.settings, &other.settings) {
+                (VolumeSettings::Direct, VolumeSettings::Direct) => true,
+                (VolumeSettings::Managed(left), VolumeSettings::Managed(right)) => {
+                    left.metadata == right.metadata && left.format_major == right.format_major
+                }
+                _ => false,
+            }
     }
 }
 
@@ -159,7 +202,10 @@ impl Catalog {
             .volumes
             .get_mut(alias)
             .with_context(|| format!("volume alias {alias:?} is not in the catalog"))?;
-        definition.file_layout = file_layout;
+        let VolumeSettings::Managed(settings) = &mut definition.settings else {
+            bail!("volume alias {alias:?} is not a Managed volume");
+        };
+        settings.file_layout = file_layout;
         Ok(())
     }
 
@@ -216,10 +262,12 @@ struct StoredVolume {
     volume_id: [u8; 16],
     model: String,
     storage: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     metadata: Option<String>,
-    #[serde(default)]
-    file_layout: FileLayoutPolicy,
-    format_major: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_layout: Option<FileLayoutPolicy>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    format_major: Option<u16>,
 }
 
 impl From<&Catalog> for StoredCatalog {
@@ -238,17 +286,25 @@ impl From<&Catalog> for StoredCatalog {
 
 impl From<&VolumeDefinition> for StoredVolume {
     fn from(volume: &VolumeDefinition) -> Self {
+        let (metadata, file_layout, format_major) = match &volume.settings {
+            VolumeSettings::Direct => (None, None, None),
+            VolumeSettings::Managed(settings) => (
+                settings.metadata.as_ref().map(ToString::to_string),
+                Some(settings.file_layout),
+                Some(settings.format_major),
+            ),
+        };
         Self {
             volume_id: *volume.volume_id.as_bytes(),
-            model: match volume.model {
+            model: match volume.model() {
                 VolumeModel::Direct => "direct",
                 VolumeModel::Managed => "managed",
             }
             .into(),
             storage: volume.storage.to_string(),
-            metadata: volume.metadata.as_ref().map(ToString::to_string),
-            file_layout: volume.file_layout,
-            format_major: volume.format_major,
+            metadata,
+            file_layout,
+            format_major,
         }
     }
 }
@@ -268,8 +324,27 @@ impl TryFrom<StoredVolume> for VolumeDefinition {
             .metadata
             .map(|value| Url::parse(&value).context("invalid metadata URL in catalog"))
             .transpose()?;
-        Self::new(volume_id, model, storage, metadata, volume.format_major)?
-            .with_file_layout(volume.file_layout)
+        match model {
+            VolumeModel::Direct => {
+                if metadata.is_some()
+                    || volume.file_layout.is_some()
+                    || volume.format_major.is_some()
+                {
+                    bail!("Direct volume contains Managed-only catalog settings");
+                }
+                Self::direct(volume_id, storage)
+            }
+            VolumeModel::Managed => {
+                let file_layout = volume
+                    .file_layout
+                    .context("Managed volume is missing its file layout policy")?;
+                let format_major = volume
+                    .format_major
+                    .context("Managed volume is missing its format major")?;
+                Self::managed(volume_id, storage, metadata, format_major)?
+                    .with_file_layout(file_layout)
+            }
+        }
     }
 }
 
@@ -288,55 +363,4 @@ fn require_credential_free(kind: &str, url: &Url) -> Result<()> {
         bail!("{kind} URL must not contain credentials");
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn old_catalog_defaults_to_whole_and_accepts_layout_updates() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("volumes.json");
-        fs::write(
-            &path,
-            r#"{
-  "schema_major": 1,
-  "volumes": {
-    "workspace": {
-      "volume_id": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
-      "model": "managed",
-      "storage": "memory:///workspace",
-      "metadata": null,
-      "format_major": 1
-    }
-  }
-}
-"#,
-        )
-        .unwrap();
-
-        let mut catalog = Catalog::load(&path).unwrap();
-        let current = catalog.get("workspace").unwrap().clone();
-        assert_eq!(current.file_layout, FileLayoutPolicy::Whole);
-
-        let configured = current
-            .with_file_layout(FileLayoutPolicy::FastCdcV2020 {
-                minimum_file_size: 1024 * 1024,
-                minimum_size: 64 * 1024,
-                target_size: 256 * 1024,
-                maximum_size: 1024 * 1024,
-            })
-            .unwrap();
-        catalog
-            .configure_file_layout("workspace", configured.file_layout)
-            .unwrap();
-        catalog.save().unwrap();
-
-        let reopened = Catalog::load(path).unwrap();
-        assert!(matches!(
-            reopened.get("workspace").unwrap().file_layout,
-            FileLayoutPolicy::FastCdcV2020 { .. }
-        ));
-    }
 }

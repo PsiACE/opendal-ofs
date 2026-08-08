@@ -6,7 +6,7 @@
 // "License"); you may not use this file except in compliance
 // with the License.
 
-//! Object-backed Managed Sync orchestration.
+//! Volume-independent Sync orchestration.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -14,7 +14,6 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use futures::{StreamExt as _, stream};
 use opendal::{Operator, services};
 
 use super::local::{NativeIdentity, fs_operator, set_executable};
@@ -23,14 +22,8 @@ use super::{
     StagedTree, build_publication, reconcile,
 };
 use crate::filesystem::{
-    ChangeCursor, NodeId, NodeKind, OperationId, PublicationProgress, VolumeId,
-};
-use crate::managed::namespace::{
-    ContentRef, FileVersionLayout, FileVersionRecord, NamespaceSnapshot,
-};
-use crate::managed::pack::PackId;
-use crate::managed::{
-    AuthorityKnownContent, D1Metadata, FileLayoutPolicy, ManagedMaterializer, ManagedVolume,
+    ChangeCursor, FileVersion, MaterializeRequest, NodeId, NodeKind, OperationId,
+    PublicationProgress, Volume, VolumeId, VolumeObservation, VolumeReader, VolumeSnapshot,
 };
 
 #[derive(Clone, Debug)]
@@ -44,32 +37,19 @@ pub struct SyncResult {
 }
 
 #[derive(Clone)]
-pub struct SyncEngine {
+pub struct SyncEngine<V> {
     volume_id: VolumeId,
-    volume: ManagedVolume,
+    volume: V,
     transfer_concurrency: NonZeroUsize,
 }
 
-impl SyncEngine {
-    pub fn object(volume_id: VolumeId, data_operator: Operator) -> Result<Self> {
-        Ok(Self {
-            volume_id,
-            volume: ManagedVolume::object(volume_id, data_operator)?,
+impl<V: Volume> SyncEngine<V> {
+    pub fn new(volume: V) -> Self {
+        Self {
+            volume_id: volume.id(),
+            volume,
             transfer_concurrency: NonZeroUsize::new(4).expect("default concurrency is non-zero"),
-        })
-    }
-
-    pub fn d1(volume_id: VolumeId, data_operator: Operator, metadata: D1Metadata) -> Result<Self> {
-        Ok(Self {
-            volume_id,
-            volume: ManagedVolume::d1(volume_id, data_operator, metadata)?,
-            transfer_concurrency: NonZeroUsize::new(4).expect("default concurrency is non-zero"),
-        })
-    }
-
-    pub fn with_file_layout(mut self, policy: FileLayoutPolicy) -> Result<Self> {
-        self.volume = self.volume.with_file_layout(policy)?;
-        Ok(self)
+        }
     }
 
     pub fn with_transfer_concurrency(mut self, concurrency: NonZeroUsize) -> Self {
@@ -261,11 +241,11 @@ impl SyncEngine {
                     }
                 }
             }
-            let materializer = self.volume.materializer()?;
+            let reader = self.volume.reader()?;
             let full_tree = state.base.is_empty() && local.entries().is_empty();
             staged_full_tree = full_tree;
             let installed = materialize_files(
-                &materializer,
+                &reader,
                 &target,
                 staged.root(),
                 installs,
@@ -354,54 +334,31 @@ impl SyncEngine {
         );
         let requires_materialization = !merged_input.same_content(&frozen_input);
         let frozen = fs_operator(staged.root())?;
-        let known_content = remote
-            .map(AuthorityKnownContent::from_snapshot)
-            .transpose()?
-            .unwrap_or_default();
         let remote_files = remote.map(snapshot_files).transpose()?.unwrap_or_default();
-        let files = merged
+        let mut prepared = BTreeMap::new();
+        let mut changed = Vec::new();
+        for (path, _) in merged
             .entries()
             .iter()
             .filter(|(_, entry)| entry.kind == LocalKind::File)
-            .map(|(path, _)| {
-                let reusable = match (known_digests.get(path), remote_files.get(path)) {
-                    (Some(digest), Some(version)) if *digest == version.logical_digest => {
-                        Some(version.clone())
-                    }
-                    _ => None,
-                };
-                (path.clone(), reusable)
-            })
-            .collect::<Vec<_>>();
-        let sealed = stream::iter(files)
-            .map(|(path, reusable)| {
-                let volume = self.volume.clone();
-                let frozen = frozen.clone();
-                let known_content = &known_content;
-                async move {
-                    let version = match reusable {
-                        Some(version) => version,
-                        None => {
-                            volume
-                                .seal_file_with_known_content(&frozen, &path, known_content)
-                                .await?
-                        }
-                    };
-                    Ok::<_, anyhow::Error>((path, version))
+        {
+            match (known_digests.get(path), remote_files.get(path)) {
+                (Some(digest), Some(version)) if *digest == version.logical_digest => {
+                    prepared.insert(path.clone(), version.clone());
                 }
-            })
-            .buffer_unordered(self.transfer_concurrency.get())
-            .collect::<Vec<_>>()
-            .await;
-        let mut prepared = BTreeMap::new();
-        for sealed in sealed {
-            let (path, version) = sealed?;
-            prepared.insert(path, version);
+                _ => changed.push(path.clone()),
+            }
         }
+        prepared.extend(
+            self.volume
+                .stage_files(&frozen, changed, remote, self.transfer_concurrency)
+                .await?,
+        );
 
         let mut publication_state = state.clone();
         publication_state.common = remote.map_or(ChangeCursor::Genesis, |snapshot| snapshot.cursor);
         let publication = build_publication(
+            &self.volume,
             self.volume_id,
             operation,
             remote,
@@ -441,7 +398,7 @@ impl SyncEngine {
 
 async fn advance_common_base(
     progress: PublicationProgress,
-    snapshot: &NamespaceSnapshot,
+    snapshot: &VolumeSnapshot,
     replica: &Path,
     state_path: &Path,
 ) -> Result<ReplicaState> {
@@ -533,7 +490,7 @@ impl FrozenTree {
 async fn committed_tree_is_safe(
     state: &ReplicaState,
     replica: &Path,
-    committed: &NamespaceSnapshot,
+    committed: &VolumeSnapshot,
     anchor: &Path,
 ) -> Result<bool> {
     let local = LocalTree::scan(replica).await?;
@@ -567,7 +524,7 @@ async fn matches_frozen(root: &Path, expected: &FrozenTree) -> Result<bool> {
 fn directory_changes(
     state: &ReplicaState,
     local: &LocalTree,
-    remote: &NamespaceSnapshot,
+    remote: &VolumeSnapshot,
 ) -> Result<(bool, bool)> {
     let base_kinds = state
         .base
@@ -645,7 +602,7 @@ fn directories(kinds: &BTreeMap<String, LocalKind>) -> BTreeSet<String> {
 async fn create_remote_directories(
     staged: &mut StagedTree,
     target: &Operator,
-    remote: &NamespaceSnapshot,
+    remote: &VolumeSnapshot,
 ) -> Result<()> {
     for (path, node) in snapshot_paths(remote)? {
         if remote.nodes[&node].kind == NodeKind::Directory {
@@ -660,7 +617,7 @@ async fn delete_absent_directories(
     staged: &mut StagedTree,
     target: &Operator,
     local: &LocalTree,
-    remote: &NamespaceSnapshot,
+    remote: &VolumeSnapshot,
 ) -> Result<()> {
     let remote = snapshot_paths(remote)?
         .into_iter()
@@ -681,7 +638,7 @@ async fn delete_absent_directories(
     Ok(())
 }
 
-async fn state_from_snapshot(snapshot: &NamespaceSnapshot, replica: &Path) -> Result<ReplicaState> {
+async fn state_from_snapshot(snapshot: &VolumeSnapshot, replica: &Path) -> Result<ReplicaState> {
     let local = LocalTree::scan(replica).await?;
     let mut state = ReplicaState::empty(snapshot.volume_id);
     state.common = snapshot.cursor;
@@ -817,103 +774,38 @@ fn install_staged_changes(replica: &Path, staged: &StagedTree, before: &FrozenTr
     Ok(())
 }
 
-async fn materialize_files(
-    materializer: &ManagedMaterializer,
+async fn materialize_files<R: VolumeReader>(
+    reader: &R,
     target: &Operator,
     root: &Path,
-    files: Vec<(String, FileVersionRecord, [u8; 32], bool)>,
+    files: Vec<(String, FileVersion, [u8; 32], bool)>,
     full_tree: bool,
     transfer_concurrency: NonZeroUsize,
 ) -> Result<Vec<(String, [u8; 32], bool)>> {
-    let mut packed =
-        BTreeMap::<PackId, Vec<(String, FileVersionRecord, [u8; 32], bool, ContentRef)>>::new();
-    let mut unpacked = Vec::new();
-    for (path, version, digest, executable) in files {
-        let content = match &version.layout {
-            FileVersionLayout::Whole { content } if full_tree && content.logical_length > 0 => {
-                Some(*content)
-            }
-            _ => None,
-        };
-        let location = match content {
-            Some(content) => materializer
-                .pack_locations(content)
-                .await
-                .ok()
-                .and_then(|locations| locations.into_iter().next()),
-            None => None,
-        };
-        match (content, location) {
-            (Some(content), Some(location)) => packed
-                .entry(location.pack)
-                .or_default()
-                .push((path, version, digest, executable, content)),
-            _ => unpacked.push((path, version, digest, executable)),
-        }
-    }
-    let packed_results = stream::iter(packed)
-        .map(|(id, files)| {
-            let materializer = materializer.clone();
-            let target = target.clone();
-            let root = root.to_owned();
-            async move {
-                let pack = materializer.read_full_pack(id).await;
-                let mut installed = Vec::with_capacity(files.len());
-                if let Ok(pack) = &pack
-                    && files
-                        .iter()
-                        .all(|(_, _, _, _, content)| pack.content(*content).is_some())
-                {
-                    for (path, _, digest, executable, content) in files {
-                        let bytes = pack
-                            .content(content)
-                            .expect("all selected pack entries were checked");
-                        target.write(&path, bytes.to_vec()).await?;
-                        set_executable(&root.join(&path), executable)?;
-                        installed.push((path, digest, executable));
-                    }
-                } else {
-                    for (path, version, digest, executable, _) in files {
-                        materializer.materialize(&version, &target, &path).await?;
-                        set_executable(&root.join(&path), executable)?;
-                        installed.push((path, digest, executable));
-                    }
-                }
-                Ok::<_, anyhow::Error>(installed)
-            }
+    let requests = files
+        .iter()
+        .map(|(path, version, _, _)| MaterializeRequest {
+            path: path.clone(),
+            version: version.clone(),
         })
-        .buffer_unordered(transfer_concurrency.get())
-        .collect::<Vec<_>>()
-        .await;
-    let mut installed = Vec::new();
-    for group in packed_results {
-        installed.extend(group?);
+        .collect();
+    reader
+        .materialize(target, requests, full_tree, transfer_concurrency)
+        .await?;
+    for (path, _, _, executable) in &files {
+        set_executable(&root.join(path), *executable)?;
     }
-
-    let unpacked_results = stream::iter(unpacked)
-        .map(|(path, version, digest, executable)| {
-            let materializer = materializer.clone();
-            let target = target.clone();
-            let root = root.to_owned();
-            async move {
-                materializer.materialize(&version, &target, &path).await?;
-                set_executable(&root.join(&path), executable)?;
-                Ok::<_, anyhow::Error>((path, digest, executable))
-            }
-        })
-        .buffer_unordered(transfer_concurrency.get())
-        .collect::<Vec<_>>()
-        .await;
-    for file in unpacked_results {
-        installed.push(file?);
-    }
+    let installed = files
+        .into_iter()
+        .map(|(path, _, digest, executable)| (path, digest, executable))
+        .collect();
     Ok(installed)
 }
 
-async fn materialize_tree(
-    volume: &ManagedVolume,
+async fn materialize_tree<V: Volume>(
+    volume: &V,
     replica: &Path,
-    snapshot: &NamespaceSnapshot,
+    snapshot: &VolumeSnapshot,
     transfer_concurrency: NonZeroUsize,
 ) -> Result<()> {
     let staging = fresh_sibling(replica, "materialize");
@@ -922,7 +814,7 @@ async fn materialize_tree(
         .to_str()
         .context("materialization path is not valid Unicode")?;
     let target = Operator::new(services::Fs::default().root(root))?.finish();
-    let materializer = volume.materializer()?;
+    let reader = volume.reader()?;
     let result = async {
         let mut files = Vec::new();
         for (path, node) in snapshot_paths(snapshot)? {
@@ -943,7 +835,7 @@ async fn materialize_tree(
             }
         }
         materialize_files(
-            &materializer,
+            &reader,
             &target,
             &staging,
             files
@@ -986,7 +878,7 @@ fn install_tree(replica: &Path, staging: &Path) -> Result<()> {
     Ok(())
 }
 
-fn snapshot_files(snapshot: &NamespaceSnapshot) -> Result<BTreeMap<String, FileVersionRecord>> {
+fn snapshot_files(snapshot: &VolumeSnapshot) -> Result<BTreeMap<String, FileVersion>> {
     snapshot_paths(snapshot)?
         .into_iter()
         .filter_map(|(path, node)| {
@@ -1005,7 +897,7 @@ fn snapshot_files(snapshot: &NamespaceSnapshot) -> Result<BTreeMap<String, FileV
         .collect()
 }
 
-fn snapshot_paths(snapshot: &NamespaceSnapshot) -> Result<BTreeMap<String, NodeId>> {
+fn snapshot_paths(snapshot: &VolumeSnapshot) -> Result<BTreeMap<String, NodeId>> {
     let mut paths = BTreeMap::new();
     let mut pending = vec![(String::new(), snapshot.root)];
     while let Some((path, node)) = pending.pop() {

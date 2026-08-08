@@ -30,25 +30,6 @@ pub enum Metadata {
     D1(D1Metadata),
 }
 
-impl Metadata {
-    pub async fn create_format(
-        &self,
-        desired: &ManagedFormat,
-    ) -> Result<ManagedFormat, ManagedError> {
-        match self {
-            Self::Object(metadata) => metadata.create_format(desired).await,
-            Self::D1(metadata) => metadata.create_format(desired).await,
-        }
-    }
-
-    pub async fn read_format(&self) -> Result<ManagedFormat, ManagedError> {
-        match self {
-            Self::Object(metadata) => metadata.read_format().await,
-            Self::D1(metadata) => metadata.read_format().await,
-        }
-    }
-}
-
 fn require_same_format(
     desired: &ManagedFormat,
     observed: ManagedFormat,

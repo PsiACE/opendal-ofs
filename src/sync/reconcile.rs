@@ -12,8 +12,9 @@ use anyhow::{Context, Result, bail};
 
 use super::{ConflictRecord, ReplicaState, StagedTree};
 use crate::filesystem::NodeKind;
-use crate::filesystem::{ChangeCursor, FileVersionId, Generation, NodeId};
-use crate::managed::namespace::{FileVersionRecord, NamespaceSnapshot};
+use crate::filesystem::{
+    ChangeCursor, FileVersion, FileVersionId, Generation, NodeId, VolumeSnapshot,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReconcilePlan {
@@ -69,14 +70,14 @@ struct RemoteDirectory {
     directory_generation: Generation,
 }
 
-/// Reconcile staged local file content with one authoritative Managed snapshot.
+/// Reconcile staged local file content with one authoritative volume snapshot.
 ///
 /// The result contains decisions only. Installing or publishing data is a
 /// separate operation, so this function performs no I/O.
 pub fn reconcile(
     replica: &ReplicaState,
     local: &StagedTree,
-    remote: &NamespaceSnapshot,
+    remote: &VolumeSnapshot,
 ) -> Result<ReconcilePlan> {
     if replica.volume != remote.volume_id {
         bail!("replica state and remote namespace belong to different volumes");
@@ -514,7 +515,7 @@ impl RemotePath {
     }
 }
 
-fn remote_paths(snapshot: &NamespaceSnapshot) -> Result<BTreeMap<String, RemotePath>> {
+fn remote_paths(snapshot: &VolumeSnapshot) -> Result<BTreeMap<String, RemotePath>> {
     let mut paths = BTreeMap::new();
     let mut pending = vec![(String::new(), snapshot.root)];
     let mut expanded = BTreeSet::new();
@@ -528,7 +529,7 @@ fn remote_paths(snapshot: &NamespaceSnapshot) -> Result<BTreeMap<String, RemoteP
                 let version_id = record
                     .file_version
                     .context("remote file has no file version")?;
-                let version: &FileVersionRecord = snapshot
+                let version: &FileVersion = snapshot
                     .file_versions
                     .get(&version_id)
                     .context("remote file version is missing")?;

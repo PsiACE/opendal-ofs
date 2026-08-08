@@ -10,13 +10,21 @@
 [chat]: https://img.shields.io/discord/1081052318650339399
 [discord]: https://opendal.apache.org/discord
 
-`ofs` is a userspace filesystem backed by OpenDAL.
+`ofs` provides Mount and Sync access to named filesystems backed by OpenDAL.
 
 ## Status
 
-`ofs` is a work in progress. It provides the existing Direct Mount interface
-and a Managed Sync implementation of the two-axis filesystem architecture in
-[RFC 016](rfcs/0016_filesystem_architecture.md).
+`ofs` is a work in progress. Its two independent choices are the volume model
+and the access model:
+
+| | Mount | Sync |
+| --- | --- | --- |
+| Direct volume | Available | Not yet available |
+| Managed volume | Not yet available | Available |
+
+A Direct volume exposes an existing object namespace. A Managed volume stores
+filesystem identity and namespace metadata. Mount provides an online filesystem,
+while Sync reconciles an ordinary local directory only when explicitly invoked.
 
 Managed Sync uses a local directory as the working filesystem and publishes
 explicitly to a format v1 Managed volume. Namespace metadata can use colocated
@@ -49,17 +57,49 @@ cargo install ofs
 
 > `cargo` is the Rust package manager. Follow the Rust [installation guide](https://www.rust-lang.org/tools/install) to install it.
 
-### Mount directory
+### Create and mount a Direct volume
+
+Choose a catalog path, then register a credential-free OpenDAL URL under a local
+volume name:
 
 ```shell
-ofs <mount-point> 'fs://?root=<directory>'
+export OFS_CONFIG="$PWD/ofs-volumes.json"
+
+ofs volume create archive \
+  --model direct \
+  --storage 'fs://?root=/srv/archive'
+
+mkdir -p /mnt/archive
+ofs mount archive /mnt/archive --read-only
 ```
 
-### Mount S3 bucket
+The mount runs in the foreground. Stop it with Ctrl-C.
+
+For S3, keep credentials in provider environment variables rather than the
+catalog URL:
 
 ```shell
-ofs <mount-point> 's3://?root=<path>&bucket=<bucket>&endpoint=<endpoint>&region=<region>&access_key_id=<access-key-id>&secret_access_key=<secret-access-key>'
+export AWS_ACCESS_KEY_ID='<access-key-id>'
+export AWS_SECRET_ACCESS_KEY='<secret-access-key>'
+export AWS_REGION='<region>'
+
+ofs volume create archive \
+  --model direct \
+  --storage 's3://<bucket>/<path>?endpoint=<endpoint>&region=<region>'
+
+ofs mount archive /mnt/archive --read-only
 ```
+
+Use `ofs mount archive /mnt/archive` when writable Direct access is intended.
+Direct writes replace complete objects and may not provide atomic rename or
+stable identity across rename.
+
+### Create and synchronize a Managed volume
+
+Managed Sync keeps the working tree on the native local filesystem and
+publishes only during an explicit `ofs sync`. See the
+[Managed Sync guide](docs/managed-sync.md) for Object and D1 setup, conflict
+handling, recovery, and maintenance.
 
 ## Branding
 

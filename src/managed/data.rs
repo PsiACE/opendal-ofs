@@ -29,16 +29,15 @@ use opendal::{ErrorKind, Operator, Writer};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use super::{ManagedError, ManagedErrorKind};
+use super::{ManagedError, ManagedErrorKind, ManagedExtension, ManagedFormat};
 use crate::filesystem::{ChangeCursor, NodeKind, OperationId};
 use crate::managed::namespace::{
-    ChunkSpan, ChunkingAlgorithm, ChunkingSpec, ContentRef, DataExtent, FileExtent,
-    FileVersionLayout, FileVersionRecord, NamespaceSnapshot,
+    ChunkSpan, ContentRef, FileVersionLayout, FileVersionRecord, NamespaceSnapshot,
 };
 use crate::managed::pack::{PackId, PackIndex, PackReadSession, PackStore};
 
 const READ_WINDOW: u64 = 4 * 1024 * 1024;
-const LOOSE_ROOT: &str = "data/v1/loose/sha256";
+const LOOSE_ROOT: &str = ".ofs/managed/data/v1/loose/sha256";
 const SMALL_CONTENT_LIMIT: u64 = 256 * 1024;
 const PACK_LOGICAL_LIMIT: u64 = 8 * 1024 * 1024;
 static PACK_RETIREMENT_EPOCH: AtomicU64 = AtomicU64::new(1);
@@ -108,9 +107,6 @@ impl PackRetirement {
 pub enum FileLayoutPolicy {
     #[default]
     Whole,
-    Fixed {
-        chunk_size: u32,
-    },
     #[serde(rename = "fastcdc_v2020")]
     FastCdcV2020 {
         minimum_file_size: u64,
@@ -128,17 +124,9 @@ impl FileLayoutPolicy {
     pub const fn name(self) -> &'static str {
         match self {
             Self::Whole => "whole",
-            Self::Fixed { .. } => "fixed",
             Self::FastCdcV2020 { .. } => "fastcdc_v2020",
         }
     }
-}
-
-/// Ordered ranges discovered from one frozen sparse file.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SparseExtent {
-    Hole { logical_length: u64 },
-    Data { logical_length: u64 },
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -163,10 +151,12 @@ impl Digest {
 pub(crate) struct ManagedData {
     operator: Operator,
     policy: FileLayoutPolicy,
+    fastcdc_enabled: bool,
+    pack_enabled: bool,
 }
 
 impl ManagedData {
-    pub(crate) fn new(operator: Operator) -> Result<Self, ManagedError> {
+    pub(crate) fn new(operator: Operator, format: &ManagedFormat) -> Result<Self, ManagedError> {
         let capability = operator.info().full_capability();
         if !capability.stat
             || !capability.read
@@ -182,17 +172,22 @@ impl ManagedData {
         Ok(Self {
             operator,
             policy: FileLayoutPolicy::Whole,
+            fastcdc_enabled: format.extension_enabled(ManagedExtension::FastCdc),
+            pack_enabled: format.extension_enabled(ManagedExtension::Pack),
         })
     }
 
     pub(crate) fn set_policy(&mut self, policy: FileLayoutPolicy) -> Result<(), ManagedError> {
         policy.validate()?;
+        if matches!(policy, FileLayoutPolicy::FastCdcV2020 { .. }) && !self.fastcdc_enabled {
+            return Err(unsupported("data-fastcdc/1 is not enabled for this volume"));
+        }
         self.policy = policy;
         Ok(())
     }
 
     pub(crate) fn read_session(&self) -> Result<PackReadSession, ManagedError> {
-        PackReadSession::new(self.operator.clone())
+        PackReadSession::new(self.operator.clone(), self.pack_enabled)
     }
 
     pub(crate) async fn seal_file(
@@ -214,9 +209,6 @@ impl ManagedData {
             FileLayoutPolicy::Whole => {
                 self.seal_whole_file_with_known_content(local, frozen_path, known)
                     .await
-            }
-            FileLayoutPolicy::Fixed { chunk_size } => {
-                self.seal_fixed(local, frozen_path, chunk_size, known).await
             }
             FileLayoutPolicy::FastCdcV2020 {
                 minimum_file_size,
@@ -317,59 +309,6 @@ impl ManagedData {
         Ok(version)
     }
 
-    async fn seal_fixed(
-        &self,
-        local: &Operator,
-        path: &str,
-        chunk_size: u32,
-        known: &AuthorityKnownContent,
-    ) -> Result<FileVersionRecord, ManagedError> {
-        let size = frozen_size(local, path).await?;
-        if size == 0 {
-            return Ok(FileVersionRecord::whole(0, Sha256::digest([]).into()));
-        }
-        let reader = local
-            .reader(path)
-            .await
-            .map_err(|_| unavailable("read frozen file"))?;
-        let mut logical = Sha256::new();
-        let mut chunks = Vec::new();
-        let mut offset = 0;
-        while offset < size {
-            let end = size.min(offset + u64::from(chunk_size));
-            let buffer = reader
-                .read(offset..end)
-                .await
-                .map_err(|_| unavailable("read frozen file"))?;
-            let bytes = buffer.to_bytes();
-            if bytes.len() as u64 != end - offset {
-                return Err(corrupt("read frozen file", "source returned a short range"));
-            }
-            logical.update(&bytes);
-            let content = self.persist_bytes(&bytes, known).await?;
-            chunks.push(ChunkSpan {
-                logical_offset: offset,
-                logical_length: content.logical_length,
-                content,
-            });
-            offset = end;
-        }
-        let chunk_size = u64::from(chunk_size);
-        build_version(
-            size,
-            logical.finalize().into(),
-            FileVersionLayout::Chunked {
-                chunking: ChunkingSpec {
-                    algorithm: ChunkingAlgorithm::Fixed,
-                    minimum_size: chunk_size,
-                    target_size: chunk_size,
-                    maximum_size: chunk_size,
-                },
-                chunks,
-            },
-        )
-    }
-
     async fn seal_fastcdc(
         &self,
         local: &Operator,
@@ -408,117 +347,13 @@ impl ManagedData {
         build_version(
             size,
             logical.finalize().into(),
-            FileVersionLayout::Chunked {
-                chunking: ChunkingSpec {
-                    algorithm: ChunkingAlgorithm::FastCdcV2020 { revision: 1 },
-                    minimum_size: u64::from(minimum_size),
-                    target_size: u64::from(target_size),
-                    maximum_size: u64::from(maximum_size),
-                },
+            FileVersionLayout::FastCdc {
+                revision: 1,
+                minimum_size: u64::from(minimum_size),
+                target_size: u64::from(target_size),
+                maximum_size: u64::from(maximum_size),
                 chunks: spans,
             },
-        )
-    }
-
-    pub(crate) async fn seal_extents(
-        &self,
-        local: &Operator,
-        path: &str,
-        staged: &[SparseExtent],
-    ) -> Result<FileVersionRecord, ManagedError> {
-        self.seal_extents_with_known_content(local, path, staged, &AuthorityKnownContent::default())
-            .await
-    }
-
-    pub(crate) async fn seal_extents_with_known_content(
-        &self,
-        local: &Operator,
-        path: &str,
-        staged: &[SparseExtent],
-        known: &AuthorityKnownContent,
-    ) -> Result<FileVersionRecord, ManagedError> {
-        let size = frozen_size(local, path).await?;
-        if size == 0 && staged.is_empty() {
-            return Ok(FileVersionRecord::whole(0, Sha256::digest([]).into()));
-        }
-        let mut logical = Sha256::new();
-        let mut logical_offset = 0_u64;
-        let mut extents = Vec::with_capacity(staged.len());
-        for extent in staged {
-            let length = match extent {
-                SparseExtent::Hole { logical_length } | SparseExtent::Data { logical_length } => {
-                    *logical_length
-                }
-            };
-            if length == 0 {
-                return Err(invalid(
-                    "seal sparse file",
-                    "extent length must be positive",
-                ));
-            }
-            let end = logical_offset
-                .checked_add(length)
-                .filter(|end| *end <= size)
-                .ok_or_else(|| invalid("seal sparse file", "extent is outside the frozen file"))?;
-            match extent {
-                SparseExtent::Hole { .. } => {
-                    let reader = local
-                        .reader(path)
-                        .await
-                        .map_err(|_| unavailable("read frozen file"))?;
-                    let mut offset = logical_offset;
-                    while offset < end {
-                        let range_end = (offset + READ_WINDOW).min(end);
-                        let bytes = reader
-                            .read(offset..range_end)
-                            .await
-                            .map_err(|_| unavailable("read frozen file"))?
-                            .to_bytes();
-                        if bytes.len() as u64 != range_end - offset {
-                            return Err(corrupt(
-                                "read frozen file",
-                                "source returned a short range",
-                            ));
-                        }
-                        if bytes.iter().any(|byte| *byte != 0) {
-                            return Err(invalid("seal sparse file", "declared hole contains data"));
-                        }
-                        logical.update(&bytes);
-                        offset = range_end;
-                    }
-                    extents.push(FileExtent::Hole {
-                        logical_offset,
-                        logical_length: length,
-                    });
-                }
-                SparseExtent::Data { .. } => {
-                    let digest =
-                        digest_range(local, path, logical_offset..end, &mut logical).await?;
-                    let content = self
-                        .persist_range(local, path, logical_offset..end, digest, known)
-                        .await?;
-                    extents.push(FileExtent::Data {
-                        extent: DataExtent {
-                            logical_offset,
-                            logical_length: length,
-                            data_offset: 0,
-                            content,
-                        },
-                    });
-                }
-            }
-            logical_offset = end;
-        }
-        if logical_offset != size {
-            return Err(invalid(
-                "seal sparse file",
-                "extents do not cover the frozen file",
-            ));
-        }
-        build_version(
-            size,
-            logical.finalize().into(),
-            FileVersionLayout::Extents { extents },
         )
     }
 
@@ -527,6 +362,8 @@ impl ManagedData {
         snapshot: &NamespaceSnapshot,
         operation: OperationId,
     ) -> Result<PackMaintenance, ManagedError> {
+        self.require_pack_extension()?;
+        self.validate_snapshot_extensions(snapshot)?;
         let contents = reachable_whole_content(snapshot, "pack reachable data")?;
 
         let mut index = PackIndex::open_or_empty(self.operator.clone()).await?;
@@ -577,11 +414,18 @@ impl ManagedData {
         })
     }
 
+    pub(crate) async fn rebuild_pack_index(&self) -> Result<usize, ManagedError> {
+        self.require_pack_extension()?;
+        PackStore::new(self.operator.clone())?.rebuild_index().await
+    }
+
     pub(crate) async fn repack_reachable(
         &self,
         snapshot: &NamespaceSnapshot,
         operation: OperationId,
     ) -> Result<Option<PackRetirement>, ManagedError> {
+        self.require_pack_extension()?;
+        self.validate_snapshot_extensions(snapshot)?;
         let live = reachable_content(snapshot, "repack content")?;
         let Some(mut index) = PackIndex::open(self.operator.clone()).await? else {
             return Ok(None);
@@ -658,6 +502,8 @@ impl ManagedData {
         current: &NamespaceSnapshot,
         retirement: PackRetirement,
     ) -> Result<Vec<PackId>, ManagedError> {
+        self.require_pack_extension()?;
+        self.validate_snapshot_extensions(current)?;
         if current.cursor.sequence() < retirement.fixed_at.sequence() {
             return Err(invalid(
                 "finalize repack",
@@ -737,6 +583,8 @@ impl ManagedData {
         &self,
         snapshot: &NamespaceSnapshot,
     ) -> Result<usize, ManagedError> {
+        self.require_pack_extension()?;
+        self.validate_snapshot_extensions(snapshot)?;
         let capability = self.operator.info().full_capability();
         if !capability.list || !capability.delete {
             return Ok(0);
@@ -909,60 +757,6 @@ impl ManagedData {
         Ok(content)
     }
 
-    async fn persist_range(
-        &self,
-        source: &Operator,
-        path: &str,
-        range: Range<u64>,
-        digest: Digest,
-        known: &AuthorityKnownContent,
-    ) -> Result<ContentRef, ManagedError> {
-        let content = ContentRef {
-            digest: *digest.as_bytes(),
-            logical_length: range.end - range.start,
-        };
-        if known.contains(&content) {
-            return Ok(content);
-        }
-        let key = loose_key(&content);
-        match self.operator.writer_with(&key).if_not_exists(true).await {
-            Err(error) if already_exists(&error) => {}
-            Err(_) => return Err(unavailable("create loose data")),
-            Ok(mut writer) => {
-                let observed = match copy_range(source, path, range, Some(&mut writer), None).await
-                {
-                    Ok(observed) => observed,
-                    Err(error) => {
-                        let _ = writer.abort().await;
-                        return Err(error);
-                    }
-                };
-                if observed != digest {
-                    let _ = writer.abort().await;
-                    return Err(invalid(
-                        "write loose data",
-                        "frozen input changed while it was being sealed",
-                    ));
-                }
-                if let Err(error) = writer.close().await
-                    && !already_exists(&error)
-                {
-                    return Err(unavailable("commit loose data"));
-                }
-            }
-        }
-        let mut observed = Sha256::new();
-        self.copy_content(
-            &content,
-            0..content.logical_length,
-            None,
-            &mut observed,
-            None,
-        )
-        .await?;
-        Ok(content)
-    }
-
     /// Stream verified content into a caller-owned materialization path.
     #[cfg(test)]
     pub(crate) async fn read_to(
@@ -1030,6 +824,7 @@ impl ManagedData {
         mut target: Option<&mut Writer>,
         packs: Option<&PackReadSession>,
     ) -> Result<(), ManagedError> {
+        self.validate_manifest_extension(version)?;
         let mut logical = Sha256::new();
         match &version.layout {
             FileVersionLayout::Whole { content } => {
@@ -1042,7 +837,7 @@ impl ManagedData {
                 )
                 .await?;
             }
-            FileVersionLayout::Chunked { chunks, .. } => {
+            FileVersionLayout::FastCdc { chunks, .. } => {
                 for chunk in chunks {
                     self.copy_content(
                         &chunk.content,
@@ -1054,27 +849,6 @@ impl ManagedData {
                     .await?;
                 }
             }
-            FileVersionLayout::Extents { extents } => {
-                for extent in extents {
-                    match extent {
-                        FileExtent::Hole { logical_length, .. } => {
-                            write_zeroes(target.as_deref_mut(), &mut logical, *logical_length)
-                                .await?;
-                        }
-                        FileExtent::Data { extent } => {
-                            let end = extent.data_offset + extent.logical_length;
-                            self.copy_content(
-                                &extent.content,
-                                extent.data_offset..end,
-                                target.as_deref_mut(),
-                                &mut logical,
-                                packs,
-                            )
-                            .await?;
-                        }
-                    }
-                }
-            }
         }
         let observed: [u8; 32] = logical.finalize().into();
         if observed != version.logical_digest {
@@ -1082,6 +856,34 @@ impl ManagedData {
                 "read loose data",
                 "logical content digest does not match the file version",
             ));
+        }
+        Ok(())
+    }
+
+    fn require_pack_extension(&self) -> Result<(), ManagedError> {
+        if self.pack_enabled {
+            Ok(())
+        } else {
+            Err(unsupported("data-pack/1 is not enabled for this volume"))
+        }
+    }
+
+    fn validate_manifest_extension(&self, version: &FileVersionRecord) -> Result<(), ManagedError> {
+        if matches!(version.layout, FileVersionLayout::FastCdc { .. }) && !self.fastcdc_enabled {
+            Err(unsupported(
+                "file manifest requires the disabled data-fastcdc/1 extension",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn validate_snapshot_extensions(
+        &self,
+        snapshot: &NamespaceSnapshot,
+    ) -> Result<(), ManagedError> {
+        for version in snapshot.file_versions.values() {
+            self.validate_manifest_extension(version)?;
         }
         Ok(())
     }
@@ -1275,14 +1077,8 @@ fn collect_content_refs(layout: &FileVersionLayout, output: &mut BTreeSet<Conten
         FileVersionLayout::Whole { content } => {
             output.insert(*content);
         }
-        FileVersionLayout::Chunked { chunks, .. } => {
+        FileVersionLayout::FastCdc { chunks, .. } => {
             output.extend(chunks.iter().map(|chunk| chunk.content));
-        }
-        FileVersionLayout::Extents { extents } => {
-            output.extend(extents.iter().filter_map(|extent| match extent {
-                FileExtent::Data { extent } => Some(extent.content),
-                FileExtent::Hole { .. } => None,
-            }));
         }
     }
 }
@@ -1290,11 +1086,6 @@ fn collect_content_refs(layout: &FileVersionLayout, output: &mut BTreeSet<Conten
 fn validate_policy(policy: FileLayoutPolicy) -> Result<(), ManagedError> {
     match policy {
         FileLayoutPolicy::Whole => Ok(()),
-        FileLayoutPolicy::Fixed { chunk_size } if chunk_size > 0 => Ok(()),
-        FileLayoutPolicy::Fixed { .. } => Err(invalid(
-            "configure Managed data",
-            "fixed chunk size must be positive",
-        )),
         FileLayoutPolicy::FastCdcV2020 {
             minimum_file_size: _,
             minimum_size,
@@ -1334,73 +1125,6 @@ fn build_version(
 ) -> Result<FileVersionRecord, ManagedError> {
     FileVersionRecord::from_layout(size, digest, layout)
         .ok_or_else(|| invalid("seal Managed data", "generated file manifest is invalid"))
-}
-
-async fn digest_range(
-    source: &Operator,
-    path: &str,
-    range: Range<u64>,
-    logical: &mut Sha256,
-) -> Result<Digest, ManagedError> {
-    copy_range(source, path, range, None, Some(logical)).await
-}
-
-async fn copy_range(
-    source: &Operator,
-    path: &str,
-    range: Range<u64>,
-    mut target: Option<&mut Writer>,
-    mut logical: Option<&mut Sha256>,
-) -> Result<Digest, ManagedError> {
-    let reader = source
-        .reader(path)
-        .await
-        .map_err(|_| unavailable("read frozen file"))?;
-    let mut digest = Sha256::new();
-    let mut offset = range.start;
-    while offset < range.end {
-        let end = (offset + READ_WINDOW).min(range.end);
-        let bytes = reader
-            .read(offset..end)
-            .await
-            .map_err(|_| unavailable("read frozen file"))?
-            .to_bytes();
-        if bytes.len() as u64 != end - offset {
-            return Err(corrupt("read frozen file", "source returned a short range"));
-        }
-        digest.update(&bytes);
-        if let Some(logical) = logical.as_deref_mut() {
-            logical.update(&bytes);
-        }
-        if let Some(writer) = target.as_deref_mut() {
-            writer
-                .write(bytes)
-                .await
-                .map_err(|_| unavailable("write loose data"))?;
-        }
-        offset = end;
-    }
-    Ok(Digest::from_bytes(digest.finalize().into()))
-}
-
-async fn write_zeroes(
-    mut target: Option<&mut Writer>,
-    logical: &mut Sha256,
-    mut length: u64,
-) -> Result<(), ManagedError> {
-    const ZEROES: [u8; 8192] = [0; 8192];
-    while length > 0 {
-        let count = length.min(ZEROES.len() as u64) as usize;
-        logical.update(&ZEROES[..count]);
-        if let Some(writer) = target.as_deref_mut() {
-            writer
-                .write(ZEROES[..count].to_vec())
-                .await
-                .map_err(|_| unavailable("write materialized file"))?;
-        }
-        length -= count as u64;
-    }
-    Ok(())
 }
 
 async fn digest_and_copy(
@@ -1511,6 +1235,14 @@ fn invalid(action: &'static str, message: &'static str) -> ManagedError {
     ManagedError::new(ManagedErrorKind::Invalid, action, message)
 }
 
+fn unsupported(message: &'static str) -> ManagedError {
+    ManagedError::new(
+        ManagedErrorKind::UnsupportedFormat,
+        "use Managed data",
+        message,
+    )
+}
+
 fn corrupt(action: &'static str, message: &'static str) -> ManagedError {
     ManagedError::new(ManagedErrorKind::Corrupt, action, message)
 }
@@ -1546,6 +1278,16 @@ mod tests {
 
     fn memory() -> Operator {
         Operator::new(services::Memory::default()).unwrap().finish()
+    }
+
+    fn managed_data(operator: Operator) -> ManagedData {
+        let format = ManagedFormat::v1(
+            VolumeId::from_bytes([42; 16]),
+            crate::managed::MetadataPlacement::ColocatedObject,
+            [ManagedExtension::FastCdc, ManagedExtension::Pack],
+        )
+        .unwrap();
+        ManagedData::new(operator, &format).unwrap()
     }
 
     fn pack_test_storage() -> Operator {
@@ -1623,20 +1365,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fixed_cdc_and_sparse_layouts_round_trip() {
+    async fn whole_and_fastcdc_layouts_round_trip() {
         let source = memory();
         let stored = memory();
         let target = memory();
         let bytes: Vec<u8> = (0..8192).map(|index| (index * 31) as u8).collect();
         source.write("input", bytes.clone()).await.unwrap();
 
-        let mut data = ManagedData::new(stored).unwrap();
-        data.set_policy(FileLayoutPolicy::Fixed { chunk_size: 1024 })
-            .unwrap();
-        let fixed = data.seal_file(&source, "input").await.unwrap();
-        assert!(matches!(fixed.layout, FileVersionLayout::Chunked { .. }));
-        data.read_to(&fixed, &target, "fixed").await.unwrap();
-        assert_eq!(target.read("fixed").await.unwrap().to_bytes(), bytes);
+        let mut data = managed_data(stored);
 
         data.set_policy(FileLayoutPolicy::FastCdcV2020 {
             minimum_file_size: bytes.len() as u64 + 1,
@@ -1659,41 +1395,9 @@ mod tests {
         })
         .unwrap();
         let cdc = data.seal_file(&source, "input").await.unwrap();
-        assert!(matches!(cdc.layout, FileVersionLayout::Chunked { .. }));
+        assert!(matches!(cdc.layout, FileVersionLayout::FastCdc { .. }));
         data.read_to(&cdc, &target, "cdc").await.unwrap();
         assert_eq!(target.read("cdc").await.unwrap().to_bytes(), bytes);
-
-        let sparse = b"\0\0DATA\0\0\0";
-        source.write("sparse", sparse.to_vec()).await.unwrap();
-        let extents = data
-            .seal_extents(
-                &source,
-                "sparse",
-                &[
-                    SparseExtent::Hole { logical_length: 2 },
-                    SparseExtent::Data { logical_length: 4 },
-                    SparseExtent::Hole { logical_length: 3 },
-                ],
-            )
-            .await
-            .unwrap();
-        data.read_to(&extents, &target, "sparse").await.unwrap();
-        assert_eq!(
-            target.read("sparse").await.unwrap().to_bytes(),
-            sparse.as_slice()
-        );
-
-        let invalid = data
-            .seal_extents(
-                &source,
-                "input",
-                &[SparseExtent::Hole {
-                    logical_length: bytes.len() as u64,
-                }],
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(invalid.kind(), ManagedErrorKind::Invalid);
     }
 
     #[tokio::test]
@@ -1702,7 +1406,7 @@ mod tests {
         let stored = memory();
         source.write("live", b"live".to_vec()).await.unwrap();
         source.write("orphan", b"orphan".to_vec()).await.unwrap();
-        let data = ManagedData::new(stored.clone()).unwrap();
+        let data = managed_data(stored.clone());
         let live = data.seal_whole_file(&source, "live").await.unwrap();
         let orphan = data.seal_whole_file(&source, "orphan").await.unwrap();
         let snapshot = snapshot_with_file(live.clone());
@@ -1757,7 +1461,7 @@ mod tests {
             .await
             .unwrap();
         source.write("orphan", b"orphan".to_vec()).await.unwrap();
-        let data = ManagedData::new(stored.clone()).unwrap();
+        let data = managed_data(stored.clone());
         let small = data.seal_whole_file(&source, "small").await.unwrap();
         let large = data.seal_whole_file(&source, "large").await.unwrap();
         let orphan = data.seal_whole_file(&source, "orphan").await.unwrap();
@@ -1857,7 +1561,7 @@ mod tests {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
-        let pack_key = format!("data/v1/packs/{pack_hex}.pack");
+        let pack_key = format!(".ofs/managed/extensions/data-pack/v1/packs/sha256/{pack_hex}.pack");
         let original = stored.read(&pack_key).await.unwrap().to_bytes();
         let mut corrupt_pack = original.to_vec();
         corrupt_pack[26] ^= 0xff;
@@ -1885,32 +1589,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn small_file_pack_excludes_chunks_and_extents() {
+    async fn small_file_pack_excludes_fastcdc_chunks() {
         let source = memory();
         let stored = memory();
         let target = memory();
         source.write("whole", b"whole file".to_vec()).await.unwrap();
         source.write("chunked", b"abcdefgh".to_vec()).await.unwrap();
-        source.write("extent", b"DATA".to_vec()).await.unwrap();
 
-        let mut data = ManagedData::new(stored.clone()).unwrap();
+        let mut data = managed_data(stored.clone());
         let whole = data.seal_whole_file(&source, "whole").await.unwrap();
-        data.set_policy(FileLayoutPolicy::Fixed { chunk_size: 4 })
-            .unwrap();
+        data.set_policy(FileLayoutPolicy::FastCdcV2020 {
+            minimum_file_size: 0,
+            minimum_size: 64,
+            target_size: 256,
+            maximum_size: 1024,
+        })
+        .unwrap();
         let chunked = data.seal_file(&source, "chunked").await.unwrap();
-        let extent = data
-            .seal_extents(
-                &source,
-                "extent",
-                &[SparseExtent::Data { logical_length: 4 }],
-            )
-            .await
-            .unwrap();
-        let snapshot = snapshot_with_files([
-            ("whole", whole.clone()),
-            ("chunked", chunked.clone()),
-            ("extent", extent.clone()),
-        ]);
+        let snapshot =
+            snapshot_with_files([("whole", whole.clone()), ("chunked", chunked.clone())]);
 
         let packed = data
             .pack_reachable(&snapshot, OperationId::from_bytes([31; 16]))
@@ -1922,7 +1619,7 @@ mod tests {
         assert_eq!(packed.packed_content, vec![whole_ref]);
 
         let index = PackIndex::open(stored.clone()).await.unwrap().unwrap();
-        let FileVersionLayout::Chunked { chunks, .. } = &chunked.layout else {
+        let FileVersionLayout::FastCdc { chunks, .. } = &chunked.layout else {
             unreachable!()
         };
         assert!(
@@ -1930,24 +1627,11 @@ mod tests {
                 .iter()
                 .all(|chunk| index.locations(chunk.content).is_empty())
         );
-        let FileVersionLayout::Extents { extents } = &extent.layout else {
-            unreachable!()
-        };
-        assert!(extents.iter().all(|extent| match extent {
-            FileExtent::Data { extent } => index.locations(extent.content).is_empty(),
-            FileExtent::Hole { .. } => true,
-        }));
-
         assert_eq!(data.reclaim_packed_loose(&snapshot).await.unwrap(), 1);
         data.read_to(&chunked, &target, "chunked").await.unwrap();
-        data.read_to(&extent, &target, "extent").await.unwrap();
         assert_eq!(
             target.read("chunked").await.unwrap().to_bytes(),
             b"abcdefgh".as_slice()
-        );
-        assert_eq!(
-            target.read("extent").await.unwrap().to_bytes(),
-            b"DATA".as_slice()
         );
     }
 
@@ -1956,7 +1640,7 @@ mod tests {
     async fn repack_keeps_live_content_until_old_pack_retirement() {
         let stored = pack_test_storage();
         let target = memory();
-        let data = ManagedData::new(stored.clone()).unwrap();
+        let data = managed_data(stored.clone());
         let live_bytes = b"live after repack".to_vec();
         let dead_bytes = b"dead before repack".to_vec();
         let live_content = ContentRef {
@@ -2079,13 +1763,18 @@ mod tests {
         let source = memory();
         let stored = memory();
         let target = memory();
-        source.write("input", b"abcdefgh".to_vec()).await.unwrap();
-        let mut data = ManagedData::new(stored.clone()).unwrap();
-        data.set_policy(FileLayoutPolicy::Fixed { chunk_size: 4 })
-            .unwrap();
+        source.write("input", vec![7; 8192]).await.unwrap();
+        let mut data = managed_data(stored.clone());
+        data.set_policy(FileLayoutPolicy::FastCdcV2020 {
+            minimum_file_size: 0,
+            minimum_size: 64,
+            target_size: 256,
+            maximum_size: 1024,
+        })
+        .unwrap();
         let version = data.seal_file(&source, "input").await.unwrap();
-        let FileVersionLayout::Chunked { chunks, .. } = &version.layout else {
-            panic!("fixed policy returned another layout")
+        let FileVersionLayout::FastCdc { chunks, .. } = &version.layout else {
+            panic!("FastCDC policy returned another layout")
         };
         stored
             .write(&loose_key(&chunks[0].content), b"bad".to_vec())

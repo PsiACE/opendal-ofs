@@ -17,17 +17,13 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::filesystem::{
-    ChangeCursor, DirectoryEntry, FileVersionId, Generation, NodeAttributes, NodeId, NodeKind,
-    OperationId, VolumeId,
-};
-use crate::managed::namespace::{
-    DirectoryRecord, FileVersionLayout, FileVersionRecord, NamespaceSnapshot, NodeRecord,
-    validate_snapshot,
+    ChangeCursor, DirectoryEntry, DirectoryRecord, FileVersion, FileVersionId, Generation,
+    NodeAttributes, NodeId, NodeKind, NodeRecord, OperationId, VolumeId, VolumeSnapshot,
 };
 use crate::sync::local::NativeIdentity;
 
 const STATE_FORMAT: &str = "ofs-sync-replica";
-const STATE_MAJOR: u16 = 1;
+const STATE_MAJOR: u16 = 2;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -61,7 +57,7 @@ pub struct ConflictRecord {
 pub struct ReplicaState {
     pub volume: VolumeId,
     pub common: ChangeCursor,
-    pub authority: Option<NamespaceSnapshot>,
+    pub authority: Option<VolumeSnapshot>,
     pub base: BTreeMap<String, BaseEntry>,
     pub pending: Option<PendingIntent>,
     pub conflicts: Vec<ConflictRecord>,
@@ -210,7 +206,7 @@ struct FileVersionWire {
     id: [u8; 32],
     logical_size: u64,
     logical_digest: [u8; 32],
-    layout: FileVersionLayout,
+    descriptor: Vec<u8>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -392,8 +388,8 @@ impl TryFrom<CursorWire> for ChangeCursor {
     }
 }
 
-impl From<&NamespaceSnapshot> for SnapshotWire {
-    fn from(snapshot: &NamespaceSnapshot) -> Self {
+impl From<&VolumeSnapshot> for SnapshotWire {
+    fn from(snapshot: &VolumeSnapshot) -> Self {
         Self {
             cursor: CursorWire::from(snapshot.cursor),
             root: *snapshot.root.as_bytes(),
@@ -436,7 +432,7 @@ impl From<&NamespaceSnapshot> for SnapshotWire {
                     id: *record.id.as_bytes(),
                     logical_size: record.logical_size,
                     logical_digest: record.logical_digest,
-                    layout: record.layout.clone(),
+                    descriptor: record.descriptor().into(),
                 })
                 .collect(),
         }
@@ -444,7 +440,7 @@ impl From<&NamespaceSnapshot> for SnapshotWire {
 }
 
 impl SnapshotWire {
-    fn into_snapshot(self, volume_id: VolumeId) -> Result<NamespaceSnapshot> {
+    fn into_snapshot(self, volume_id: VolumeId) -> Result<VolumeSnapshot> {
         let node_count = self.nodes.len();
         let nodes = self
             .nodes
@@ -501,12 +497,12 @@ impl SnapshotWire {
                 let id = FileVersionId::from_bytes(record.id);
                 (
                     id,
-                    FileVersionRecord {
+                    FileVersion::from_parts(
                         id,
-                        logical_size: record.logical_size,
-                        logical_digest: record.logical_digest,
-                        layout: record.layout,
-                    },
+                        record.logical_size,
+                        record.logical_digest,
+                        record.descriptor,
+                    ),
                 )
             })
             .collect::<BTreeMap<_, _>>();
@@ -516,7 +512,7 @@ impl SnapshotWire {
         {
             bail!("replica authority snapshot repeats a record");
         }
-        let snapshot = NamespaceSnapshot {
+        let snapshot = VolumeSnapshot {
             volume_id,
             cursor: self.cursor.try_into()?,
             root: NodeId::from_bytes(self.root),
@@ -547,7 +543,7 @@ impl From<NodeKindWire> for NodeKind {
     }
 }
 
-fn validate_base(snapshot: &NamespaceSnapshot, base: &BTreeMap<String, BaseEntry>) -> Result<()> {
+fn validate_base(snapshot: &VolumeSnapshot, base: &BTreeMap<String, BaseEntry>) -> Result<()> {
     let mut expected = BTreeMap::new();
     let mut pending = vec![(String::new(), snapshot.root)];
     while let Some((path, node)) = pending.pop() {
@@ -586,6 +582,49 @@ fn validate_base(snapshot: &NamespaceSnapshot, base: &BTreeMap<String, BaseEntry
             || version.is_some_and(|version| saved.local_size != Some(version.logical_size))
         {
             bail!("replica base disagrees with authority snapshot at {path:?}");
+        }
+    }
+    Ok(())
+}
+
+fn validate_snapshot(snapshot: &VolumeSnapshot) -> Result<()> {
+    let root = snapshot
+        .nodes
+        .get(&snapshot.root)
+        .context("root node is missing")?;
+    if root.kind != NodeKind::Directory || !snapshot.directories.contains_key(&snapshot.root) {
+        bail!("root node is not a directory");
+    }
+    for (id, node) in &snapshot.nodes {
+        if *id != node.id {
+            bail!("node map key does not match its record identity");
+        }
+        match node.kind {
+            NodeKind::Directory => {
+                if node.file_version.is_some() || !snapshot.directories.contains_key(id) {
+                    bail!("directory node has invalid backing records");
+                }
+            }
+            NodeKind::RegularFile => {
+                let version = node.file_version.context("file node has no file version")?;
+                if !snapshot.file_versions.contains_key(&version) {
+                    bail!("file node references a missing file version");
+                }
+            }
+        }
+    }
+    for (id, directory) in &snapshot.directories {
+        if *id != directory.node {
+            bail!("directory map key does not match its record identity");
+        }
+        for entry in directory.entries.values() {
+            let child = snapshot
+                .nodes
+                .get(&entry.node)
+                .context("directory entry references a missing node")?;
+            if child.kind != entry.kind {
+                bail!("directory entry kind disagrees with its node");
+            }
         }
     }
     Ok(())

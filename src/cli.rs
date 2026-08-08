@@ -31,15 +31,7 @@ pub(crate) struct Cli {
     pub transfer_concurrency: NonZeroUsize,
 
     #[command(subcommand)]
-    pub command: Option<Command>,
-
-    /// FUSE mount path for the Direct Mount compatibility form.
-    #[arg(env = "OFS_MOUNT_PATH", index = 1, value_name = "MOUNT_PATH")]
-    pub mount_path: Option<PathBuf>,
-
-    /// OpenDAL URL for the Direct Mount compatibility form.
-    #[arg(env = "OFS_BACKEND", index = 2, value_name = "BACKEND_URL")]
-    pub backend: Option<Url>,
+    pub command: Command,
 }
 
 #[derive(Debug, Subcommand)]
@@ -49,10 +41,25 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: VolumeCommand,
     },
+    /// Mount a named volume as an online filesystem.
+    Mount(MountArgs),
     /// Reconcile and publish a local Sync replica.
     Sync(SyncArgs),
     /// Report the durable state of a local replica.
     Status(StatusArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct MountArgs {
+    /// Named Direct volume from the local catalog.
+    pub alias: String,
+
+    /// Local path where the volume will be mounted.
+    pub mount_path: PathBuf,
+
+    /// Prevent filesystem mutations through this mount.
+    #[arg(long)]
+    pub read_only: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -75,6 +82,10 @@ pub(crate) struct VolumeGcArgs {
 pub(crate) struct VolumePackArgs {
     /// Named Managed volume from the local catalog.
     pub alias: String,
+
+    /// Rebuild the derived placement index from verified pack footers before packing.
+    #[arg(long)]
+    pub rebuild_index: bool,
 
     /// Repack dead entries, then wait this process-local grace period before retiring old packs.
     #[arg(long, env = "OFS_PACK_GRACE_SECONDS", value_name = "SECONDS")]
@@ -101,8 +112,8 @@ pub(crate) struct VolumeCreateArgs {
     #[arg(long, env = "OFS_STORAGE_URL", value_name = "URL")]
     pub storage: Url,
 
-    /// Credential-free D1 metadata URL. Set its token with OFS_D1_TOKEN.
-    #[arg(long, env = "OFS_METADATA_URL", value_name = "URL")]
+    /// Credential-free D1 metadata URL. Managed volumes also read OFS_METADATA_URL.
+    #[arg(long, value_name = "URL")]
     pub metadata: Option<Url>,
 
     /// Foreground file layout. Existing volumes keep their configured value when omitted.
@@ -145,9 +156,9 @@ pub(crate) struct SyncArgs {
     #[arg(long, value_name = "PATH")]
     pub state: PathBuf,
 
-    /// Resolve this retained conflict with the current local candidate.
+    /// Resolve a retained conflict with the current local candidate. May be repeated.
     #[arg(long, value_name = "RELATIVE_PATH")]
-    pub resolve: Option<String>,
+    pub resolve: Vec<String>,
 }
 
 #[derive(Debug, Args)]

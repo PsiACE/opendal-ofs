@@ -35,7 +35,7 @@ pub struct StagedFile {
     pub digest: [u8; 32],
 }
 
-/// Immutable input for a later Managed FileVersion builder.
+/// Immutable input for a later volume file-version builder.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StagedTree {
     root: PathBuf,

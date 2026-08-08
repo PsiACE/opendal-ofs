@@ -20,6 +20,7 @@ use std::fmt;
 /// Stable failure classes exposed by Managed volume actions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ManagedErrorKind {
+    UnsupportedFormat,
     Invalid,
     Conflict,
     Corrupt,

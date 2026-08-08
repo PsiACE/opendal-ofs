@@ -14,9 +14,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use ofs::catalog::{Catalog, VolumeDefinition};
-use ofs::filesystem::{AccessModel, Capabilities, OperationId, VolumeId, VolumeModel};
+use ofs::filesystem::{AccessModel, OperationId, VolumeId, VolumeModel};
 use ofs::managed::{
-    D1Config, D1Metadata, FileLayoutPolicy, ManagedDataFormat, ManagedError, ManagedErrorKind,
+    D1Config, D1Metadata, FileLayoutPolicy, ManagedError, ManagedErrorKind, ManagedExtension,
     ManagedFormat, ManagedVolume, Metadata, MetadataPlacement, ObjectMetadata,
 };
 use ofs::sync::{ReplicaState, SyncEngine};
@@ -25,7 +25,7 @@ use opendal::layers::ConcurrentLimitLayer;
 use url::Url;
 
 use crate::cli::{
-    Cli, Command, FileLayoutArg, StatusArgs, SyncArgs, VolumeCommand, VolumeCreateArgs,
+    Cli, Command, FileLayoutArg, MountArgs, StatusArgs, SyncArgs, VolumeCommand, VolumeCreateArgs,
     VolumeGcArgs, VolumePackArgs,
 };
 
@@ -36,43 +36,21 @@ const DEFAULT_FASTCDC_MAXIMUM_CHUNK_SIZE: u32 = 1024 * 1024;
 
 pub(crate) async fn run(cli: Cli) -> Result<()> {
     let transfer_concurrency = cli.transfer_concurrency;
-    match (cli.command, cli.mount_path, cli.backend) {
-        (
-            Some(Command::Volume {
-                command: VolumeCommand::Create(args),
-            }),
-            None,
-            None,
-        ) => create_volume(cli.config.as_deref(), args, transfer_concurrency).await,
-        (
-            Some(Command::Volume {
-                command: VolumeCommand::Pack(args),
-            }),
-            None,
-            None,
-        ) => pack_volume(cli.config.as_deref(), args, transfer_concurrency).await,
-        (
-            Some(Command::Volume {
-                command: VolumeCommand::Gc(args),
-            }),
-            None,
-            None,
-        ) => gc_volume(cli.config.as_deref(), args, transfer_concurrency).await,
-        (Some(Command::Sync(args)), None, None) => {
-            sync_volume(cli.config.as_deref(), args, transfer_concurrency).await
+    match cli.command {
+        Command::Volume {
+            command: VolumeCommand::Create(args),
+        } => create_volume(cli.config.as_deref(), args, transfer_concurrency).await,
+        Command::Volume {
+            command: VolumeCommand::Pack(args),
+        } => pack_volume(cli.config.as_deref(), args, transfer_concurrency).await,
+        Command::Volume {
+            command: VolumeCommand::Gc(args),
+        } => gc_volume(cli.config.as_deref(), args, transfer_concurrency).await,
+        Command::Mount(args) => {
+            mount_volume(cli.config.as_deref(), args, transfer_concurrency).await
         }
-        (Some(Command::Status(args)), None, None) => {
-            status(cli.config.as_deref(), args, transfer_concurrency)
-        }
-        (None, Some(mount_path), Some(backend)) => {
-            mount(&mount_path, &backend, transfer_concurrency).await
-        }
-        (Some(_), _, _) => {
-            bail!("a subcommand cannot be combined with Direct Mount arguments; run `ofs --help`")
-        }
-        (None, _, _) => {
-            bail!("provide a volume command or both MOUNT_PATH and BACKEND_URL; run `ofs --help`")
-        }
+        Command::Sync(args) => sync_volume(cli.config.as_deref(), args, transfer_concurrency).await,
+        Command::Status(args) => status(cli.config.as_deref(), args, transfer_concurrency),
     }
 }
 
@@ -106,6 +84,11 @@ async fn pack_volume(
     transfer_concurrency: NonZeroUsize,
 ) -> Result<()> {
     let volume = open_managed_volume(config, &args.alias, transfer_concurrency).await?;
+    let rebuilt = if args.rebuild_index {
+        Some(volume.rebuild_pack_index().await?)
+    } else {
+        None
+    };
     let observed = volume
         .observe()
         .await?
@@ -150,7 +133,7 @@ async fn pack_volume(
         reclaimed = volume.reclaim_packed_loose(&current).await?;
     }
     println!(
-        "packed {:?}: packs={} content={} logical_bytes={} replacements={} retired={} reclaimed={}",
+        "packed {:?}: packs={} content={} logical_bytes={} replacements={} retired={} reclaimed={}{}",
         args.alias,
         packed.packs.len(),
         packed.reclaimable_loose.len(),
@@ -158,6 +141,9 @@ async fn pack_volume(
         replacements,
         retired,
         reclaimed,
+        rebuilt
+            .map(|content| format!(" rebuilt_index_content={content}"))
+            .unwrap_or_default(),
     );
     Ok(())
 }
@@ -172,60 +158,79 @@ async fn open_managed_volume(
         .get(alias)
         .with_context(|| format!("volume alias {alias:?} is not in the catalog"))?
         .clone();
-    if definition.model != VolumeModel::Managed || definition.format_major != 1 {
+    let settings = definition
+        .managed_settings()
+        .context("Managed volume maintenance requires a Managed volume")?;
+    if settings.format_major != 1 {
         bail!("Managed volume maintenance requires a Managed volume using format v1");
     }
 
     let data = open_operator(&definition.storage, transfer_concurrency)?;
-    ManagedDataFormat::read(&data).await?.validate_for_write()?;
-    let metadata = open_metadata(data.clone(), definition.metadata.as_ref())?;
-    let placement = if definition.metadata.is_some() {
+    let metadata = open_metadata(data.clone(), settings.metadata.as_ref())?;
+    let placement = if settings.metadata.is_some() {
         MetadataPlacement::ExternalD1
     } else {
         MetadataPlacement::ColocatedObject
     };
-    let expected = ManagedFormat::v1(
-        definition.volume_id,
-        placement,
-        definition.storage.to_string(),
-    )?;
-    if metadata.read_format().await? != expected {
+    let expected = managed_format(definition.volume_id, placement)?;
+    let data_format = ObjectMetadata::new(data.clone()).read_format().await?;
+    if data_format != expected {
         bail!("volume catalog and Managed format v1 binding disagree");
     }
-    Ok(match metadata {
-        Metadata::Object(_) => ManagedVolume::object(definition.volume_id, data)?,
-        Metadata::D1(metadata) => ManagedVolume::d1(definition.volume_id, data, metadata)?,
-    })
+    if let Metadata::D1(metadata) = &metadata
+        && metadata.read_format().await? != data_format
+    {
+        bail!("Managed data root and transactional metadata binding disagree");
+    }
+    match metadata {
+        Metadata::Object(_) => ManagedVolume::object(expected, data),
+        Metadata::D1(metadata) => ManagedVolume::d1(expected, data, metadata),
+    }?
+    .with_file_layout(settings.file_layout)
+    .map_err(Into::into)
 }
 
 async fn create_volume(
     config: Option<&Path>,
-    args: VolumeCreateArgs,
+    mut args: VolumeCreateArgs,
     transfer_concurrency: NonZeroUsize,
 ) -> Result<()> {
-    if args.model != VolumeModel::Managed {
-        bail!(
-            "named Direct volumes are not implemented; use `ofs MOUNT_PATH BACKEND_URL` for Direct Mount"
-        );
+    if args.model == VolumeModel::Managed && args.metadata.is_none() {
+        args.metadata = env::var_os("OFS_METADATA_URL")
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                value
+                    .into_string()
+                    .map_err(|_| anyhow!("OFS_METADATA_URL is not valid UTF-8"))
+                    .and_then(|value| {
+                        Url::parse(&value).context("OFS_METADATA_URL is not a valid URL")
+                    })
+            })
+            .transpose()?;
     }
-
     let mut catalog = match config {
         Some(path) => Catalog::load(path),
         None => Catalog::load_from_env(),
     }
     .context("cannot open the volume catalog; set --config or OFS_CONFIG to a writable path")?;
     let configured = catalog.get(&args.alias).cloned();
+    if args.model == VolumeModel::Direct {
+        return create_direct_volume(catalog, configured.as_ref(), args, transfer_concurrency);
+    }
+
     let file_layout = requested_file_layout(
         &args,
-        configured.as_ref().map(|definition| definition.file_layout),
+        configured
+            .as_ref()
+            .and_then(VolumeDefinition::managed_settings)
+            .map(|settings| settings.file_layout),
     )?;
     let provisional_id = configured
         .as_ref()
         .map(|definition| definition.volume_id)
         .unwrap_or_else(VolumeId::generate);
-    let provisional = VolumeDefinition::new(
+    let provisional = VolumeDefinition::managed(
         provisional_id,
-        args.model,
         args.storage.clone(),
         args.metadata.clone(),
         1,
@@ -247,18 +252,17 @@ async fn create_volume(
         MetadataPlacement::ColocatedObject
     };
     let data = open_operator(&args.storage, transfer_concurrency)?;
-    ManagedDataFormat::v1()
-        .activate(&data)
-        .await
-        .map_err(create_format_error)?;
-    let metadata = open_metadata(data, args.metadata.as_ref())?;
-    let desired = ManagedFormat::v1(provisional_id, placement, args.storage.to_string())?;
-    let format = match metadata.create_format(&desired).await {
+    let metadata = open_metadata(data.clone(), args.metadata.as_ref())?;
+    let desired = managed_format(provisional_id, placement)?;
+    let data_metadata = ObjectMetadata::new(data);
+    let format = match data_metadata.create_format(&desired).await {
         Ok(format) => format,
         Err(error) if configured.is_none() && error.kind() == ManagedErrorKind::Conflict => {
-            let observed = metadata.read_format().await.map_err(create_format_error)?;
-            let expected =
-                ManagedFormat::v1(observed.volume_id(), placement, args.storage.to_string())?;
+            let observed = data_metadata
+                .read_format()
+                .await
+                .map_err(create_format_error)?;
+            let expected = managed_format(observed.volume_id(), placement)?;
             if observed != expected {
                 return Err(create_format_error(error));
             }
@@ -266,14 +270,13 @@ async fn create_volume(
         }
         Err(error) => return Err(create_format_error(error)),
     };
-    let definition = VolumeDefinition::new(
-        format.volume_id(),
-        args.model,
-        args.storage,
-        args.metadata,
-        1,
-    )?
-    .with_file_layout(file_layout)?;
+    if let Metadata::D1(metadata) = &metadata
+        && metadata.create_format(&format).await? != format
+    {
+        bail!("Managed data root and transactional metadata binding disagree");
+    }
+    let definition = VolumeDefinition::managed(format.volume_id(), args.storage, args.metadata, 1)?
+        .with_file_layout(file_layout)?;
     let created = if configured.is_some() {
         catalog.configure_file_layout(&args.alias, file_layout)?;
         false
@@ -287,6 +290,41 @@ async fn create_volume(
 
     let action = if created { "created" } else { "opened" };
     println!("{action} managed volume {:?} with format v1", args.alias);
+    Ok(())
+}
+
+fn create_direct_volume(
+    mut catalog: Catalog,
+    configured: Option<&VolumeDefinition>,
+    args: VolumeCreateArgs,
+    transfer_concurrency: NonZeroUsize,
+) -> Result<()> {
+    if args.metadata.is_some() {
+        bail!("--metadata is only valid with --model managed");
+    }
+    if args.file_layout.is_some()
+        || args.fastcdc_minimum_file_size.is_some()
+        || args.fastcdc_minimum_chunk_size.is_some()
+        || args.fastcdc_target_chunk_size.is_some()
+        || args.fastcdc_maximum_chunk_size.is_some()
+    {
+        bail!("file layout options are only valid with --model managed");
+    }
+
+    let volume_id = configured
+        .map(|definition| definition.volume_id)
+        .unwrap_or_else(VolumeId::generate);
+    open_operator(&args.storage, transfer_concurrency)
+        .context("cannot configure the Direct volume storage")?;
+    let definition = VolumeDefinition::direct(volume_id, args.storage)
+        .context("volume URLs must be credential-free; supply credentials through provider environment variables")?;
+    let created = catalog.create(&args.alias, definition)?;
+    catalog.save().context(
+        "the Direct volume binding could not be saved; fix the catalog path and repeat the command",
+    )?;
+
+    let action = if created { "created" } else { "opened" };
+    println!("{action} direct volume {:?}", args.alias);
     Ok(())
 }
 
@@ -342,6 +380,15 @@ fn open_metadata(data: Operator, metadata: Option<&Url>) -> Result<Metadata> {
     }
 }
 
+fn managed_format(volume_id: VolumeId, placement: MetadataPlacement) -> Result<ManagedFormat> {
+    ManagedFormat::v1(
+        volume_id,
+        placement,
+        [ManagedExtension::FastCdc, ManagedExtension::Pack],
+    )
+    .map_err(Into::into)
+}
+
 async fn sync_volume(
     config: Option<&Path>,
     args: SyncArgs,
@@ -352,36 +399,39 @@ async fn sync_volume(
         .get(&args.alias)
         .with_context(|| format!("volume alias {:?} is not in the catalog", args.alias))?
         .clone();
-    if definition.model != VolumeModel::Managed || definition.format_major != 1 {
+    let settings = definition
+        .managed_settings()
+        .context("sync requires a Managed volume")?;
+    if settings.format_major != 1 {
         bail!("sync requires a Managed volume using format v1");
     }
 
     let data = open_operator(&definition.storage, transfer_concurrency)?;
-    ManagedDataFormat::read(&data).await?.validate_for_write()?;
-    let metadata = open_metadata(data.clone(), definition.metadata.as_ref())?;
-    let placement = if definition.metadata.is_some() {
+    let metadata = open_metadata(data.clone(), settings.metadata.as_ref())?;
+    let placement = if settings.metadata.is_some() {
         MetadataPlacement::ExternalD1
     } else {
         MetadataPlacement::ColocatedObject
     };
-    let expected = ManagedFormat::v1(
-        definition.volume_id,
-        placement,
-        definition.storage.to_string(),
-    )?;
-    if metadata.read_format().await? != expected {
+    let expected = managed_format(definition.volume_id, placement)?;
+    let data_format = ObjectMetadata::new(data.clone()).read_format().await?;
+    if data_format != expected {
         bail!("volume catalog and Managed format v1 binding disagree");
     }
-
-    let engine = match metadata {
-        Metadata::Object(_) => SyncEngine::object(definition.volume_id, data)?,
-        Metadata::D1(metadata) => SyncEngine::d1(definition.volume_id, data, metadata)?,
+    if let Metadata::D1(metadata) = &metadata
+        && metadata.read_format().await? != data_format
+    {
+        bail!("Managed data root and transactional metadata binding disagree");
     }
-    .with_file_layout(definition.file_layout)?
-    .with_transfer_concurrency(transfer_concurrency);
-    let resolutions = args.resolve.into_iter().collect::<Vec<_>>();
+
+    let volume = match metadata {
+        Metadata::Object(_) => ManagedVolume::object(expected, data),
+        Metadata::D1(metadata) => ManagedVolume::d1(expected, data, metadata),
+    }?
+    .with_file_layout(settings.file_layout)?;
+    let engine = SyncEngine::new(volume).with_transfer_concurrency(transfer_concurrency);
     let result = engine
-        .sync(&args.replica, &args.state, &resolutions)
+        .sync(&args.replica, &args.state, &args.resolve)
         .await?;
     if !result.conflicts.is_empty() {
         bail!(
@@ -412,41 +462,18 @@ fn status(
     let (alias, definition) = catalog
         .find_by_id(state.volume)
         .context("replica volume is not in the local catalog")?;
-    if definition.model != VolumeModel::Managed {
-        bail!("replica state is not bound to a Managed volume");
-    }
+    let settings = definition
+        .managed_settings()
+        .context("replica state is not bound to a Managed volume")?;
     let storage = open_operator(&definition.storage, transfer_concurrency)?;
     let storage_capabilities = storage.info().full_capability();
-    let metadata_authority = if definition.metadata.is_some() {
+    let metadata_authority = if settings.metadata.is_some() {
         "d1"
     } else {
         "object"
     };
-    let capabilities = Capabilities::managed_sync_v1();
-    let guarantees = capabilities
-        .guarantees()
-        .map(|capability| {
-            serde_json::json!({
-                "name": capability.name.as_str(),
-                "guarantee": capability.guarantee,
-            })
-        })
-        .collect::<Vec<_>>();
-    let limitations = capabilities
-        .limitations()
-        .map(|limitation| {
-            serde_json::json!({
-                "name": limitation.name.as_str(),
-                "reason": limitation.reason,
-            })
-        })
-        .collect::<Vec<_>>();
-    let layout_settings = match definition.file_layout {
+    let layout_settings = match settings.file_layout {
         FileLayoutPolicy::Whole => serde_json::Value::Null,
-        FileLayoutPolicy::Fixed { chunk_size } => serde_json::json!({
-            "algorithm": "fixed",
-            "chunk_size": chunk_size,
-        }),
         FileLayoutPolicy::FastCdcV2020 {
             minimum_file_size,
             minimum_size,
@@ -462,14 +489,12 @@ fn status(
     };
     let value = serde_json::json!({
         "volume": alias,
-        "volume_model": model_name(definition.model),
+        "volume_model": model_name(definition.model()),
         "access_model": access_name(AccessModel::Sync),
         "replica": display_path(&args.replica),
         "common_sequence": state.common.sequence(),
         "pending": state.pending.is_some(),
         "conflicts": state.conflicts.len(),
-        "capabilities": guarantees,
-        "limitations": limitations,
         "assembly": {
             "volume": "managed",
             "access": "sync",
@@ -489,11 +514,11 @@ fn status(
             "durable_state_owners": ["managed_metadata", "managed_data", "sync_replica"],
         },
         "format": {
-            "managed_volume_major": definition.format_major,
+            "managed_volume_major": settings.format_major,
             "managed_data_major": 1,
         },
         "data_policy": {
-            "foreground_layout": definition.file_layout.name(),
+            "foreground_layout": settings.file_layout.name(),
             "layout_settings": layout_settings,
             "foreground_placement": "loose",
             "pack_maintenance": "explicit",
@@ -512,24 +537,13 @@ fn status(
         println!("{}", serde_json::to_string(&value)?);
     } else {
         println!(
-            "{}: Managed Sync at change {}, {} pending, {} conflict(s)",
+            "{}: {} {} at change {}, {} pending, {} conflict(s)",
             display_path(&args.replica),
+            model_name(definition.model()),
+            access_name(AccessModel::Sync),
             state.common.sequence(),
             usize::from(state.pending.is_some()),
             state.conflicts.len()
-        );
-        println!(
-            "guarantees: {}; limitations: {}",
-            capabilities
-                .guarantees()
-                .map(|capability| capability.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", "),
-            capabilities
-                .limitations()
-                .map(|limitation| limitation.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
         );
     }
     Ok(())
@@ -612,6 +626,9 @@ fn d1_config(url: &Url) -> Result<D1Config> {
 
 fn create_format_error(error: ManagedError) -> anyhow::Error {
     match error.kind() {
+        ManagedErrorKind::UnsupportedFormat => anyhow!(
+            "the storage uses an unsupported Managed format, layout, or extension; use a supported client or choose a dedicated empty storage root"
+        ),
         ManagedErrorKind::Invalid => anyhow!(
             "cannot create Managed format v1 because the storage lacks required conditional writes or the format binding is invalid"
         ),
@@ -627,24 +644,34 @@ fn create_format_error(error: ManagedError) -> anyhow::Error {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
-async fn mount(
-    mount_path: &Path,
-    backend_url: &Url,
+async fn mount_volume(
+    config: Option<&Path>,
+    args: MountArgs,
     transfer_concurrency: NonZeroUsize,
 ) -> Result<()> {
+    let catalog = load_catalog(config)?;
+    let definition = catalog
+        .get(&args.alias)
+        .with_context(|| format!("volume alias {:?} is not in the catalog", args.alias))?;
+    if definition.model() != VolumeModel::Direct {
+        bail!(
+            "mount currently supports Direct volumes; {:?} is Managed",
+            args.alias
+        );
+    }
+    let operator = open_operator(&definition.storage, transfer_concurrency)
+        .context("cannot open the Direct volume storage configured in the catalog")?;
+    mount(&args.mount_path, operator, args.read_only).await
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
+async fn mount(mount_path: &Path, backend: Operator, read_only: bool) -> Result<()> {
     use fuse3::MountOptions;
     use fuse3::path::Session;
     use std::env;
 
-    if backend_url.has_host() {
-        log::warn!("backend host will be ignored");
-    }
-    let backend = Operator::via_iter(backend_url.scheme(), backend_url.query_pairs().into_owned())
-        .map(|operator| operator.layer(ConcurrentLimitLayer::new(transfer_concurrency.get())))
-        .map_err(|_| anyhow!("cannot configure BACKEND_URL; check its scheme and arguments"))?;
-
     let mut options = MountOptions::default();
+    options.read_only(read_only);
     let mut gid: u32 = nix::unistd::getgid().into();
     let mut uid: u32 = nix::unistd::getuid().into();
     if nix::unistd::getuid().is_root() {
@@ -678,6 +705,6 @@ async fn mount(
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "macos")))]
-async fn mount(_: &Path, _: &Url, _: NonZeroUsize) -> Result<()> {
+async fn mount(_: &Path, _: Operator, _: bool) -> Result<()> {
     bail!("Direct Mount is supported on Linux, FreeBSD, and macOS")
 }

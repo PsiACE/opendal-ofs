@@ -20,16 +20,18 @@
 //! This module defines semantic values only. It does not prescribe a volume
 //! implementation, an access frontend, or a durable representation.
 
-mod capability;
 mod identity;
 mod model;
 mod namespace;
 mod publication;
+mod volume;
 
-pub use capability::{
-    Capabilities, CapabilityGuarantee, CapabilityLimitation, CapabilityName, LimitationName,
-};
 pub use identity::{ChangeCursor, FileVersionId, Generation, NodeId, OperationId, VolumeId};
 pub use model::{AccessModel, VolumeModel};
 pub use namespace::{DirectoryEntry, NodeAttributes, NodeKind};
 pub use publication::{CommitOutcome, PublicationProgress};
+pub use volume::{
+    DirectoryPrecondition, DirectoryRecord, FileVersion, MaterializeRequest, NodePrecondition,
+    NodeRecord, Volume, VolumeError, VolumeErrorKind, VolumeObservation, VolumePublication,
+    VolumeReader, VolumeSnapshot,
+};

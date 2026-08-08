@@ -31,10 +31,10 @@ use crate::filesystem::OperationId;
 use crate::managed::namespace::ContentRef;
 use crate::managed::section::{self, Record as SectionRecord, Reference as SectionReference};
 
-const PACK_ROOT: &str = "data/v1/packs";
-const INDEX_ROOT: &str = "data/v1/pack-index";
-const INDEX_SECTION_ROOT: &str = "data/v1/pack-index/sections/sha256";
-const HEAD_KEY: &str = "data/v1/pack-index/head.cbor";
+const PACK_ROOT: &str = ".ofs/managed/extensions/data-pack/v1/packs/sha256";
+const INDEX_ROOT: &str = ".ofs/managed/indexes/data-pack/v1";
+const INDEX_SECTION_ROOT: &str = ".ofs/managed/indexes/data-pack/v1/sections/sha256";
+const HEAD_KEY: &str = ".ofs/managed/indexes/data-pack/v1/head.ofs";
 const PACK_MAGIC: &[u8; 8] = b"OFSPACK1";
 const TRAILER_MAGIC: &[u8; 8] = b"OFSPTRL1";
 const FOOTER_MAGIC: &str = "ofs-pack-footer";
@@ -94,6 +94,7 @@ type CachedPack = Arc<OnceCell<Result<Arc<SealedPack>, ManagedError>>>;
 /// Pack locations fixed for one materialization operation.
 #[derive(Clone, Debug)]
 pub(crate) struct PackReadSession {
+    enabled: bool,
     operator: Operator,
     store: PackStore,
     index: Arc<OnceCell<Result<Option<PackIndex>, ManagedError>>>,
@@ -101,9 +102,12 @@ pub(crate) struct PackReadSession {
 }
 
 impl PackReadSession {
-    pub(crate) fn new(operator: Operator) -> Result<Self, ManagedError> {
-        require_index_read_capabilities(&operator)?;
+    pub(crate) fn new(operator: Operator, enabled: bool) -> Result<Self, ManagedError> {
+        if enabled {
+            require_index_read_capabilities(&operator)?;
+        }
         Ok(Self {
+            enabled,
             operator: operator.clone(),
             store: PackStore { operator },
             index: Arc::new(OnceCell::new()),
@@ -116,6 +120,9 @@ impl PackReadSession {
         &self,
         content: ContentRef,
     ) -> Result<Vec<PackLocation>, ManagedError> {
+        if !self.enabled {
+            return Ok(Vec::new());
+        }
         let operator = self.operator.clone();
         let index = self
             .index
@@ -130,6 +137,9 @@ impl PackReadSession {
 
     /// Download a complete pack without retaining it in this session.
     pub(crate) async fn read_full(&self, id: PackId) -> Result<VerifiedPack, ManagedError> {
+        if !self.enabled {
+            return Err(unsupported("data-pack/1 is not enabled for this volume"));
+        }
         self.store.read_complete(id).await
     }
 
@@ -402,16 +412,6 @@ impl PackStore {
         Ok((SealedPack { id, locations }, complete))
     }
 
-    /// Read and validate one indexed content range.
-    pub async fn read(
-        &self,
-        content: ContentRef,
-        location: PackLocation,
-    ) -> Result<Vec<u8>, ManagedError> {
-        let (pack, _) = self.inspect_inner(location.pack, false).await?;
-        self.read_verified(content, location, &pack).await
-    }
-
     pub(crate) async fn read_verified(
         &self,
         content: ContentRef,
@@ -437,7 +437,7 @@ impl PackStore {
     }
 
     /// Rebuild and publish the derived pack index from verified pack footers.
-    pub async fn rebuild_index(&self) -> Result<PackIndex, ManagedError> {
+    pub(crate) async fn rebuild_index(&self) -> Result<usize, ManagedError> {
         let mut locations: BTreeMap<ContentRef, Vec<PackLocation>> = BTreeMap::new();
         let entries = self
             .operator
@@ -458,12 +458,15 @@ impl PackStore {
         let mut index = PackIndex {
             operator: self.operator.clone(),
             locations,
-            sections: BTreeSet::new(),
+            sections: Vec::new(),
+            dirty: BTreeSet::new(),
             revision: parent,
             head_etag,
         };
+        index.dirty.extend(index.locations.keys().copied());
+        let content_count = index.locations.len();
         index.persist().await?;
-        Ok(index)
+        Ok(content_count)
     }
 
     pub(crate) async fn delete(&self, id: PackId) -> Result<(), ManagedError> {
@@ -505,7 +508,8 @@ fn validate_location(
 pub struct PackIndex {
     operator: Operator,
     locations: BTreeMap<ContentRef, Vec<PackLocation>>,
-    sections: BTreeSet<[u8; 32]>,
+    sections: Vec<StoredIndexSectionReference>,
+    dirty: BTreeSet<ContentRef>,
     revision: Option<[u8; 32]>,
     head_etag: Option<String>,
 }
@@ -524,6 +528,7 @@ impl PackIndex {
             if !locations.contains(location) {
                 locations.push(*location);
                 locations.sort_unstable();
+                self.dirty.insert(*content);
             }
         }
     }
@@ -553,8 +558,12 @@ impl PackIndex {
     }
 
     pub(crate) fn remove_packs(&mut self, retired: &BTreeSet<PackId>) {
-        for locations in self.locations.values_mut() {
+        for (content, locations) in &mut self.locations {
+            let before = locations.len();
             locations.retain(|location| !retired.contains(&location.pack));
+            if locations.len() != before {
+                self.dirty.insert(*content);
+            }
         }
         normalize_locations(&mut self.locations);
     }
@@ -609,16 +618,13 @@ impl PackIndex {
             CHECKPOINT_MAGIC,
             "open pack index",
         )?;
-        let sections = checkpoint
-            .sections
-            .iter()
-            .map(|section| section.id)
-            .collect();
+        let sections = checkpoint.sections.clone();
         let locations = checkpoint.into_locations(&operator).await?;
         Ok(Some(Self {
             operator,
             locations,
             sections,
+            dirty: BTreeSet::new(),
             revision: Some(head.revision),
             head_etag: etag,
         }))
@@ -630,7 +636,8 @@ impl PackIndex {
             None => Ok(Self {
                 operator,
                 locations: BTreeMap::new(),
-                sections: BTreeSet::new(),
+                sections: Vec::new(),
+                dirty: BTreeSet::new(),
                 revision: None,
                 head_etag: None,
             }),
@@ -642,9 +649,13 @@ impl PackIndex {
         require_index_create_capabilities(&self.operator)?;
         self.require_update()?;
         normalize_locations(&mut self.locations);
-        let checkpoint =
-            IndexCheckpoint::from_locations(&self.operator, &self.locations, &self.sections)
-                .await?;
+        let checkpoint = IndexCheckpoint::from_locations(
+            &self.operator,
+            &self.locations,
+            &self.sections,
+            &self.dirty,
+        )
+        .await?;
         let checkpoint_bytes = encode(&checkpoint, "persist pack index")?;
         let checkpoint_id = digest(&checkpoint_bytes);
         create_immutable(
@@ -718,11 +729,8 @@ impl PackIndex {
             .await?
             .ok_or_else(|| corrupt("persist pack index", "published head is missing"))?;
         self.revision = Some(revision_id);
-        self.sections = checkpoint
-            .sections
-            .iter()
-            .map(|section| section.id)
-            .collect();
+        self.sections = checkpoint.sections;
+        self.dirty.clear();
         self.head_etag = etag;
         Ok(())
     }
@@ -800,54 +808,85 @@ impl IndexCheckpoint {
     async fn from_locations(
         operator: &Operator,
         locations: &BTreeMap<ContentRef, Vec<PackLocation>>,
-        known_sections: &BTreeSet<[u8; 32]>,
+        previous: &[StoredIndexSectionReference],
+        dirty: &BTreeSet<ContentRef>,
     ) -> Result<Self, ManagedError> {
-        let records = locations
-            .iter()
-            .map(|(content, locations)| {
-                Ok(SectionRecord {
-                    key: content_key(*content),
-                    value: encode(locations, "persist pack index")?,
-                })
-            })
-            .collect::<Result<Vec<_>, ManagedError>>()?;
-        let encoded = section::encode([0; 16], INDEX_SECTION, records, "persist pack index")?;
-        let mut sections = Vec::with_capacity(encoded.len());
-        for section in encoded {
-            let present = if known_sections.contains(&section.reference.id) {
-                match operator
-                    .stat(&index_section_key(section.reference.id))
-                    .await
-                {
-                    Ok(metadata) if metadata.content_length() == section.bytes.len() as u64 => true,
-                    Ok(_) => {
-                        return Err(corrupt(
-                            "persist pack index",
-                            "existing index section has another length",
-                        ));
-                    }
-                    Err(error) if error.kind() == ErrorKind::NotFound => false,
-                    Err(_) => {
-                        return Err(unavailable(
-                            "persist pack index",
-                            "index section cannot be inspected",
-                        ));
-                    }
-                }
-            } else {
-                false
-            };
-            if !present {
-                create_immutable(
-                    operator,
-                    &index_section_key(section.reference.id),
-                    &section.bytes,
-                    "persist pack index",
-                )
-                .await?;
-            }
-            sections.push(section.reference.into());
+        validate_index_sections(previous, "persist pack index")?;
+        let mut changes = BTreeMap::new();
+        for content in dirty {
+            changes.insert(
+                content_key(*content),
+                locations
+                    .get(content)
+                    .map(|locations| encode(locations, "persist pack index"))
+                    .transpose()?,
+            );
         }
+        let mut sections = Vec::new();
+        for stored in previous {
+            let keys = changes
+                .keys()
+                .take_while(|key| key.as_slice() <= stored.last_key.as_slice())
+                .cloned()
+                .collect::<Vec<_>>();
+            if keys.is_empty() {
+                sections.push(stored.clone());
+                continue;
+            }
+            let reference = stored.as_reference();
+            let bytes = read_required(
+                operator,
+                &index_section_key(reference.id),
+                "persist pack index",
+            )
+            .await?;
+            let mut records = section::decode(&reference, [0; 16], &bytes, "persist pack index")?
+                .into_iter()
+                .map(|record| (record.key, record.value))
+                .collect::<BTreeMap<_, _>>();
+            let mut changed = false;
+            for key in keys {
+                match changes.remove(&key).expect("collected index change") {
+                    Some(value) => {
+                        changed |= records.insert(key, value.clone()).as_ref() != Some(&value);
+                    }
+                    None => changed |= records.remove(&key).is_some(),
+                }
+            }
+            if !changed {
+                sections.push(stored.clone());
+                continue;
+            }
+            sections.extend(
+                persist_index_sections(
+                    operator,
+                    section::encode(
+                        [0; 16],
+                        INDEX_SECTION,
+                        records
+                            .into_iter()
+                            .map(|(key, value)| SectionRecord { key, value })
+                            .collect(),
+                        "persist pack index",
+                    )?,
+                )
+                .await?,
+            );
+        }
+        if !changes.is_empty() {
+            let records = changes
+                .into_iter()
+                .filter_map(|(key, value)| value.map(|value| SectionRecord { key, value }))
+                .collect();
+            sections.extend(
+                persist_index_sections(
+                    operator,
+                    section::encode([0; 16], INDEX_SECTION, records, "persist pack index")?,
+                )
+                .await?,
+            );
+        }
+        validate_index_sections(&sections, "persist pack index")?;
         Ok(Self {
             magic: CHECKPOINT_MAGIC.to_owned(),
             major: FORMAT_MAJOR,
@@ -859,20 +898,10 @@ impl IndexCheckpoint {
         self,
         operator: &Operator,
     ) -> Result<BTreeMap<ContentRef, Vec<PackLocation>>, ManagedError> {
+        validate_index_sections(&self.sections, "open pack index")?;
         let mut output = BTreeMap::new();
         let mut previous = None;
-        let mut previous_section: Option<&StoredIndexSectionReference> = None;
         for stored in &self.sections {
-            if stored.kind != INDEX_SECTION
-                || stored.records == 0
-                || stored.first_key > stored.last_key
-                || previous_section.is_some_and(|previous| previous.last_key >= stored.first_key)
-            {
-                return Err(corrupt(
-                    "open pack index",
-                    "index section references are invalid",
-                ));
-            }
             let reference = stored.as_reference();
             let bytes = read_required(
                 operator,
@@ -896,10 +925,44 @@ impl IndexCheckpoint {
                 previous = Some(content);
                 output.insert(content, locations);
             }
-            previous_section = Some(stored);
         }
         Ok(output)
     }
+}
+
+fn validate_index_sections(
+    sections: &[StoredIndexSectionReference],
+    action: &'static str,
+) -> Result<(), ManagedError> {
+    if sections.iter().any(|section| {
+        section.kind != INDEX_SECTION
+            || section.records == 0
+            || section.first_key > section.last_key
+    }) || sections
+        .windows(2)
+        .any(|pair| pair[0].last_key >= pair[1].first_key)
+    {
+        return Err(corrupt(action, "index section references are invalid"));
+    }
+    Ok(())
+}
+
+async fn persist_index_sections(
+    operator: &Operator,
+    encoded: Vec<section::Encoded>,
+) -> Result<Vec<StoredIndexSectionReference>, ManagedError> {
+    let mut sections = Vec::with_capacity(encoded.len());
+    for section in encoded {
+        create_immutable(
+            operator,
+            &index_section_key(section.reference.id),
+            &section.bytes,
+            "persist pack index",
+        )
+        .await?;
+        sections.push(section.reference.into());
+    }
+    Ok(sections)
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1053,12 +1116,12 @@ fn pack_key(id: PackId) -> String {
 }
 
 fn checkpoint_key(id: [u8; 32]) -> String {
-    format!("{INDEX_ROOT}/checkpoints/{}.cbor", hex(&id))
+    format!("{INDEX_ROOT}/checkpoints/sha256/{}.ofs", hex(&id))
 }
 
 fn index_section_key(id: [u8; 32]) -> String {
     let encoded = hex(&id);
-    format!("{INDEX_SECTION_ROOT}/{}/{}.section", &encoded[..2], encoded)
+    format!("{INDEX_SECTION_ROOT}/{encoded}.ofs")
 }
 
 fn content_key(content: ContentRef) -> Vec<u8> {
@@ -1079,7 +1142,7 @@ fn content_from_key(key: &[u8]) -> Option<ContentRef> {
 }
 
 fn revision_key(id: [u8; 32]) -> String {
-    format!("{INDEX_ROOT}/revisions/{}.cbor", hex(&id))
+    format!("{INDEX_ROOT}/revisions/sha256/{}.ofs", hex(&id))
 }
 
 fn pack_id_from_key(key: &str) -> Option<PackId> {
@@ -1171,6 +1234,14 @@ fn invalid(action: &'static str, message: &'static str) -> ManagedError {
     ManagedError::new(ManagedErrorKind::Invalid, action, message)
 }
 
+fn unsupported(message: &'static str) -> ManagedError {
+    ManagedError::new(
+        ManagedErrorKind::UnsupportedFormat,
+        "read Managed pack",
+        message,
+    )
+}
+
 fn corrupt(action: &'static str, message: &'static str) -> ManagedError {
     ManagedError::new(ManagedErrorKind::Corrupt, action, message)
 }
@@ -1191,6 +1262,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn index_persist_rewrites_only_the_dirty_section() {
+        let operator = memory();
+        let pack = PackId([9; 32]);
+        let mut locations = (0_u32..80)
+            .map(|index| {
+                let content = content_ref(&index.to_be_bytes());
+                (
+                    content,
+                    vec![PackLocation {
+                        pack,
+                        offset: u64::from(index) * 4,
+                        stored_length: 4,
+                        logical_length: content.logical_length,
+                    }],
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let records = locations
+            .iter()
+            .map(|(content, locations)| SectionRecord {
+                key: content_key(*content),
+                value: encode(locations, "test").unwrap(),
+            })
+            .collect();
+        let previous = persist_index_sections(
+            &operator,
+            section::encode_for_test([0; 16], INDEX_SECTION, records, 256, 512, 2048).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(previous.len() > 2);
+        let changed = *locations.keys().nth(40).unwrap();
+        locations.get_mut(&changed).unwrap()[0].offset += 1;
+
+        let checkpoint = IndexCheckpoint::from_locations(
+            &operator,
+            &locations,
+            &previous,
+            &BTreeSet::from([changed]),
+        )
+        .await
+        .unwrap();
+        let previous_ids = previous
+            .iter()
+            .map(|section| section.id)
+            .collect::<BTreeSet<_>>();
+        let current_ids = checkpoint
+            .sections
+            .iter()
+            .map(|section| section.id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            previous_ids.intersection(&current_ids).count(),
+            previous.len() - 1
+        );
+        assert_eq!(
+            checkpoint.into_locations(&operator).await.unwrap(),
+            locations
+        );
+    }
+
+    #[tokio::test]
     async fn filesystem_pack_creates_index_but_refuses_unsafe_update() {
         let root = TempDir::new().unwrap();
         let operator = Operator::new(services::Fs::default().root(root.path().to_str().unwrap()))
@@ -1208,9 +1341,13 @@ mod tests {
         assert_eq!(sealed.locations.len(), 2);
         let alpha = content_ref(b"alpha");
         let location = sealed.locations[&alpha];
-        assert_eq!(store.read(alpha, location).await.unwrap(), b"alpha");
+        assert_eq!(
+            store.read_verified(alpha, location, &sealed).await.unwrap(),
+            b"alpha"
+        );
 
-        let rebuilt = store.rebuild_index().await.unwrap();
+        assert_eq!(store.rebuild_index().await.unwrap(), 2);
+        let rebuilt = PackIndex::open(operator.clone()).await.unwrap().unwrap();
         assert_eq!(rebuilt.locations(alpha), &[location]);
         let mut reopened = PackIndex::open(operator).await.unwrap().unwrap();
         let error = reopened.persist().await.unwrap_err();
@@ -1231,12 +1368,12 @@ mod tests {
         assert_eq!(complete.content(content_ref(b"missing")), None);
         assert_eq!(
             store
-                .read(content, sealed.locations[&content])
+                .read_verified(content, sealed.locations[&content], &sealed)
                 .await
                 .unwrap(),
             b"on disk"
         );
-        store.rebuild_index().await.unwrap();
+        assert_eq!(store.rebuild_index().await.unwrap(), 1);
         let reopened = PackIndex::open(operator).await.unwrap().unwrap();
         assert_eq!(reopened.locations(content), &[sealed.locations[&content]]);
     }

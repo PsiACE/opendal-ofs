@@ -39,15 +39,15 @@ use crate::filesystem::{
 use crate::managed::section::{self, Record as SectionRecord, Reference as SectionReference};
 use crate::managed::{ManagedError, ManagedErrorKind};
 
-const HEAD_KEY: &str = ".ofs/managed-sync/head.json";
-const TRANSACTION_ROOT: &str = ".ofs/managed-sync/transactions";
-const CHECKPOINT_ROOT: &str = ".ofs/managed-sync/checkpoints";
-const SECTION_ROOT: &str = ".ofs/managed-sync/sections/sha256";
-const RESULT_ROOT: &str = ".ofs/managed-sync/results";
+const HEAD_KEY: &str = ".ofs/managed/metadata/v1/head.json";
+const TRANSACTION_ROOT: &str = ".ofs/managed/metadata/v1/transactions";
+const CHECKPOINT_ROOT: &str = ".ofs/managed/metadata/v1/checkpoints/sha256";
+const SECTION_ROOT: &str = ".ofs/managed/metadata/v1/sections/sha256";
+const RESULT_ROOT: &str = ".ofs/managed/metadata/v1/results";
 const TRANSACTION_MAGIC: &[u8] = b"OFS1TXN\0";
 const CHECKPOINT_MAGIC: &[u8] = b"OFS1CHK\0";
 const RESULT_MAGIC: &[u8] = b"OFS1RES\0";
-const HEAD_MAGIC: &str = "ofs-managed-sync-head";
+const HEAD_MAGIC: &str = "ofs-managed-head";
 const FORMAT_MAJOR: u16 = 1;
 const MAX_TAIL_TRANSACTIONS: u16 = 32;
 const NODE_SECTION: u8 = 1;
@@ -137,7 +137,7 @@ impl ObjectNamespace {
     ) -> Result<NamespaceObservation, ManagedError> {
         let recovered = self.recover(&head).await?;
         Ok(NamespaceObservation {
-            snapshot: recovered.snapshot,
+            snapshot: recovered,
             revision,
             authority: Box::new(ObservationAuthority { head }),
         })
@@ -183,24 +183,24 @@ impl ObjectNamespace {
                 value.authority.head.tail_transactions + 1 >= MAX_TAIL_TRANSACTIONS
             });
         let (checkpoint, checkpoint_cursor, tail_transactions) = if checkpoint_due {
-            let known_sections = match observed {
-                Some(observed) => match self
-                    .read_checkpoint(&observed.authority.head.checkpoint)
-                    .await
-                {
-                    Ok(checkpoint) => checkpoint
-                        .sections
-                        .into_iter()
-                        .map(|section| section.id)
-                        .collect(),
-                    Err(error) if error.kind() == ManagedErrorKind::Corrupt => BTreeSet::new(),
-                    Err(error) => return Err(error),
-                },
-                None => BTreeSet::new(),
+            let checkpoint = match observed {
+                Some(observed) => {
+                    let previous = self
+                        .read_checkpoint(&observed.authority.head.checkpoint)
+                        .await?;
+                    if previous.cursor != observed.authority.head.checkpoint_cursor {
+                        return Err(corrupt(
+                            "checkpoint Managed namespace",
+                            "checkpoint and HEAD disagree",
+                        ));
+                    }
+                    let mut transactions = self.read_tail(&observed.authority.head).await?;
+                    transactions.push(stored.clone());
+                    self.checkpoint_incremental(&publication.target, &previous, &transactions)
+                        .await?
+                }
+                None => self.checkpoint_full(&publication.target).await?,
             };
-            let checkpoint = self
-                .checkpoint(&publication.target, &known_sections)
-                .await?;
             let bytes = encode_cbor(
                 CHECKPOINT_MAGIC,
                 &checkpoint,
@@ -364,7 +364,7 @@ impl ObjectNamespace {
             return Ok(CommitOutcome::Absent);
         };
         let head = decode_head(&bytes)?;
-        let recovered = self.recover(&head).await?;
+        let snapshot = self.recover(&head).await?;
         if self.transaction_is_committed(&head, operation).await? {
             self.ensure_result(
                 operation,
@@ -375,13 +375,11 @@ impl ObjectNamespace {
             return Ok(CommitOutcome::Committed(target.cursor.into_cursor()?));
         }
         let parent = target.parent.into_cursor()?;
-        if recovered.snapshot.cursor == parent
-            || recovered.snapshot.cursor.sequence() <= parent.sequence()
-        {
+        if snapshot.cursor == parent || snapshot.cursor.sequence() <= parent.sequence() {
             return Ok(CommitOutcome::Absent);
         }
         Ok(CommitOutcome::Conflict {
-            observed: recovered.snapshot.cursor,
+            observed: snapshot.cursor,
         })
     }
 
@@ -525,17 +523,12 @@ impl ObjectNamespace {
             .ok_or_else(|| corrupt("read Managed namespace", "transaction is missing"))
     }
 
-    async fn recover(&self, head: &StoredHead) -> Result<Recovered, ManagedError> {
+    async fn recover(&self, head: &StoredHead) -> Result<NamespaceSnapshot, ManagedError> {
         head.validate(self.volume_id)?;
-        match self.recover_bounded(head).await {
-            Err(error) if error.kind() == ManagedErrorKind::Corrupt => {
-                self.recover_from_genesis(head).await
-            }
-            recovered => recovered,
-        }
+        self.recover_bounded(head).await
     }
 
-    async fn recover_bounded(&self, head: &StoredHead) -> Result<Recovered, ManagedError> {
+    async fn recover_bounded(&self, head: &StoredHead) -> Result<NamespaceSnapshot, ManagedError> {
         let checkpoint = self.read_checkpoint(&head.checkpoint).await?;
         if checkpoint.major != FORMAT_MAJOR
             || checkpoint.volume_id != *self.volume_id.as_bytes()
@@ -550,34 +543,7 @@ impl ObjectNamespace {
         validate_snapshot(&snapshot)
             .map_err(|_| corrupt("read Managed namespace", "checkpoint is invalid"))?;
 
-        let mut tail = Vec::with_capacity(head.tail_transactions.into());
-        if head.tail_transactions > 0 {
-            let latest = OperationId::from_bytes(head.latest_transaction);
-            let mut current = self.required_transaction(latest).await?;
-            let latest_bytes = encode_cbor(TRANSACTION_MAGIC, &current, "read Managed namespace")?;
-            if sha256(&latest_bytes) != head.latest_transaction_sha256
-                || current.cursor != head.cursor
-            {
-                return Err(corrupt(
-                    "read Managed namespace",
-                    "latest transaction and HEAD disagree",
-                ));
-            }
-            for index in 0..head.tail_transactions {
-                if index != 0 {
-                    current = self
-                        .required_transaction(OperationId::from_bytes(
-                            current.parent.operation.ok_or_else(|| {
-                                corrupt("read Managed namespace", "transaction tail is incomplete")
-                            })?,
-                        ))
-                        .await?;
-                }
-                tail.push(current.clone());
-            }
-        }
-        tail.reverse();
-        for transaction in tail {
+        for transaction in self.read_tail(head).await? {
             if transaction.parent.into_cursor()? != snapshot.cursor {
                 return Err(corrupt(
                     "read Managed namespace",
@@ -592,10 +558,13 @@ impl ObjectNamespace {
                 "checkpoint and transaction tail do not reach HEAD",
             ));
         }
-        Ok(Recovered { snapshot })
+        Ok(snapshot)
     }
 
-    async fn recover_from_genesis(&self, head: &StoredHead) -> Result<Recovered, ManagedError> {
+    async fn read_tail(&self, head: &StoredHead) -> Result<Vec<StoredTransaction>, ManagedError> {
+        if head.tail_transactions == 0 {
+            return Ok(Vec::new());
+        }
         let mut current = self
             .required_transaction(OperationId::from_bytes(head.latest_transaction))
             .await?;
@@ -607,52 +576,26 @@ impl ObjectNamespace {
                 "latest transaction and HEAD disagree",
             ));
         }
-        let mut history = Vec::new();
-        loop {
-            let parent = current.parent.into_cursor()?;
-            history.push(current);
-            let Some(operation) = parent.operation() else {
-                if parent != ChangeCursor::Genesis {
-                    return Err(corrupt(
-                        "read Managed namespace",
-                        "transaction history does not reach genesis",
-                    ));
-                }
-                break;
-            };
-            current = self.required_transaction(operation).await?;
-        }
-        history.reverse();
-        let mut snapshot = None;
-        for transaction in history {
-            let observed = snapshot
-                .as_ref()
-                .map_or(ChangeCursor::Genesis, |snapshot: &NamespaceSnapshot| {
-                    snapshot.cursor
-                });
-            if transaction.parent.into_cursor()? != observed {
-                return Err(corrupt(
-                    "read Managed namespace",
-                    "transaction history is not consecutive",
-                ));
+        let mut tail = Vec::with_capacity(head.tail_transactions.into());
+        for index in 0..head.tail_transactions {
+            if index != 0 {
+                current = self
+                    .required_transaction(OperationId::from_bytes(
+                        current.parent.operation.ok_or_else(|| {
+                            corrupt("read Managed namespace", "transaction tail is incomplete")
+                        })?,
+                    ))
+                    .await?;
             }
-            snapshot = Some(apply_transaction(snapshot, &transaction)?);
+            tail.push(current.clone());
         }
-        let snapshot = snapshot
-            .ok_or_else(|| corrupt("read Managed namespace", "transaction history is empty"))?;
-        if snapshot.cursor != head.cursor.into_cursor()? {
-            return Err(corrupt(
-                "read Managed namespace",
-                "transaction history does not reach HEAD",
-            ));
-        }
-        Ok(Recovered { snapshot })
+        tail.reverse();
+        Ok(tail)
     }
 
-    async fn checkpoint(
+    async fn checkpoint_full(
         &self,
         snapshot: &NamespaceSnapshot,
-        known_sections: &BTreeSet<[u8; 32]>,
     ) -> Result<StoredCheckpoint, ManagedError> {
         let scope = *self.volume_id.as_bytes();
         let mut encoded = Vec::new();
@@ -731,33 +674,7 @@ impl ObjectNamespace {
             "checkpoint Managed namespace",
         )?);
 
-        let mut sections: Vec<StoredSectionReference> = Vec::with_capacity(encoded.len());
-        for section in encoded {
-            let present = if known_sections.contains(&section.reference.id) {
-                match self
-                    .operator
-                    .stat(&section_key(&section.reference.id))
-                    .await
-                {
-                    Ok(metadata) if metadata.content_length() == section.bytes.len() as u64 => true,
-                    Ok(_) => {
-                        return Err(corrupt(
-                            "checkpoint Managed namespace",
-                            "existing checkpoint section has another length",
-                        ));
-                    }
-                    Err(error) if error.kind() == ErrorKind::NotFound => false,
-                    Err(_) => return Err(unavailable("checkpoint Managed namespace")),
-                }
-            } else {
-                false
-            };
-            if !present {
-                self.ensure_immutable(&section_key(&section.reference.id), &section.bytes)
-                    .await?;
-            }
-            sections.push(section.reference.into());
-        }
+        let mut sections = self.persist_sections(encoded).await?;
         sections.sort_by(|left, right| {
             left.kind
                 .cmp(&right.kind)
@@ -772,6 +689,167 @@ impl ObjectNamespace {
         })
     }
 
+    async fn checkpoint_incremental(
+        &self,
+        snapshot: &NamespaceSnapshot,
+        previous: &StoredCheckpoint,
+        transactions: &[StoredTransaction],
+    ) -> Result<StoredCheckpoint, ManagedError> {
+        validate_section_references(&previous.sections)?;
+        let mut cursor = previous.cursor.into_cursor()?;
+        for transaction in transactions {
+            if transaction.parent.into_cursor()? != cursor {
+                return Err(corrupt(
+                    "checkpoint Managed namespace",
+                    "checkpoint transactions are not consecutive",
+                ));
+            }
+            cursor = transaction.cursor.into_cursor()?;
+        }
+        if cursor != snapshot.cursor {
+            return Err(corrupt(
+                "checkpoint Managed namespace",
+                "checkpoint transactions do not reach the target",
+            ));
+        }
+        let sections = self
+            .rewrite_checkpoint_sections(&previous.sections, section_changes(transactions)?)
+            .await?;
+        Ok(StoredCheckpoint {
+            major: FORMAT_MAJOR,
+            volume_id: *self.volume_id.as_bytes(),
+            cursor: snapshot.cursor.into(),
+            root: *snapshot.root.as_bytes(),
+            sections,
+        })
+    }
+
+    async fn rewrite_checkpoint_sections(
+        &self,
+        previous: &[StoredSectionReference],
+        mut changes: CheckpointChanges,
+    ) -> Result<Vec<StoredSectionReference>, ManagedError> {
+        validate_section_references(previous)?;
+        let mut output = Vec::new();
+        for kind in [
+            NODE_SECTION,
+            DIRECTORY_SECTION,
+            DIRECTORY_ENTRY_SECTION,
+            FILE_VERSION_SECTION,
+        ] {
+            let pending = changes.records.entry(kind).or_default();
+            for stored in previous.iter().filter(|section| section.kind == kind) {
+                let keys = pending
+                    .keys()
+                    .take_while(|key| key.as_slice() <= stored.last_key.as_slice())
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let removes_directory = kind == DIRECTORY_ENTRY_SECTION
+                    && changes
+                        .removed_directories
+                        .iter()
+                        .any(|directory| section_may_contain_directory(stored, directory));
+                if keys.is_empty() && !removes_directory {
+                    output.push(stored.clone());
+                    continue;
+                }
+                let reference = stored.as_reference();
+                let mut records = self
+                    .read_section_records(&reference, "checkpoint Managed namespace")
+                    .await?
+                    .into_iter()
+                    .map(|record| (record.key, record.value))
+                    .collect::<BTreeMap<_, _>>();
+                let mut changed = false;
+                if removes_directory {
+                    let before = records.len();
+                    records.retain(|key, _| {
+                        !changes
+                            .removed_directories
+                            .iter()
+                            .any(|directory| key.starts_with(directory))
+                    });
+                    changed = records.len() != before;
+                }
+                for key in keys {
+                    match pending.remove(&key).expect("collected pending change") {
+                        Some(value) => {
+                            changed |= records.insert(key, value.clone()).as_ref() != Some(&value);
+                        }
+                        None => changed |= records.remove(&key).is_some(),
+                    }
+                }
+                if !changed {
+                    output.push(stored.clone());
+                    continue;
+                }
+                let records = records
+                    .into_iter()
+                    .map(|(key, value)| SectionRecord { key, value })
+                    .collect();
+                output.extend(
+                    self.persist_sections(section::encode(
+                        *self.volume_id.as_bytes(),
+                        kind,
+                        records,
+                        "checkpoint Managed namespace",
+                    )?)
+                    .await?,
+                );
+            }
+            if !pending.is_empty() {
+                let records = std::mem::take(pending)
+                    .into_iter()
+                    .filter_map(|(key, value)| value.map(|value| SectionRecord { key, value }))
+                    .collect();
+                output.extend(
+                    self.persist_sections(section::encode(
+                        *self.volume_id.as_bytes(),
+                        kind,
+                        records,
+                        "checkpoint Managed namespace",
+                    )?)
+                    .await?,
+                );
+            }
+        }
+        validate_section_references(&output)?;
+        Ok(output)
+    }
+
+    async fn read_section_records(
+        &self,
+        reference: &SectionReference,
+        action: &'static str,
+    ) -> Result<Vec<SectionRecord>, ManagedError> {
+        let bytes = self
+            .operator
+            .read(&section_key(&reference.id))
+            .await
+            .map_err(|error| {
+                if error.kind() == ErrorKind::NotFound {
+                    corrupt(action, "checkpoint section is missing")
+                } else {
+                    unavailable(action)
+                }
+            })?
+            .to_bytes();
+        section::decode(reference, *self.volume_id.as_bytes(), &bytes, action)
+    }
+
+    async fn persist_sections(
+        &self,
+        encoded: Vec<section::Encoded>,
+    ) -> Result<Vec<StoredSectionReference>, ManagedError> {
+        let mut references = Vec::with_capacity(encoded.len());
+        for section in encoded {
+            self.ensure_immutable(&section_key(&section.reference.id), &section.bytes)
+                .await?;
+            references.push(section.reference.into());
+        }
+        Ok(references)
+    }
+
     async fn read_snapshot(
         &self,
         checkpoint: StoredCheckpoint,
@@ -783,24 +861,10 @@ impl ObjectNamespace {
         let mut file_versions = BTreeMap::new();
         for stored in checkpoint.sections {
             let reference = stored.as_reference();
-            let bytes = self
-                .operator
-                .read(&section_key(&reference.id))
-                .await
-                .map_err(|error| {
-                    if error.kind() == ErrorKind::NotFound {
-                        corrupt("read Managed namespace", "checkpoint section is missing")
-                    } else {
-                        unavailable("read Managed namespace")
-                    }
-                })?
-                .to_bytes();
-            for record in section::decode(
-                &reference,
-                *self.volume_id.as_bytes(),
-                &bytes,
-                "read Managed namespace",
-            )? {
+            for record in self
+                .read_section_records(&reference, "read Managed namespace")
+                .await?
+            {
                 match reference.kind {
                     NODE_SECTION => {
                         let stored: StoredNodeSection =
@@ -1001,20 +1065,20 @@ fn conditional_result(result: opendal::Result<opendal::Metadata>) -> Result<bool
 }
 
 fn transaction_key(operation: OperationId) -> String {
-    format!("{TRANSACTION_ROOT}/{}.cbor", hex(operation.as_bytes()))
+    format!("{TRANSACTION_ROOT}/{}.ofs", hex(operation.as_bytes()))
 }
 
 fn result_key(operation: OperationId) -> String {
-    format!("{RESULT_ROOT}/{}.cbor", hex(operation.as_bytes()))
+    format!("{RESULT_ROOT}/{}.ofs", hex(operation.as_bytes()))
 }
 
 fn checkpoint_key(id: &[u8; 32]) -> String {
-    format!("{CHECKPOINT_ROOT}/{}.cbor", hex(id))
+    format!("{CHECKPOINT_ROOT}/{}.ofs", hex(id))
 }
 
 fn section_key(id: &[u8; 32]) -> String {
     let encoded = hex(id);
-    format!("{SECTION_ROOT}/{}/{}.section", &encoded[..2], encoded)
+    format!("{SECTION_ROOT}/{encoded}.ofs")
 }
 
 fn directory_entry_key(directory: NodeId, name: &str) -> Vec<u8> {
@@ -1161,10 +1225,6 @@ fn unavailable(action: &'static str) -> ManagedError {
         action,
         "object metadata is unavailable",
     )
-}
-
-struct Recovered {
-    snapshot: NamespaceSnapshot,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1388,6 +1448,11 @@ struct StoredSectionReference {
     encoded_bytes: u64,
 }
 
+struct CheckpointChanges {
+    records: BTreeMap<u8, BTreeMap<Vec<u8>, Option<Vec<u8>>>>,
+    removed_directories: BTreeSet<[u8; 16]>,
+}
+
 impl From<SectionReference> for StoredSectionReference {
     fn from(reference: SectionReference) -> Self {
         Self {
@@ -1435,6 +1500,96 @@ fn validate_section_references(sections: &[StoredSectionReference]) -> Result<()
         previous = Some(section);
     }
     Ok(())
+}
+
+fn section_changes(transactions: &[StoredTransaction]) -> Result<CheckpointChanges, ManagedError> {
+    let mut changes = CheckpointChanges {
+        records: BTreeMap::new(),
+        removed_directories: BTreeSet::new(),
+    };
+    for transaction in transactions {
+        let nodes = changes.records.entry(NODE_SECTION).or_default();
+        for node in &transaction.put_nodes {
+            nodes.insert(
+                node.id.to_vec(),
+                Some(encode_section_value(
+                    &StoredNodeSection {
+                        generation: node.generation,
+                        kind: node.kind,
+                        attributes: node.attributes,
+                        file_version: node.file_version,
+                    },
+                    "checkpoint Managed namespace",
+                )?),
+            );
+        }
+        for id in &transaction.remove_nodes {
+            nodes.insert(id.to_vec(), None);
+        }
+
+        let directories = changes.records.entry(DIRECTORY_SECTION).or_default();
+        for directory in &transaction.put_directories {
+            directories.insert(
+                directory.node.to_vec(),
+                Some(encode_section_value(
+                    &StoredDirectorySection {
+                        generation: directory.generation,
+                    },
+                    "checkpoint Managed namespace",
+                )?),
+            );
+        }
+        for id in &transaction.remove_directories {
+            directories.insert(id.to_vec(), None);
+            changes.removed_directories.insert(*id);
+        }
+
+        let entries = changes.records.entry(DIRECTORY_ENTRY_SECTION).or_default();
+        for id in &transaction.remove_directories {
+            entries.retain(|key, _| !key.starts_with(id));
+        }
+        for entry in &transaction.put_directory_entries {
+            entries.insert(
+                directory_entry_key(NodeId::from_bytes(entry.directory), &entry.name),
+                Some(encode_section_value(
+                    &entry.entry,
+                    "checkpoint Managed namespace",
+                )?),
+            );
+        }
+        for entry in &transaction.remove_directory_entries {
+            entries.insert(
+                directory_entry_key(NodeId::from_bytes(entry.directory), &entry.name),
+                None,
+            );
+        }
+
+        let versions = changes.records.entry(FILE_VERSION_SECTION).or_default();
+        for version in &transaction.put_file_versions {
+            versions.insert(
+                version.id.to_vec(),
+                Some(encode_section_value(
+                    &StoredFileVersionSection {
+                        logical_size: version.logical_size,
+                        logical_digest: version.logical_digest,
+                        layout: version.layout.clone(),
+                    },
+                    "checkpoint Managed namespace",
+                )?),
+            );
+        }
+        for id in &transaction.remove_file_versions {
+            versions.insert(id.to_vec(), None);
+        }
+    }
+    Ok(changes)
+}
+
+fn section_may_contain_directory(section: &StoredSectionReference, directory: &[u8; 16]) -> bool {
+    match (section.first_key.get(..16), section.last_key.get(..16)) {
+        (Some(first), Some(last)) => first <= directory.as_slice() && directory.as_slice() <= last,
+        _ => true,
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -2209,31 +2364,232 @@ mod tests {
             volume_id: snapshot.volume_id,
             operator: operator.clone(),
         };
-        let checkpoint = namespace
-            .checkpoint(&snapshot, &BTreeSet::new())
-            .await
-            .unwrap();
+        let checkpoint = namespace.checkpoint_full(&snapshot).await.unwrap();
         assert!(
             checkpoint
                 .sections
                 .iter()
                 .any(|section| section.kind == DIRECTORY_ENTRY_SECTION)
         );
-        let known = checkpoint
-            .sections
-            .iter()
-            .map(|section| section.id)
-            .collect();
         let missing = section_key(&checkpoint.sections[0].id);
         operator.delete(&missing).await.unwrap();
-        let checkpoint = namespace.checkpoint(&snapshot, &known).await.unwrap();
+        let checkpoint = namespace.checkpoint_full(&snapshot).await.unwrap();
         assert!(operator.stat(&missing).await.is_ok());
         let recovered = namespace.read_snapshot(checkpoint).await.unwrap();
         assert_eq!(recovered, snapshot);
     }
 
     #[tokio::test]
-    async fn retained_transactions_rebuild_a_missing_checkpoint_section() {
+    async fn incremental_checkpoint_rewrites_only_the_affected_section() {
+        let scope = [21; 16];
+        let operator = Operator::new(Memory::default()).unwrap().finish();
+        let namespace = ObjectNamespace {
+            volume_id: VolumeId::from_bytes(scope),
+            operator,
+        };
+        let records = (0_u32..80)
+            .map(|index| SectionRecord {
+                key: index.to_be_bytes().to_vec(),
+                value: vec![index as u8; 32],
+            })
+            .collect::<Vec<_>>();
+        let encoded =
+            section::encode_for_test(scope, NODE_SECTION, records.clone(), 256, 512, 2048).unwrap();
+        assert!(encoded.len() > 2);
+        let previous = namespace.persist_sections(encoded).await.unwrap();
+        let changed_key = 40_u32.to_be_bytes().to_vec();
+        let changed_section = previous
+            .iter()
+            .find(|section| {
+                section.first_key.as_slice() <= changed_key.as_slice()
+                    && changed_key.as_slice() <= section.last_key.as_slice()
+            })
+            .unwrap()
+            .id;
+        let previous_ids = previous
+            .iter()
+            .map(|section| section.id)
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut changes = CheckpointChanges {
+            records: BTreeMap::new(),
+            removed_directories: BTreeSet::new(),
+        };
+        changes
+            .records
+            .entry(NODE_SECTION)
+            .or_default()
+            .insert(changed_key.clone(), Some(b"changed".to_vec()));
+
+        let rewritten = namespace
+            .rewrite_checkpoint_sections(&previous, changes)
+            .await
+            .unwrap();
+        let rewritten_ids = rewritten
+            .iter()
+            .map(|section| section.id)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            previous_ids.intersection(&rewritten_ids).count(),
+            previous.len() - 1
+        );
+        assert!(!rewritten_ids.contains(&changed_section));
+
+        let mut recovered = BTreeMap::new();
+        for stored in &rewritten {
+            for record in namespace
+                .read_section_records(&stored.as_reference(), "test")
+                .await
+                .unwrap()
+            {
+                recovered.insert(record.key, record.value);
+            }
+        }
+        let mut expected = records
+            .into_iter()
+            .map(|record| (record.key, record.value))
+            .collect::<BTreeMap<_, _>>();
+        expected.insert(changed_key, b"changed".to_vec());
+        assert_eq!(recovered, expected);
+    }
+
+    #[tokio::test]
+    async fn incremental_checkpoint_removes_a_directory_entry_range() {
+        let scope = [22; 16];
+        let operator = Operator::new(Memory::default()).unwrap().finish();
+        let namespace = ObjectNamespace {
+            volume_id: VolumeId::from_bytes(scope),
+            operator,
+        };
+        let removed = [2; 16];
+        let records = [([1; 16], 30_u8), (removed, 60_u8), ([3; 16], 90_u8)]
+            .into_iter()
+            .flat_map(|(directory, end)| {
+                (end - 30..end).map(move |index| SectionRecord {
+                    key: directory_entry_key(
+                        NodeId::from_bytes(directory),
+                        &format!("entry-{index:03}"),
+                    ),
+                    value: vec![index; 32],
+                })
+            })
+            .collect::<Vec<_>>();
+        let encoded =
+            section::encode_for_test(scope, DIRECTORY_ENTRY_SECTION, records, 256, 512, 2048)
+                .unwrap();
+        let previous = namespace.persist_sections(encoded).await.unwrap();
+        let changes = CheckpointChanges {
+            records: BTreeMap::new(),
+            removed_directories: BTreeSet::from([removed]),
+        };
+
+        let rewritten = namespace
+            .rewrite_checkpoint_sections(&previous, changes)
+            .await
+            .unwrap();
+        let mut recovered = Vec::new();
+        for stored in &rewritten {
+            recovered.extend(
+                namespace
+                    .read_section_records(&stored.as_reference(), "test")
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert_eq!(recovered.len(), 60);
+        assert!(
+            recovered
+                .iter()
+                .all(|record| !record.key.starts_with(&removed))
+        );
+    }
+
+    #[tokio::test]
+    async fn incremental_checkpoint_drops_entries_for_a_directory_created_and_deleted_in_tail() {
+        let first = OperationId::from_bytes([31; 16]);
+        let first_cursor = ChangeCursor::at(NonZeroU64::new(1).unwrap(), first);
+        let base = root_snapshot(first_cursor);
+        let operator = Operator::new(Memory::default()).unwrap().finish();
+        let namespace = ObjectNamespace {
+            volume_id: base.volume_id,
+            operator,
+        };
+        let previous = namespace.checkpoint_full(&base).await.unwrap();
+
+        let second = OperationId::from_bytes([32; 16]);
+        let second_cursor = ChangeCursor::at(NonZeroU64::new(2).unwrap(), second);
+        let child = NodeId::from_bytes([9; 16]);
+        let mut created = base.clone();
+        created.cursor = second_cursor;
+        created.nodes.insert(
+            child,
+            NodeRecord {
+                id: child,
+                generation: managed_generation(1),
+                kind: NodeKind::Directory,
+                attributes: NodeAttributes::default(),
+                file_version: None,
+            },
+        );
+        created.directories.insert(
+            child,
+            DirectoryRecord {
+                node: child,
+                generation: managed_generation(1),
+                entries: BTreeMap::from([(
+                    "entry".to_owned(),
+                    DirectoryEntry {
+                        node: base.root,
+                        kind: NodeKind::Directory,
+                    },
+                )]),
+            },
+        );
+        created
+            .directories
+            .get_mut(&created.root)
+            .unwrap()
+            .entries
+            .insert(
+                "child".to_owned(),
+                DirectoryEntry {
+                    node: child,
+                    kind: NodeKind::Directory,
+                },
+            );
+        let create = StoredTransaction::from_publication(
+            &NamespacePublication {
+                operation: second,
+                parent: first_cursor,
+                expected_nodes: Vec::new(),
+                expected_directories: Vec::new(),
+                target: created.clone(),
+            },
+            Some(&base),
+        );
+
+        let third = OperationId::from_bytes([33; 16]);
+        let mut removed = base.clone();
+        removed.cursor = ChangeCursor::at(NonZeroU64::new(3).unwrap(), third);
+        let remove = StoredTransaction::from_publication(
+            &NamespacePublication {
+                operation: third,
+                parent: second_cursor,
+                expected_nodes: Vec::new(),
+                expected_directories: Vec::new(),
+                target: removed.clone(),
+            },
+            Some(&created),
+        );
+
+        let checkpoint = namespace
+            .checkpoint_incremental(&removed, &previous, &[create, remove])
+            .await
+            .unwrap();
+        assert_eq!(namespace.read_snapshot(checkpoint).await.unwrap(), removed);
+    }
+
+    #[tokio::test]
+    async fn missing_checkpoint_section_is_reported_as_corruption() {
         let operation = OperationId::from_bytes([10; 16]);
         let cursor = ChangeCursor::at(NonZeroU64::new(1).unwrap(), operation);
         let snapshot = root_snapshot(cursor);
@@ -2266,6 +2622,7 @@ mod tests {
             .delete(&section_key(&checkpoint.sections[0].id))
             .await
             .unwrap();
-        assert_eq!(namespace.recover(&head).await.unwrap().snapshot, snapshot);
+        let error = namespace.recover(&head).await.unwrap_err();
+        assert_eq!(error.kind(), ManagedErrorKind::Corrupt);
     }
 }
