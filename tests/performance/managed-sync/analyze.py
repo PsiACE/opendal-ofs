@@ -15,6 +15,7 @@ import math
 import statistics
 from collections import defaultdict
 from pathlib import Path
+from urllib.parse import unquote
 
 
 def read_tsv(path: Path) -> list[list[str]]:
@@ -66,6 +67,21 @@ def request_phase(start_ns: int, intervals) -> str:
     return "setup_or_lifecycle"
 
 
+def object_class(path: str) -> str:
+    decoded = "/" + unquote(path).lstrip("/")
+    if "/.ofs/managed/indexes/data-pack/v1/packs/sha256/" in decoded:
+        return "pack_data"
+    if "/.ofs/managed/indexes/data-pack/v1/" in decoded:
+        return "secondary_index"
+    if "/.ofs/managed/data/v1/loose/sha256/" in decoded or "/data/sha256/" in decoded:
+        return "loose_data"
+    if decoded.endswith("/.ofs/managed/volume.json") or decoded.endswith("/metadata/format"):
+        return "format"
+    if "/.ofs/managed/metadata/v1/" in decoded or "/metadata/" in decoded:
+        return "metadata"
+    return "control"
+
+
 def load_requests(path: Path, intervals):
     distribution = defaultdict(lambda: {"count": 0, "bytes_in": 0, "bytes_out": 0})
     uploaded = defaultdict(lambda: {"request_bytes": 0, "data_put_bytes": 0})
@@ -73,18 +89,20 @@ def load_requests(path: Path, intervals):
     noop_data_puts = []
     for line in path.open(encoding="utf-8"):
         request = json.loads(line)
-        run = next((name for name in intervals if f"/ab/{name}/" in request["path"]), None)
+        decoded_path = unquote(request["path"])
+        run = next((name for name in intervals if f"/ab/{name}" in decoded_path), None)
         if run is None:
             continue
         observed_runs.add(run)
         phase = request_phase(request["start_ns"], intervals[run])
-        object_class = "data" if "/data/" in request["path"] else "metadata"
-        key = (run, phase, request["method"], object_class)
+        classification = object_class(decoded_path)
+        is_range = request.get("range") is not None
+        key = (run, phase, request["method"], request["status"], classification, is_range)
         distribution[key]["count"] += 1
         distribution[key]["bytes_in"] += request["bytes_in"]
         distribution[key]["bytes_out"] += request["bytes_out"]
         uploaded[run]["request_bytes"] += request["bytes_in"]
-        if request["method"] == "PUT" and object_class == "data":
+        if request["method"] == "PUT" and classification in {"loose_data", "pack_data"}:
             uploaded[run]["data_put_bytes"] += request["bytes_in"]
             if phase == "noop":
                 noop_data_puts.append(request)
@@ -93,12 +111,38 @@ def load_requests(path: Path, intervals):
             "run": key[0],
             "phase": key[1],
             "method": key[2],
-            "object_class": key[3],
+            "status": key[3],
+            "object_class": key[4],
+            "range": key[5],
             **values,
         }
         for key, values in sorted(distribution.items())
     ]
     return rows, dict(uploaded), observed_runs, noop_data_puts
+
+
+def load_object_inventory(directory: Path, inputs):
+    inventories = []
+    for run, values in sorted(inputs.items()):
+        totals = defaultdict(lambda: {"objects": 0, "bytes": 0})
+        path = directory / "runs" / run / "objects.jsonl"
+        for line in path.open(encoding="utf-8"):
+            record = json.loads(line)
+            if record.get("status") != "success" or record.get("type") != "file":
+                continue
+            classification = object_class(record["key"])
+            totals[classification]["objects"] += 1
+            totals[classification]["bytes"] += int(record["size"])
+        for classification, total in sorted(totals.items()):
+            inventories.append(
+                {
+                    "run": run,
+                    "release": values["release"],
+                    "object_class": classification,
+                    **total,
+                }
+            )
+    return inventories
 
 
 def load_inputs(path: Path):
@@ -132,6 +176,7 @@ def main() -> None:
         directory / "requests.jsonl", intervals
     )
     inputs = load_inputs(directory / "inputs.tsv")
+    object_inventory = load_object_inventory(directory, inputs)
     for run, values in uploaded.items():
         inputs[run].update(values)
     context = {key: value for key, value in read_tsv(directory / "context.tsv")}
@@ -183,14 +228,21 @@ def main() -> None:
         "samples": samples,
         "statistics": statistics_by_metric,
         "request_distribution": requests,
+        "object_inventory": object_inventory,
         "gates": gates,
     }
     (directory / "results.json").write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     with (directory / "requests.tsv").open("w", encoding="utf-8") as output:
-        output.write("run\tphase\tmethod\tobject_class\tcount\tbytes_in\tbytes_out\n")
+        output.write(
+            "run\tphase\tmethod\tstatus\tobject_class\trange\tcount\tbytes_in\tbytes_out\n"
+        )
         for row in requests:
+            output.write("\t".join(str(row[key]) for key in row) + "\n")
+    with (directory / "objects.tsv").open("w", encoding="utf-8") as output:
+        output.write("run\trelease\tobject_class\tobjects\tbytes\n")
+        for row in object_inventory:
             output.write("\t".join(str(row[key]) for key in row) + "\n")
     print(json.dumps({"verdict": verdict, "statistics": statistics_by_metric, "gates": gates}, indent=2))
     raise SystemExit(verdict != "pass")

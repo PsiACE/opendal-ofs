@@ -131,6 +131,8 @@ for index in "${!schedule[@]}"; do
     OFS_PERF_ROUNDS="$rounds" "$suite/workload.sh"
 
   mc_run du --json "performance/$bucket/$object_root" >"$run_root/object-inventory.json"
+  mc_run ls --recursive --json "performance/$bucket/$object_root" \
+    >"$run_root/objects.jsonl"
   read -r stored_bytes stored_objects < <(
     python3 - "$run_root/object-inventory.json" <<'PY'
 import json, sys

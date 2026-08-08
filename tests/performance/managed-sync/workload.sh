@@ -87,7 +87,7 @@ for round in $(seq 1 "$rounds"); do
   measure publication "$round" "$evidence/publication-$round.txt" \
     "$OFS_BIN" sync "$volume" "$next_tree" --state "$next_state"
   rm -rf "$current_tree"
-  rm -f "$current_state"
+  rm -rf "$current_state"
   current_tree=$next_tree
   current_state=$next_state
 done

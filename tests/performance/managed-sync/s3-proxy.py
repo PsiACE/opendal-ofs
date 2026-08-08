@@ -142,6 +142,7 @@ def handler(upstream_host: str, upstream_port: int, request_log: RequestLog):
                         "end_ns": time.time_ns(),
                         "method": self.command,
                         "path": self.path,
+                        "range": self.headers.get("Range"),
                         "start_ns": started_ns,
                         "status": status,
                     }
