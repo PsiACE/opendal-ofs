@@ -311,7 +311,7 @@ impl D1Namespace {
             ),
             put_checkpoint(
                 checkpoint.as_deref(),
-                publication,
+                target_sequence,
                 &operation,
                 &payload,
                 self.store_key(),
@@ -324,7 +324,11 @@ impl D1Namespace {
                 ],
             ),
             statement(
-                format!("DELETE FROM {TRANSACTIONS} WHERE store_key = ? AND target_sequence < (SELECT checkpoint_sequence FROM {HEADS} WHERE store_key = ?) AND status = 'committed'"),
+                format!("DELETE FROM {CHECKPOINTS} WHERE store_key = ? AND target_sequence < (SELECT checkpoint_sequence FROM {HEADS} WHERE store_key = ?)"),
+                vec![self.store_key().into(), self.store_key().into()],
+            ),
+            statement(
+                format!("DELETE FROM {TRANSACTIONS} WHERE store_key = ? AND (status = 'rejected' OR (status = 'committed' AND target_sequence <= COALESCE((SELECT checkpoint_sequence FROM {HEADS} WHERE store_key = ?), 0)))"),
                 vec![self.store_key().into(), self.store_key().into()],
             ),
             statement(
@@ -610,7 +614,7 @@ fn schema_statements() -> Vec<D1Statement> {
         ),
         statement(
             format!(
-                "CREATE TABLE IF NOT EXISTS {CHECKPOINTS} (store_key TEXT NOT NULL, target_sequence INTEGER NOT NULL, operation_id TEXT NOT NULL, root_node TEXT NOT NULL, snapshot_json TEXT NOT NULL, PRIMARY KEY (store_key, target_sequence))"
+                "CREATE TABLE IF NOT EXISTS {CHECKPOINTS} (store_key TEXT NOT NULL, target_sequence INTEGER NOT NULL, snapshot_json TEXT NOT NULL, PRIMARY KEY (store_key, target_sequence))"
             ),
             Vec::new(),
         ),
@@ -728,7 +732,7 @@ fn put_records(
 
 fn put_checkpoint(
     checkpoint: Option<&str>,
-    publication: &NamespacePublication,
+    target_sequence: i64,
     operation: &str,
     payload: &str,
     store_key: String,
@@ -736,13 +740,11 @@ fn put_checkpoint(
     let checkpoint = checkpoint.map_or(Value::Null, |value| value.to_owned().into());
     Ok(statement(
         format!(
-            "INSERT OR IGNORE INTO {CHECKPOINTS} (store_key, target_sequence, operation_id, root_node, snapshot_json) SELECT ?, ?, ?, ?, ? WHERE ? IS NOT NULL AND EXISTS (SELECT 1 FROM {RESULTS} WHERE store_key = ? AND operation_id = ? AND payload_json = ? AND outcome = 'committed')"
+            "INSERT OR IGNORE INTO {CHECKPOINTS} (store_key, target_sequence, snapshot_json) SELECT ?, ?, ? WHERE ? IS NOT NULL AND EXISTS (SELECT 1 FROM {RESULTS} WHERE store_key = ? AND operation_id = ? AND payload_json = ? AND outcome = 'committed')"
         ),
         vec![
             store_key.clone().into(),
-            sqlite_integer(publication.target.cursor.sequence())?.into(),
-            operation.to_owned().into(),
-            hex(publication.target.root.as_bytes()).into(),
+            target_sequence.into(),
             checkpoint.clone(),
             checkpoint,
             store_key.into(),
