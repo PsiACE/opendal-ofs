@@ -39,15 +39,17 @@ use crate::managed::format::ExtentMap;
 use crate::managed::format::sstable::{self, Record as TableRecord, TableRef};
 use crate::managed::{ManagedError, ManagedErrorKind};
 
-const HEAD_KEY: &str = ".ofs/managed/metadata/v1/head.json";
-const TRANSACTION_ROOT: &str = ".ofs/managed/metadata/v1/transactions";
+const HEAD_KEY: &str = ".ofs/managed/metadata/v1/head.ofs";
 const MANIFEST_ROOT: &str = ".ofs/managed/metadata/v1/manifests/sha256";
 const SSTABLE_ROOT: &str = ".ofs/managed/metadata/v1/sstables/sha256";
-const TRANSACTION_MAGIC: &[u8] = b"OFS1TXN\0";
+const CHANGE_MAGIC: &[u8] = b"OFS1CHG\0";
 const MANIFEST_MAGIC: &[u8] = b"OFS1MAN\0";
-const HEAD_MAGIC: &str = "ofs-managed-head";
+const HEAD_MAGIC: &[u8; 8] = b"OFS1HDZ1";
 const FORMAT_MAJOR: u16 = 1;
 const MAX_TAIL_TRANSACTIONS: u16 = 32;
+const MAX_TAIL_BYTES: usize = 128 * 1024;
+const MAX_HEAD_BYTES: usize = 256 * 1024;
+const HEAD_COMPRESSION_LEVEL: i32 = 3;
 const NODE_PREFIX: u8 = 1;
 const DIRECTORY_PREFIX: u8 = 2;
 const DIRECTORY_ENTRY_PREFIX: u8 = 3;
@@ -74,7 +76,6 @@ impl NamespaceObservation {
 struct ObservationAuthority {
     head: StoredHead,
     manifest: Option<StoredManifest>,
-    wal: Option<Vec<StoredTransaction>>,
 }
 
 impl std::fmt::Debug for ObservationAuthority {
@@ -86,7 +87,7 @@ impl std::fmt::Debug for ObservationAuthority {
                 "manifest_tables",
                 &self.manifest.as_ref().map_or(0, |value| value.tables.len()),
             )
-            .field("wal_transactions", &self.wal.as_ref().map_or(0, Vec::len))
+            .field("tail_changes", &self.head.tail.len())
             .finish()
     }
 }
@@ -134,17 +135,18 @@ impl ObjectNamespace {
         };
         let head = decode_head(&bytes)?;
         head.validate(self.volume_id)?;
-        if base.volume_id == self.volume_id && base.cursor == head.cursor.into_cursor()? {
+        if base.volume_id == self.volume_id {
             validate_snapshot(base)?;
-            return Ok(Some(NamespaceObservation {
-                snapshot: base.clone(),
-                revision,
-                authority: Box::new(ObservationAuthority {
-                    head,
-                    manifest: None,
-                    wal: None,
-                }),
-            }));
+            if let Some(snapshot) = replay_tail_from(base, &head)? {
+                return Ok(Some(NamespaceObservation {
+                    snapshot,
+                    revision,
+                    authority: Box::new(ObservationAuthority {
+                        head,
+                        manifest: None,
+                    }),
+                }));
+            }
         }
         self.recover_observation(head, revision).await.map(Some)
     }
@@ -154,14 +156,13 @@ impl ObjectNamespace {
         head: StoredHead,
         revision: String,
     ) -> Result<NamespaceObservation, ManagedError> {
-        let (snapshot, manifest, wal) = self.recover(&head).await?;
+        let (snapshot, manifest) = self.recover(&head).await?;
         Ok(NamespaceObservation {
             snapshot,
             revision,
             authority: Box::new(ObservationAuthority {
                 head,
                 manifest: Some(manifest),
-                wal: Some(wal),
             }),
         })
     }
@@ -184,11 +185,11 @@ impl ObjectNamespace {
         }
         let base = observed.map(|value| &value.snapshot);
         let stored = StoredTransaction::from_publication(publication, base);
-        let bytes = encode_cbor(TRANSACTION_MAGIC, &stored, "publish Managed namespace")?;
-        let transaction_sha256 = sha256(&bytes);
+        let bytes = encode_cbor(CHANGE_MAGIC, &stored, "publish Managed namespace")?;
+        let request_sha256 = sha256(&bytes);
         if !validate_publication(publication, base)? {
             if matches!(
-                self.resolve_known(publication.operation, Some(transaction_sha256))
+                self.resolve_known(publication.operation, Some(request_sha256))
                     .await?,
                 CommitOutcome::Committed(_)
             ) {
@@ -199,14 +200,17 @@ impl ObjectNamespace {
             });
         }
 
+        let appended_tail_bytes =
+            observed.map_or(0, |value| value.authority.head.tail_bytes()) + bytes.len();
         let checkpoint_due = observed.is_none()
             || observed.is_some_and(|value| {
-                value.authority.head.tail_transactions + 1 >= MAX_TAIL_TRANSACTIONS
+                value.authority.head.tail.len() + 1 >= usize::from(MAX_TAIL_TRANSACTIONS)
+                    || appended_tail_bytes > MAX_TAIL_BYTES
             });
-        let (checkpoint, checkpoint_cursor, tail_transactions) = if checkpoint_due {
-            // The publication target and recovered WAL are pinned by the
-            // observation used for CAS. Building a manifest never rereads the
-            // remote checkpoint or WAL.
+        let (checkpoint, checkpoint_cursor, tail) = if checkpoint_due {
+            // The publication target and committed change tail are pinned by
+            // the observation used for CAS. Building a manifest never rereads
+            // the remote checkpoint or HEAD.
             let mut committed = match observed {
                 Some(value) => {
                     let manifest = match &value.authority.manifest {
@@ -218,11 +222,7 @@ impl ObjectNamespace {
                 None => BTreeMap::new(),
             };
             if let Some(observed) = observed {
-                let wal = match &observed.authority.wal {
-                    Some(wal) => wal.clone(),
-                    None => self.read_tail(&observed.authority.head).await?,
-                };
-                for transaction in &wal {
+                for transaction in &observed.authority.head.tail {
                     committed.insert(
                         OperationId::from_bytes(transaction.operation),
                         StoredCommittedResult::from_transaction(transaction)?,
@@ -233,7 +233,7 @@ impl ObjectNamespace {
                 publication.operation,
                 StoredCommittedResult {
                     cursor: stored.cursor,
-                    transaction_sha256,
+                    request_sha256,
                 },
             );
             let checkpoint = self
@@ -243,25 +243,23 @@ impl ObjectNamespace {
             let checkpoint_id = sha256(&bytes);
             self.ensure_immutable(&manifest_key(&checkpoint_id), &bytes)
                 .await?;
-            (checkpoint_id, publication.target.cursor.into(), 0)
+            (checkpoint_id, publication.target.cursor.into(), Vec::new())
         } else {
             let observed = observed.expect("checkpoint policy has an observation");
-            self.ensure_transaction(publication.operation, &bytes)
-                .await?;
+            let mut tail = observed.authority.head.tail.clone();
+            tail.push(stored.clone());
             (
                 observed.authority.head.checkpoint,
                 observed.authority.head.checkpoint_cursor,
-                observed.authority.head.tail_transactions + 1,
+                tail,
             )
         };
         let head = StoredHead::new(
             self.volume_id,
             stored.cursor,
-            stored.operation,
-            transaction_sha256,
             checkpoint,
             checkpoint_cursor,
-            tail_transactions,
+            tail,
         )?
         .with_maintenance_epoch(observed.map_or(0, |value| value.authority.head.maintenance_epoch));
         let head = encode_head(&head)?;
@@ -365,15 +363,14 @@ impl ObjectNamespace {
             return Ok(CommitOutcome::Absent);
         };
         head.validate(self.volume_id)?;
-        if let Some(transaction) = self
-            .read_tail(&head)
-            .await?
-            .into_iter()
+        if let Some(transaction) = head
+            .tail
+            .iter()
             .find(|transaction| transaction.operation == *operation.as_bytes())
         {
             let observed_sha256 = sha256(&encode_cbor(
-                TRANSACTION_MAGIC,
-                &transaction,
+                CHANGE_MAGIC,
+                transaction,
                 "resolve Managed publication",
             )?);
             require_same_operation(expected_sha256, observed_sha256)?;
@@ -381,24 +378,10 @@ impl ObjectNamespace {
         }
         let manifest = self.read_manifest(&head.checkpoint).await?;
         if let Some(result) = self.read_operation_result(&manifest, operation).await? {
-            require_same_operation(expected_sha256, result.transaction_sha256)?;
+            require_same_operation(expected_sha256, result.request_sha256)?;
             return Ok(CommitOutcome::Committed(result.cursor.into_cursor()?));
         }
-        let Some(target) = self.read_transaction(operation).await? else {
-            return Ok(CommitOutcome::Absent);
-        };
-        let transaction_sha256 = sha256(&encode_cbor(
-            TRANSACTION_MAGIC,
-            &target,
-            "resolve Managed publication",
-        )?);
-        require_same_operation(expected_sha256, transaction_sha256)?;
-        let parent = target.parent.into_cursor()?;
-        let current = head.cursor.into_cursor()?;
-        if current == parent || current.sequence() <= parent.sequence() {
-            return Ok(CommitOutcome::Absent);
-        }
-        Ok(CommitOutcome::Conflict { observed: current })
+        Ok(CommitOutcome::Absent)
     }
 
     async fn outcome_after_race(
@@ -417,15 +400,6 @@ impl ObjectNamespace {
             .await?
             .map_or(ChangeCursor::Genesis, |value| value.snapshot.cursor);
         Ok(CommitOutcome::Conflict { observed })
-    }
-
-    async fn ensure_transaction(
-        &self,
-        operation: OperationId,
-        expected: &[u8],
-    ) -> Result<(), ManagedError> {
-        self.ensure_immutable(&transaction_key(operation), expected)
-            .await
     }
 
     async fn ensure_immutable(&self, key: &str, expected: &[u8]) -> Result<(), ManagedError> {
@@ -459,44 +433,10 @@ impl ObjectNamespace {
         }
     }
 
-    async fn read_transaction(
-        &self,
-        operation: OperationId,
-    ) -> Result<Option<StoredTransaction>, ManagedError> {
-        match self.operator.read(&transaction_key(operation)).await {
-            Ok(bytes) => {
-                let transaction: StoredTransaction = decode_cbor(
-                    TRANSACTION_MAGIC,
-                    &bytes.to_bytes(),
-                    "read Managed transaction",
-                )?;
-                if transaction.operation != *operation.as_bytes() {
-                    return Err(corrupt(
-                        "read Managed transaction",
-                        "transaction key and operation disagree",
-                    ));
-                }
-                transaction.validate(self.volume_id)?;
-                Ok(Some(transaction))
-            }
-            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-            Err(_) => Err(unavailable("read Managed transaction")),
-        }
-    }
-
-    async fn required_transaction(
-        &self,
-        operation: OperationId,
-    ) -> Result<StoredTransaction, ManagedError> {
-        self.read_transaction(operation)
-            .await?
-            .ok_or_else(|| corrupt("read Managed namespace", "transaction is missing"))
-    }
-
     async fn recover(
         &self,
         head: &StoredHead,
-    ) -> Result<(NamespaceSnapshot, StoredManifest, Vec<StoredTransaction>), ManagedError> {
+    ) -> Result<(NamespaceSnapshot, StoredManifest), ManagedError> {
         head.validate(self.volume_id)?;
         self.recover_bounded(head).await
     }
@@ -504,7 +444,7 @@ impl ObjectNamespace {
     async fn recover_bounded(
         &self,
         head: &StoredHead,
-    ) -> Result<(NamespaceSnapshot, StoredManifest, Vec<StoredTransaction>), ManagedError> {
+    ) -> Result<(NamespaceSnapshot, StoredManifest), ManagedError> {
         let checkpoint = self.read_manifest(&head.checkpoint).await?;
         if checkpoint.major != FORMAT_MAJOR
             || checkpoint.volume_id != *self.volume_id.as_bytes()
@@ -519,8 +459,7 @@ impl ObjectNamespace {
         validate_snapshot(&snapshot)
             .map_err(|_| corrupt("read Managed namespace", "checkpoint is invalid"))?;
 
-        let wal = self.read_tail(head).await?;
-        for transaction in &wal {
+        for transaction in &head.tail {
             if transaction.parent.into_cursor()? != snapshot.cursor {
                 return Err(corrupt(
                     "read Managed namespace",
@@ -535,39 +474,7 @@ impl ObjectNamespace {
                 "checkpoint and transaction tail do not reach HEAD",
             ));
         }
-        Ok((snapshot, checkpoint, wal))
-    }
-
-    async fn read_tail(&self, head: &StoredHead) -> Result<Vec<StoredTransaction>, ManagedError> {
-        if head.tail_transactions == 0 {
-            return Ok(Vec::new());
-        }
-        let mut current = self
-            .required_transaction(OperationId::from_bytes(head.latest_transaction))
-            .await?;
-        let latest_bytes = encode_cbor(TRANSACTION_MAGIC, &current, "read Managed namespace")?;
-        if sha256(&latest_bytes) != head.latest_transaction_sha256 || current.cursor != head.cursor
-        {
-            return Err(corrupt(
-                "read Managed namespace",
-                "latest transaction and HEAD disagree",
-            ));
-        }
-        let mut tail = Vec::with_capacity(head.tail_transactions.into());
-        for index in 0..head.tail_transactions {
-            if index != 0 {
-                current = self
-                    .required_transaction(OperationId::from_bytes(
-                        current.parent.operation.ok_or_else(|| {
-                            corrupt("read Managed namespace", "transaction tail is incomplete")
-                        })?,
-                    ))
-                    .await?;
-            }
-            tail.push(current.clone());
-        }
-        tail.reverse();
-        Ok(tail)
+        Ok((snapshot, checkpoint))
     }
 
     async fn checkpoint_full(
@@ -917,10 +824,6 @@ fn conditional_result(result: opendal::Result<opendal::Metadata>) -> Result<bool
     }
 }
 
-fn transaction_key(operation: OperationId) -> String {
-    format!("{TRANSACTION_ROOT}/{}.ofs", hex(operation.as_bytes()))
-}
-
 fn manifest_key(id: &[u8; 32]) -> String {
     format!("{MANIFEST_ROOT}/{}.ofs", hex(id))
 }
@@ -1000,14 +903,63 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn encode_head(value: &StoredHead) -> Result<Vec<u8>, ManagedError> {
-    let mut bytes = serde_json::to_vec(value)
-        .map_err(|_| invalid("write Managed namespace", "HEAD cannot be encoded"))?;
-    bytes.push(b'\n');
+    let body = encode_table_value(value, "write Managed namespace")?;
+    if body.len() > MAX_HEAD_BYTES {
+        return Err(invalid(
+            "write Managed namespace",
+            "HEAD exceeds its decoded size limit",
+        ));
+    }
+    let decoded_length = u32::try_from(body.len()).map_err(|_| {
+        invalid(
+            "write Managed namespace",
+            "HEAD exceeds its decoded size limit",
+        )
+    })?;
+    let compressed = zstd::bulk::compress(&body, HEAD_COMPRESSION_LEVEL)
+        .map_err(|_| invalid("write Managed namespace", "HEAD cannot be compressed"))?;
+    let mut bytes = Vec::with_capacity(12 + compressed.len() + 32);
+    bytes.extend_from_slice(HEAD_MAGIC);
+    bytes.extend_from_slice(&decoded_length.to_be_bytes());
+    bytes.extend_from_slice(&compressed);
+    let checksum: [u8; 32] = Sha256::digest(&bytes).into();
+    bytes.extend_from_slice(&checksum);
     Ok(bytes)
 }
 
 fn decode_head(bytes: &[u8]) -> Result<StoredHead, ManagedError> {
-    serde_json::from_slice(bytes).map_err(|_| corrupt("read Managed namespace", "HEAD is invalid"))
+    let encoded = bytes
+        .strip_prefix(HEAD_MAGIC)
+        .and_then(|bytes| bytes.get(..bytes.len().checked_sub(32)?))
+        .ok_or_else(|| corrupt("read Managed namespace", "HEAD format is invalid"))?;
+    let expected = bytes
+        .get(bytes.len().saturating_sub(32)..)
+        .ok_or_else(|| corrupt("read Managed namespace", "HEAD checksum is missing"))?;
+    if Sha256::digest(&bytes[..bytes.len() - 32]).as_slice() != expected {
+        return Err(corrupt(
+            "read Managed namespace",
+            "HEAD checksum does not match",
+        ));
+    }
+    let (length, compressed) = encoded
+        .split_first_chunk::<4>()
+        .ok_or_else(|| corrupt("read Managed namespace", "HEAD length is missing"))?;
+    let decoded_length = u32::from_be_bytes(*length) as usize;
+    if decoded_length > MAX_HEAD_BYTES {
+        return Err(corrupt(
+            "read Managed namespace",
+            "HEAD decoded size exceeds its limit",
+        ));
+    }
+    let body = zstd::bulk::decompress(compressed, decoded_length)
+        .map_err(|_| corrupt("read Managed namespace", "HEAD compression is invalid"))?;
+    if body.len() != decoded_length {
+        return Err(corrupt(
+            "read Managed namespace",
+            "HEAD decoded length does not match",
+        ));
+    }
+    decode_table_value(&body, "read Managed namespace")
 }
 
 fn encode_cbor<T: Serialize>(
@@ -1108,22 +1060,31 @@ fn unavailable(action: &'static str) -> ManagedError {
     )
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct StoredHead {
-    magic: String,
     major: u16,
     volume_id: [u8; 16],
     cursor: StoredCursor,
-    latest_transaction: [u8; 16],
-    latest_transaction_sha256: [u8; 32],
     checkpoint: [u8; 32],
     checkpoint_cursor: StoredCursor,
-    tail_transactions: u16,
+    tail: Vec<StoredTransaction>,
     maintenance_epoch: u64,
     maintenance_state: StoredMaintenanceState,
     maintenance_fixed_cursor: Option<StoredCursor>,
-    checksum: [u8; 32],
+}
+
+impl std::fmt::Debug for StoredHead {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StoredHead")
+            .field("cursor", &self.cursor)
+            .field("checkpoint_cursor", &self.checkpoint_cursor)
+            .field("tail_changes", &self.tail.len())
+            .field("maintenance_epoch", &self.maintenance_epoch)
+            .field("maintenance_state", &self.maintenance_state)
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1137,41 +1098,33 @@ impl StoredHead {
     fn new(
         volume_id: VolumeId,
         cursor: StoredCursor,
-        latest_transaction: [u8; 16],
-        latest_transaction_sha256: [u8; 32],
         checkpoint: [u8; 32],
         checkpoint_cursor: StoredCursor,
-        tail_transactions: u16,
+        tail: Vec<StoredTransaction>,
     ) -> Result<Self, ManagedError> {
-        let mut head = Self {
-            magic: HEAD_MAGIC.into(),
+        let head = Self {
             major: FORMAT_MAJOR,
             volume_id: *volume_id.as_bytes(),
             cursor,
-            latest_transaction,
-            latest_transaction_sha256,
             checkpoint,
             checkpoint_cursor,
-            tail_transactions,
+            tail,
             maintenance_epoch: 0,
             maintenance_state: StoredMaintenanceState::Idle,
             maintenance_fixed_cursor: None,
-            checksum: [0; 32],
         };
         head.validate_shape()?;
-        head.checksum = head_checksum(&head);
         Ok(head)
     }
 
     fn with_maintenance_epoch(mut self, epoch: u64) -> Self {
         self.maintenance_epoch = epoch;
-        self.checksum = head_checksum(&self);
         self
     }
 
     fn validate(&self, volume_id: VolumeId) -> Result<(), ManagedError> {
         self.validate_shape()?;
-        if self.volume_id != *volume_id.as_bytes() || self.checksum != head_checksum(self) {
+        if self.volume_id != *volume_id.as_bytes() {
             return Err(corrupt(
                 "read Managed namespace",
                 "HEAD integrity is invalid",
@@ -1183,19 +1136,43 @@ impl StoredHead {
     fn validate_shape(&self) -> Result<(), ManagedError> {
         let cursor = self.cursor.into_cursor()?;
         let checkpoint = self.checkpoint_cursor.into_cursor()?;
-        if self.magic != HEAD_MAGIC
-            || self.major != FORMAT_MAJOR
-            || cursor.operation() != Some(OperationId::from_bytes(self.latest_transaction))
-            || self.tail_transactions > MAX_TAIL_TRANSACTIONS
-            || checkpoint
-                .sequence()
-                .checked_add(u64::from(self.tail_transactions))
-                != Some(cursor.sequence())
+        if self.major != FORMAT_MAJOR
+            || self.tail.len() > usize::from(MAX_TAIL_TRANSACTIONS)
+            || self.tail_bytes() > MAX_TAIL_BYTES
+            || checkpoint.sequence().checked_add(self.tail.len() as u64) != Some(cursor.sequence())
             || self.gc_sweep().is_err()
         {
             return Err(corrupt("read Managed namespace", "HEAD shape is invalid"));
         }
+        let mut parent = checkpoint;
+        for change in &self.tail {
+            change.validate(VolumeId::from_bytes(self.volume_id))?;
+            if change.parent.into_cursor()? != parent {
+                return Err(corrupt(
+                    "read Managed namespace",
+                    "HEAD change tail is not consecutive",
+                ));
+            }
+            parent = change.cursor.into_cursor()?;
+        }
+        if parent != cursor {
+            return Err(corrupt(
+                "read Managed namespace",
+                "HEAD change tail does not reach its cursor",
+            ));
+        }
         Ok(())
+    }
+
+    fn tail_bytes(&self) -> usize {
+        self.tail
+            .iter()
+            .map(|change| {
+                encode_table_value(change, "encode Managed HEAD")
+                    .expect("validated change can be encoded")
+                    .len()
+            })
+            .sum()
     }
 
     fn gc_sweep(&self) -> Result<Option<NamespaceGcSweep>, ManagedError> {
@@ -1228,7 +1205,6 @@ impl StoredHead {
         })?;
         self.maintenance_state = StoredMaintenanceState::Sweeping;
         self.maintenance_fixed_cursor = Some(self.cursor);
-        self.checksum = head_checksum(self);
         Ok(NamespaceGcSweep::new(
             self.maintenance_epoch,
             self.cursor.into_cursor()?,
@@ -1244,46 +1220,7 @@ impl StoredHead {
         }
         self.maintenance_state = StoredMaintenanceState::Idle;
         self.maintenance_fixed_cursor = None;
-        self.checksum = head_checksum(self);
         Ok(())
-    }
-}
-
-fn head_checksum(head: &StoredHead) -> [u8; 32] {
-    let mut digest = Sha256::new();
-    digest.update(b"OFS1HEAD\0");
-    digest.update(head.magic.as_bytes());
-    digest.update(head.major.to_be_bytes());
-    digest.update(head.volume_id);
-    update_cursor_digest(&mut digest, head.cursor);
-    digest.update(head.latest_transaction);
-    digest.update(head.latest_transaction_sha256);
-    digest.update(head.checkpoint);
-    update_cursor_digest(&mut digest, head.checkpoint_cursor);
-    digest.update(head.tail_transactions.to_be_bytes());
-    digest.update(head.maintenance_epoch.to_be_bytes());
-    digest.update([match head.maintenance_state {
-        StoredMaintenanceState::Idle => 0,
-        StoredMaintenanceState::Sweeping => 1,
-    }]);
-    match head.maintenance_fixed_cursor {
-        Some(cursor) => {
-            digest.update([1]);
-            update_cursor_digest(&mut digest, cursor);
-        }
-        None => digest.update([0]),
-    }
-    digest.finalize().into()
-}
-
-fn update_cursor_digest(digest: &mut Sha256, cursor: StoredCursor) {
-    digest.update(cursor.sequence.to_be_bytes());
-    match cursor.operation {
-        Some(operation) => {
-            digest.update([1]);
-            digest.update(operation);
-        }
-        None => digest.update([0]),
     }
 }
 
@@ -1322,19 +1259,15 @@ struct StoredManifest {
 #[serde(deny_unknown_fields)]
 struct StoredCommittedResult {
     cursor: StoredCursor,
-    transaction_sha256: [u8; 32],
+    request_sha256: [u8; 32],
 }
 
 impl StoredCommittedResult {
     fn from_transaction(transaction: &StoredTransaction) -> Result<Self, ManagedError> {
-        let bytes = encode_cbor(
-            TRANSACTION_MAGIC,
-            transaction,
-            "checkpoint Managed namespace",
-        )?;
+        let bytes = encode_cbor(CHANGE_MAGIC, transaction, "checkpoint Managed namespace")?;
         Ok(Self {
             cursor: transaction.cursor,
-            transaction_sha256: sha256(&bytes),
+            request_sha256: sha256(&bytes),
         })
     }
 
@@ -1592,6 +1525,43 @@ fn apply_transaction(
 ) -> Result<NamespaceSnapshot, ManagedError> {
     let change = transaction.to_change(base.as_ref())?;
     change.apply(base)
+}
+
+fn replay_tail_from(
+    base: &NamespaceSnapshot,
+    head: &StoredHead,
+) -> Result<Option<NamespaceSnapshot>, ManagedError> {
+    let target = head.cursor.into_cursor()?;
+    if base.cursor == target {
+        return Ok(Some(base.clone()));
+    }
+    let mut start = None;
+    for (index, transaction) in head.tail.iter().enumerate() {
+        if transaction.parent.into_cursor()? == base.cursor {
+            start = Some(index);
+            break;
+        }
+    }
+    let Some(start) = start else {
+        return Ok(None);
+    };
+    let mut snapshot = base.clone();
+    for transaction in &head.tail[start..] {
+        if transaction.parent.into_cursor()? != snapshot.cursor {
+            return Err(corrupt(
+                "read Managed namespace",
+                "transaction tail is not consecutive",
+            ));
+        }
+        snapshot = apply_transaction(Some(snapshot), transaction)?;
+    }
+    if snapshot.cursor != target {
+        return Err(corrupt(
+            "read Managed namespace",
+            "transaction tail does not reach HEAD",
+        ));
+    }
+    Ok(Some(snapshot))
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1985,16 +1955,8 @@ mod tests {
         let volume = VolumeId::from_bytes([1; 16]);
         let operation = OperationId::from_bytes([2; 16]);
         let cursor = ChangeCursor::at(NonZeroU64::new(1).unwrap(), operation);
-        let mut head = StoredHead::new(
-            volume,
-            cursor.into(),
-            *operation.as_bytes(),
-            [3; 32],
-            [4; 32],
-            cursor.into(),
-            0,
-        )
-        .unwrap();
+        let mut head =
+            StoredHead::new(volume, cursor.into(), [4; 32], cursor.into(), Vec::new()).unwrap();
 
         let sweep = head.begin_gc().unwrap();
         let mut recovered = decode_head(&encode_head(&head).unwrap()).unwrap();
@@ -2050,7 +2012,7 @@ mod tests {
     }
 
     #[test]
-    fn wide_directory_transaction_encodes_only_entry_changes() {
+    fn wide_directory_change_encodes_only_entry_changes() {
         let first = OperationId::from_bytes([11; 16]);
         let first_cursor = ChangeCursor::at(NonZeroU64::new(1).unwrap(), first);
         let mut base = root_snapshot(first_cursor);
@@ -2089,7 +2051,7 @@ mod tests {
             target: target.clone(),
         };
         let stored = StoredTransaction::from_publication(&publication, Some(&base));
-        let encoded = encode_cbor(TRANSACTION_MAGIC, &stored, "test").unwrap();
+        let encoded = encode_cbor(CHANGE_MAGIC, &stored, "test").unwrap();
         assert!(encoded.len() < 2_000, "encoded {} bytes", encoded.len());
     }
 
@@ -2133,7 +2095,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn committed_operations_resolve_from_manifest_then_wal() {
+    async fn committed_operations_resolve_from_checkpoint_and_inline_tail() {
         let first = OperationId::from_bytes([41; 16]);
         let first_cursor = ChangeCursor::at(NonZeroU64::new(1).unwrap(), first);
         let first_snapshot = root_snapshot(first_cursor);
@@ -2178,16 +2140,12 @@ mod tests {
         };
         let stored =
             StoredTransaction::from_publication(&second_publication, Some(&first_snapshot));
-        let bytes = encode_cbor(TRANSACTION_MAGIC, &stored, "test").unwrap();
-        namespace.ensure_transaction(second, &bytes).await.unwrap();
         let head = StoredHead::new(
             namespace.volume_id,
             stored.cursor,
-            stored.operation,
-            sha256(&bytes),
             first_head.checkpoint,
             first_head.checkpoint_cursor,
-            1,
+            vec![stored],
         )
         .unwrap();
         namespace
