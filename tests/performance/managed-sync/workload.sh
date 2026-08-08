@@ -13,7 +13,6 @@ set -euo pipefail
 : "${OFS_INPUTS:?}" "${OFS_COMMANDS:?}" "${OFS_RELEASE:?}" "${OFS_RUN_ID:?}"
 
 rounds=${OFS_PERF_ROUNDS:-12}
-pack=${OFS_PERF_PACK:-0}
 volume=performance-volume
 catalog="$OFS_RUN_ROOT/catalog.json"
 evidence="$OFS_RUN_ROOT/evidence"
@@ -135,21 +134,6 @@ for round in $(seq 1 "$rounds"); do
   current_state=$next_state
 done
 
-if [[ $pack == 1 ]]; then
-  "$OFS_BIN" volume pack --help >/dev/null 2>&1 || {
-    printf '%s\n' 'selected release does not support the pack scenario' >&2
-    exit 2
-  }
-  measure maintenance pack "$evidence/pack.txt" \
-    "$OFS_BIN" volume pack "$volume"
-  indexed_tree="$OFS_RUN_ROOT/replica-indexed"
-  indexed_state="$OFS_RUN_ROOT/state-indexed.json"
-  mkdir "$indexed_tree"
-  measure indexed_read cold "$evidence/indexed-read.txt" \
-    "$OFS_BIN" sync "$volume" "$indexed_tree" --state "$indexed_state"
-  diff -qr "$current_tree" "$indexed_tree" >/dev/null
-fi
-
 measure catchup lagging "$evidence/catchup-lagging.txt" \
   "$OFS_BIN" sync "$volume" "$lagging_tree" --state "$lagging_state"
 diff -qr "$current_tree" "$lagging_tree" >/dev/null
@@ -199,7 +183,6 @@ pathlib.Path(sys.argv[2]).write_text(
 PY
 {
   printf '%s\t%s\trounds\t%s\n' "$OFS_RELEASE" "$OFS_RUN_ID" "$rounds"
-  printf '%s\t%s\tpack\t%s\n' "$OFS_RELEASE" "$OFS_RUN_ID" "$pack"
   printf '%s\t%s\tlogical_files\t%s\n' "$OFS_RELEASE" "$OFS_RUN_ID" "$logical_files"
   printf '%s\t%s\tlogical_bytes\t%s\n' "$OFS_RELEASE" "$OFS_RUN_ID" "$logical_bytes"
 } >>"$OFS_INPUTS"

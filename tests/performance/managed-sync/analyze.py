@@ -69,6 +69,8 @@ def request_phase(start_ns: int, intervals) -> str:
 
 def object_class(path: str) -> str:
     decoded = "/" + unquote(path).lstrip("/")
+    if "/.ofs/managed/data/v1/segments/sha256/" in decoded:
+        return "segment_data"
     if "/.ofs/managed/indexes/data-pack/v1/packs/sha256/" in decoded:
         return "pack_data"
     if "/.ofs/managed/indexes/data-pack/v1/" in decoded:
@@ -104,7 +106,11 @@ def load_requests(path: Path, intervals):
         distribution[key]["bytes_in"] += request["bytes_in"]
         distribution[key]["bytes_out"] += request["bytes_out"]
         uploaded[run]["request_bytes"] += request["bytes_in"]
-        if request["method"] == "PUT" and classification in {"loose_data", "pack_data"}:
+        if request["method"] == "PUT" and classification in {
+            "segment_data",
+            "loose_data",
+            "pack_data",
+        }:
             uploaded[run]["data_put_bytes"] += request["bytes_in"]
             if phase == "noop":
                 noop_data_puts.append(request)
@@ -188,7 +194,7 @@ def comparison_summary(samples, requests, inventories, inputs, equal):
         }
     )
     metadata_classes = {"format", "metadata", "secondary_index"}
-    data_classes = {"loose_data", "pack_data"}
+    data_classes = {"segment_data", "loose_data", "pack_data"}
     for row in inventories:
         total = object_totals[row["run"]]
         total["total_objects"] += row["objects"]

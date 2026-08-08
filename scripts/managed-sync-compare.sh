@@ -30,7 +30,6 @@ Options:
                           release build of the current working tree.
   --output DIRECTORY      New evidence directory.
   --rounds N              Lifecycle generations (default: 12).
-  --pack                  Pack eligible blobs before the final cold catch-up.
   -h, --help              Show this help.
 EOF
 }
@@ -40,7 +39,6 @@ baseline=
 candidate=
 output=
 rounds=12
-pack=0
 while (($#)); do
   case $1 in
     --baseline|--candidate|--output|--rounds)
@@ -53,10 +51,6 @@ while (($#)); do
       usage
       exit 0
       ;;
-    --pack)
-      pack=1
-      shift
-      ;;
     *)
       printf 'unexpected argument: %s\n' "$1" >&2
       usage >&2
@@ -68,7 +62,7 @@ done
 [[ -n $baseline ]] || { printf '%s\n' '--baseline is required' >&2; exit 2; }
 [[ $rounds =~ ^[1-9][0-9]*$ ]] || { printf '%s\n' '--rounds must be greater than zero' >&2; exit 2; }
 
-declare -a settings=("OFS_PERF_ROUNDS=$rounds" "OFS_PERF_PACK=$pack")
+declare -a settings=("OFS_PERF_ROUNDS=$rounds")
 select_source() {
   local role=$1 source=$2 path
   if [[ -f $source ]]; then

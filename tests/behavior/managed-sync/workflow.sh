@@ -136,21 +136,12 @@ printf '%s\n' '#!/bin/sh' 'printf "managed sync executable\\n"' >"$replica_a/too
 chmod u+x "$replica_a/tools/run.sh"
 OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a"
 OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_b" --state "$state_b"
-printf '%s\n' 'acceptance: pack live small content and repeat idempotently'
-first_pack=$(OFS_CONFIG="$config" "$OFS_BIN" volume pack workspace)
-grep -Eq 'packs=[1-9][0-9]*' <<<"$first_pack" || fail 'first pack run produced no pack'
-grep -Eq 'content=[1-9][0-9]*' <<<"$first_pack" || fail 'first pack run indexed no content'
-rebuilt_index=$(OFS_CONFIG="$config" "$OFS_BIN" volume reindex workspace)
-grep -Eq 'content=[1-9][0-9]*' <<<"$rebuilt_index" || \
-  fail 'pack index rebuild did not recover content locations'
-second_pack=$(OFS_CONFIG="$config" "$OFS_BIN" volume pack workspace)
-grep -Fq 'packs=0 content=0 logical_bytes=0' <<<"$second_pack" || \
-  fail 'second pack run was not idempotent'
-cp "$replica_a/first.txt" "$replica_a/reused-from-pack.txt"
+printf '%s\n' 'acceptance: reuse known content at a new path'
+cp "$replica_a/first.txt" "$replica_a/reused-content.txt"
 OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a"
 OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_b" --state "$state_b"
-cmp "$replica_a/reused-from-pack.txt" "$replica_b/reused-from-pack.txt" || \
-  fail 'authority-known packed content did not round trip at a new path'
+cmp "$replica_a/reused-content.txt" "$replica_b/reused-content.txt" || \
+  fail 'authority-known content did not round trip at a new path'
 [[ -d "$replica_b/nested/level" ]] || fail 'nested directories were not materialized'
 cmp "$replica_a/nested/level/entry.txt" "$replica_b/nested/level/entry.txt" || \
   fail 'nested file content did not round trip'
@@ -286,7 +277,7 @@ grep -Fxq 'history change 60' "$replica_b/checkpoint.txt" || \
   fail 'replica did not recover the fixed target after a long change history'
 garbage_collection=$(OFS_CONFIG="$config" "$OFS_BIN" volume gc workspace)
 grep -Eq 'deleted=[1-9][0-9]*' <<<"$garbage_collection" || \
-  fail 'namespace-fenced collection removed no unreachable loose data'
+  fail 'namespace-fenced collection removed no unreachable data segments'
 
 printf '%s\n' 'acceptance: rebuild a cold client from remote authority'
 OFS_CONFIG="$cold_config" "$OFS_BIN" "${volume_create[@]}"

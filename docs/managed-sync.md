@@ -1,298 +1,179 @@
 # Managed Sync
 
-Managed Sync reconciles an ordinary local directory with a Managed volume. The
-local directory stays usable while disconnected. Remote publication happens
-only when you run `ofs sync`.
+Managed Sync reconciles an ordinary local directory with a Managed volume. It
+preserves stable filesystem identity, detects concurrent changes with
+generation preconditions, retains conflicts for explicit resolution, and
+publishes each accepted namespace change atomically.
 
-This guide explains the Managed Sync contract and its local acceptance
-environment. The filesystem concepts come from
-[RFC 016](../rfcs/0016_filesystem_architecture.md) and are not specific to
-Sync.
+RFC 016 defines two independent axes: Direct or Managed is the volume model;
+Mount or Sync is the access model. Sync is a frontend over the common Volume
+interface. Object and transactional metadata are implementations of the same
+Managed namespace contract. The data format is shared by Managed Mount and
+Managed Sync.
 
-## The two RFC 016 axes
+## Commands
 
-RFC 016 separates namespace authority from the way a user accesses it:
+Create a Managed volume and bind it to a local alias:
 
-| Axis | Choices | Meaning |
-| --- | --- | --- |
-| Volume Model | Direct, Managed | Who owns the remote namespace and its filesystem identities |
-| Access Model | Mount, Sync | Whether the remote view or a materialized local tree is the working filesystem |
+```shell
+ofs --config volumes.json volume create workspace \
+  --model managed \
+  --storage 's3://bucket/prefix?region=us-east-1'
+```
 
-`NodeId`, `FileVersion`, `Generation`, `DirectoryEntry`, `ChangeCursor`,
-capabilities, errors, and publication outcomes are shared filesystem semantics.
-A Managed volume uses the same authoritative identities and publication rules
-whether it is opened through Mount or Sync. Direct volumes use the same
-vocabulary where it applies, with storage object versions and paths supplying
-their weaker identity model.
+Use `OFS_STORAGE_URL` instead of `--storage` when runtime configuration should
+come from the environment. Credentials remain in the provider's standard
+environment or credential chain and are never written to the catalog or
+volume.
 
-The named-volume commands in this guide assemble a Managed volume with Sync
-access. Sync adds durable local intent, a common base, three-way reconciliation,
-retained conflicts, and local materialization. Those concerns do not belong to
-the Managed volume format.
+Reconcile a local replica:
 
-## Runtime storage concurrency
+```shell
+ofs --config volumes.json sync workspace ./tree --state ./workspace.state
+```
 
-Sync, Mount, pack, reindex, and garbage collection accept
-`--transfer-concurrency N`; `OFS_TRANSFER_CONCURRENCY` provides the same
-setting. The default is four, and the value must be greater than zero. The
-assembled OpenDAL operator uses it as its operation limit, and Sync also uses
-it to bound publication and materialization work. Volume creation and `status`
-do not perform parallel transfers and therefore do not accept the option. This
-is runtime configuration, not part of a Volume Model, Access Model, or durable
+Inspect replica state:
+
+```shell
+ofs --config volumes.json status --state ./workspace.state --json
+```
+
+Resolve a retained conflict with the current local file:
+
+```shell
+ofs --config volumes.json sync workspace ./tree \
+  --state ./workspace.state \
+  --resolve path/to/file
+```
+
+Collect unreachable data segments against a fenced namespace snapshot:
+
+```shell
+ofs --config volumes.json volume gc workspace
+```
+
+All storage commands accept `--transfer-concurrency`; the equivalent
+environment variable is `OFS_TRANSFER_CONCURRENCY`. Retry and concurrency are
+provided by OpenDAL layers shared by the assembled operators.
+
+## Durable boundaries
+
+The Managed superblock is the one persistent source of volume identity and
+format selection. It records the Managed specification, naming policy,
+metadata format, file-version format, data format, and required extensions. It
+does not record credentials, endpoints, local paths, chunk sizes, segment size
+targets, retry settings, or checkpoint schedules.
+
+Object metadata uses these objects:
+
+```text
+.ofs/managed/metadata/v1/superblock.json
+.ofs/managed/metadata/v1/head.ofs
+.ofs/managed/metadata/v1/manifests/sha256/<digest>.ofs
+.ofs/managed/metadata/v1/sstables/sha256/<digest>.sst
+```
+
+`head.ofs` is the sole mutable commit point. It has a fixed format marker,
+decoded-length field, zstd-compressed canonical CBOR body, and SHA-256 checksum.
+A conditional PUT replaces it.
+It names an immutable checkpoint and contains a bounded ordered tail of
+committed namespace changes. A reader fetches HEAD once, reads the manifest and
+the selected SSTable blocks, then applies the inline tail. Recent operation
+results resolve from HEAD; older results are typed records in the checkpoint
+SSTable.
+
+When a client snapshot cursor occurs in the inline tail, the reader applies
+only the suffix after that cursor. It does not reread the checkpoint manifest
+or SSTable blocks. A cold client, or a client older than the retained tail,
+recovers from the checkpoint.
+
+Transactional metadata stores the same filesystem facts and operation results
+in its native transaction and snapshot model. It does not copy a second
+metadata authority into object storage.
+
+File data uses immutable content-addressed segments:
+
+```text
+.ofs/managed/data/v1/segments/sha256/<first-two-hex>/<digest>.seg
+```
+
+Each segment contains a fixed header, raw content regions, a canonical footer,
+and a fixed trailer with the footer range and segment checksum. A `FileVersion`
+stores its logical size, whole-file digest, and extent map. Every extent stores
+its logical offset, `ContentRef`, `SegmentRef`, and byte offset in that segment.
+The extent map is authoritative filesystem metadata; no secondary index is
+needed to read a committed file.
+
+The segment footer makes an object independently inspectable. The extent map
+makes the read path direct: it does not LIST, read a footer, or fetch another
+location object before accessing bytes. Full reconstruction downloads each
+selected segment once. Incremental reconstruction sends all selected ranges
+for one segment through OpenDAL's reader, allowing its native range coalescing
+to reduce HTTP requests.
+
+## Staging and publication
+
+Sync freezes changed local files before remote mutation. Files smaller than the
+chunking threshold produce one logical content extent. Larger files use
+FastCDC, which improves reuse after localized changes. Whole-file and FastCDC
+are placement policy, not format variants: the stored extent map is sufficient
+for every reader.
+
+Staging deduplicates new `ContentRef` values against the fixed authority
+snapshot and within the publication. New content is sorted and placed into a
+small number of immutable segments. Segment size, chunking parameters, and
+concurrency are runtime policy and may change without changing the durable
 format.
 
-## Managed volumes in Sync
+The end-to-end order is:
 
-Sync treats Managed metadata and file data as one remote Volume contract. It
-does not interpret metadata checkpoints, file manifests, packs, or secondary
-indexes. The volume validates its storage format and required extensions before
-Sync scans or publishes anything.
+1. Observe one metadata snapshot and version token.
+2. Freeze changed local files.
+3. Stage and verify immutable data segments.
+4. Build a namespace publication with generation preconditions.
+5. Commit through the metadata authority.
+6. Persist the new Sync common base and install the reconciled local tree.
 
-Every file version stores one extent map. An empty file has no extents, a
-whole file has one extent, and a chunked file has multiple extents. The format
-does not store the algorithm or parameters that selected those boundaries.
-Packing is explicit maintenance and does not change the filesystem-visible
-file version, node generation, or change cursor.
+Data written before a failed metadata commit is unreachable and can be removed
+by fenced garbage collection. Data is never published after its metadata
+reference.
 
-Data is written and verified before metadata can reference it. If publication
-fails after that write, the result may be an unreachable loose object. The
-namespace remains valid, and explicit garbage collection can reclaim the
-object later.
+## Validation and failure behavior
 
-During an update, the fixed parent snapshot is also proof that its reachable
-`ContentRef` values are durable. Sync still reads and hashes changed local
-input, but it does not probe or download matching content again. New content
-keeps the same create-only write and read-back verification. This applies to
-every extent without changing Sync semantics.
+Readers fail closed on unknown format identifiers, required extensions, fields,
+record kinds, codecs, invalid ranges, overflow, checksums, or filesystem
+invariants. Immutable object collisions are accepted only when the existing
+object validates against the same identity. A missing referenced segment or
+checkpoint is corruption, not an empty file or absent namespace.
 
-## Create an Object metadata volume on MinIO
+An `OperationId` is an idempotency key. Repeating the same committed request
+returns its committed cursor. Reusing it for another payload is a conflict. A
+conditional-write race returns the observed authority state and does not create
+a second commit path.
 
-Keep provider credentials in the environment. The volume catalog stores only
-the credential-free storage URL and the stable volume binding.
+Garbage collection first acquires a metadata maintenance fence and fixes the
+namespace cursor. It marks segment references reachable from that snapshot,
+uses one recursive inventory, deletes unreferenced segment objects through
+OpenDAL's bulk deletion interface, and releases the fence. A segment containing
+any reachable extent remains live.
 
-```shell
-export OFS_CONFIG="$PWD/ofs-volumes.json"
-export AWS_ACCESS_KEY_ID=minioadmin
-export AWS_SECRET_ACCESS_KEY=minioadmin
-export AWS_REGION=us-east-1
+## Tests and performance evidence
 
-ofs volume create workspace \
-  --model managed \
-  --storage 's3://managed-sync/workspace?endpoint=http%3A%2F%2F127.0.0.1%3A19000&region=us-east-1'
-```
+Behavior tests exercise user-visible Sync publication, catch-up, conflict,
+recovery, and garbage collection. Regression tests cover failures that would
+corrupt or misinterpret durable data. Tests do not constrain buffer sizes,
+private call sequences, or other implementation details.
 
-With no `--metadata` argument, namespace metadata is stored beside the data in
-the same OpenDAL-backed root. Its authoritative superblock is
-`.ofs/managed/metadata/v1/superblock.json`. Repeating the command reads that
-same format v1 volume and leaves its identity unchanged.
-
-Use a different storage root for each volume. The root is private Managed
-storage, not an object namespace for other tools to edit.
-
-## Extent write policy
-
-The current writer keeps small files as one extent and uses FastCDC for larger
-files. Its threshold and chunk-size targets are runtime write policy: changing
-them can alter the cost of newly written files but cannot alter how an existing
-file version is decoded. A reader needs only the ordered offsets, blob digests,
-and lengths in the extent map.
-
-Run `ofs volume pack` to aggregate eligible loose blobs into a derived read
-index. Packing does not change any published `FileVersion` or extent map.
-
-## Create a D1 metadata volume with MinIO data
-
-D1 holds the authoritative namespace while MinIO holds immutable file data.
-Set the D1 token separately from the catalog URL.
-
-```shell
-export OFS_CONFIG="$PWD/ofs-volumes.json"
-export OFS_D1_TOKEN=local-d1-token
-export AWS_ACCESS_KEY_ID=minioadmin
-export AWS_SECRET_ACCESS_KEY=minioadmin
-export AWS_REGION=us-east-1
-
-ofs volume create workspace \
-  --model managed \
-  --storage 's3://managed-sync/workspace?endpoint=http%3A%2F%2F127.0.0.1%3A19000&region=us-east-1' \
-  --metadata 'd1://local/managed-sync/workspace?api_base=http%3A%2F%2F127.0.0.1%3A19001%2Fclient%2Fv4'
-```
-
-The D1 URL has the form `d1://ACCOUNT/DATABASE/STORE`. D1 holds the only
-superblock for this placement; the data store does not contain or validate a
-second copy. The local catalog is only a binding cache and must agree with the
-identity read from D1. For a remote D1 deployment, omit the local `api_base`
-override unless the endpoint requires it.
-
-## Synchronize a local directory
-
-Keep the replica state outside the synchronized directory. It contains the
-durable common base, publication intent, and conflict records.
-
-```shell
-mkdir -p worktree state
-
-ofs sync workspace worktree --state state/worktree.json
-ofs status --state state/worktree.json
-ofs status --state state/worktree.json --json
-```
-
-A sync freezes a stable view of local input, records its publication intent,
-writes and verifies data, then publishes one metadata transaction. The common
-base advances only after the committed target has been installed locally. If a
-process stops after its intent becomes durable, repeat the same `ofs sync`
-command. Recovery uses the original operation identity instead of guessing
-whether the transaction committed.
-
-The durable staging area records the complete logical tree but stores file
-content only for changed paths. Unchanged files reuse the `FileVersion` fixed
-by the authority snapshot. Remote reconciliation installs only affected local
-paths. This keeps update staging proportional to the change while preserving
-the same crash-recovery contract.
-
-A no-op sync does not republish unchanged content. Hard links and symbolic
-links are rejected before publication because format v1 does not advertise
-those capabilities. Regular files, directories, empty files, executable bits,
-renames, and directory moves use the Managed namespace contract.
-
-## Resolve a conflict
-
-Concurrent changes on different paths merge normally. When both replicas
-change the same file from the same common base, Sync preserves the local and
-remote candidates and reports a conflict.
-
-```shell
-ofs status --state state/worktree.json --json
-ofs sync workspace worktree --state state/worktree.json --resolve path/to/file
-```
-
-`--resolve` publishes the current local candidate for that path. Review the
-file before running the command. Sync never chooses a last writer silently.
-
-## Pack data
-
-Packing is explicit maintenance over a fixed namespace snapshot. It selects
-reachable, non-empty whole-file content no larger than 256 KiB. A pack contains
-at most 8 MiB of logical content. The command writes an immutable pack, verifies
-its footer, and publishes a derived pack index.
-
-```shell
-ofs volume pack workspace
-```
-
-Running the same command again is safe. Content that already has a verified
-pack location is not packed again.
-
-The placement index is secondary state. Rebuild it from immutable pack
-trailers and footers without repacking data:
-
-```shell
-ofs volume reindex workspace
-```
-
-Reindexing is the only pack operation that lists pack objects. It uses object
-lengths returned by the listing when available, then reads only the fixed
-trailer and referenced footer ranges. Foreground reads never list packs.
-
-A cold full-tree materialization downloads and verifies each selected pack
-once, then writes all of its files from that verified body. Incremental Sync
-keeps range reads because downloading a whole pack for one changed file would
-amplify data transfer. The choice belongs to the materialization operation and
-does not change the pack format or index.
-
-Packs and their placement index are derived read caches under
-`.ofs/managed/indexes/data-pack/v1/`. Loose content remains authoritative.
-Deleting the whole pack index tree cannot make a committed file version
-unreadable. Garbage collection reads one recursive inventory of loose objects.
-Eligible keys are submitted through the OpenDAL deleter, which uses the
-provider's batch limits. Malformed loose keys remain untouched. A live digest
-stored with an unexpected object length fails closed before deletion. If
-deletion stops after some provider batches, rerun the command; the next
-inventory continues with the objects that remain.
-
-Unreachable loose objects require a namespace maintenance fence:
-
-```shell
-ofs volume gc workspace
-```
-
-The metadata authority fixes a change cursor and blocks publication before the
-collector deletes anything. A stopped collector leaves a resumable sweep;
-another invocation continues the same epoch. Finishing the sweep and returning
-the authority to idle uses the matching authority token. This prevents a
-writer from publishing a reference to an object that GC has just classified as
-unreachable.
-
-## Run the local acceptance environment
-
-The xtask command surface starts MinIO and a local D1 Query API through Docker
-Compose or Podman Compose. It also creates the MinIO bucket used by the
-workflows.
-
-```shell
-cargo x managed-sync doctor
-cargo x managed-sync test workflow object
-cargo x managed-sync test workflow d1
-```
-
-The two workflow commands exercise the same user-visible contract with Object
-metadata and D1 metadata. They cover publication, cold materialization,
-rename, delete, disjoint merge, explicit conflict resolution, killed-process
-recovery, checkpoint catch-up, pack maintenance, garbage collection, and
-credential-free status output.
-
-Bub drives the public CLI and ordinary directories. A separate oracle checks
-the resulting tree and state:
-
-```shell
-cargo x managed-sync bub .local/evidence/managed-sync-bub
-```
-
-The release A/B harness writes its evidence to the requested directory:
-
-```shell
-cargo x managed-sync perf .local/evidence/managed-sync-performance
-```
-
-For an explicit baseline binary, branch, or commit, use the single comparison
-entry point. The candidate defaults to a fresh release build of the current
-working tree:
+The release comparison runs the same deterministic multi-generation workload
+against two binaries and verifies byte-for-byte logical equality. It reports
+full and range requests, request and response bytes, metadata/data/total object
+counts and sizes, lifecycle latency, publication latency, and catch-up latency:
 
 ```shell
 scripts/managed-sync-compare.sh \
   --baseline psiace/managed-sync-layers \
-  --output .local/evidence/managed-sync-comparison
+  --output .local/evidence/managed-sync-authoritative-vs-layers
 ```
 
-`comparison.json` reports request counts, request and response bytes,
-metadata/data/total remote object counts and bytes, latency, and logical tree
-equality. Raw requests, inventories, manifests, and commands remain beside it.
-
-The fixed acceptance thresholds are at most 10 percent sustained lifecycle
-regression and at most 15 percent publication or catch-up p95 regression. The
-harness also checks that a no-op sync does not upload file data.
-
-Use `cargo x managed-sync up` and `cargo x managed-sync down` only when you need
-to inspect the fixture manually. Set `OFS_COMPOSE` to `docker`, `podman`, or
-`podman-compose` if automatic runtime detection does not select the intended
-command.
-
-## OpenDAL boundary
-
-Managed data and colocated Object metadata use OpenDAL `Operator` directly for
-read, create-only write, stat, recursive list, provider-batched deletion, and
-head compare-and-swap. SSTable block and packfile reads use OpenDAL
-`Reader::fetch`, which merges nearby byte ranges and returns zero-copy slices
-for the requested ranges.
-Local Sync scanning and ordinary file I/O use the OpenDAL filesystem service.
-Native filesystem calls remain where object operations cannot express an
-atomic local state replacement, Unix link inspection, or permission handling.
-
-A custom OpenDAL layer is appropriate only when it preserves the object
-operation contract and can report its capabilities accurately. Retry,
-timeouts, telemetry, immutable caching, or a self-describing object codec can
-fit that boundary. Namespace transactions, `FileVersion` construction,
-packing, and Sync reconciliation do not. Each assembled storage operator uses
-OpenDAL's `ConcurrentLimitLayer` with the shared runtime concurrency value and
-its jittered `RetryLayer` for temporary provider failures. OFS does not add a
-project-specific storage layer.
+The harness retains raw request logs, object inventories, timings, and logical
+manifests so every aggregate can be recomputed.

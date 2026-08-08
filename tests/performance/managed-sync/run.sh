@@ -17,15 +17,12 @@ candidate_sha=${OFS_PERF_CANDIDATE:-$(git -C "$workspace" rev-parse HEAD)}
 candidate_binary=${OFS_PERF_CANDIDATE_BIN:-}
 output=${1:-$workspace/.local/performance/managed-sync-ab-$(date -u +%Y%m%dT%H%M%SZ)}
 rounds=${OFS_PERF_ROUNDS:-12}
-pack=${OFS_PERF_PACK:-0}
 bucket=ofs-managed-performance
 access_key=ofs-performance
 secret_key=ofs-performance-password
 minio_image=${MINIO_IMAGE:-quay.io/minio/minio:RELEASE.2024-09-22T00-33-43Z}
 mc_image=${MC_IMAGE:-quay.io/minio/mc:RELEASE.2024-09-16T17-43-14Z}
 schedule=(baseline candidate candidate baseline baseline candidate)
-
-[[ $pack == 0 || $pack == 1 ]] || { printf '%s\n' 'OFS_PERF_PACK must be 0 or 1' >&2; exit 2; }
 
 if [[ -n ${OFS_CONTAINER_RUNTIME:-} ]]; then
   runtime=$OFS_CONTAINER_RUNTIME
@@ -136,7 +133,6 @@ proxy_port=$(<"$proxy_ready")
   printf 'container_runtime\t%s\n' "$runtime"
   printf 'minio_image\t%s\n' "$minio_image"
   printf 'rounds\t%s\n' "$rounds"
-  printf 'pack\t%s\n' "$pack"
 } >"$output/context.tsv"
 
 for index in "${!schedule[@]}"; do
@@ -150,7 +146,7 @@ for index in "${!schedule[@]}"; do
     OFS_BIN="$scratch/ofs-$release" OFS_RUN_ROOT="$run_root" OFS_STORAGE_URL="$storage_url" \
     OFS_METRICS="$output/samples.tsv" OFS_INPUTS="$output/inputs.tsv" \
     OFS_COMMANDS="$output/commands.tsv" OFS_RELEASE="$release" OFS_RUN_ID="$run" \
-    OFS_PERF_ROUNDS="$rounds" OFS_PERF_PACK="$pack" "$suite/workload.sh"
+    OFS_PERF_ROUNDS="$rounds" "$suite/workload.sh"
 
   mc_run du --json "performance/$bucket/$object_root" >"$run_root/object-inventory.json"
   mc_run ls --recursive --json "performance/$bucket/$object_root" \
