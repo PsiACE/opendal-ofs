@@ -46,6 +46,36 @@ measure() {
     "$started_ns" "$ended_ns" >>"$OFS_METRICS"
 }
 
+write_deterministic() {
+  local path=$1 size=$2 seed=$3
+  python3 - "$path" "$size" "$seed" <<'PY'
+import hashlib
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+size = int(sys.argv[2])
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_bytes(hashlib.shake_256(sys.argv[3].encode()).digest(size))
+PY
+}
+
+rewrite_window() {
+  local path=$1 offset=$2 size=$3 seed=$4
+  python3 - "$path" "$offset" "$size" "$seed" <<'PY'
+import hashlib
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+offset = int(sys.argv[2])
+size = int(sys.argv[3])
+with path.open("r+b") as output:
+    output.seek(offset)
+    output.write(hashlib.shake_256(sys.argv[4].encode()).digest(size))
+PY
+}
+
 create=("$OFS_BIN" volume create "$volume")
 if "$OFS_BIN" volume create --help 2>&1 | grep -q -- '--model'; then
   create+=(--model managed)
@@ -58,11 +88,15 @@ source_state="$OFS_RUN_ROOT/state-source.json"
 lagging_tree="$OFS_RUN_ROOT/replica-lagging"
 lagging_state="$OFS_RUN_ROOT/state-lagging.json"
 mkdir -p "$source_tree/memory" "$source_tree/skills" "$lagging_tree"
-{
-  printf 'shared seed\n'
-  head -c 1048576 /dev/zero
-} >"$source_tree/memory/seed.bin"
-printf 'managed sync performance\n' >"$source_tree/skills/storage.txt"
+write_deterministic "$source_tree/memory/seed.bin" $((16 * 1024 * 1024)) seed
+for group in $(seq 0 7); do
+  for item in $(seq 0 15); do
+    write_deterministic \
+      "$source_tree/skills/group-$group/file-$item.dat" \
+      "$((1024 + (group * 16 + item) * 113))" \
+      "small-$group-$item"
+  done
+done
 
 run_command "$evidence/initial-publication.txt" \
   "$OFS_BIN" sync "$volume" "$source_tree" --state "$source_state"
@@ -80,10 +114,18 @@ for round in $(seq 1 "$rounds"); do
   measure catchup "$round" "$evidence/catchup-$round.txt" \
     "$OFS_BIN" sync "$volume" "$next_tree" --state "$next_state"
   diff -qr "$current_tree" "$next_tree" >/dev/null
-  {
-    printf 'generation %02d\n' "$round"
-    head -c 262144 /dev/zero
-  } >"$next_tree/memory/generation-$round.bin"
+  rewrite_window \
+    "$next_tree/memory/seed.bin" \
+    "$(((round * 1048573) % (15 * 1024 * 1024)))" \
+    $((64 * 1024)) "seed-edit-$round"
+  group=$((round % 8))
+  item=$((round % 16))
+  write_deterministic \
+    "$next_tree/skills/group-$group/file-$item.dat" \
+    "$((4096 + round * 257))" "small-edit-$round"
+  write_deterministic \
+    "$next_tree/memory/generation-$round.bin" \
+    $((256 * 1024)) "generation-$round"
   measure publication "$round" "$evidence/publication-$round.txt" \
     "$OFS_BIN" sync "$volume" "$next_tree" --state "$next_state"
   rm -rf "$current_tree"
@@ -108,6 +150,37 @@ read -r logical_files logical_bytes < <(
   find "$current_tree" -type f -printf '%s\n' |
     awk '{ bytes += $1; files += 1 } END { print files + 0, bytes + 0 }'
 )
+python3 - "$current_tree" "$OFS_RUN_ROOT/logical-tree.json" <<'PY'
+import hashlib
+import json
+import pathlib
+import stat
+import sys
+
+root = pathlib.Path(sys.argv[1])
+entries = []
+for path in sorted(root.rglob("*")):
+    relative = path.relative_to(root).as_posix()
+    if path.is_dir():
+        entries.append({"path": relative, "type": "directory"})
+        continue
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    entries.append(
+        {
+            "path": relative,
+            "type": "file",
+            "bytes": path.stat().st_size,
+            "executable": bool(path.stat().st_mode & stat.S_IXUSR),
+            "sha256": digest.hexdigest(),
+        }
+    )
+pathlib.Path(sys.argv[2]).write_text(
+    json.dumps(entries, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+)
+PY
 {
   printf '%s\t%s\trounds\t%s\n' "$OFS_RELEASE" "$OFS_RUN_ID" "$rounds"
   printf '%s\t%s\tlogical_files\t%s\n' "$OFS_RELEASE" "$OFS_RUN_ID" "$logical_files"

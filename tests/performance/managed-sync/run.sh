@@ -10,9 +10,11 @@
 set -euo pipefail
 
 baseline_sha=${OFS_PERF_BASELINE:-b262c3ae9f0c8147a3295072fc05e36adb1f9702}
+baseline_binary=${OFS_PERF_BASELINE_BIN:-}
 workspace=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
 suite="$workspace/tests/performance/managed-sync"
 candidate_sha=${OFS_PERF_CANDIDATE:-$(git -C "$workspace" rev-parse HEAD)}
+candidate_binary=${OFS_PERF_CANDIDATE_BIN:-}
 output=${1:-$workspace/.local/performance/managed-sync-ab-$(date -u +%Y%m%dT%H%M%SZ)}
 rounds=${OFS_PERF_ROUNDS:-12}
 bucket=ofs-managed-performance
@@ -32,8 +34,22 @@ fi
 for command in git cargo curl python3 "$runtime"; do
   command -v "$command" >/dev/null || { printf 'required command is missing: %s\n' "$command" >&2; exit 2; }
 done
-git -C "$workspace" cat-file -e "$baseline_sha^{commit}"
-git -C "$workspace" cat-file -e "$candidate_sha^{commit}"
+if [[ -n $baseline_binary ]]; then
+  [[ -x $baseline_binary ]] || { printf 'baseline binary is not executable: %s\n' "$baseline_binary" >&2; exit 2; }
+  baseline_binary=$(cd "$(dirname "$baseline_binary")" && pwd)/$(basename "$baseline_binary")
+  baseline_identity="binary:$baseline_binary"
+else
+  git -C "$workspace" cat-file -e "$baseline_sha^{commit}"
+  baseline_identity=$(git -C "$workspace" rev-parse "$baseline_sha^{commit}")
+fi
+if [[ -n $candidate_binary ]]; then
+  [[ -x $candidate_binary ]] || { printf 'candidate binary is not executable: %s\n' "$candidate_binary" >&2; exit 2; }
+  candidate_binary=$(cd "$(dirname "$candidate_binary")" && pwd)/$(basename "$candidate_binary")
+  candidate_identity="binary:$candidate_binary"
+else
+  git -C "$workspace" cat-file -e "$candidate_sha^{commit}"
+  candidate_identity=$(git -C "$workspace" rev-parse "$candidate_sha^{commit}")
+fi
 [[ ! -e $output ]] || { printf 'output path already exists: %s\n' "$output" >&2; exit 2; }
 mkdir -p "$output/runs"
 output=$(cd "$output" && pwd)
@@ -61,17 +77,19 @@ cleanup() {
 }
 trap cleanup EXIT
 
-git -C "$workspace" worktree add --detach "$scratch/baseline" "$baseline_sha" >/dev/null
-git -C "$workspace" worktree add --detach "$scratch/candidate" "$candidate_sha" >/dev/null
-
 build_release() {
-  local release=$1 source=$2
+  local release=$1 source=$2 binary=$3
+  if [[ -n $binary ]]; then
+    cp "$binary" "$scratch/ofs-$release"
+    return
+  fi
+  git -C "$workspace" worktree add --detach "$source" "${4}" >/dev/null
   CARGO_TARGET_DIR="$scratch/target-$release" \
     cargo build --manifest-path "$source/Cargo.toml" --release --locked --bin ofs
   cp "$scratch/target-$release/release/ofs" "$scratch/ofs-$release"
 }
-build_release baseline "$scratch/baseline"
-build_release candidate "$scratch/candidate"
+build_release baseline "$scratch/baseline" "$baseline_binary" "$baseline_sha"
+build_release candidate "$scratch/candidate" "$candidate_binary" "$candidate_sha"
 
 "$runtime" run -d --rm --name "$container" -p 127.0.0.1::9000 \
   -e "MINIO_ROOT_USER=$access_key" -e "MINIO_ROOT_PASSWORD=$secret_key" \
@@ -108,8 +126,8 @@ proxy_port=$(<"$proxy_ready")
 : >"$output/inputs.tsv"
 : >"$output/commands.tsv"
 {
-  printf 'baseline_sha\t%s\n' "$baseline_sha"
-  printf 'candidate_sha\t%s\n' "$candidate_sha"
+  printf 'baseline\t%s\n' "$baseline_identity"
+  printf 'candidate\t%s\n' "$candidate_identity"
   printf 'rustc\t%s\n' "$(rustc --version)"
   printf 'kernel\t%s\n' "$(uname -srmo)"
   printf 'container_runtime\t%s\n' "$runtime"

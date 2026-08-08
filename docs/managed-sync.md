@@ -48,9 +48,11 @@ does not interpret metadata checkpoints, file manifests, packs, or secondary
 indexes. The volume validates its storage format and required extensions before
 Sync scans or publishes anything.
 
-Format v1 uses FastCDC at or above 1 MiB and whole-file content below that
-threshold. Packing is explicit maintenance and does not change the
-filesystem-visible file version, node generation, or change cursor.
+Every file version stores one extent map. An empty file has no extents, a
+whole file has one extent, and a chunked file has multiple extents. The format
+does not store the algorithm or parameters that selected those boundaries.
+Packing is explicit maintenance and does not change the filesystem-visible
+file version, node generation, or change cursor.
 
 Data is written and verified before metadata can reference it. If publication
 fails after that write, the result may be an unreachable loose object. The
@@ -61,7 +63,7 @@ During an update, the fixed parent snapshot is also proof that its reachable
 `ContentRef` values are durable. Sync still reads and hashes changed local
 input, but it does not probe or download matching content again. New content
 keeps the same create-only write and read-back verification. This applies to
-whole files and FastCDC chunks without changing Sync semantics.
+every extent without changing Sync semantics.
 
 ## Create an Object metadata volume on MinIO
 
@@ -80,22 +82,23 @@ ofs volume create workspace \
 ```
 
 With no `--metadata` argument, namespace metadata is stored beside the data in
-the same OpenDAL-backed root. Repeating the command opens the same format v1
-volume and leaves its identity unchanged.
+the same OpenDAL-backed root. Its authoritative superblock is
+`.ofs/managed/metadata/v1/superblock.json`. Repeating the command reads that
+same format v1 volume and leaves its identity unchanged.
 
 Use a different storage root for each volume. The root is private Managed
 storage, not an object namespace for other tools to edit.
 
-## Large-file chunking
+## Extent write policy
 
-Format v1 uses FastCDC v2020 for files of at least 1 MiB, with 64 KiB minimum,
-256 KiB target, and 1 MiB maximum chunks. These writer values are fixed. Each
-file-version manifest stores the values needed to interpret its chunks, so a
-reader does not depend on local configuration.
+The current writer keeps small files as one extent and uses FastCDC for larger
+files. Its threshold and chunk-size targets are runtime write policy: changing
+them can alter the cost of newly written files but cannot alter how an existing
+file version is decoded. A reader needs only the ordered offsets, blob digests,
+and lengths in the extent map.
 
-Smaller files remain whole. Run `ofs volume pack` to aggregate their physical
-content into a derived read index; packing does not change any published
-`FileVersion`.
+Run `ofs volume pack` to aggregate eligible loose blobs into a derived read
+index. Packing does not change any published `FileVersion` or extent map.
 
 ## Create a D1 metadata volume with MinIO data
 
@@ -115,8 +118,11 @@ ofs volume create workspace \
   --metadata 'd1://local/managed-sync/workspace?api_base=http%3A%2F%2F127.0.0.1%3A19001%2Fclient%2Fv4'
 ```
 
-The D1 URL has the form `d1://ACCOUNT/DATABASE/STORE`. For a remote D1
-deployment, omit the local `api_base` override unless the endpoint requires it.
+The D1 URL has the form `d1://ACCOUNT/DATABASE/STORE`. D1 holds the only
+superblock for this placement; the data store does not contain or validate a
+second copy. The local catalog is only a binding cache and must agree with the
+identity read from D1. For a remote D1 deployment, omit the local `api_base`
+override unless the endpoint requires it.
 
 ## Synchronize a local directory
 
@@ -248,6 +254,20 @@ The release A/B harness writes its evidence to the requested directory:
 cargo x managed-sync perf .local/evidence/managed-sync-performance
 ```
 
+For an explicit baseline binary, branch, or commit, use the single comparison
+entry point. The candidate defaults to a fresh release build of the current
+working tree:
+
+```shell
+scripts/managed-sync-compare.sh \
+  --baseline psiace/managed-sync-layers \
+  --output .local/evidence/managed-sync-comparison
+```
+
+`comparison.json` reports request counts, request and response bytes,
+metadata/data/total remote object counts and bytes, latency, and logical tree
+equality. Raw requests, inventories, manifests, and commands remain beside it.
+
 The fixed acceptance thresholds are at most 10 percent sustained lifecycle
 regression and at most 15 percent publication or catch-up p95 regression. The
 harness also checks that a no-op sync does not upload file data.
@@ -261,8 +281,9 @@ command.
 
 Managed data and colocated Object metadata use OpenDAL `Operator` directly for
 read, create-only write, stat, recursive list, provider-batched deletion, and
-head compare-and-swap. Section reads use OpenDAL `Reader::fetch`, which merges
-nearby byte ranges and returns zero-copy slices for the requested sections.
+head compare-and-swap. SSTable block and packfile reads use OpenDAL
+`Reader::fetch`, which merges nearby byte ranges and returns zero-copy slices
+for the requested ranges.
 Local Sync scanning and ordinary file I/O use the OpenDAL filesystem service.
 Native filesystem calls remain where object operations cannot express an
 atomic local state replacement, Unix link inspection, or permission handling.

@@ -98,7 +98,8 @@ the selected backend and frontend can enforce generation-checked publication.
 Managed Sync keeps the working tree on the native local filesystem and
 publishes only during an explicit `ofs sync`. See the
 [Managed Sync guide](docs/managed-sync.md) for Object and D1 setup, conflict
-handling, recovery, and maintenance.
+handling, recovery, maintenance, and the current-versus-baseline comparison
+entry point.
 
 ## Branding
 
