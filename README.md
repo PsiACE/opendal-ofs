@@ -28,7 +28,9 @@ while Sync reconciles an ordinary local directory only when explicitly invoked.
 
 Managed Sync uses a local directory as the working filesystem and publishes
 explicitly to a format v1 Managed volume. Namespace metadata can use colocated
-objects or D1, while immutable data is accessed through OpenDAL. See the
+objects or D1, while immutable data is accessed through OpenDAL. Volume names
+are client-local catalog aliases, so disposable containers may register the
+same remote volume under different names. See the
 [Managed Sync documentation](docs/managed-sync.md) for the workflow,
 architecture, and storage format.
 

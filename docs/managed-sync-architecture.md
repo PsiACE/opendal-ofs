@@ -49,6 +49,28 @@ storage format. The catalog stores a credential-free volume binding. Runtime
 credentials come from provider environment variables or the provider's normal
 credential chain.
 
+## Remote identity and local aliases
+
+The superblock `VolumeId` identifies the remote Managed volume. A catalog name
+is only a local alias for a credential-free tuple of `VolumeId`, data locator,
+and optional metadata locator. Alias text has no remote meaning, so two
+containers can use different names for the same volume.
+
+`volume create` is an open-first ensure-and-register operation. An unbound
+client looks for an existing superblock before attempting to initialize one.
+If no superblock exists, Metadata atomically creates one with a new `VolumeId`;
+if it does exist, the command registers the observed identity under the
+requested local alias. A configured alias only verifies its saved identity and
+locators against the remote format. It never recreates a missing superblock
+from local catalog state. One catalog keeps at most one alias for a `VolumeId`,
+while independent catalogs choose their aliases independently.
+
+Replica state stores `VolumeId`, not the alias or catalog path. Before Sync
+reads or mutates either side, the application resolves the current alias and
+checks that its `VolumeId` matches the replica state. Losing a catalog therefore
+does not change remote identity; a disposable client can register a new alias
+from the same locators and cold-materialize into a new replica.
+
 ## Namespace model
 
 The filesystem core uses stable `NodeId` values. A node has a generation,

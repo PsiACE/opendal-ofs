@@ -23,8 +23,10 @@ Without `--metadata`, namespace metadata is stored beside the data objects.
 The storage URL saved in the catalog must not contain credentials.
 `OFS_STORAGE_URL` may provide the storage URL instead of `--storage`.
 
-Running the same command with the same alias and storage binding reopens the
-volume. A different binding is rejected.
+The command registers `workspace` as a local alias. If the selected root has no
+Managed superblock, it creates one. Otherwise it reads the existing `VolumeId`
+and binds the alias to it. Repeating the same local binding verifies it; a
+different binding for an existing alias is rejected.
 
 ## Create a volume with D1 Metadata
 
@@ -65,6 +67,31 @@ The first sync has two possible outcomes:
 
 The state file records the volume identity, verified common base, pending
 operation, and retained conflicts. Do not place it inside the replica.
+
+## Attach from another container
+
+Aliases belong to a local catalog and do not need to match between containers.
+With the same credentials and storage locators, another container can choose a
+different catalog and alias:
+
+```shell
+export OFS_CONFIG=/state/agent-b-volumes.json
+
+ofs volume create restored-memory \
+  --model managed \
+  --storage 's3://bucket/prefix?region=us-east-1'
+
+mkdir -p /workspace/memory
+ofs sync restored-memory /workspace/memory \
+  --state /state/agent-b-replica.state
+```
+
+The create command reads the existing superblock, so `restored-memory` resolves
+to the same remote `VolumeId` that another client may call `workspace`. The
+first sync into an empty directory materializes the current generation. Both
+clients can then edit their ordinary directories and publish with their own
+aliases. The normal generation checks, three-way merge, and conflict rules
+apply; aliases never participate in reconciliation.
 
 ## Work and publish
 
@@ -107,7 +134,8 @@ The JSON object contains:
 
 ```json
 {
-  "volume": "workspace",
+  "volume_alias": "workspace",
+  "volume_id": "00112233445566778899aabbccddeeff",
   "volume_model": "managed",
   "access_model": "sync",
   "common_sequence": 12,
@@ -167,8 +195,9 @@ ofs sync workspace ./recovered \
 ```
 
 If the catalog was also lost, first run `volume create` with the original
-storage and metadata locators. The command reads the existing superblock and
-binds the local alias to that volume identity.
+storage and metadata locators. The replacement alias may differ from the lost
+one. The command reads the existing superblock and binds the new local alias to
+that volume identity.
 
 ## Collect unreachable segments
 
