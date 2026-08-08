@@ -22,18 +22,16 @@ use super::{
     StagedTree, build_publication, reconcile,
 };
 use crate::filesystem::{
-    ChangeCursor, FileVersion, MaterializeRequest, NodeId, NodeKind, OperationId,
-    PublicationProgress, Volume, VolumeId, VolumeObservation, VolumeReader, VolumeSnapshot,
+    ChangeCursor, CommitOutcome, FileVersion, MaterializeRequest, NodeId, NodeKind, OperationId,
+    Volume, VolumeId, VolumeObservation, VolumeReader, VolumeSnapshot,
 };
 
 #[derive(Clone, Debug)]
 pub struct SyncResult {
-    pub volume: VolumeId,
     pub common: ChangeCursor,
     pub conflicts: Vec<ConflictRecord>,
     pub pending: bool,
     pub published: bool,
-    pub materialized: bool,
 }
 
 #[derive(Clone)]
@@ -75,11 +73,8 @@ impl<V: Volume> SyncEngine<V> {
         }
 
         let prior_staging = if let Some(pending) = state.pending.clone() {
-            let progress = PublicationProgress::prepared(pending.base)
-                .record_outcome(self.volume.resolve(pending.operation).await?)
-                .context("resolve prepared publication")?;
-            match progress {
-                PublicationProgress::Published { committed } => {
+            match self.volume.resolve(pending.operation).await? {
+                CommitOutcome::Committed(committed) => {
                     let observed = self
                         .volume
                         .observe()
@@ -100,7 +95,7 @@ impl<V: Volume> SyncEngine<V> {
                         )
                         .await?;
                     if !target_is_live && !safe_to_install {
-                        return Ok(result(&state, false, false));
+                        return Ok(result(&state, false));
                     }
                     let materialized = !target_is_live;
                     if materialized {
@@ -112,29 +107,20 @@ impl<V: Volume> SyncEngine<V> {
                         )
                         .await?;
                     }
-                    let progress = progress
-                        .record_install(observed.snapshot().cursor)
-                        .context("record installed publication")?;
-                    state = advance_common_base(
-                        progress,
-                        observed.snapshot(),
-                        replica_path,
-                        state_path,
-                    )
-                    .await?;
+                    state =
+                        advance_common_base(observed.snapshot(), replica_path, state_path).await?;
                     remove_tree(&pending.staging)?;
-                    return Ok(result(&state, true, materialized));
+                    return Ok(result(&state, true));
                 }
-                PublicationProgress::Unknown { .. } => {
-                    return Ok(result(&state, false, false));
+                CommitOutcome::Unknown => {
+                    return Ok(result(&state, false));
                 }
-                PublicationProgress::Retry { .. } => {
+                CommitOutcome::Absent | CommitOutcome::Conflict { .. } => {
                     if !pending.staging.is_dir() {
                         bail!("pending publication staging is missing; restore it before recovery");
                     }
                     Some(pending.staging)
                 }
-                _ => bail!("resolved publication entered an invalid state"),
             }
         } else {
             None
@@ -158,7 +144,7 @@ impl<V: Volume> SyncEngine<V> {
                         snapshot.cursor == state.common && local_matches_state(&local, &state)
                     })
                 {
-                    return Ok(result(&state, false, false));
+                    return Ok(result(&state, false));
                 }
                 let staging_path = fresh_sibling(state_path, "publish");
                 let known_digests = known_local_digests(&local, &state);
@@ -186,9 +172,6 @@ impl<V: Volume> SyncEngine<V> {
 
         if let Some(remote) = remote {
             let plan = reconcile(&state, &staged, remote)?;
-            if plan.base != state.common || plan.remote != remote.cursor {
-                bail!("reconciliation plan does not match its fixed inputs");
-            }
             install_remote |= remote.cursor != state.common;
             let target = fs_operator(staged.root())?;
             let (merge_remote_directories, publish_local_directories) =
@@ -202,9 +185,9 @@ impl<V: Volume> SyncEngine<V> {
             let mut installs = Vec::new();
             for action in plan.actions {
                 match action {
-                    ReconcileAction::KeepLocal { .. } => {}
-                    ReconcileAction::PublishLocal { .. } => publish = true,
-                    ReconcileAction::PublishRename { .. } => publish = true,
+                    ReconcileAction::KeepLocal => {}
+                    ReconcileAction::PublishLocal => publish = true,
+                    ReconcileAction::PublishRename => publish = true,
                     ReconcileAction::InstallRemote {
                         path,
                         node,
@@ -274,22 +257,21 @@ impl<V: Volume> SyncEngine<V> {
             state.pending = None;
             state.install(state_path)?;
             remove_tree(&staging_path)?;
-            return Ok(result(&state, false, false));
+            return Ok(result(&state, false));
         }
 
         if !publish {
             state.conflicts.clear();
             if let Some(remote) = remote {
+                if install_remote && !matches_frozen(replica_path, &frozen_input).await? {
+                    bail!("local replica changed while remote state was being installed");
+                }
                 if install_remote {
-                    if matches_frozen(replica_path, &frozen_input).await? {
-                        if staged_full_tree {
-                            StagedTree::remove_manifest(&staging_path)?;
-                            install_tree(replica_path, &staging_path)?;
-                        } else {
-                            install_staged_changes(replica_path, &staged, &frozen_input)?;
-                        }
+                    if staged_full_tree {
+                        StagedTree::remove_manifest(&staging_path)?;
+                        install_tree(replica_path, &staging_path)?;
                     } else {
-                        install_remote = false;
+                        install_staged_changes(replica_path, &staged, &frozen_input)?;
                     }
                 }
                 state = state_from_snapshot(remote, replica_path).await?;
@@ -298,14 +280,13 @@ impl<V: Volume> SyncEngine<V> {
             }
             state.install(state_path)?;
             remove_tree(&staging_path)?;
-            return Ok(result(&state, false, install_remote));
+            return Ok(result(&state, false));
         }
 
         let operation = OperationId::generate();
         staged.save_manifest()?;
         state.pending = Some(PendingIntent {
             operation,
-            base: remote.map_or(ChangeCursor::Genesis, |snapshot| snapshot.cursor),
             staging: staging_path.clone(),
             renames: local_renames,
         });
@@ -366,61 +347,46 @@ impl<V: Volume> SyncEngine<V> {
             &merged,
             &prepared,
         )?;
-        let progress = PublicationProgress::prepared(publication.parent)
-            .record_outcome(self.volume.publish(observed.as_ref(), &publication).await?)
-            .context("record publication outcome")?;
-        match progress {
-            PublicationProgress::Published { .. } => {
+        match self.volume.publish(observed.as_ref(), &publication).await? {
+            CommitOutcome::Committed(committed) if committed == publication.target.cursor => {
                 let unchanged = matches_frozen(replica_path, &frozen_input).await?;
                 if !unchanged {
-                    return Ok(result(&state, false, false));
+                    return Ok(result(&state, false));
                 }
                 let materialized = requires_materialization;
                 if materialized {
                     install_staged_changes(replica_path, &staged, &frozen_input)?;
                 }
-                let progress = progress
-                    .record_install(publication.target.cursor)
-                    .context("record installed publication")?;
-                state =
-                    advance_common_base(progress, &publication.target, replica_path, state_path)
-                        .await?;
+                state = advance_common_base(&publication.target, replica_path, state_path).await?;
                 remove_tree(&staging_path)?;
-                Ok(result(&state, true, materialized))
+                Ok(result(&state, true))
             }
-            PublicationProgress::Retry { .. } | PublicationProgress::Unknown { .. } => {
-                Ok(result(&state, false, false))
+            CommitOutcome::Absent | CommitOutcome::Conflict { .. } | CommitOutcome::Unknown => {
+                Ok(result(&state, false))
             }
-            _ => bail!("publication entered an invalid state"),
+            CommitOutcome::Committed(_) => {
+                bail!("volume returned a commit cursor that does not match the publication")
+            }
         }
     }
 }
 
 async fn advance_common_base(
-    progress: PublicationProgress,
     snapshot: &VolumeSnapshot,
     replica: &Path,
     state_path: &Path,
 ) -> Result<ReplicaState> {
     let state = state_from_snapshot(snapshot, replica).await?;
-    let progress = progress
-        .record_common_base(state.common)
-        .context("advance publication common base")?;
-    let _complete = progress
-        .record_intent_clear()
-        .context("clear completed publication intent")?;
     state.install(state_path)?;
     Ok(state)
 }
 
-fn result(state: &ReplicaState, published: bool, materialized: bool) -> SyncResult {
+fn result(state: &ReplicaState, published: bool) -> SyncResult {
     SyncResult {
-        volume: state.volume,
         common: state.common,
         conflicts: state.conflicts.clone(),
         pending: state.pending.is_some(),
         published,
-        materialized,
     }
 }
 
@@ -501,7 +467,7 @@ async fn committed_tree_is_safe(
             let files_are_safe = plan.actions.iter().all(|action| {
                 matches!(
                     action,
-                    ReconcileAction::KeepLocal { .. }
+                    ReconcileAction::KeepLocal
                         | ReconcileAction::InstallRemote { .. }
                         | ReconcileAction::DeleteLocal { .. }
                 )

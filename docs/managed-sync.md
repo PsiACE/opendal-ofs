@@ -32,13 +32,12 @@ the Managed volume format.
 
 ## Runtime storage concurrency
 
-`--transfer-concurrency N` and `OFS_TRANSFER_CONCURRENCY` set the shared OFS
-storage concurrency value. The default is four, and the value must be greater
-than zero. Each assembled OpenDAL storage operator uses it as its operation
-limit. Sync uses the same value to bound publication and materialization work.
-Direct Mount, Managed Sync, and Managed maintenance therefore use one setting.
-This is runtime configuration, not part of a Volume Model, Access Model, or
-durable format.
+Remote commands accept `--transfer-concurrency N`; `OFS_TRANSFER_CONCURRENCY`
+provides the same setting. The default is four, and the value must be greater
+than zero. The assembled OpenDAL operator uses it as its operation limit, and
+Sync uses it to bound publication and materialization work. `status` does not
+open storage and therefore does not accept the option. This is runtime
+configuration, not part of a Volume Model, Access Model, or durable format.
 
 ## Managed volumes in Sync
 
@@ -48,7 +47,7 @@ indexes. The volume validates its storage format and required extensions before
 Sync scans or publishes anything.
 
 The CLI exposes `whole` and `fastcdc` writer policies, with whole-file writes as
-the default. FastCDC applies at or above its configured file-size threshold, so
+the default. FastCDC uses its fixed format-v1 policy at or above 1 MiB, so
 smaller files remain whole. Packing is explicit maintenance and does not change
 the filesystem-visible file version, node generation, or change cursor.
 
@@ -97,14 +96,10 @@ ofs volume create workspace \
   --file-layout fastcdc
 ```
 
-The defaults use FastCDC v2020 for files of at least 1 MiB, with 64 KiB minimum,
-256 KiB target, and 1 MiB maximum chunks. Override them with
-`--fastcdc-minimum-file-size`, `--fastcdc-minimum-chunk-size`,
-`--fastcdc-target-chunk-size`, and `--fastcdc-maximum-chunk-size`. Each option
-takes a byte count. The corresponding environment variables are
-`OFS_FASTCDC_MINIMUM_FILE_SIZE`, `OFS_FASTCDC_MINIMUM_CHUNK_SIZE`,
-`OFS_FASTCDC_TARGET_CHUNK_SIZE`, and `OFS_FASTCDC_MAXIMUM_CHUNK_SIZE`.
-`OFS_FILE_LAYOUT` sets `whole` or `fastcdc`.
+Format v1 uses FastCDC v2020 for files of at least 1 MiB, with 64 KiB minimum,
+256 KiB target, and 1 MiB maximum chunks. These interpretation parameters are
+fixed rather than stored as per-client tuning. `OFS_FILE_LAYOUT` selects
+`whole` or `fastcdc`.
 
 The catalog keeps the selected policy. Reopening an existing catalog without
 layout options preserves its current policy. Supplying a layout updates future
@@ -146,8 +141,8 @@ durable common base, publication intent, and conflict records.
 mkdir -p worktree state
 
 ofs sync workspace worktree --state state/worktree.json
-ofs status worktree --state state/worktree.json
-ofs status worktree --state state/worktree.json --json
+ofs status --state state/worktree.json
+ofs status --state state/worktree.json --json
 ```
 
 A sync freezes a stable view of local input, records its publication intent,
@@ -175,7 +170,7 @@ change the same file from the same common base, Sync preserves the local and
 remote candidates and reports a conflict.
 
 ```shell
-ofs status worktree --state state/worktree.json --json
+ofs status --state state/worktree.json --json
 ofs sync workspace worktree --state state/worktree.json --resolve path/to/file
 ```
 
@@ -196,16 +191,16 @@ ofs volume pack workspace
 Running the same command again is safe. Content that already has a verified
 pack location is not packed again.
 
-The placement index is derived from pack footers. Rebuild it explicitly after
-an index loss or integrity failure:
+The placement index is secondary state. Rebuild it from immutable pack
+trailers and footers without repacking data:
 
 ```shell
-ofs volume pack workspace --rebuild-index
+ofs volume reindex workspace
 ```
 
-Rebuilding lists pack objects and verifies every footer before publishing the
-replacement index. It does not change file versions, loose content, or pack
-contents.
+Reindexing is the only pack operation that lists pack objects. It uses object
+lengths returned by the listing when available, then reads only the fixed
+trailer and referenced footer ranges. Foreground reads never list packs.
 
 A cold full-tree materialization downloads and verifies each selected pack
 once, then writes all of its files from that verified body. Incremental Sync

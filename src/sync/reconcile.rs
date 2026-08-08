@@ -12,24 +12,17 @@ use anyhow::{Context, Result, bail};
 
 use super::{ConflictRecord, ReplicaState, StagedTree};
 use crate::filesystem::NodeKind;
-use crate::filesystem::{
-    ChangeCursor, FileVersion, FileVersionId, Generation, NodeId, VolumeSnapshot,
-};
+use crate::filesystem::{FileVersion, FileVersionId, Generation, NodeId, VolumeSnapshot};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ReconcilePlan {
-    pub base: ChangeCursor,
-    pub remote: ChangeCursor,
+pub(crate) struct ReconcilePlan {
     pub actions: Vec<ReconcileAction>,
     pub local_renames: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ReconcileAction {
-    KeepLocal {
-        path: String,
-        digest: Option<[u8; 32]>,
-    },
+pub(crate) enum ReconcileAction {
+    KeepLocal,
     InstallRemote {
         path: String,
         node: NodeId,
@@ -39,15 +32,8 @@ pub enum ReconcileAction {
     DeleteLocal {
         path: String,
     },
-    PublishLocal {
-        path: String,
-        digest: Option<[u8; 32]>,
-    },
-    PublishRename {
-        from: String,
-        path: String,
-        node: NodeId,
-    },
+    PublishLocal,
+    PublishRename,
     Conflict(ConflictRecord),
     Unsupported {
         path: String,
@@ -74,7 +60,7 @@ struct RemoteDirectory {
 ///
 /// The result contains decisions only. Installing or publishing data is a
 /// separate operation, so this function performs no I/O.
-pub fn reconcile(
+pub(crate) fn reconcile(
     replica: &ReplicaState,
     local: &StagedTree,
     remote: &VolumeSnapshot,
@@ -146,27 +132,15 @@ pub fn reconcile(
             };
 
         let action = if local_digest.is_some() && local_digest == remote_digest {
-            Some(ReconcileAction::KeepLocal {
-                path,
-                digest: local_digest,
-            })
+            Some(ReconcileAction::KeepLocal)
         } else {
             match (local_changed, remote_changed) {
-                (false, false) if local_digest.is_some() => Some(ReconcileAction::KeepLocal {
-                    path,
-                    digest: local_digest,
-                }),
+                (false, false) if local_digest.is_some() => Some(ReconcileAction::KeepLocal),
                 (false, false) => None,
-                (true, false) => Some(ReconcileAction::PublishLocal {
-                    path,
-                    digest: local_digest,
-                }),
+                (true, false) => Some(ReconcileAction::PublishLocal),
                 (false, true) => Some(remote_action(path, remote_path)),
                 (true, true) if local_digest == remote_digest => {
-                    local_digest.map(|digest| ReconcileAction::KeepLocal {
-                        path,
-                        digest: Some(digest),
-                    })
+                    local_digest.map(|_| ReconcileAction::KeepLocal)
                 }
                 (true, true) => Some(ReconcileAction::Conflict(ConflictRecord {
                     path,
@@ -181,8 +155,6 @@ pub fn reconcile(
     }
 
     Ok(ReconcilePlan {
-        base: replica.common,
-        remote: remote.cursor,
         actions,
         local_renames,
     })
@@ -233,10 +205,7 @@ fn reconcile_remote_renames(
             });
             actions.push(install_remote(new_path.clone(), renamed));
         } else if old_local.is_none() && new_local == Some(renamed.digest) {
-            actions.push(ReconcileAction::KeepLocal {
-                path: new_path.clone(),
-                digest: new_local,
-            });
+            actions.push(ReconcileAction::KeepLocal);
         } else {
             actions.push(ReconcileAction::Unsupported {
                 path: old_path.clone(),
@@ -253,7 +222,7 @@ fn reconcile_local_renames(
     handled: &mut BTreeSet<String>,
     actions: &mut Vec<ReconcileAction>,
 ) -> Result<BTreeMap<String, String>> {
-    let local_paths = local.source_identities();
+    let local_paths = local.logical().entries();
     let mut renames = replica
         .pending
         .as_ref()
@@ -269,10 +238,10 @@ fn reconcile_local_renames(
         }
     }
     let mut local_by_identity = BTreeMap::new();
-    for (path, identity) in local_paths {
-        if let Some(identity) = identity {
+    for (path, entry) in local_paths {
+        if let Some(identity) = entry.native_identity {
             local_by_identity
-                .entry(*identity)
+                .entry(identity)
                 .and_modify(|value: &mut Option<String>| *value = None)
                 .or_insert_with(|| Some(path.clone()));
         }
@@ -313,21 +282,14 @@ fn reconcile_local_renames(
         {
             handled.insert(from.clone());
             handled.insert(path.clone());
-            actions.push(ReconcileAction::PublishRename {
-                from: from.clone(),
-                path: path.clone(),
-                node: base.node,
-            });
+            actions.push(ReconcileAction::PublishRename);
         } else if remote_target.is_some_and(|entry| entry.node() == base.node)
             && remote_source.is_none()
             && remote_target.is_some_and(|entry| local_matches_remote(local, path, entry))
         {
             handled.insert(from.clone());
             handled.insert(path.clone());
-            actions.push(ReconcileAction::KeepLocal {
-                path: path.clone(),
-                digest: local.files().get(path).map(|file| file.digest),
-            });
+            actions.push(ReconcileAction::KeepLocal);
         } else {
             handled.insert(from.clone());
             handled.insert(path.clone());
@@ -345,7 +307,7 @@ fn reconcile_local_renames(
 
 fn validate_subtree_renames(
     replica: &ReplicaState,
-    local: &BTreeMap<String, Option<super::local::NativeIdentity>>,
+    local: &BTreeMap<String, super::local::LocalEntry>,
     renames: &BTreeMap<String, String>,
 ) -> Result<()> {
     for (from, path) in renames {
@@ -412,7 +374,7 @@ fn reject_unidentified_moves(
     handled: &mut BTreeSet<String>,
     actions: &mut Vec<ReconcileAction>,
 ) {
-    let local_paths = local.source_identities();
+    let local_paths = local.logical().entries();
     let deleted = replica
         .base
         .iter()
@@ -440,16 +402,18 @@ fn reject_unidentified_moves(
             .base
             .get(path)
             .is_some_and(|entry| entry.local_identity.is_some())
-    }) && added
-        .iter()
-        .all(|path| local_paths.get(path).is_some_and(Option::is_some));
+    }) && added.iter().all(|path| {
+        local_paths
+            .get(path)
+            .is_some_and(|entry| entry.native_identity.is_some())
+    });
     let crosses_devices = deleted.iter().any(|from| {
         replica.base[from].digest.is_none()
             && added.iter().any(|path| {
                 !local.files().contains_key(path)
                     && replica.base[from]
                         .local_identity
-                        .zip(local_paths[path])
+                        .zip(local_paths[path].native_identity)
                         .is_some_and(|(from, to)| from.device != to.device)
             })
     });

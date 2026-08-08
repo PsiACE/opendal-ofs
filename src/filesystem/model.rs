@@ -23,12 +23,3 @@ pub enum VolumeModel {
     /// Filesystem metadata is authoritative and references immutable data.
     Managed,
 }
-
-/// Selects what state an application reads and writes immediately.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum AccessModel {
-    /// Applications operate on an online remote filesystem view.
-    Mount,
-    /// Applications operate on an ordinary local replica.
-    Sync,
-}

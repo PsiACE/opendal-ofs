@@ -22,7 +22,7 @@ use crate::filesystem::{
 ///
 /// Rename identity belongs to reconciliation. This builder preserves identity
 /// at an unchanged path, but never treats equal content as proof of a rename.
-pub fn build_publication<V: Volume>(
+pub(crate) fn build_publication<V: Volume>(
     volume_api: &V,
     volume: VolumeId,
     operation: OperationId,

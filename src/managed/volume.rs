@@ -83,10 +83,7 @@ impl ManagedMaterializer {
             .await
     }
 
-    pub(crate) async fn pack_locations(
-        &self,
-        content: ContentRef,
-    ) -> Result<Vec<PackLocation>, ManagedError> {
+    pub(crate) async fn pack_locations(&self, content: ContentRef) -> Vec<PackLocation> {
         self.packs.locations(content).await
     }
 
@@ -315,7 +312,6 @@ impl ManagedVolume {
             .await
     }
 
-    /// Rebuild the derived pack placement index from verified pack footers.
     pub async fn rebuild_pack_index(&self) -> Result<usize, ManagedError> {
         self.data.rebuild_pack_index().await
     }
@@ -347,11 +343,7 @@ impl VolumeReader for ManagedMaterializer {
                 _ => None,
             };
             let location = match content {
-                Some(content) => self
-                    .pack_locations(content)
-                    .await
-                    .ok()
-                    .and_then(|locations| locations.into_iter().next()),
+                Some(content) => self.pack_locations(content).await.into_iter().next(),
                 None => None,
             };
             match (content, location) {

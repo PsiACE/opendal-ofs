@@ -20,7 +20,7 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 use super::{ManagedError, ManagedErrorKind};
-use crate::filesystem::{VolumeId, VolumeModel};
+use crate::filesystem::VolumeId;
 
 pub(crate) const SUPERBLOCK_KEY: &str = ".ofs/managed/volume.json";
 
@@ -31,7 +31,7 @@ const SUPPORTED_EXTENSIONS: &[&str] = &[FASTCDC_EXTENSION];
 
 /// Naming rules fixed by the Managed volume format.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum NamingPolicy {
+enum NamingPolicy {
     PortableUtf8V1,
 }
 
@@ -84,10 +84,6 @@ impl ManagedFormat {
         Ok(format)
     }
 
-    pub const fn volume_model(&self) -> VolumeModel {
-        VolumeModel::Managed
-    }
-
     pub const fn volume_id(&self) -> VolumeId {
         self.volume_id
     }
@@ -96,19 +92,11 @@ impl ManagedFormat {
         self.metadata_placement
     }
 
-    pub const fn naming_policy(&self) -> NamingPolicy {
-        self.naming_policy
-    }
-
-    pub fn extensions(&self) -> &BTreeSet<String> {
-        &self.extensions
-    }
-
-    pub fn extension_enabled(&self, extension: ManagedExtension) -> bool {
+    pub(crate) fn extension_enabled(&self, extension: ManagedExtension) -> bool {
         self.extensions.contains(extension.id())
     }
 
-    pub fn validate_for_read(&self) -> Result<(), ManagedError> {
+    pub(crate) fn validate_for_read(&self) -> Result<(), ManagedError> {
         if self
             .extensions
             .iter()
@@ -119,7 +107,7 @@ impl ManagedFormat {
         Ok(())
     }
 
-    pub fn validate_for_write(&self) -> Result<(), ManagedError> {
+    pub(crate) fn validate_for_write(&self) -> Result<(), ManagedError> {
         self.validate_for_read()
     }
 

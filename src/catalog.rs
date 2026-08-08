@@ -18,7 +18,6 @@
 //! Credential-free local names for volumes.
 
 use std::collections::BTreeMap;
-use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write as _};
 use std::path::{Path, PathBuf};
@@ -30,7 +29,7 @@ use url::Url;
 use crate::filesystem::{VolumeId, VolumeModel};
 use crate::managed::FileLayoutPolicy;
 
-const SCHEMA_MAJOR: u16 = 2;
+const SCHEMA_MAJOR: u16 = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VolumeDefinition {
@@ -49,7 +48,6 @@ pub enum VolumeSettings {
 pub struct ManagedVolumeSettings {
     pub metadata: Option<Url>,
     pub file_layout: FileLayoutPolicy,
-    pub format_major: u16,
 }
 
 impl VolumeDefinition {
@@ -61,38 +59,24 @@ impl VolumeDefinition {
             settings: VolumeSettings::Direct,
         })
     }
-
     pub fn managed(
         volume_id: VolumeId,
         storage: Url,
         metadata: Option<Url>,
-        format_major: u16,
+        file_layout: FileLayoutPolicy,
     ) -> Result<Self> {
         require_credential_free("storage", &storage)?;
         if let Some(metadata) = &metadata {
             require_credential_free("metadata", metadata)?;
-        }
-        if format_major == 0 {
-            bail!("Managed volume format major must be greater than zero");
         }
         Ok(Self {
             volume_id,
             storage,
             settings: VolumeSettings::Managed(ManagedVolumeSettings {
                 metadata,
-                file_layout: FileLayoutPolicy::Whole,
-                format_major,
+                file_layout,
             }),
         })
-    }
-
-    pub fn with_file_layout(mut self, file_layout: FileLayoutPolicy) -> Result<Self> {
-        file_layout.validate()?;
-        let VolumeSettings::Managed(settings) = &mut self.settings else {
-            bail!("Direct volumes do not have a Managed file layout policy");
-        };
-        settings.file_layout = file_layout;
-        Ok(self)
     }
 
     pub fn managed_settings(&self) -> Option<&ManagedVolumeSettings> {
@@ -108,18 +92,6 @@ impl VolumeDefinition {
             VolumeSettings::Managed(_) => VolumeModel::Managed,
         }
     }
-
-    pub fn has_same_binding(&self, other: &Self) -> bool {
-        self.volume_id == other.volume_id
-            && self.storage == other.storage
-            && match (&self.settings, &other.settings) {
-                (VolumeSettings::Direct, VolumeSettings::Direct) => true,
-                (VolumeSettings::Managed(left), VolumeSettings::Managed(right)) => {
-                    left.metadata == right.metadata && left.format_major == right.format_major
-                }
-                _ => false,
-            }
-    }
 }
 
 #[derive(Debug)]
@@ -129,13 +101,6 @@ pub struct Catalog {
 }
 
 impl Catalog {
-    pub fn load_from_env() -> Result<Self> {
-        let path = env::var_os("OFS_CONFIG")
-            .filter(|value| !value.is_empty())
-            .context("OFS_CONFIG must name the catalog JSON file")?;
-        Self::load(path)
-    }
-
     pub fn load(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
         let bytes = match fs::read(&path) {
@@ -190,23 +155,6 @@ impl Catalog {
                 Ok(true)
             }
         }
-    }
-
-    pub fn configure_file_layout(
-        &mut self,
-        alias: &str,
-        file_layout: FileLayoutPolicy,
-    ) -> Result<()> {
-        file_layout.validate()?;
-        let definition = self
-            .volumes
-            .get_mut(alias)
-            .with_context(|| format!("volume alias {alias:?} is not in the catalog"))?;
-        let VolumeSettings::Managed(settings) = &mut definition.settings else {
-            bail!("volume alias {alias:?} is not a Managed volume");
-        };
-        settings.file_layout = file_layout;
-        Ok(())
     }
 
     pub fn save(&self) -> Result<()> {
@@ -266,8 +214,6 @@ struct StoredVolume {
     metadata: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     file_layout: Option<FileLayoutPolicy>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    format_major: Option<u16>,
 }
 
 impl From<&Catalog> for StoredCatalog {
@@ -286,12 +232,11 @@ impl From<&Catalog> for StoredCatalog {
 
 impl From<&VolumeDefinition> for StoredVolume {
     fn from(volume: &VolumeDefinition) -> Self {
-        let (metadata, file_layout, format_major) = match &volume.settings {
-            VolumeSettings::Direct => (None, None, None),
+        let (metadata, file_layout) = match &volume.settings {
+            VolumeSettings::Direct => (None, None),
             VolumeSettings::Managed(settings) => (
                 settings.metadata.as_ref().map(ToString::to_string),
                 Some(settings.file_layout),
-                Some(settings.format_major),
             ),
         };
         Self {
@@ -304,7 +249,6 @@ impl From<&VolumeDefinition> for StoredVolume {
             storage: volume.storage.to_string(),
             metadata,
             file_layout,
-            format_major,
         }
     }
 }
@@ -326,10 +270,7 @@ impl TryFrom<StoredVolume> for VolumeDefinition {
             .transpose()?;
         match model {
             VolumeModel::Direct => {
-                if metadata.is_some()
-                    || volume.file_layout.is_some()
-                    || volume.format_major.is_some()
-                {
+                if metadata.is_some() || volume.file_layout.is_some() {
                     bail!("Direct volume contains Managed-only catalog settings");
                 }
                 Self::direct(volume_id, storage)
@@ -338,11 +279,7 @@ impl TryFrom<StoredVolume> for VolumeDefinition {
                 let file_layout = volume
                     .file_layout
                     .context("Managed volume is missing its file layout policy")?;
-                let format_major = volume
-                    .format_major
-                    .context("Managed volume is missing its format major")?;
-                Self::managed(volume_id, storage, metadata, format_major)?
-                    .with_file_layout(file_layout)
+                Self::managed(volume_id, storage, metadata, file_layout)
             }
         }
     }

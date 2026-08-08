@@ -17,18 +17,8 @@ use url::Url;
 #[command(version, about = "OpenDAL filesystem")]
 pub(crate) struct Cli {
     /// Volume catalog. OFS_CONFIG provides the same setting.
-    #[arg(long, env = "OFS_CONFIG", global = true, value_name = "PATH")]
-    pub config: Option<PathBuf>,
-
-    /// Maximum concurrency for OFS storage operations.
-    #[arg(
-        long,
-        env = "OFS_TRANSFER_CONCURRENCY",
-        global = true,
-        default_value = "4",
-        value_name = "N"
-    )]
-    pub transfer_concurrency: NonZeroUsize,
+    #[arg(long, env = "OFS_CONFIG", value_name = "PATH")]
+    pub config: PathBuf,
 
     #[command(subcommand)]
     pub command: Command,
@@ -57,17 +47,18 @@ pub(crate) struct MountArgs {
     /// Local path where the volume will be mounted.
     pub mount_path: PathBuf,
 
-    /// Prevent filesystem mutations through this mount.
-    #[arg(long)]
-    pub read_only: bool,
+    #[command(flatten)]
+    pub runtime: StorageOptions,
 }
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum VolumeCommand {
     /// Create or reopen a volume and save its credential-free binding.
-    Create(Box<VolumeCreateArgs>),
+    Create(VolumeCreateArgs),
     /// Pack live small whole files through the current Managed namespace root.
     Pack(VolumePackArgs),
+    /// Rebuild the derived pack index from immutable pack footers.
+    Reindex(VolumeReindexArgs),
     /// Remove loose data unreachable from the current Managed namespace root.
     Gc(VolumeGcArgs),
 }
@@ -76,6 +67,9 @@ pub(crate) enum VolumeCommand {
 pub(crate) struct VolumeGcArgs {
     /// Named Managed volume from the local catalog.
     pub alias: String,
+
+    #[command(flatten)]
+    pub runtime: StorageOptions,
 }
 
 #[derive(Debug, Args)]
@@ -83,16 +77,24 @@ pub(crate) struct VolumePackArgs {
     /// Named Managed volume from the local catalog.
     pub alias: String,
 
-    /// Rebuild the derived placement index from verified pack footers before packing.
-    #[arg(long)]
-    pub rebuild_index: bool,
+    #[command(flatten)]
+    pub runtime: StorageOptions,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct VolumeReindexArgs {
+    /// Named Managed volume from the local catalog.
+    pub alias: String,
+
+    #[command(flatten)]
+    pub runtime: StorageOptions,
 }
 
 #[derive(Debug, Args)]
 pub(crate) struct VolumeCreateArgs {
     pub alias: String,
 
-    /// Namespace authority model. This implementation supports managed.
+    /// Namespace authority model.
     #[arg(long, value_parser = parse_volume_model, value_name = "MODEL")]
     pub model: VolumeModel,
 
@@ -108,21 +110,8 @@ pub(crate) struct VolumeCreateArgs {
     #[arg(long, env = "OFS_FILE_LAYOUT", value_enum, value_name = "LAYOUT")]
     pub file_layout: Option<FileLayoutArg>,
 
-    /// Smallest file written with FastCDC.
-    #[arg(long, env = "OFS_FASTCDC_MINIMUM_FILE_SIZE", value_name = "BYTES")]
-    pub fastcdc_minimum_file_size: Option<u64>,
-
-    /// Minimum FastCDC chunk size.
-    #[arg(long, env = "OFS_FASTCDC_MINIMUM_CHUNK_SIZE", value_name = "BYTES")]
-    pub fastcdc_minimum_chunk_size: Option<u32>,
-
-    /// Target FastCDC chunk size.
-    #[arg(long, env = "OFS_FASTCDC_TARGET_CHUNK_SIZE", value_name = "BYTES")]
-    pub fastcdc_target_chunk_size: Option<u32>,
-
-    /// Maximum FastCDC chunk size.
-    #[arg(long, env = "OFS_FASTCDC_MAXIMUM_CHUNK_SIZE", value_name = "BYTES")]
-    pub fastcdc_maximum_chunk_size: Option<u32>,
+    #[command(flatten)]
+    pub runtime: StorageOptions,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -147,13 +136,25 @@ pub(crate) struct SyncArgs {
     /// Resolve a retained conflict with the current local candidate. May be repeated.
     #[arg(long, value_name = "RELATIVE_PATH")]
     pub resolve: Vec<String>,
+
+    #[command(flatten)]
+    pub runtime: StorageOptions,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct StorageOptions {
+    /// Maximum concurrency for storage operations in this command.
+    #[arg(
+        long,
+        env = "OFS_TRANSFER_CONCURRENCY",
+        default_value = "4",
+        value_name = "N"
+    )]
+    pub transfer_concurrency: NonZeroUsize,
 }
 
 #[derive(Debug, Args)]
 pub(crate) struct StatusArgs {
-    /// Local directory used as the Sync replica.
-    pub replica: PathBuf,
-
     /// Durable replica state stored outside the replica directory.
     #[arg(long, value_name = "PATH")]
     pub state: PathBuf,

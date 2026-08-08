@@ -79,7 +79,7 @@ if direct_sync_error=$(OFS_CONFIG="$direct_config" "$OFS_BIN" sync archive "$col
   --state "$OFS_CASE_ROOT/state/direct.json" 2>&1); then
   fail 'Direct Sync started even though that access combination is unavailable'
 fi
-grep -Fq 'sync requires a Managed volume' <<<"$direct_sync_error" || \
+grep -Fq 'requires a Managed volume' <<<"$direct_sync_error" || \
   fail 'unavailable Direct Sync did not report an actionable admission error'
 
 volume_create=(volume create workspace --model managed --storage "$OFS_STORAGE_URL")
@@ -108,12 +108,12 @@ cmp "$replica_a/first.txt" "$replica_b/first.txt" || fail 'empty replica did not
 printf '%s\n' 'acceptance: reject hard links before publication'
 printf '%s\n' 'must remain local' >"$replica_a/hard-link-source.txt"
 if ln "$replica_a/hard-link-source.txt" "$replica_a/hard-link-alias.txt" 2>/dev/null; then
-  before_hard_link=$(OFS_CONFIG="$config" "$OFS_BIN" status "$replica_a" --state "$state_a" --json)
+  before_hard_link=$(OFS_CONFIG="$config" "$OFS_BIN" status --state "$state_a" --json)
   if hard_link_error=$(OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a" 2>&1); then
     fail 'hard-linked files were published'
   fi
   grep -Fq 'hard link' <<<"$hard_link_error" || fail 'hard-link rejection was not explicit'
-  after_hard_link=$(OFS_CONFIG="$config" "$OFS_BIN" status "$replica_a" --state "$state_a" --json)
+  after_hard_link=$(OFS_CONFIG="$config" "$OFS_BIN" status --state "$state_a" --json)
   [[ "$before_hard_link" == "$after_hard_link" ]] || fail 'hard-link rejection changed replica state'
   rm "$replica_a/hard-link-alias.txt"
 fi
@@ -133,9 +133,9 @@ printf '%s\n' 'acceptance: pack live small content and repeat idempotently'
 first_pack=$(OFS_CONFIG="$config" "$OFS_BIN" volume pack workspace)
 grep -Eq 'packs=[1-9][0-9]*' <<<"$first_pack" || fail 'first pack run produced no pack'
 grep -Eq 'content=[1-9][0-9]*' <<<"$first_pack" || fail 'first pack run indexed no content'
-rebuilt_index=$(OFS_CONFIG="$config" "$OFS_BIN" volume pack workspace --rebuild-index)
-grep -Eq 'rebuilt_index_content=[1-9][0-9]*' <<<"$rebuilt_index" || \
-  fail 'pack index rebuild did not recover verified content locations'
+rebuilt_index=$(OFS_CONFIG="$config" "$OFS_BIN" volume reindex workspace)
+grep -Eq 'content=[1-9][0-9]*' <<<"$rebuilt_index" || \
+  fail 'pack index rebuild did not recover content locations'
 second_pack=$(OFS_CONFIG="$config" "$OFS_BIN" volume pack workspace)
 grep -Fq 'packs=0 content=0 logical_bytes=0' <<<"$second_pack" || \
   fail 'second pack run was not idempotent'
@@ -212,7 +212,7 @@ grep -Fxq 'second candidate from replica a' "$replica_a/shared-two.txt" || \
   fail 'second remote conflict candidate was lost'
 grep -Fxq 'second candidate from replica b' "$replica_b/shared-two.txt" || \
   fail 'second local conflict candidate was lost'
-conflict_status=$(OFS_CONFIG="$config" "$OFS_BIN" status "$replica_b" --state "$state_b" --json)
+conflict_status=$(OFS_CONFIG="$config" "$OFS_BIN" status --state "$state_b" --json)
 grep -Eq '"conflicts"[[:space:]]*:[[:space:]]*2' <<<"$conflict_status" || \
   fail 'status did not report both unresolved conflicts'
 
@@ -239,7 +239,7 @@ for _ in $(seq 1 200); do
   if ! kill -0 "$crash_pid" 2>/dev/null; then
     break
   fi
-  recovery_status=$(OFS_CONFIG="$config" "$OFS_BIN" status "$replica_a" --state "$state_a" --json 2>/dev/null || true)
+  recovery_status=$(OFS_CONFIG="$config" "$OFS_BIN" status --state "$state_a" --json 2>/dev/null || true)
   if grep -Eq '"pending"[[:space:]]*:[[:space:]]*true' <<<"$recovery_status"; then
     if kill -KILL "$crash_pid" 2>/dev/null; then
       intent_observed=true
@@ -250,7 +250,7 @@ for _ in $(seq 1 200); do
 done
 wait "$crash_pid" 2>/dev/null || true
 [[ "$intent_observed" == true ]] || fail 'could not interrupt sync after its intent became durable'
-recovery_status=$(OFS_CONFIG="$config" "$OFS_BIN" status "$replica_a" --state "$state_a" --json)
+recovery_status=$(OFS_CONFIG="$config" "$OFS_BIN" status --state "$state_a" --json)
 grep -Eq '"pending"[[:space:]]*:[[:space:]]*true' <<<"$recovery_status" || \
   fail 'process death lost the durable publication intent'
 recovered=false
@@ -262,7 +262,7 @@ for _ in $(seq 1 5); do
   sleep 0.05
 done
 [[ "$recovered" == true ]] || fail 'repeated sync could not resolve the durable publication intent'
-recovery_status=$(OFS_CONFIG="$config" "$OFS_BIN" status "$replica_a" --state "$state_a" --json)
+recovery_status=$(OFS_CONFIG="$config" "$OFS_BIN" status --state "$state_a" --json)
 grep -Eq '"pending"[[:space:]]*:[[:space:]]*false' <<<"$recovery_status" || \
   fail 'recovered publication did not clear its completed intent'
 OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_b" --state "$state_b"
@@ -294,27 +294,19 @@ OFS_CONFIG="$cold_config" "$OFS_BIN" sync workspace "$cold_replica" --state "$co
 after_noop=$(cd "$cold_replica" && find . -type f -exec sha256sum {} + | LC_ALL=C sort)
 [[ "$before_noop" == "$after_noop" ]] || fail 'a no-op sync changed user-visible files'
 
-printf '%s\n' 'acceptance: status exposes the selected models without secrets'
-status_json=$(OFS_CONFIG="$cold_config" "$OFS_BIN" status "$cold_replica" --state "$cold_state" --json)
+printf '%s\n' 'acceptance: status exposes durable replica state without internals or secrets'
+status_json=$(OFS_CONFIG="$cold_config" "$OFS_BIN" status --state "$cold_state" --json)
 grep -Eq '"volume_model"[[:space:]]*:[[:space:]]*"managed"' <<<"$status_json" || \
   fail 'status did not report volume_model=managed'
 grep -Eq '"access_model"[[:space:]]*:[[:space:]]*"sync"' <<<"$status_json" || \
   fail 'status did not report access_model=sync'
-grep -Eq '"metadata_authority"[[:space:]]*:[[:space:]]*"(object|d1)"' <<<"$status_json" || \
-  fail 'status did not report its metadata authority'
-grep -Fq '"local_tree_operator":"opendal_fs"' <<<"$status_json" || \
-  fail 'status did not report OpenDAL fs local I/O'
-grep -Fq '"durable_state_owners":' <<<"$status_json" || \
-  fail 'status omitted durable state ownership'
-grep -Fq '"foreground_layout":"whole"' <<<"$status_json" || \
-  fail 'status did not report the default file layout'
+grep -Eq '"common_sequence"[[:space:]]*:[[:space:]]*73' <<<"$status_json" || \
+  fail 'status did not report the durable common sequence'
 grep -Eq '"conflicts"[[:space:]]*:[[:space:]]*0' <<<"$status_json" || \
   fail 'status still reports conflicts after explicit resolution'
-if grep -Eq '"capabilities"|"limitations"|"guarantee"' <<<"$status_json"; then
-  fail 'status exposed a static Managed-Sync capability bundle'
+if grep -Eq '"capabilities"|"limitations"|"guarantee"|"metadata_authority"|"layout_settings"|"local_tree_operator"|"durable_state_owners"|"foreground_layout"|"storage_capabilities"' <<<"$status_json"; then
+  fail 'status exposed assembly details or a static capability bundle'
 fi
-grep -Fq -- '"storage_capabilities":' <<<"$status_json" || \
-  fail 'status omitted observed storage capabilities'
 
 for name in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN OFS_D1_TOKEN; do
   secret=${!name:-}

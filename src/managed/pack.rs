@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Immutable content packs and their rebuildable physical index.
+//! Immutable content packs and their derived physical index.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
@@ -55,7 +55,6 @@ pub(crate) struct PackLocation {
     pub pack: PackId,
     pub offset: u64,
     pub stored_length: u64,
-    pub logical_length: u64,
 }
 
 /// Result of sealing one immutable pack.
@@ -99,19 +98,15 @@ impl PackReadSession {
     }
 
     /// Return locations from the pack index fixed for this operation.
-    pub(crate) async fn locations(
-        &self,
-        content: ContentRef,
-    ) -> Result<Vec<PackLocation>, ManagedError> {
+    pub(crate) async fn locations(&self, content: ContentRef) -> Vec<PackLocation> {
         let operator = self.operator.clone();
         let index = self
             .index
             .get_or_init(|| async move { PackIndex::open(operator).await })
             .await;
         match index {
-            Ok(Some(index)) => Ok(index.locations(content).to_vec()),
-            Ok(None) => Ok(Vec::new()),
-            Err(_) => Ok(Vec::new()),
+            Ok(Some(index)) => index.locations(content).to_vec(),
+            Ok(None) | Err(_) => Vec::new(),
         }
     }
 
@@ -122,15 +117,18 @@ impl PackReadSession {
 
     /// Read one packed location. `None` means the fixed index has no location.
     pub(crate) async fn read(&self, content: ContentRef) -> Result<Option<Vec<u8>>, ManagedError> {
-        let locations = self.locations(content).await?;
+        let locations = self.locations(content).await;
         if locations.is_empty() {
             return Ok(None);
         }
 
         let mut failure = None;
         for location in locations {
-            match self.store.read_range(content, location).await {
-                Ok(bytes) => return Ok(Some(bytes)),
+            match self
+                .read_ranges(location.pack, &[(content, location)])
+                .await
+            {
+                Ok(mut bytes) => return Ok(bytes.pop()),
                 Err(error) => failure = Some(error),
             }
         }
@@ -194,14 +192,10 @@ pub(crate) struct PackStore {
 impl PackStore {
     pub(crate) fn new(operator: Operator) -> Result<Self, ManagedError> {
         let capability = operator.info().full_capability();
-        if !capability.read
-            || !capability.write
-            || !capability.write_with_if_not_exists
-            || !capability.stat
-        {
+        if !capability.read || !capability.write || !capability.write_with_if_not_exists {
             return Err(unavailable(
                 "open pack store",
-                "pack storage requires read, write, stat, and create-only write",
+                "pack storage requires read, write, and create-only write",
             ));
         }
         Ok(Self { operator })
@@ -271,7 +265,6 @@ impl PackStore {
                         pack: id,
                         offset: entry.offset,
                         stored_length: entry.stored_length,
-                        logical_length: entry.content.logical_length,
                     },
                 )
             })
@@ -281,71 +274,31 @@ impl PackStore {
 
     /// Download and verify a complete pack for reading several entries.
     pub(crate) async fn read_complete(&self, id: PackId) -> Result<VerifiedPack, ManagedError> {
-        let (pack, bytes) = self.inspect_inner(id, true, None).await?;
-        Ok(VerifiedPack {
-            pack,
-            bytes: bytes.expect("complete inspection retains the downloaded pack"),
-        })
-    }
-
-    async fn inspect_inner(
-        &self,
-        id: PackId,
-        verify_checksum: bool,
-        length_hint: Option<u64>,
-    ) -> Result<(SealedPack, Option<Vec<u8>>), ManagedError> {
         let key = pack_key(id);
-        let complete = if verify_checksum {
-            Some(
-                self.operator
-                    .read(&key)
-                    .await
-                    .map_err(|_| unavailable("inspect pack", "pack is unavailable"))?
-                    .to_bytes()
-                    .to_vec(),
-            )
-        } else {
-            None
-        };
-        let length = match &complete {
-            Some(bytes) => bytes.len() as u64,
-            None => match length_hint {
-                Some(length) => length,
-                None => self
-                    .operator
-                    .stat(&key)
-                    .await
-                    .map_err(|_| unavailable("inspect pack", "pack metadata is unavailable"))?
-                    .content_length(),
-            },
-        };
+        let bytes = self
+            .operator
+            .read(&key)
+            .await
+            .map_err(|_| unavailable("read pack", "pack is unavailable"))?
+            .to_bytes()
+            .to_vec();
+        let length = bytes.len() as u64;
         if length < HEADER_LENGTH + TRAILER_LENGTH {
-            return Err(corrupt("inspect pack", "pack is shorter than its envelope"));
+            return Err(corrupt("read pack", "pack is shorter than its envelope"));
         }
 
-        let trailer = match &complete {
-            Some(bytes) => bytes[(length - TRAILER_LENGTH) as usize..].to_vec(),
-            None => self
-                .operator
-                .read_with(&key)
-                .range(length - TRAILER_LENGTH..length)
-                .content_length_hint(length)
-                .await
-                .map_err(|_| unavailable("inspect pack", "pack trailer is unavailable"))?
-                .to_bytes()
-                .to_vec(),
-        };
+        let trailer = &bytes[(length - TRAILER_LENGTH) as usize..];
         if trailer.len() != TRAILER_LENGTH as usize || &trailer[..8] != TRAILER_MAGIC {
-            return Err(corrupt("inspect pack", "pack trailer is invalid"));
+            return Err(corrupt("read pack", "pack trailer is invalid"));
         }
-        let footer_offset = u64_at(&trailer, 8);
-        let footer_length = u64_at(&trailer, 16);
+        let footer_offset = u64_at(trailer, 8);
+        let footer_length = u64_at(trailer, 16);
         let expected_checksum: [u8; 32] = trailer[24..56]
             .try_into()
             .expect("trailer checksum has fixed length");
         if expected_checksum != id.0 {
             return Err(corrupt(
-                "inspect pack",
+                "read pack",
                 "pack trailer does not match its identity",
             ));
         }
@@ -353,38 +306,27 @@ impl PackStore {
         if footer_offset < HEADER_LENGTH
             || footer_offset.checked_add(footer_length) != Some(trailer_offset)
         {
-            return Err(corrupt("inspect pack", "pack footer range is invalid"));
+            return Err(corrupt("read pack", "pack footer range is invalid"));
         }
 
-        if let Some(complete) = &complete {
-            let body = &complete[..complete.len() - 32];
-            let actual_checksum: [u8; 32] = Sha256::digest(body).into();
-            if actual_checksum != expected_checksum {
-                return Err(corrupt(
-                    "inspect pack",
-                    "pack checksum does not match its identity",
-                ));
-            }
-            if &body[..8] != PACK_MAGIC || u16_at(body, 8) != FORMAT_MAJOR {
-                return Err(corrupt("inspect pack", "pack header is invalid"));
-            }
+        let body = &bytes[..bytes.len() - 32];
+        let actual_checksum: [u8; 32] = Sha256::digest(body).into();
+        if actual_checksum != expected_checksum {
+            return Err(corrupt(
+                "read pack",
+                "pack checksum does not match its identity",
+            ));
+        }
+        if &body[..8] != PACK_MAGIC || u16_at(body, 8) != FORMAT_MAJOR {
+            return Err(corrupt("read pack", "pack header is invalid"));
         }
 
-        let footer_bytes = match &complete {
-            Some(bytes) => bytes[footer_offset as usize..trailer_offset as usize].to_vec(),
-            None => self
-                .operator
-                .read_with(&key)
-                .range(footer_offset..trailer_offset)
-                .content_length_hint(length)
-                .await
-                .map_err(|_| unavailable("inspect pack", "pack footer is unavailable"))?
-                .to_bytes()
-                .to_vec(),
-        };
-        let footer: Footer = decode(&footer_bytes, "inspect pack")?;
+        let footer: Footer = decode(
+            &bytes[footer_offset as usize..trailer_offset as usize],
+            "read pack",
+        )?;
         if footer.magic != FOOTER_MAGIC || footer.major != FORMAT_MAJOR {
-            return Err(corrupt("inspect pack", "pack footer version is invalid"));
+            return Err(corrupt("read pack", "pack footer version is invalid"));
         }
 
         let mut locations = BTreeMap::new();
@@ -398,17 +340,15 @@ impl PackStore {
                 || entry.offset.checked_add(entry.stored_length).is_none()
                 || entry.offset + entry.stored_length > footer_offset
             {
-                return Err(corrupt("inspect pack", "pack footer entry is invalid"));
+                return Err(corrupt("read pack", "pack footer entry is invalid"));
             }
-            if let Some(complete) = &complete {
-                let start = entry.offset as usize;
-                let end = (entry.offset + entry.stored_length) as usize;
-                if content_ref(&complete[start..end]) != entry.content {
-                    return Err(corrupt(
-                        "inspect pack",
-                        "pack entry does not match its content reference",
-                    ));
-                }
+            let start = entry.offset as usize;
+            let end = (entry.offset + entry.stored_length) as usize;
+            if content_ref(&bytes[start..end]) != entry.content {
+                return Err(corrupt(
+                    "read pack",
+                    "pack entry does not match its content reference",
+                ));
             }
             previous = Some(entry.content);
             previous_end = entry.offset + entry.stored_length;
@@ -418,42 +358,115 @@ impl PackStore {
                     pack: id,
                     offset: entry.offset,
                     stored_length: entry.stored_length,
-                    logical_length: entry.content.logical_length,
                 },
             );
         }
-        Ok((SealedPack { id, locations }, complete))
+        Ok(VerifiedPack {
+            pack: SealedPack { id, locations },
+            bytes,
+        })
     }
 
-    pub(crate) async fn read_range(
+    async fn read_footer(
         &self,
-        content: ContentRef,
-        location: PackLocation,
-    ) -> Result<Vec<u8>, ManagedError> {
-        validate_indexed_range(content, location, location.pack)?;
-        let bytes = self
-            .operator
-            .read_with(&pack_key(location.pack))
-            .range(location.offset..location.offset + location.stored_length)
-            .await
-            .map_err(|_| unavailable("read pack content", "content range is unavailable"))?
-            .to_bytes()
-            .to_vec();
-        if bytes.len() as u64 != location.stored_length || content_ref(&bytes) != content {
+        id: PackId,
+        length_hint: Option<u64>,
+    ) -> Result<SealedPack, ManagedError> {
+        let key = pack_key(id);
+        let length = match length_hint {
+            Some(length) => length,
+            None => self
+                .operator
+                .stat(&key)
+                .await
+                .map_err(|_| unavailable("rebuild pack index", "pack metadata is unavailable"))?
+                .content_length(),
+        };
+        if length < HEADER_LENGTH + TRAILER_LENGTH {
             return Err(corrupt(
-                "read pack content",
-                "content range fails validation",
+                "rebuild pack index",
+                "pack is shorter than its envelope",
             ));
         }
-        Ok(bytes)
+
+        let trailer_offset = length - TRAILER_LENGTH;
+        let trailer = self
+            .operator
+            .read_with(&key)
+            .range(trailer_offset..length)
+            .content_length_hint(length)
+            .await
+            .map_err(|_| unavailable("rebuild pack index", "pack trailer is unavailable"))?
+            .to_bytes();
+        if trailer.len() != TRAILER_LENGTH as usize || &trailer[..8] != TRAILER_MAGIC {
+            return Err(corrupt("rebuild pack index", "pack trailer is invalid"));
+        }
+        let footer_offset = u64_at(&trailer, 8);
+        let footer_length = u64_at(&trailer, 16);
+        let checksum: [u8; 32] = trailer[24..56]
+            .try_into()
+            .expect("trailer checksum has fixed length");
+        if checksum != id.0
+            || footer_offset < HEADER_LENGTH
+            || footer_offset.checked_add(footer_length) != Some(trailer_offset)
+        {
+            return Err(corrupt(
+                "rebuild pack index",
+                "pack footer location is invalid",
+            ));
+        }
+
+        let footer = self
+            .operator
+            .read_with(&key)
+            .range(footer_offset..trailer_offset)
+            .content_length_hint(length)
+            .await
+            .map_err(|_| unavailable("rebuild pack index", "pack footer is unavailable"))?;
+        let footer: Footer = decode(&footer.to_bytes(), "rebuild pack index")?;
+        if footer.magic != FOOTER_MAGIC || footer.major != FORMAT_MAJOR {
+            return Err(corrupt(
+                "rebuild pack index",
+                "pack footer version is invalid",
+            ));
+        }
+
+        let mut locations = BTreeMap::new();
+        let mut previous = None;
+        let mut previous_end = HEADER_LENGTH;
+        for entry in footer.entries {
+            if previous.is_some_and(|value| value >= entry.content)
+                || entry.codec != Codec::Raw
+                || entry.stored_length != entry.content.logical_length
+                || entry.offset < previous_end
+                || entry.offset.checked_add(entry.stored_length).is_none()
+                || entry.offset + entry.stored_length > footer_offset
+            {
+                return Err(corrupt(
+                    "rebuild pack index",
+                    "pack footer entry is invalid",
+                ));
+            }
+            previous = Some(entry.content);
+            previous_end = entry.offset + entry.stored_length;
+            locations.insert(
+                entry.content,
+                PackLocation {
+                    pack: id,
+                    offset: entry.offset,
+                    stored_length: entry.stored_length,
+                },
+            );
+        }
+        Ok(SealedPack { id, locations })
     }
 
-    /// Rebuild and publish the derived pack index from verified pack footers.
     pub(crate) async fn rebuild_index(&self) -> Result<usize, ManagedError> {
-        if !self.operator.info().full_capability().list {
+        let capability = self.operator.info().full_capability();
+        if !capability.list || !capability.stat {
             return Err(unavailable(
                 "rebuild pack index",
-                "pack storage does not support list",
+                "pack index rebuild requires list and stat",
             ));
         }
         let mut locations: BTreeMap<ContentRef, Vec<PackLocation>> = BTreeMap::new();
@@ -463,22 +476,20 @@ impl PackStore {
             .await
             .map_err(|_| unavailable("rebuild pack index", "pack listing is unavailable"))?;
         for entry in entries {
-            let path = entry.path();
-            let Some(id) = pack_id_from_key(path) else {
+            let Some(id) = pack_id_from_key(entry.path()) else {
                 continue;
             };
             let length = entry.metadata().content_length();
-            let length_hint = (length > 0).then_some(length);
-            let pack = self
-                .inspect_inner(id, false, length_hint)
-                .await
-                .map(|(pack, _)| pack)?;
+            let pack = self.read_footer(id, (length > 0).then_some(length)).await?;
             for (content, location) in pack.locations {
                 locations.entry(content).or_default().push(location);
             }
         }
         normalize_locations(&mut locations);
-        let (published, head_etag) = read_head_etag(&self.operator).await?;
+        let (published, head_etag) = match read_head(&self.operator).await? {
+            Some((_, etag)) => (true, etag),
+            None => (false, None),
+        };
         let mut index = PackIndex {
             operator: self.operator.clone(),
             locations,
@@ -488,9 +499,9 @@ impl PackStore {
             head_etag,
         };
         index.dirty.extend(index.locations.keys().copied());
-        let content_count = index.locations.len();
+        let content = index.locations.len();
         index.persist().await?;
-        Ok(content_count)
+        Ok(content)
     }
 }
 
@@ -500,7 +511,6 @@ fn validate_indexed_range(
     pack: PackId,
 ) -> Result<(), ManagedError> {
     if location.pack != pack
-        || location.logical_length != content.logical_length
         || location.stored_length != content.logical_length
         || location
             .offset
@@ -545,20 +555,6 @@ impl PackIndex {
         }
     }
 
-    pub(crate) fn require_update(&self) -> Result<(), ManagedError> {
-        if self.published
-            && (!self.operator.info().full_capability().write_with_if_match
-                || self.head_etag.is_none())
-        {
-            Err(unavailable(
-                "persist pack index",
-                "updating an existing pack index requires compare-and-swap and a revision token",
-            ))
-        } else {
-            Ok(())
-        }
-    }
-
     /// Open the published index. A missing head means no index exists yet.
     pub(crate) async fn open(operator: Operator) -> Result<Option<Self>, ManagedError> {
         require_index_read_capabilities(&operator)?;
@@ -596,7 +592,15 @@ impl PackIndex {
     /// Publish immutable sections through one conditional head update.
     pub(crate) async fn persist(&mut self) -> Result<(), ManagedError> {
         require_index_create_capabilities(&self.operator)?;
-        self.require_update()?;
+        if self.published
+            && (!self.operator.info().full_capability().write_with_if_match
+                || self.head_etag.is_none())
+        {
+            return Err(unavailable(
+                "persist pack index",
+                "updating an existing pack index requires compare-and-swap and a revision token",
+            ));
+        }
         normalize_locations(&mut self.locations);
         let head =
             IndexHead::from_locations(&self.operator, &self.locations, &self.sections, &self.dirty)
@@ -850,9 +854,6 @@ impl IndexHead {
                 if previous.is_some_and(|value| value >= content)
                     || locations.is_empty()
                     || !locations.windows(2).all(|pair| pair[0] < pair[1])
-                    || locations
-                        .iter()
-                        .any(|location| location.logical_length != content.logical_length)
                 {
                     return Err(corrupt("open pack index", "index entries are invalid"));
                 }
@@ -971,13 +972,6 @@ async fn read_head(operator: &Operator) -> Result<Option<(Vec<u8>, Option<String
         .and_then(|metadata| metadata.etag())
         .map(str::to_owned);
     Ok(Some((bytes, etag)))
-}
-
-async fn read_head_etag(operator: &Operator) -> Result<(bool, Option<String>), ManagedError> {
-    Ok(match read_head(operator).await? {
-        Some((_, etag)) => (true, etag),
-        None => (false, None),
-    })
 }
 
 async fn create_immutable(
@@ -1185,10 +1179,8 @@ fn unavailable(action: &'static str, message: &'static str) -> ManagedError {
 
 #[cfg(test)]
 mod tests {
-    use opendal::services;
-    use tempfile::TempDir;
-
     use super::*;
+    use opendal::services;
 
     fn memory() -> Operator {
         Operator::new(services::Memory::default()).unwrap().finish()
@@ -1207,7 +1199,6 @@ mod tests {
                         pack,
                         offset: u64::from(index) * 4,
                         stored_length: 4,
-                        logical_length: content.logical_length,
                     }],
                 )
             })
@@ -1258,34 +1249,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn filesystem_pack_creates_index_but_refuses_unsafe_update() {
-        let root = TempDir::new().unwrap();
-        let operator = Operator::new(services::Fs::default().root(root.path().to_str().unwrap()))
-            .unwrap()
-            .finish();
-        let store = PackStore::new(operator.clone()).unwrap();
-        let operation = OperationId::from_bytes([7; 16]);
-        let sealed = store
-            .seal(
-                operation,
-                vec![b"alpha".to_vec(), b"beta".to_vec(), b"alpha".to_vec()],
-            )
-            .await
-            .unwrap();
-        assert_eq!(sealed.locations.len(), 2);
-        let alpha = content_ref(b"alpha");
-        let location = sealed.locations[&alpha];
-        assert_eq!(store.read_range(alpha, location).await.unwrap(), b"alpha");
-
-        assert_eq!(store.rebuild_index().await.unwrap(), 2);
-        let rebuilt = PackIndex::open(operator.clone()).await.unwrap().unwrap();
-        assert_eq!(rebuilt.locations(alpha), &[location]);
-        let mut reopened = PackIndex::open(operator).await.unwrap().unwrap();
-        let error = reopened.persist().await.unwrap_err();
-        assert_eq!(error.kind(), ManagedErrorKind::Unavailable);
-    }
-
-    #[tokio::test]
     async fn memory_pack_reads_new_create_only_index() {
         let operator = memory();
         let store = PackStore::new(operator.clone()).unwrap();
@@ -1297,16 +1260,6 @@ mod tests {
         let complete = store.read_complete(sealed.id).await.unwrap();
         assert_eq!(complete.content(content), Some(b"on disk".as_slice()));
         assert_eq!(complete.content(content_ref(b"missing")), None);
-        assert_eq!(
-            store
-                .read_range(content, sealed.locations[&content])
-                .await
-                .unwrap(),
-            b"on disk"
-        );
-        assert_eq!(store.rebuild_index().await.unwrap(), 1);
-        let reopened = PackIndex::open(operator).await.unwrap().unwrap();
-        assert_eq!(reopened.locations(content), &[sealed.locations[&content]]);
     }
 
     #[tokio::test]

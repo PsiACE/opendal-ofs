@@ -42,7 +42,7 @@ for _ in $(seq 1 300); do
   if ! kill -0 "$sync_pid" 2>/dev/null; then
     break
   fi
-  status=$(OFS_CONFIG="$catalog" "$OFS_BIN" status "$replica" --state "$state" --json 2>/dev/null || true)
+  status=$(OFS_CONFIG="$catalog" "$OFS_BIN" status --state "$state" --json 2>/dev/null || true)
   if grep -Eq '"pending"[[:space:]]*:[[:space:]]*true' <<<"$status"; then
     if kill -STOP "$sync_pid" 2>/dev/null; then
       stopped=true

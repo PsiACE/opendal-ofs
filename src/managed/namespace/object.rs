@@ -167,13 +167,6 @@ impl ObjectNamespace {
         }
 
         let stored = StoredTransaction::from_publication(publication, base);
-        let interpreted = apply_transaction(base.cloned(), &stored)?;
-        if interpreted != publication.target {
-            return Err(invalid(
-                "publish Managed namespace",
-                "transaction does not reproduce its target",
-            ));
-        }
         let bytes = encode_cbor(TRANSACTION_MAGIC, &stored, "publish Managed namespace")?;
         let transaction_sha256 = sha256(&bytes);
         self.ensure_transaction(publication.operation, &bytes)

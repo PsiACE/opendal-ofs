@@ -23,13 +23,6 @@ pub use object::ObjectMetadata;
 
 use super::{ManagedError, ManagedFormat};
 
-/// Physical metadata placement for a Managed volume.
-#[derive(Clone)]
-pub enum Metadata {
-    Object(ObjectMetadata),
-    D1(D1Metadata),
-}
-
 fn require_same_format(
     desired: &ManagedFormat,
     observed: ManagedFormat,

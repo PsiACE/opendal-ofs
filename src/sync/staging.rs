@@ -25,23 +25,21 @@ use super::local::{
 const COPY_CHUNK: usize = 1024 * 1024;
 const COPY_CONCURRENCY: usize = 8;
 const MANIFEST_FORMAT: &str = "ofs-staged-tree";
-const MANIFEST_MAJOR: u16 = 1;
+const MANIFEST_MAJOR: u16 = 2;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct StagedFile {
+pub(crate) struct StagedFile {
     pub size: u64,
-    pub source_modified: String,
     pub digest: [u8; 32],
 }
 
 /// Immutable input for a later volume file-version builder.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StagedTree {
+pub(crate) struct StagedTree {
     root: PathBuf,
     logical: LocalTree,
     files: BTreeMap<String, StagedFile>,
-    source_identities: BTreeMap<String, Option<NativeIdentity>>,
     content_paths: BTreeSet<String>,
 }
 
@@ -68,12 +66,6 @@ impl StagedTree {
                     .with_context(|| format!("create staging directory {path:?}"))?;
             }
         }
-        let source_identities = tree
-            .entries()
-            .iter()
-            .map(|(path, entry)| (path.clone(), entry.native_identity))
-            .collect();
-
         let prepared = stream::iter(
             tree.entries()
                 .iter()
@@ -120,7 +112,6 @@ impl StagedTree {
             root: root.to_owned(),
             logical: LocalTree::from_entries(root, tree.entries().clone()),
             files,
-            source_identities,
             content_paths,
         };
         staged.save_manifest()?;
@@ -146,7 +137,6 @@ impl StagedTree {
             root: root.to_owned(),
             logical: LocalTree::from_entries(root, stored.entries),
             files: stored.files,
-            source_identities: stored.source_identities,
             content_paths: stored.content_paths,
         };
         staged.validate()?;
@@ -239,12 +229,9 @@ impl StagedTree {
             path.clone(),
             StagedFile {
                 size: entry.size,
-                source_modified: entry.modified.clone(),
                 digest,
             },
         );
-        self.source_identities
-            .insert(path.clone(), entry.native_identity);
         self.content_paths.insert(path.clone());
         self.logical.insert(path, entry);
         Ok(())
@@ -258,8 +245,6 @@ impl StagedTree {
         }
         self.files.remove(&path);
         self.content_paths.remove(&path);
-        self.source_identities
-            .insert(path.clone(), entry.native_identity);
         self.logical.insert(path, entry);
         Ok(())
     }
@@ -267,23 +252,12 @@ impl StagedTree {
     pub fn remove_logical_path(&mut self, path: &str) {
         self.logical.remove(path);
         self.files.remove(path);
-        self.source_identities.remove(path);
         self.content_paths.remove(path);
         self.remove_descendants(path);
     }
 
     pub fn matches_source_observation(&self, observed: &LocalTree) -> bool {
         self.logical.entries() == observed.entries()
-            && self.source_identities
-                == observed
-                    .entries()
-                    .iter()
-                    .map(|(path, entry)| (path.clone(), entry.native_identity))
-                    .collect()
-    }
-
-    pub(crate) fn source_identities(&self) -> &BTreeMap<String, Option<NativeIdentity>> {
-        &self.source_identities
     }
 
     fn remove_descendants(&mut self, path: &str) {
@@ -298,7 +272,6 @@ impl StagedTree {
         for descendant in descendants {
             self.logical.remove(&descendant);
             self.files.remove(&descendant);
-            self.source_identities.remove(&descendant);
             self.content_paths.remove(&descendant);
         }
     }
@@ -311,10 +284,7 @@ impl StagedTree {
             .filter(|(_, entry)| entry.kind == LocalKind::File)
             .map(|(path, _)| path)
             .collect::<BTreeSet<_>>();
-        if logical_files != self.files.keys().collect()
-            || self.logical.entries().keys().collect::<BTreeSet<_>>()
-                != self.source_identities.keys().collect()
-        {
+        if logical_files != self.files.keys().collect() {
             bail!("staged tree manifest does not describe one complete logical tree");
         }
         for path in &self.content_paths {
@@ -339,7 +309,6 @@ struct StoredStagedTree {
     major: u16,
     entries: BTreeMap<String, LocalEntry>,
     files: BTreeMap<String, StagedFile>,
-    source_identities: BTreeMap<String, Option<NativeIdentity>>,
     content_paths: BTreeSet<String>,
 }
 
@@ -350,7 +319,6 @@ impl From<&StagedTree> for StoredStagedTree {
             major: MANIFEST_MAJOR,
             entries: staged.logical.entries().clone(),
             files: staged.files.clone(),
-            source_identities: staged.source_identities.clone(),
             content_paths: staged.content_paths.clone(),
         }
     }
@@ -380,7 +348,6 @@ async fn stage_file(
         }
         return Ok(StagedFile {
             size: expected.size,
-            source_modified: expected.modified.clone(),
             digest,
         });
     }
@@ -451,7 +418,6 @@ async fn stage_file(
     }
     Ok(StagedFile {
         size: expected.size,
-        source_modified: expected.modified.clone(),
         digest,
     })
 }

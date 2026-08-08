@@ -52,7 +52,7 @@ while [[ ! -f $OFS_RUN_ROOT/.bub-conflict-ready ]]; do
   ((SECONDS < deadline)) || { printf 'Bub did not reach the conflict checkpoint\n' >&2; exit 124; }
   sleep 1
 done
-OFS_CONFIG="$config" "$OFS_BIN" status "$b" --state "$state_b" --json \
+OFS_CONFIG="$config" "$OFS_BIN" status --state "$state_b" --json \
   >"$OFS_RUN_ROOT/status-conflict.json"
 grep -Fxq 'candidate from replica a' "$a/shared.txt"
 grep -Fxq 'candidate from replica b' "$b/shared.txt"
@@ -76,9 +76,8 @@ diff -ru "$b" "$c"
 grep -Fxq 'candidate from replica b' "$c/shared.txt"
 
 for replica in a b c; do
-  directory=${!replica}
   state_name="state_$replica"
-  OFS_CONFIG="$config" "$OFS_BIN" status "$directory" --state "${!state_name}" --json \
+  OFS_CONFIG="$config" "$OFS_BIN" status --state "${!state_name}" --json \
     >"$OFS_RUN_ROOT/status-$replica.json"
 done
 python3 - "$OFS_RUN_ROOT" <<'PY'

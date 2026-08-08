@@ -70,7 +70,7 @@ ofs volume create archive \
   --storage 'fs://?root=/srv/archive'
 
 mkdir -p /mnt/archive
-ofs mount archive /mnt/archive --read-only
+ofs mount archive /mnt/archive
 ```
 
 The mount runs in the foreground. Stop it with Ctrl-C.
@@ -87,12 +87,11 @@ ofs volume create archive \
   --model direct \
   --storage 's3://<bucket>/<path>?endpoint=<endpoint>&region=<region>'
 
-ofs mount archive /mnt/archive --read-only
+ofs mount archive /mnt/archive
 ```
 
-Use `ofs mount archive /mnt/archive` when writable Direct access is intended.
-Direct writes replace complete objects and may not provide atomic rename or
-stable identity across rename.
+Direct mounts are read-only. Writable Direct access remains unavailable until
+the selected backend and frontend can enforce generation-checked publication.
 
 ### Create and synchronize a Managed volume
 

@@ -20,9 +20,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
-use fastcdc::v2020::{
-    AVERAGE_MAX, AVERAGE_MIN, AsyncStreamCDC, MAXIMUM_MAX, MAXIMUM_MIN, MINIMUM_MAX, MINIMUM_MIN,
-};
+use fastcdc::v2020::AsyncStreamCDC;
 use futures::StreamExt;
 use opendal::{ErrorKind, Operator, Writer};
 use serde::{Deserialize, Serialize};
@@ -39,6 +37,10 @@ const READ_WINDOW: u64 = 4 * 1024 * 1024;
 const LOOSE_ROOT: &str = ".ofs/managed/data/v1/loose/sha256";
 const SMALL_CONTENT_LIMIT: u64 = 256 * 1024;
 const PACK_LOGICAL_LIMIT: u64 = 8 * 1024 * 1024;
+const FASTCDC_MINIMUM_FILE_SIZE: u64 = 1024 * 1024;
+const FASTCDC_MINIMUM_SIZE: u32 = 64 * 1024;
+const FASTCDC_TARGET_SIZE: u32 = 256 * 1024;
+const FASTCDC_MAXIMUM_SIZE: u32 = 1024 * 1024;
 
 /// Physical locations published by one explicit small whole-file maintenance run.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -86,25 +88,7 @@ pub enum FileLayoutPolicy {
     #[default]
     Whole,
     #[serde(rename = "fastcdc_v2020")]
-    FastCdcV2020 {
-        minimum_file_size: u64,
-        minimum_size: u32,
-        target_size: u32,
-        maximum_size: u32,
-    },
-}
-
-impl FileLayoutPolicy {
-    pub fn validate(self) -> Result<(), ManagedError> {
-        validate_policy(self)
-    }
-
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Whole => "whole",
-            Self::FastCdcV2020 { .. } => "fastcdc_v2020",
-        }
-    }
+    FastCdcV2020,
 }
 
 #[derive(Clone, Copy)]
@@ -161,8 +145,7 @@ impl ManagedData {
     }
 
     pub(crate) fn set_policy(&mut self, policy: FileLayoutPolicy) -> Result<(), ManagedError> {
-        policy.validate()?;
-        if matches!(policy, FileLayoutPolicy::FastCdcV2020 { .. }) && !self.fastcdc_enabled {
+        if policy == FileLayoutPolicy::FastCdcV2020 && !self.fastcdc_enabled {
             return Err(unsupported("data-fastcdc/1 is not enabled for this volume"));
         }
         self.policy = policy;
@@ -184,14 +167,9 @@ impl ManagedData {
                 self.seal_whole_file_with_known_content(local, frozen_path, known)
                     .await
             }
-            FileLayoutPolicy::FastCdcV2020 {
-                minimum_file_size,
-                minimum_size,
-                target_size,
-                maximum_size,
-            } => {
+            FileLayoutPolicy::FastCdcV2020 => {
                 let size = frozen_size(local, frozen_path).await?;
-                if size < minimum_file_size {
+                if size < FASTCDC_MINIMUM_FILE_SIZE {
                     self.seal_whole_file_with_known_content(local, frozen_path, known)
                         .await
                 } else {
@@ -200,9 +178,9 @@ impl ManagedData {
                         frozen_path,
                         size,
                         FastCdcSizes {
-                            minimum: minimum_size,
-                            target: target_size,
-                            maximum: maximum_size,
+                            minimum: FASTCDC_MINIMUM_SIZE,
+                            target: FASTCDC_TARGET_SIZE,
+                            maximum: FASTCDC_MAXIMUM_SIZE,
                         },
                         known,
                     )
@@ -212,7 +190,7 @@ impl ManagedData {
         }
     }
 
-    pub(crate) async fn seal_whole_file_with_known_content(
+    async fn seal_whole_file_with_known_content(
         &self,
         local: &Operator,
         frozen_path: &str,
@@ -804,30 +782,6 @@ fn collect_content_refs(layout: &FileVersionLayout, output: &mut BTreeSet<Conten
     }
 }
 
-fn validate_policy(policy: FileLayoutPolicy) -> Result<(), ManagedError> {
-    match policy {
-        FileLayoutPolicy::Whole => Ok(()),
-        FileLayoutPolicy::FastCdcV2020 {
-            minimum_file_size: _,
-            minimum_size,
-            target_size,
-            maximum_size,
-        } if (MINIMUM_MIN..=MINIMUM_MAX).contains(&minimum_size)
-            && (AVERAGE_MIN..=AVERAGE_MAX).contains(&target_size)
-            && (MAXIMUM_MIN..=MAXIMUM_MAX).contains(&maximum_size)
-            && minimum_size <= target_size
-            && target_size <= maximum_size
-            && target_size.is_power_of_two() =>
-        {
-            Ok(())
-        }
-        FileLayoutPolicy::FastCdcV2020 { .. } => Err(invalid(
-            "configure Managed data",
-            "FastCDC v2020 sizes are invalid",
-        )),
-    }
-}
-
 async fn frozen_size(source: &Operator, path: &str) -> Result<u64, ManagedError> {
     let metadata = source
         .stat(path)
@@ -1094,31 +1048,21 @@ mod tests {
         let source = memory();
         let stored = memory();
         let target = memory();
-        let bytes: Vec<u8> = (0..8192).map(|index| (index * 31) as u8).collect();
+        let small = vec![7; 8192];
+        let bytes: Vec<u8> = (0..2 * 1024 * 1024)
+            .map(|index| (index * 31) as u8)
+            .collect();
+        source.write("small", small).await.unwrap();
         source.write("input", bytes.clone()).await.unwrap();
 
         let mut data = managed_data(stored);
-
-        data.set_policy(FileLayoutPolicy::FastCdcV2020 {
-            minimum_file_size: bytes.len() as u64 + 1,
-            minimum_size: 64,
-            target_size: 256,
-            maximum_size: 1024,
-        })
-        .unwrap();
-        let below_threshold = seal_file(&data, &source, "input").await;
+        data.set_policy(FileLayoutPolicy::FastCdcV2020).unwrap();
+        let below_threshold = seal_file(&data, &source, "small").await;
         assert!(matches!(
             below_threshold.layout,
             FileVersionLayout::Whole { .. }
         ));
 
-        data.set_policy(FileLayoutPolicy::FastCdcV2020 {
-            minimum_file_size: 0,
-            minimum_size: 64,
-            target_size: 256,
-            maximum_size: 1024,
-        })
-        .unwrap();
         let cdc = seal_file(&data, &source, "input").await;
         assert!(matches!(cdc.layout, FileVersionLayout::FastCdc { .. }));
         data.read_to(&cdc, &target, "cdc").await.unwrap();
@@ -1316,17 +1260,15 @@ mod tests {
         let stored = memory();
         let target = memory();
         source.write("whole", b"whole file".to_vec()).await.unwrap();
-        source.write("chunked", b"abcdefgh".to_vec()).await.unwrap();
+        let chunked_bytes = vec![11; 2 * 1024 * 1024];
+        source
+            .write("chunked", chunked_bytes.clone())
+            .await
+            .unwrap();
 
         let mut data = managed_data(stored.clone());
         let whole = seal_whole_file(&data, &source, "whole").await;
-        data.set_policy(FileLayoutPolicy::FastCdcV2020 {
-            minimum_file_size: 0,
-            minimum_size: 64,
-            target_size: 256,
-            maximum_size: 1024,
-        })
-        .unwrap();
+        data.set_policy(FileLayoutPolicy::FastCdcV2020).unwrap();
         let chunked = seal_file(&data, &source, "chunked").await;
         let snapshot =
             snapshot_with_files([("whole", whole.clone()), ("chunked", chunked.clone())]);
@@ -1352,7 +1294,7 @@ mod tests {
         data.read_to(&chunked, &target, "chunked").await.unwrap();
         assert_eq!(
             target.read("chunked").await.unwrap().to_bytes(),
-            b"abcdefgh".as_slice()
+            chunked_bytes
         );
     }
 
@@ -1361,15 +1303,12 @@ mod tests {
         let source = memory();
         let stored = memory();
         let target = memory();
-        source.write("input", vec![7; 8192]).await.unwrap();
+        source
+            .write("input", vec![7; 2 * 1024 * 1024])
+            .await
+            .unwrap();
         let mut data = managed_data(stored.clone());
-        data.set_policy(FileLayoutPolicy::FastCdcV2020 {
-            minimum_file_size: 0,
-            minimum_size: 64,
-            target_size: 256,
-            maximum_size: 1024,
-        })
-        .unwrap();
+        data.set_policy(FileLayoutPolicy::FastCdcV2020).unwrap();
         let version = seal_file(&data, &source, "input").await;
         let FileVersionLayout::FastCdc { chunks, .. } = &version.layout else {
             panic!("FastCDC policy returned another layout")

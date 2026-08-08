@@ -23,11 +23,11 @@ use crate::filesystem::{
 use crate::sync::local::NativeIdentity;
 
 const STATE_FORMAT: &str = "ofs-sync-replica";
-const STATE_MAJOR: u16 = 2;
+const STATE_MAJOR: u16 = 3;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BaseEntry {
+pub(crate) struct BaseEntry {
     pub node: NodeId,
     pub generation: Generation,
     pub directory_generation: Option<Generation>,
@@ -41,7 +41,6 @@ pub struct BaseEntry {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingIntent {
     pub operation: OperationId,
-    pub base: ChangeCursor,
     pub staging: PathBuf,
     pub renames: BTreeMap<String, String>,
 }
@@ -57,8 +56,8 @@ pub struct ConflictRecord {
 pub struct ReplicaState {
     pub volume: VolumeId,
     pub common: ChangeCursor,
-    pub authority: Option<VolumeSnapshot>,
-    pub base: BTreeMap<String, BaseEntry>,
+    pub(crate) authority: Option<VolumeSnapshot>,
+    pub(crate) base: BTreeMap<String, BaseEntry>,
     pub pending: Option<PendingIntent>,
     pub conflicts: Vec<ConflictRecord>,
 }
@@ -126,7 +125,6 @@ struct StateWire {
     major: u16,
     volume: [u8; 16],
     common: CursorWire,
-    #[serde(default)]
     authority: Option<SnapshotWire>,
     base: BTreeMap<String, BaseWire>,
     pending: Option<IntentWire>,
@@ -145,16 +143,11 @@ struct CursorWire {
 struct BaseWire {
     node: [u8; 16],
     generation: Vec<u8>,
-    #[serde(default)]
     directory_generation: Option<Vec<u8>>,
     digest: Option<[u8; 32]>,
-    #[serde(default)]
     local_identity: Option<NativeIdentityWire>,
-    #[serde(default)]
     local_size: Option<u64>,
-    #[serde(default)]
     local_modified: Option<String>,
-    #[serde(default)]
     local_executable: Option<bool>,
 }
 
@@ -213,9 +206,7 @@ struct FileVersionWire {
 #[serde(deny_unknown_fields)]
 struct IntentWire {
     operation: [u8; 16],
-    base: CursorWire,
     staging: PathBuf,
-    #[serde(default)]
     renames: BTreeMap<String, String>,
 }
 
@@ -271,7 +262,6 @@ impl From<&ReplicaState> for StateWire {
                 .collect(),
             pending: state.pending.as_ref().map(|intent| IntentWire {
                 operation: *intent.operation.as_bytes(),
-                base: CursorWire::from(intent.base),
                 staging: intent.staging.clone(),
                 renames: intent.renames.clone(),
             }),
@@ -324,7 +314,6 @@ impl TryFrom<StateWire> for ReplicaState {
             .map(|intent| -> Result<PendingIntent> {
                 Ok(PendingIntent {
                     operation: OperationId::from_bytes(intent.operation),
-                    base: intent.base.try_into()?,
                     staging: intent.staging,
                     renames: intent.renames,
                 })

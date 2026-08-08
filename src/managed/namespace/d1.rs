@@ -40,11 +40,10 @@ const NODES: &str = "ofs_managed_v1_nodes";
 const DIRECTORIES: &str = "ofs_managed_v1_directories";
 const FILE_VERSIONS: &str = "ofs_managed_v1_file_versions";
 const TRANSACTIONS: &str = "ofs_managed_v1_change_transactions";
-const EFFECTS: &str = "ofs_managed_v1_change_effects";
 const RESULTS: &str = "ofs_managed_v1_operation_results";
 const CHECKPOINTS: &str = "ofs_managed_v1_checkpoints";
 const CHECKPOINT_INTERVAL: u64 = 64;
-const SCHEMA_RESULTS: usize = 8;
+const SCHEMA_RESULTS: usize = 7;
 
 #[derive(Clone, Debug)]
 pub(crate) struct D1NamespaceObservation {
@@ -254,14 +253,6 @@ impl D1Namespace {
                 guarded(),
             )?,
             put_file_versions(self.store_key(), &delta.file_versions, &guard, guarded())?,
-            put_effects(
-                self.store_key(),
-                &delta.effects,
-                &operation,
-                target_sequence,
-                &guard,
-                guarded(),
-            )?,
         ]);
         batch.push(match observed {
             Some(observed) => statement(
@@ -341,10 +332,6 @@ impl D1Namespace {
                     target_sequence.into(), self.store_key().into(), target_sequence.into(),
                     operation.clone().into(), self.store_key().into(), target_sequence.into(),
                 ],
-            ),
-            statement(
-                format!("DELETE FROM {EFFECTS} WHERE store_key = ? AND target_sequence <= (SELECT checkpoint_sequence FROM {HEADS} WHERE store_key = ?)"),
-                vec![self.store_key().into(), self.store_key().into()],
             ),
             statement(
                 format!("DELETE FROM {TRANSACTIONS} WHERE store_key = ? AND target_sequence < (SELECT checkpoint_sequence FROM {HEADS} WHERE store_key = ?) AND status = 'committed'"),
@@ -633,12 +620,6 @@ fn schema_statements() -> Vec<D1Statement> {
         ),
         statement(
             format!(
-                "CREATE TABLE IF NOT EXISTS {EFFECTS} (store_key TEXT NOT NULL, operation_id TEXT NOT NULL, target_sequence INTEGER NOT NULL, effect_index INTEGER NOT NULL, effect_json TEXT NOT NULL, PRIMARY KEY (store_key, operation_id, effect_index))"
-            ),
-            Vec::new(),
-        ),
-        statement(
-            format!(
                 "CREATE TABLE IF NOT EXISTS {RESULTS} (store_key TEXT NOT NULL, operation_id TEXT NOT NULL, payload_json TEXT NOT NULL, outcome TEXT NOT NULL CHECK (outcome IN ('committed', 'conflict')), target_sequence INTEGER NOT NULL, target_operation TEXT, PRIMARY KEY (store_key, operation_id))"
             ),
             Vec::new(),
@@ -777,31 +758,6 @@ fn put_file_versions(
     Ok(statement(
         format!(
             "INSERT OR IGNORE INTO {FILE_VERSIONS} (store_key, file_version_id, record_json) SELECT ?, json_extract(value, '$.key'), json_extract(value, '$.record') FROM json_each(?) WHERE {guard}"
-        ),
-        params,
-    ))
-}
-
-fn put_effects(
-    store_key: String,
-    effects: &[String],
-    operation: &str,
-    target_sequence: i64,
-    guard: &str,
-    guard_params: Vec<Value>,
-) -> Result<D1Statement, ManagedError> {
-    let params = guarded_params(
-        vec![
-            store_key.into(),
-            operation.to_owned().into(),
-            target_sequence.into(),
-            encode(&effects, "publish Managed namespace")?.into(),
-        ],
-        guard_params,
-    );
-    Ok(statement(
-        format!(
-            "INSERT OR IGNORE INTO {EFFECTS} (store_key, operation_id, target_sequence, effect_index, effect_json) SELECT ?, ?, ?, CAST(key AS INTEGER), value FROM json_each(?) WHERE {guard}"
         ),
         params,
     ))
@@ -1138,7 +1094,6 @@ struct PublicationDelta {
     deleted_directories: Vec<String>,
     file_versions: Vec<FileVersionRow>,
     deleted_file_versions: Vec<String>,
-    effects: Vec<String>,
 }
 
 impl PublicationDelta {
@@ -1234,10 +1189,6 @@ impl PublicationDelta {
                 )
                 .collect::<Vec<_>>();
         effects.push(StoredEffect::SetRoot(*change.root.as_bytes()));
-        let encoded_effects = effects
-            .iter()
-            .map(|effect| encode(effect, "publish Managed namespace"))
-            .collect::<Result<Vec<_>, _>>()?;
         let stored_change = StoredChange {
             operation: *change.operation.as_bytes(),
             parent: change.parent.into(),
@@ -1263,7 +1214,6 @@ impl PublicationDelta {
             deleted_directories,
             file_versions,
             deleted_file_versions,
-            effects: encoded_effects,
         })
     }
 }

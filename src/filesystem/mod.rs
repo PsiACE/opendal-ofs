@@ -27,9 +27,9 @@ mod publication;
 mod volume;
 
 pub use identity::{ChangeCursor, FileVersionId, Generation, NodeId, OperationId, VolumeId};
-pub use model::{AccessModel, VolumeModel};
+pub use model::VolumeModel;
 pub use namespace::{DirectoryEntry, NodeAttributes, NodeKind};
-pub use publication::{CommitOutcome, PublicationProgress};
+pub use publication::CommitOutcome;
 pub use volume::{
     DirectoryPrecondition, DirectoryRecord, FileVersion, MaterializeRequest, NodePrecondition,
     NodeRecord, Volume, VolumeError, VolumeErrorKind, VolumeObservation, VolumePublication,

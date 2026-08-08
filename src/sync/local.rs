@@ -16,21 +16,21 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum LocalKind {
+pub(crate) enum LocalKind {
     Directory,
     File,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct NativeIdentity {
+pub(crate) struct NativeIdentity {
     pub device: u64,
     pub inode: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct LocalEntry {
+pub(crate) struct LocalEntry {
     pub kind: LocalKind,
     pub size: u64,
     pub modified: String,
@@ -40,7 +40,7 @@ pub struct LocalEntry {
 
 /// One stable, path-sorted observation of an ordinary directory.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LocalTree {
+pub(crate) struct LocalTree {
     root: PathBuf,
     entries: BTreeMap<String, LocalEntry>,
 }

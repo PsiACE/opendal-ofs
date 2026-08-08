@@ -16,8 +16,10 @@ mod staging;
 mod state;
 
 pub use engine::{SyncEngine, SyncResult};
-pub use local::{LocalEntry, LocalKind, LocalTree};
-pub use publication::build_publication;
-pub use reconcile::{ReconcileAction, ReconcilePlan, reconcile};
-pub use staging::{StagedFile, StagedTree};
-pub use state::{BaseEntry, ConflictRecord, PendingIntent, ReplicaState};
+pub use state::{ConflictRecord, PendingIntent, ReplicaState};
+
+pub(crate) use local::{LocalKind, LocalTree};
+pub(crate) use publication::build_publication;
+pub(crate) use reconcile::{ReconcileAction, reconcile};
+pub(crate) use staging::StagedTree;
+pub(crate) use state::BaseEntry;
