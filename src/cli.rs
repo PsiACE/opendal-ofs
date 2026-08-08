@@ -31,9 +31,9 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: VolumeCommand,
     },
-    /// Mount a named volume as an online filesystem.
+    /// Mount a named Direct volume as a read-only online filesystem.
     Mount(MountArgs),
-    /// Reconcile and publish a local Sync replica.
+    /// Reconcile and publish a local Managed Sync replica.
     Sync(SyncArgs),
     /// Report the durable state of a local replica.
     Status(StatusArgs),

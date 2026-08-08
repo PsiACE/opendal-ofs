@@ -27,10 +27,9 @@ use sha2::{Digest as _, Sha256};
 
 use super::{ManagedError, ManagedErrorKind};
 use crate::filesystem::{NodeKind, OperationId};
-use crate::managed::namespace::{
-    ChunkSpan, ContentRef, FileVersionLayout, FileVersionRecord, NamespaceSnapshot,
-};
-use crate::managed::pack::{PackId, PackIndex, PackReadSession, PackStore};
+use crate::managed::format::{ContentRef, Extent, ExtentMap};
+use crate::managed::index::{PackId, PackIndex, PackReadSession, PackStore};
+use crate::managed::metadata::namespace::{FileVersionRecord, NamespaceSnapshot};
 
 const READ_WINDOW: u64 = 4 * 1024 * 1024;
 const LOOSE_ROOT: &str = ".ofs/managed/data/v1/loose/sha256";
@@ -179,13 +178,13 @@ impl ManagedData {
         if size == 0 {
             return Ok(version);
         }
-        let FileVersionLayout::Whole { content } = &version.layout else {
-            unreachable!("whole-file sealing created another layout")
-        };
-        if known.contains(content) {
+        let content = version
+            .whole_content()
+            .expect("non-empty whole-file sealing creates one extent");
+        if known.contains(&content) {
             return Ok(version);
         }
-        let key = loose_key(content);
+        let key = loose_key(&content);
 
         let created = match self.operator.writer_with(&key).if_not_exists(true).await {
             Err(error) if already_exists(&error) => false,
@@ -247,28 +246,17 @@ impl ManagedData {
         let chunks = chunker.as_stream();
         futures::pin_mut!(chunks);
         let mut logical = Sha256::new();
-        let mut spans = Vec::new();
+        let mut extents = Vec::new();
         while let Some(chunk) = chunks.next().await {
             let chunk = chunk.map_err(|_| unavailable("chunk frozen file"))?;
             logical.update(&chunk.data);
             let content = self.persist_bytes(&chunk.data, known).await?;
-            spans.push(ChunkSpan {
+            extents.push(Extent {
                 logical_offset: chunk.offset,
-                logical_length: content.logical_length,
                 content,
             });
         }
-        build_version(
-            size,
-            logical.finalize().into(),
-            FileVersionLayout::FastCdc {
-                revision: 1,
-                minimum_size: u64::from(sizes.minimum),
-                target_size: u64::from(sizes.target),
-                maximum_size: u64::from(sizes.maximum),
-                chunks: spans,
-            },
-        )
+        build_version(size, logical.finalize().into(), ExtentMap { extents })
     }
 
     pub(crate) async fn pack_reachable(
@@ -286,21 +274,21 @@ impl ManagedData {
         let mut packed_content = Vec::new();
         let mut logical_bytes = 0_u64;
         for content in contents {
-            if content.logical_length == 0
-                || content.logical_length > SMALL_CONTENT_LIMIT
+            if content.length == 0
+                || content.length > SMALL_CONTENT_LIMIT
                 || !index.locations(content).is_empty()
             {
                 continue;
             }
-            if batch_bytes + content.logical_length > PACK_LOGICAL_LIMIT {
+            if batch_bytes + content.length > PACK_LOGICAL_LIMIT {
                 let pack = store.seal(operation, std::mem::take(&mut batch)).await?;
                 index.add(&pack);
                 sealed.push(pack);
                 batch_bytes = 0;
             }
             batch.push(self.read_loose_content(content).await?);
-            batch_bytes += content.logical_length;
-            logical_bytes += content.logical_length;
+            batch_bytes += content.length;
+            logical_bytes += content.length;
             packed_content.push(content);
         }
         if !batch.is_empty() {
@@ -342,7 +330,7 @@ impl ManagedData {
             live_lengths
                 .entry(content.digest)
                 .or_default()
-                .insert(content.logical_length);
+                .insert(content.length);
         }
         let mut result = LooseGcMaintenance::default();
         let loose = list_loose_content(&self.operator, "collect unreachable loose data").await?;
@@ -355,7 +343,7 @@ impl ManagedData {
             }
             if live_lengths
                 .get(&content.digest)
-                .is_some_and(|lengths| !lengths.contains(&content.logical_length))
+                .is_some_and(|lengths| !lengths.contains(&content.length))
             {
                 return Err(corrupt(
                     "collect unreachable loose data",
@@ -366,7 +354,7 @@ impl ManagedData {
             result.deleted += 1;
             result.deleted_bytes = result
                 .deleted_bytes
-                .checked_add(content.logical_length)
+                .checked_add(content.length)
                 .ok_or_else(|| {
                     corrupt(
                         "collect unreachable loose data",
@@ -390,7 +378,7 @@ impl ManagedData {
             .map_err(|error| referenced_data_error("pack loose data", error))?
             .to_bytes()
             .to_vec();
-        if bytes.len() as u64 != content.logical_length
+        if bytes.len() as u64 != content.length
             || <[u8; 32]>::from(Sha256::digest(&bytes)) != content.digest
         {
             return Err(corrupt(
@@ -408,10 +396,10 @@ impl ManagedData {
     ) -> Result<ContentRef, ManagedError> {
         let content = ContentRef {
             digest: Sha256::digest(bytes).into(),
-            logical_length: u64::try_from(bytes.len())
+            length: u64::try_from(bytes.len())
                 .map_err(|_| invalid("write loose data", "content length exceeds format v1"))?,
         };
-        if content.logical_length == 0 || known.contains(&content) {
+        if content.length == 0 || known.contains(&content) {
             return Ok(content);
         }
         let key = loose_key(&content);
@@ -426,7 +414,7 @@ impl ManagedData {
             Err(_) => return Err(unavailable("write loose data")),
         }
         let mut digest = Sha256::new();
-        self.copy_content(&content, 0..content.logical_length, None, &mut digest, None)
+        self.copy_content(&content, 0..content.length, None, &mut digest, None)
             .await?;
         Ok(content)
     }
@@ -499,29 +487,15 @@ impl ManagedData {
         packs: Option<&PackReadSession>,
     ) -> Result<(), ManagedError> {
         let mut logical = Sha256::new();
-        match &version.layout {
-            FileVersionLayout::Whole { content } => {
-                self.copy_content(
-                    content,
-                    0..content.logical_length,
-                    target.as_deref_mut(),
-                    &mut logical,
-                    packs,
-                )
-                .await?;
-            }
-            FileVersionLayout::FastCdc { chunks, .. } => {
-                for chunk in chunks {
-                    self.copy_content(
-                        &chunk.content,
-                        0..chunk.content.logical_length,
-                        target.as_deref_mut(),
-                        &mut logical,
-                        packs,
-                    )
-                    .await?;
-                }
-            }
+        for extent in &version.extent_map.extents {
+            self.copy_content(
+                &extent.content,
+                0..extent.content.length,
+                target.as_deref_mut(),
+                &mut logical,
+                packs,
+            )
+            .await?;
         }
         let observed: [u8; 32] = logical.finalize().into();
         if observed != version.logical_digest {
@@ -541,7 +515,7 @@ impl ManagedData {
         logical: &mut Sha256,
         packs: Option<&PackReadSession>,
     ) -> Result<(), ManagedError> {
-        if selected.start > selected.end || selected.end > content.logical_length {
+        if selected.start > selected.end || selected.end > content.length {
             return Err(corrupt("read loose data", "content range is invalid"));
         }
         let mut pack_failure = None;
@@ -598,7 +572,7 @@ impl ManagedData {
             for bytes in buffer {
                 let end = offset
                     .checked_add(bytes.len() as u64)
-                    .filter(|end| *end <= content.logical_length)
+                    .filter(|end| *end <= content.length)
                     .ok_or_else(|| {
                         corrupt("read loose data", "content is longer than its reference")
                     })?;
@@ -619,7 +593,7 @@ impl ManagedData {
                 offset = end;
             }
         }
-        if offset != content.logical_length {
+        if offset != content.length {
             return Err(corrupt("read loose data", "content returned a short range"));
         }
         let observed: [u8; 32] = content_digest.finalize().into();
@@ -656,7 +630,13 @@ fn reachable_content(
 ) -> Result<BTreeSet<ContentRef>, ManagedError> {
     let mut contents = BTreeSet::new();
     visit_reachable_file_versions(snapshot, action, |version| {
-        collect_content_refs(&version.layout, &mut contents);
+        contents.extend(
+            version
+                .extent_map
+                .extents
+                .iter()
+                .map(|extent| extent.content),
+        );
     })?;
     Ok(contents)
 }
@@ -667,7 +647,7 @@ fn reachable_whole_content(
 ) -> Result<BTreeSet<ContentRef>, ManagedError> {
     let mut contents = BTreeSet::new();
     visit_reachable_file_versions(snapshot, action, |version| {
-        if let FileVersionLayout::Whole { content } = version.layout {
+        if let Some(content) = version.whole_content() {
             contents.insert(content);
         }
     })?;
@@ -717,17 +697,6 @@ fn visit_reachable_file_versions(
     Ok(())
 }
 
-fn collect_content_refs(layout: &FileVersionLayout, output: &mut BTreeSet<ContentRef>) {
-    match layout {
-        FileVersionLayout::Whole { content } => {
-            output.insert(*content);
-        }
-        FileVersionLayout::FastCdc { chunks, .. } => {
-            output.extend(chunks.iter().map(|chunk| chunk.content));
-        }
-    }
-}
-
 async fn frozen_size(source: &Operator, path: &str) -> Result<u64, ManagedError> {
     let metadata = source
         .stat(path)
@@ -742,9 +711,9 @@ async fn frozen_size(source: &Operator, path: &str) -> Result<u64, ManagedError>
 fn build_version(
     size: u64,
     digest: [u8; 32],
-    layout: FileVersionLayout,
+    extent_map: ExtentMap,
 ) -> Result<FileVersionRecord, ManagedError> {
-    FileVersionRecord::from_layout(size, digest, layout)
+    FileVersionRecord::from_extents(size, digest, extent_map)
         .ok_or_else(|| invalid("seal Managed data", "generated file manifest is invalid"))
 }
 
@@ -811,7 +780,7 @@ async fn list_loose_content(
                 path: entry.path().to_owned(),
                 content: ContentRef {
                     digest,
-                    logical_length: entry.metadata().content_length(),
+                    length: entry.metadata().content_length(),
                 },
             })
         })
@@ -887,7 +856,7 @@ mod tests {
     use crate::filesystem::{
         ChangeCursor, DirectoryEntry, Generation, NodeAttributes, NodeId, NodeKind, VolumeId,
     };
-    use crate::managed::namespace::{DirectoryRecord, NodeRecord};
+    use crate::managed::metadata::namespace::{DirectoryRecord, NodeRecord};
 
     fn memory() -> Operator {
         Operator::new(services::Memory::default()).unwrap().finish()
@@ -976,7 +945,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn whole_and_fastcdc_layouts_round_trip() {
+    async fn small_and_large_files_round_trip() {
         let source = memory();
         let stored = memory();
         let target = memory();
@@ -986,18 +955,27 @@ mod tests {
             .collect();
         source.write("small", small).await.unwrap();
         source.write("input", bytes.clone()).await.unwrap();
+        source.write("empty", Vec::<u8>::new()).await.unwrap();
 
         let data = managed_data(stored);
-        let below_threshold = seal_file(&data, &source, "small").await;
-        assert!(matches!(
-            below_threshold.layout,
-            FileVersionLayout::Whole { .. }
-        ));
-
-        let cdc = seal_file(&data, &source, "input").await;
-        assert!(matches!(cdc.layout, FileVersionLayout::FastCdc { .. }));
-        data.read_to(&cdc, &target, "cdc").await.unwrap();
-        assert_eq!(target.read("cdc").await.unwrap().to_bytes(), bytes);
+        let small_version = seal_file(&data, &source, "small").await;
+        let large_version = seal_file(&data, &source, "input").await;
+        let empty_version = seal_file(&data, &source, "empty").await;
+        data.read_to(&small_version, &target, "small")
+            .await
+            .unwrap();
+        data.read_to(&large_version, &target, "large")
+            .await
+            .unwrap();
+        data.read_to(&empty_version, &target, "empty")
+            .await
+            .unwrap();
+        assert_eq!(
+            target.read("small").await.unwrap().to_bytes(),
+            vec![7; 8192]
+        );
+        assert_eq!(target.read("large").await.unwrap().to_bytes(), bytes);
+        assert!(target.read("empty").await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1010,25 +988,15 @@ mod tests {
         let live = seal_whole_file(&data, &source, "live").await;
         let orphan = seal_whole_file(&data, &source, "orphan").await;
         let snapshot = snapshot_with_file(live.clone());
-        let FileVersionLayout::Whole {
-            content: live_content,
-        } = live.layout
-        else {
-            unreachable!()
-        };
-        let FileVersionLayout::Whole {
-            content: orphan_content,
-        } = orphan.layout
-        else {
-            unreachable!()
-        };
+        let live_content = live.whole_content().unwrap();
+        let orphan_content = orphan.whole_content().unwrap();
         let unknown = format!("{LOOSE_ROOT}/unknown");
         stored.write(&unknown, b"keep".to_vec()).await.unwrap();
 
         let collected = data.collect_unreachable_loose(&snapshot).await.unwrap();
         assert_eq!(collected.scanned, 2);
         assert_eq!(collected.deleted, 1);
-        assert_eq!(collected.deleted_bytes, orphan_content.logical_length);
+        assert_eq!(collected.deleted_bytes, orphan_content.length);
         assert!(stored.stat(&loose_key(&live_content)).await.is_ok());
         assert!(stored.stat(&loose_key(&orphan_content)).await.is_err());
         assert!(stored.stat(&unknown).await.is_ok());
@@ -1039,7 +1007,7 @@ mod tests {
             .unwrap();
         let later = ContentRef {
             digest: Sha256::digest(b"later orphan").into(),
-            logical_length: b"later orphan".len() as u64,
+            length: b"later orphan".len() as u64,
         };
         stored
             .write(&loose_key(&later), b"later orphan".to_vec())
@@ -1140,16 +1108,10 @@ mod tests {
             .pack_reachable(&snapshot, OperationId::from_bytes([5; 16]))
             .await
             .unwrap();
-        let small_content = match &small.layout {
-            FileVersionLayout::Whole { content } => *content,
-            _ => unreachable!(),
-        };
-        let orphan_content = match &orphan.layout {
-            FileVersionLayout::Whole { content } => *content,
-            _ => unreachable!(),
-        };
+        let small_content = small.whole_content().unwrap();
+        let orphan_content = orphan.whole_content().unwrap();
         assert_eq!(packed.packed_content, vec![small_content]);
-        assert_eq!(packed.logical_bytes, small_content.logical_length);
+        assert_eq!(packed.logical_bytes, small_content.length);
         let index = PackIndex::open(stored.clone()).await.unwrap().unwrap();
         assert!(index.locations(orphan_content).is_empty());
 
@@ -1186,7 +1148,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn small_file_pack_excludes_fastcdc_chunks() {
+    async fn pack_maintenance_preserves_large_file_reads() {
         let source = memory();
         let stored = memory();
         let target = memory();
@@ -1207,20 +1169,9 @@ mod tests {
             .pack_reachable(&snapshot, OperationId::from_bytes([31; 16]))
             .await
             .unwrap();
-        let FileVersionLayout::Whole { content: whole_ref } = whole.layout else {
-            unreachable!()
-        };
+        let whole_ref = whole.whole_content().unwrap();
         assert_eq!(packed.packed_content, vec![whole_ref]);
 
-        let index = PackIndex::open(stored.clone()).await.unwrap().unwrap();
-        let FileVersionLayout::FastCdc { chunks, .. } = &chunked.layout else {
-            unreachable!()
-        };
-        assert!(
-            chunks
-                .iter()
-                .all(|chunk| index.locations(chunk.content).is_empty())
-        );
         data.read_to(&chunked, &target, "chunked").await.unwrap();
         assert_eq!(
             target.read("chunked").await.unwrap().to_bytes(),
@@ -1229,7 +1180,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn referenced_chunk_corruption_fails_closed() {
+    async fn referenced_extent_corruption_fails_closed() {
         let source = memory();
         let stored = memory();
         let target = memory();
@@ -1239,11 +1190,9 @@ mod tests {
             .unwrap();
         let data = managed_data(stored.clone());
         let version = seal_file(&data, &source, "input").await;
-        let FileVersionLayout::FastCdc { chunks, .. } = &version.layout else {
-            panic!("FastCDC policy returned another layout")
-        };
+        let content = version.extent_map.extents[0].content;
         stored
-            .write(&loose_key(&chunks[0].content), b"bad".to_vec())
+            .write(&loose_key(&content), b"bad".to_vec())
             .await
             .unwrap();
 

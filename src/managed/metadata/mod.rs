@@ -16,12 +16,16 @@
 // under the License.
 
 pub(crate) mod d1;
+pub(crate) mod namespace;
 mod object;
+mod superblock;
 
 pub use d1::{D1Config, D1Metadata};
+pub use namespace::NamespaceGcSweep;
 pub use object::ObjectMetadata;
+pub use superblock::{ManagedFormat, MetadataFormat};
 
-use super::{ManagedError, ManagedFormat};
+use super::ManagedError;
 
 fn require_same_format(
     desired: &ManagedFormat,

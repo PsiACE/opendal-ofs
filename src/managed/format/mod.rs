@@ -15,19 +15,28 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Managed volume authority and its durable format.
+//! Shared durable references and physical storage containers.
 
-mod data;
-mod error;
-mod format;
-pub(crate) mod index;
-mod metadata;
-mod volume;
+use serde::{Deserialize, Serialize};
 
-pub(crate) use data::{AuthorityKnownContent, ManagedData};
-pub use data::{LooseGcMaintenance, PackMaintenance};
-pub use error::{ManagedError, ManagedErrorKind};
-pub use metadata::{
-    D1Config, D1Metadata, ManagedFormat, MetadataFormat, NamespaceGcSweep, ObjectMetadata,
-};
-pub use volume::{ManagedObservation, ManagedVolume};
+pub(crate) mod sstable;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentRef {
+    pub digest: [u8; 32],
+    pub length: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtentMap {
+    pub extents: Vec<Extent>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Extent {
+    pub logical_offset: u64,
+    pub content: ContentRef,
+}

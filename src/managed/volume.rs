@@ -23,14 +23,14 @@ use std::num::NonZeroUsize;
 use futures::{StreamExt as _, stream};
 use opendal::Operator;
 
-use super::namespace::{
-    ContentRef, D1Namespace, D1NamespaceObservation, FileVersionLayout, FileVersionRecord,
-    NamespaceGcSweep, NamespaceObservation, NamespacePublication, NamespaceSnapshot,
-    ObjectNamespace,
+use super::format::{ContentRef, ExtentMap};
+use super::metadata::namespace::{
+    D1Namespace, D1NamespaceObservation, FileVersionRecord, NamespaceGcSweep, NamespaceObservation,
+    NamespacePublication, NamespaceSnapshot, ObjectNamespace,
 };
 use super::{
     AuthorityKnownContent, D1Metadata, LooseGcMaintenance, ManagedData, ManagedError,
-    ManagedErrorKind, ManagedFormat, MetadataPlacement, PackMaintenance,
+    ManagedErrorKind, ManagedFormat, MetadataFormat, PackMaintenance,
 };
 use crate::filesystem::{CommitOutcome, OperationId, VolumeId};
 use crate::filesystem::{
@@ -38,7 +38,7 @@ use crate::filesystem::{
     NodeRecord as FsNodeRecord, Volume, VolumeError, VolumeErrorKind, VolumeObservation,
     VolumePublication, VolumeSnapshot,
 };
-use crate::managed::pack::{PackId, PackLocation};
+use crate::managed::index::{PackId, PackLocation};
 
 #[derive(Clone)]
 pub struct ManagedVolume {
@@ -83,11 +83,11 @@ impl ManagedObservation {
 
 impl ManagedVolume {
     pub fn object(format: ManagedFormat, data_operator: Operator) -> Result<Self, ManagedError> {
-        if format.metadata_placement() != MetadataPlacement::ColocatedObject {
+        if format.metadata_format() != MetadataFormat::ObjectV1 {
             return Err(ManagedError::new(
                 ManagedErrorKind::Invalid,
                 "open Managed volume",
-                "superblock metadata placement is not colocated object storage",
+                "superblock metadata format is not object/1",
             ));
         }
         let volume_id = format.volume_id();
@@ -106,11 +106,11 @@ impl ManagedVolume {
         data_operator: Operator,
         metadata: D1Metadata,
     ) -> Result<Self, ManagedError> {
-        if format.metadata_placement() != MetadataPlacement::ExternalD1 {
+        if format.metadata_format() != MetadataFormat::TransactionalV1 {
             return Err(ManagedError::new(
                 ManagedErrorKind::Invalid,
                 "open Managed volume",
-                "superblock metadata placement is not external transactional storage",
+                "superblock metadata format is not transactional/1",
             ));
         }
         let volume_id = format.volume_id();
@@ -275,10 +275,7 @@ async fn materialize_managed_files(
     let mut unpacked = Vec::new();
     for request in requests {
         let managed = decode_file_version(&request.version)?;
-        let content = match &managed.layout {
-            FileVersionLayout::Whole { content } if content.logical_length > 0 => Some(*content),
-            _ => None,
-        };
+        let content = managed.whole_content().filter(|content| content.length > 0);
         let location = match content {
             Some(content) => packs.locations(content).await.into_iter().next(),
             None => None,
@@ -376,14 +373,14 @@ impl Volume for ManagedVolume {
     }
 
     fn initial_generation(&self) -> crate::filesystem::Generation {
-        super::namespace::managed_generation(1)
+        super::metadata::namespace::managed_generation(1)
     }
 
     fn next_generation(
         &self,
         generation: &crate::filesystem::Generation,
     ) -> Result<crate::filesystem::Generation, VolumeError> {
-        super::namespace::next_managed_generation(generation).ok_or_else(|| {
+        super::metadata::namespace::next_managed_generation(generation).ok_or_else(|| {
             VolumeError::new(
                 VolumeErrorKind::Invalid,
                 "advance filesystem generation: generation is invalid or exhausted",
@@ -477,7 +474,7 @@ fn managed_observation(
 
 fn encode_file_version(version: &FileVersionRecord) -> Result<FileVersion, ManagedError> {
     let mut descriptor = Vec::new();
-    ciborium::into_writer(&version.layout, &mut descriptor).map_err(|error| {
+    ciborium::into_writer(&version.extent_map, &mut descriptor).map_err(|error| {
         ManagedError::new(
             ManagedErrorKind::Invalid,
             "encode Managed file version",
@@ -493,17 +490,16 @@ fn encode_file_version(version: &FileVersionRecord) -> Result<FileVersion, Manag
 }
 
 fn decode_file_version(version: &FileVersion) -> Result<FileVersionRecord, VolumeError> {
-    let layout: FileVersionLayout =
-        ciborium::from_reader(version.descriptor()).map_err(|error| {
-            VolumeError::new(
-                VolumeErrorKind::Corrupt,
-                format!("decode Managed file version: {error}"),
-            )
-        })?;
-    let decoded = FileVersionRecord::from_layout(
+    let extent_map: ExtentMap = ciborium::from_reader(version.descriptor()).map_err(|error| {
+        VolumeError::new(
+            VolumeErrorKind::Corrupt,
+            format!("decode Managed file version: {error}"),
+        )
+    })?;
+    let decoded = FileVersionRecord::from_extents(
         version.logical_size,
         version.logical_digest,
-        layout,
+        extent_map,
     )
     .filter(|decoded| decoded.id == version.id)
     .ok_or_else(|| {
@@ -569,7 +565,7 @@ fn to_managed_snapshot(snapshot: &VolumeSnapshot) -> Result<NamespaceSnapshot, V
             .map(|(id, record)| {
                 (
                     *id,
-                    super::namespace::NodeRecord {
+                    super::metadata::namespace::NodeRecord {
                         id: record.id,
                         generation: record.generation.clone(),
                         kind: record.kind,
@@ -585,7 +581,7 @@ fn to_managed_snapshot(snapshot: &VolumeSnapshot) -> Result<NamespaceSnapshot, V
             .map(|(id, record)| {
                 (
                     *id,
-                    super::namespace::DirectoryRecord {
+                    super::metadata::namespace::DirectoryRecord {
                         node: record.node,
                         generation: record.generation.clone(),
                         entries: record.entries.clone(),
@@ -610,18 +606,22 @@ fn to_managed_publication(
         expected_nodes: publication
             .expected_nodes
             .iter()
-            .map(|precondition| super::namespace::NodePrecondition {
-                node: precondition.node,
-                expected_generation: precondition.expected_generation.clone(),
-            })
+            .map(
+                |precondition| super::metadata::namespace::NodePrecondition {
+                    node: precondition.node,
+                    expected_generation: precondition.expected_generation.clone(),
+                },
+            )
             .collect(),
         expected_directories: publication
             .expected_directories
             .iter()
-            .map(|precondition| super::namespace::DirectoryPrecondition {
-                directory: precondition.directory,
-                expected_generation: precondition.expected_generation.clone(),
-            })
+            .map(
+                |precondition| super::metadata::namespace::DirectoryPrecondition {
+                    directory: precondition.directory,
+                    expected_generation: precondition.expected_generation.clone(),
+                },
+            )
             .collect(),
         target: to_managed_snapshot(&publication.target)?,
     })
@@ -637,5 +637,46 @@ impl From<ManagedError> for VolumeError {
             ManagedErrorKind::Unavailable => VolumeErrorKind::Unavailable,
         };
         Self::new(kind, error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sha2::{Digest as _, Sha256};
+
+    use super::*;
+    use crate::managed::format::Extent;
+
+    #[test]
+    fn filesystem_descriptor_round_trips_a_multi_extent_file() {
+        let first = b"first ";
+        let second = b"second";
+        let logical_digest: [u8; 32] = Sha256::digest([first.as_slice(), second].concat()).into();
+        let record = FileVersionRecord::from_extents(
+            (first.len() + second.len()) as u64,
+            logical_digest,
+            ExtentMap {
+                extents: vec![
+                    Extent {
+                        logical_offset: 0,
+                        content: ContentRef {
+                            digest: Sha256::digest(first).into(),
+                            length: first.len() as u64,
+                        },
+                    },
+                    Extent {
+                        logical_offset: first.len() as u64,
+                        content: ContentRef {
+                            digest: Sha256::digest(second).into(),
+                            length: second.len() as u64,
+                        },
+                    },
+                ],
+            },
+        )
+        .unwrap();
+
+        let exposed = encode_file_version(&record).unwrap();
+        assert_eq!(decode_file_version(&exposed).unwrap(), record);
     }
 }

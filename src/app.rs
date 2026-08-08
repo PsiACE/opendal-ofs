@@ -15,7 +15,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use ofs::catalog::{Catalog, VolumeDefinition};
 use ofs::filesystem::{OperationId, VolumeId, VolumeModel};
 use ofs::managed::{
-    D1Config, D1Metadata, ManagedErrorKind, ManagedFormat, ManagedVolume, MetadataPlacement,
+    D1Config, D1Metadata, ManagedErrorKind, ManagedFormat, ManagedVolume, MetadataFormat,
     ObjectMetadata,
 };
 use ofs::sync::{ReplicaState, SyncEngine};
@@ -27,6 +27,48 @@ use crate::cli::{
     Cli, Command, MountArgs, StatusArgs, SyncArgs, VolumeCommand, VolumeCreateArgs, VolumeGcArgs,
     VolumePackArgs, VolumeReindexArgs,
 };
+
+enum MetadataAuthority {
+    Object(ObjectMetadata),
+    D1(D1Metadata),
+}
+
+impl MetadataAuthority {
+    const fn metadata_format(&self) -> MetadataFormat {
+        match self {
+            Self::Object(_) => MetadataFormat::ObjectV1,
+            Self::D1(_) => MetadataFormat::TransactionalV1,
+        }
+    }
+
+    async fn create_format(
+        &self,
+        desired: &ManagedFormat,
+    ) -> Result<ManagedFormat, ofs::managed::ManagedError> {
+        match self {
+            Self::Object(metadata) => metadata.create_format(desired).await,
+            Self::D1(metadata) => metadata.create_format(desired).await,
+        }
+    }
+
+    async fn read_format(&self) -> Result<ManagedFormat, ofs::managed::ManagedError> {
+        match self {
+            Self::Object(metadata) => metadata.read_format().await,
+            Self::D1(metadata) => metadata.read_format().await,
+        }
+    }
+
+    fn validate_volume(
+        &self,
+        format: ManagedFormat,
+        data: Operator,
+    ) -> Result<(), ofs::managed::ManagedError> {
+        match self {
+            Self::Object(_) => ManagedVolume::object(format, data).map(|_| ()),
+            Self::D1(metadata) => ManagedVolume::d1(format, data, metadata.clone()).map(|_| ()),
+        }
+    }
+}
 
 pub(crate) async fn run(cli: Cli) -> Result<()> {
     let config = cli.config;
@@ -112,25 +154,15 @@ async fn open_managed_volume(
         .managed_settings()
         .context("this operation requires a Managed volume")?;
     let data = open_operator(&definition.storage, transfer_concurrency)?;
-    let d1 = open_d1_metadata(settings.metadata.as_ref())?;
-    let placement = if settings.metadata.is_some() {
-        MetadataPlacement::ExternalD1
-    } else {
-        MetadataPlacement::ColocatedObject
-    };
-    let expected = managed_format(definition.volume_id, placement)?;
-    let data_format = ObjectMetadata::new(data.clone()).read_format().await?;
-    if data_format != expected {
+    let metadata = open_metadata(data.clone(), settings.metadata.as_ref())?;
+    let format = metadata.read_format().await?;
+    let expected = ManagedFormat::v1(definition.volume_id, metadata.metadata_format());
+    if format != expected {
         bail!("volume catalog and Managed format v1 binding disagree");
     }
-    if let Some(metadata) = &d1
-        && metadata.read_format().await? != data_format
-    {
-        bail!("Managed data root and transactional metadata binding disagree");
-    }
-    match d1 {
-        None => ManagedVolume::object(expected, data),
-        Some(metadata) => ManagedVolume::d1(expected, data, metadata),
+    match metadata {
+        MetadataAuthority::Object(_) => ManagedVolume::object(format, data),
+        MetadataAuthority::D1(metadata) => ManagedVolume::d1(format, data, metadata),
     }
     .map_err(Into::into)
 }
@@ -171,20 +203,15 @@ async fn create_volume(config: &Path, mut args: VolumeCreateArgs) -> Result<()> 
             args.alias
         );
     }
-    let placement = if args.metadata.is_some() {
-        MetadataPlacement::ExternalD1
-    } else {
-        MetadataPlacement::ColocatedObject
-    };
     let data = open_operator(&args.storage, NonZeroUsize::MIN)?;
-    let d1 = open_d1_metadata(args.metadata.as_ref())?;
-    let desired = managed_format(provisional_id, placement)?;
-    let data_metadata = ObjectMetadata::new(data);
-    let format = match data_metadata.create_format(&desired).await {
+    let metadata = open_metadata(data.clone(), args.metadata.as_ref())?;
+    let desired = ManagedFormat::v1(provisional_id, metadata.metadata_format());
+    metadata.validate_volume(desired.clone(), data)?;
+    let format = match metadata.create_format(&desired).await {
         Ok(format) => format,
         Err(error) if configured.is_none() && error.kind() == ManagedErrorKind::Conflict => {
-            let observed = data_metadata.read_format().await?;
-            let expected = managed_format(observed.volume_id(), placement)?;
+            let observed = metadata.read_format().await?;
+            let expected = ManagedFormat::v1(observed.volume_id(), metadata.metadata_format());
             if observed != expected {
                 return Err(error.into());
             }
@@ -192,9 +219,6 @@ async fn create_volume(config: &Path, mut args: VolumeCreateArgs) -> Result<()> 
         }
         Err(error) => return Err(error.into()),
     };
-    if let Some(metadata) = &d1 {
-        metadata.create_format(&format).await?;
-    }
     let definition = VolumeDefinition::managed(format.volume_id(), args.storage, args.metadata)?;
     let created = catalog.create(&args.alias, definition)?;
 
@@ -232,16 +256,14 @@ fn create_direct_volume(
     Ok(())
 }
 
-fn open_d1_metadata(metadata: Option<&Url>) -> Result<Option<D1Metadata>> {
+fn open_metadata(data: Operator, metadata: Option<&Url>) -> Result<MetadataAuthority> {
     match metadata {
-        None => Ok(None),
-        Some(url) if url.scheme() == "d1" => Ok(Some(D1Metadata::new(d1_config(url)?))),
+        None => Ok(MetadataAuthority::Object(ObjectMetadata::new(data))),
+        Some(url) if url.scheme() == "d1" => {
+            Ok(MetadataAuthority::D1(D1Metadata::new(d1_config(url)?)))
+        }
         Some(_) => bail!("--metadata must use d1://ACCOUNT/DATABASE/STORE"),
     }
-}
-
-fn managed_format(volume_id: VolumeId, placement: MetadataPlacement) -> Result<ManagedFormat> {
-    ManagedFormat::v1(volume_id, placement).map_err(Into::into)
 }
 
 async fn sync_volume(config: &Path, args: SyncArgs) -> Result<()> {

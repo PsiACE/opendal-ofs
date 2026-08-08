@@ -25,7 +25,7 @@ use sha2::{Digest as _, Sha256};
 use super::change::NamespaceChange;
 use super::validation::{validate_publication, validate_snapshot};
 use super::{
-    DirectoryPrecondition, DirectoryRecord, FileVersionLayout, FileVersionRecord, NamespaceGcSweep,
+    DirectoryPrecondition, DirectoryRecord, FileVersionRecord, NamespaceGcSweep,
     NamespacePublication, NamespaceSnapshot, NodePrecondition, NodeRecord, managed_generation,
     managed_generation_number,
 };
@@ -33,6 +33,7 @@ use crate::filesystem::{
     ChangeCursor, CommitOutcome, DirectoryEntry, FileVersionId, NodeAttributes, NodeId, NodeKind,
     OperationId, VolumeId,
 };
+use crate::managed::format::ExtentMap;
 use crate::managed::metadata::d1::{D1Session, D1Statement, statement};
 use crate::managed::{ManagedError, ManagedErrorKind};
 
@@ -1487,7 +1488,7 @@ struct StoredFileVersion {
     id: [u8; 32],
     logical_size: u64,
     logical_digest: [u8; 32],
-    layout: FileVersionLayout,
+    extent_map: ExtentMap,
 }
 
 impl From<&FileVersionRecord> for StoredFileVersion {
@@ -1496,7 +1497,7 @@ impl From<&FileVersionRecord> for StoredFileVersion {
             id: *version.id.as_bytes(),
             logical_size: version.logical_size,
             logical_digest: version.logical_digest,
-            layout: version.layout.clone(),
+            extent_map: version.extent_map.clone(),
         }
     }
 }
@@ -1507,7 +1508,7 @@ impl StoredFileVersion {
             id: FileVersionId::from_bytes(self.id),
             logical_size: self.logical_size,
             logical_digest: self.logical_digest,
-            layout: self.layout,
+            extent_map: self.extent_map,
         }
     }
 }

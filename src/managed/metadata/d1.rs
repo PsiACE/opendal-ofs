@@ -115,7 +115,6 @@ impl D1Metadata {
         &self,
         desired: &ManagedFormat,
     ) -> Result<ManagedFormat, ManagedError> {
-        desired.validate_for_write()?;
         let record = String::from_utf8(desired.encode()?).map_err(|_| {
             ManagedError::new(
                 ManagedErrorKind::Invalid,

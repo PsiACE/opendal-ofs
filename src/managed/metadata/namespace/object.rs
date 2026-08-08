@@ -16,7 +16,6 @@
 // under the License.
 
 use std::collections::BTreeMap;
-use std::collections::BTreeSet;
 use std::io::Cursor;
 use std::num::NonZeroU64;
 
@@ -28,7 +27,7 @@ use sha2::{Digest as _, Sha256};
 use super::change::NamespaceChange;
 use super::validation::{validate_publication, validate_snapshot};
 use super::{
-    DirectoryPrecondition, DirectoryRecord, FileVersionLayout, FileVersionRecord, NamespaceGcSweep,
+    DirectoryPrecondition, DirectoryRecord, FileVersionRecord, NamespaceGcSweep,
     NamespacePublication, NamespaceSnapshot, NodePrecondition, NodeRecord, managed_generation,
     managed_generation_number,
 };
@@ -36,24 +35,24 @@ use crate::filesystem::{
     ChangeCursor, CommitOutcome, DirectoryEntry, FileVersionId, NodeAttributes, NodeId, NodeKind,
     OperationId, VolumeId,
 };
-use crate::managed::section::{self, Record as SectionRecord, Reference as SectionReference};
+use crate::managed::format::ExtentMap;
+use crate::managed::format::sstable::{self, Record as TableRecord, TableRef};
 use crate::managed::{ManagedError, ManagedErrorKind};
 
 const HEAD_KEY: &str = ".ofs/managed/metadata/v1/head.json";
 const TRANSACTION_ROOT: &str = ".ofs/managed/metadata/v1/transactions";
-const CHECKPOINT_ROOT: &str = ".ofs/managed/metadata/v1/checkpoints/sha256";
-const SECTION_ROOT: &str = ".ofs/managed/metadata/v1/sections/sha256";
-const RESULT_ROOT: &str = ".ofs/managed/metadata/v1/results";
+const MANIFEST_ROOT: &str = ".ofs/managed/metadata/v1/manifests/sha256";
+const SSTABLE_ROOT: &str = ".ofs/managed/metadata/v1/sstables/sha256";
 const TRANSACTION_MAGIC: &[u8] = b"OFS1TXN\0";
-const CHECKPOINT_MAGIC: &[u8] = b"OFS1CHK\0";
-const RESULT_MAGIC: &[u8] = b"OFS1RES\0";
+const MANIFEST_MAGIC: &[u8] = b"OFS1MAN\0";
 const HEAD_MAGIC: &str = "ofs-managed-head";
 const FORMAT_MAJOR: u16 = 1;
 const MAX_TAIL_TRANSACTIONS: u16 = 32;
-const NODE_SECTION: u8 = 1;
-const DIRECTORY_SECTION: u8 = 2;
-const DIRECTORY_ENTRY_SECTION: u8 = 3;
-const FILE_VERSION_SECTION: u8 = 4;
+const NODE_PREFIX: u8 = 1;
+const DIRECTORY_PREFIX: u8 = 2;
+const DIRECTORY_ENTRY_PREFIX: u8 = 3;
+const FILE_VERSION_PREFIX: u8 = 4;
+const OPERATION_RESULT_PREFIX: u8 = 5;
 
 #[derive(Clone, Debug)]
 pub struct NamespaceObservation {
@@ -71,9 +70,25 @@ impl NamespaceObservation {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct ObservationAuthority {
     head: StoredHead,
+    manifest: Option<StoredManifest>,
+    wal: Option<Vec<StoredTransaction>>,
+}
+
+impl std::fmt::Debug for ObservationAuthority {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ObservationAuthority")
+            .field("head", &self.head)
+            .field(
+                "manifest_tables",
+                &self.manifest.as_ref().map_or(0, |value| value.tables.len()),
+            )
+            .field("wal_transactions", &self.wal.as_ref().map_or(0, Vec::len))
+            .finish()
+    }
 }
 
 #[derive(Clone)]
@@ -124,7 +139,11 @@ impl ObjectNamespace {
             return Ok(Some(NamespaceObservation {
                 snapshot: base.clone(),
                 revision,
-                authority: Box::new(ObservationAuthority { head }),
+                authority: Box::new(ObservationAuthority {
+                    head,
+                    manifest: None,
+                    wal: None,
+                }),
             }));
         }
         self.recover_observation(head, revision).await.map(Some)
@@ -135,11 +154,15 @@ impl ObjectNamespace {
         head: StoredHead,
         revision: String,
     ) -> Result<NamespaceObservation, ManagedError> {
-        let recovered = self.recover(&head).await?;
+        let (snapshot, manifest, wal) = self.recover(&head).await?;
         Ok(NamespaceObservation {
-            snapshot: recovered,
+            snapshot,
             revision,
-            authority: Box::new(ObservationAuthority { head }),
+            authority: Box::new(ObservationAuthority {
+                head,
+                manifest: Some(manifest),
+                wal: Some(wal),
+            }),
         })
     }
 
@@ -160,51 +183,71 @@ impl ObjectNamespace {
             });
         }
         let base = observed.map(|value| &value.snapshot);
+        let stored = StoredTransaction::from_publication(publication, base);
+        let bytes = encode_cbor(TRANSACTION_MAGIC, &stored, "publish Managed namespace")?;
+        let transaction_sha256 = sha256(&bytes);
         if !validate_publication(publication, base)? {
+            if matches!(
+                self.resolve_known(publication.operation, Some(transaction_sha256))
+                    .await?,
+                CommitOutcome::Committed(_)
+            ) {
+                return Ok(CommitOutcome::Committed(publication.target.cursor));
+            }
             return Ok(CommitOutcome::Conflict {
                 observed: base.map_or(ChangeCursor::Genesis, |state| state.cursor),
             });
         }
 
-        let stored = StoredTransaction::from_publication(publication, base);
-        let bytes = encode_cbor(TRANSACTION_MAGIC, &stored, "publish Managed namespace")?;
-        let transaction_sha256 = sha256(&bytes);
-        self.ensure_transaction(publication.operation, &bytes)
-            .await?;
         let checkpoint_due = observed.is_none()
             || observed.is_some_and(|value| {
                 value.authority.head.tail_transactions + 1 >= MAX_TAIL_TRANSACTIONS
             });
         let (checkpoint, checkpoint_cursor, tail_transactions) = if checkpoint_due {
-            let checkpoint = match observed {
-                Some(observed) => {
-                    let previous = self
-                        .read_checkpoint(&observed.authority.head.checkpoint)
-                        .await?;
-                    if previous.cursor != observed.authority.head.checkpoint_cursor {
-                        return Err(corrupt(
-                            "checkpoint Managed namespace",
-                            "checkpoint and HEAD disagree",
-                        ));
-                    }
-                    let mut transactions = self.read_tail(&observed.authority.head).await?;
-                    transactions.push(stored.clone());
-                    self.checkpoint_incremental(&publication.target, &previous, &transactions)
-                        .await?
+            // The publication target and recovered WAL are pinned by the
+            // observation used for CAS. Building a manifest never rereads the
+            // remote checkpoint or WAL.
+            let mut committed = match observed {
+                Some(value) => {
+                    let manifest = match &value.authority.manifest {
+                        Some(manifest) => manifest.clone(),
+                        None => self.read_manifest(&value.authority.head.checkpoint).await?,
+                    };
+                    self.read_operation_results(&manifest).await?
                 }
-                None => self.checkpoint_full(&publication.target).await?,
+                None => BTreeMap::new(),
             };
-            let bytes = encode_cbor(
-                CHECKPOINT_MAGIC,
-                &checkpoint,
-                "checkpoint Managed namespace",
-            )?;
+            if let Some(observed) = observed {
+                let wal = match &observed.authority.wal {
+                    Some(wal) => wal.clone(),
+                    None => self.read_tail(&observed.authority.head).await?,
+                };
+                for transaction in &wal {
+                    committed.insert(
+                        OperationId::from_bytes(transaction.operation),
+                        StoredCommittedResult::from_transaction(transaction)?,
+                    );
+                }
+            }
+            committed.insert(
+                publication.operation,
+                StoredCommittedResult {
+                    cursor: stored.cursor,
+                    transaction_sha256,
+                },
+            );
+            let checkpoint = self
+                .checkpoint_full(&publication.target, &committed)
+                .await?;
+            let bytes = encode_cbor(MANIFEST_MAGIC, &checkpoint, "checkpoint Managed namespace")?;
             let checkpoint_id = sha256(&bytes);
-            self.ensure_immutable(&checkpoint_key(&checkpoint_id), &bytes)
+            self.ensure_immutable(&manifest_key(&checkpoint_id), &bytes)
                 .await?;
             (checkpoint_id, publication.target.cursor.into(), 0)
         } else {
             let observed = observed.expect("checkpoint policy has an observation");
+            self.ensure_transaction(publication.operation, &bytes)
+                .await?;
             (
                 observed.authority.head.checkpoint,
                 observed.authority.head.checkpoint_cursor,
@@ -227,12 +270,7 @@ impl ObjectNamespace {
             None => self.create_head(head).await,
         };
         match replaced {
-            Ok(true) => {
-                let outcome = CommitOutcome::Committed(publication.target.cursor);
-                self.ensure_result(publication.operation, transaction_sha256, &outcome)
-                    .await?;
-                Ok(outcome)
-            }
+            Ok(true) => Ok(CommitOutcome::Committed(publication.target.cursor)),
             Ok(false) => self.outcome_after_race(publication.operation).await,
             Err(_) => match self.resolve(publication.operation).await {
                 Ok(CommitOutcome::Committed(cursor)) => Ok(CommitOutcome::Committed(cursor)),
@@ -310,7 +348,7 @@ impl ObjectNamespace {
     }
 
     pub async fn resolve(&self, operation: OperationId) -> Result<CommitOutcome, ManagedError> {
-        match self.resolve_known(operation).await {
+        match self.resolve_known(operation, None).await {
             Err(error) if error.kind() == ManagedErrorKind::Unavailable => {
                 Ok(CommitOutcome::Unknown)
             }
@@ -318,15 +356,35 @@ impl ObjectNamespace {
         }
     }
 
-    async fn resolve_known(&self, operation: OperationId) -> Result<CommitOutcome, ManagedError> {
-        let result = self.read_result(operation).await?;
+    async fn resolve_known(
+        &self,
+        operation: OperationId,
+        expected_sha256: Option<[u8; 32]>,
+    ) -> Result<CommitOutcome, ManagedError> {
+        let Some(head) = self.read_current_head().await? else {
+            return Ok(CommitOutcome::Absent);
+        };
+        head.validate(self.volume_id)?;
+        if let Some(transaction) = self
+            .read_tail(&head)
+            .await?
+            .into_iter()
+            .find(|transaction| transaction.operation == *operation.as_bytes())
+        {
+            let observed_sha256 = sha256(&encode_cbor(
+                TRANSACTION_MAGIC,
+                &transaction,
+                "resolve Managed publication",
+            )?);
+            require_same_operation(expected_sha256, observed_sha256)?;
+            return Ok(CommitOutcome::Committed(transaction.cursor.into_cursor()?));
+        }
+        let manifest = self.read_manifest(&head.checkpoint).await?;
+        if let Some(result) = self.read_operation_result(&manifest, operation).await? {
+            require_same_operation(expected_sha256, result.transaction_sha256)?;
+            return Ok(CommitOutcome::Committed(result.cursor.into_cursor()?));
+        }
         let Some(target) = self.read_transaction(operation).await? else {
-            if result.is_some() {
-                return Err(corrupt(
-                    "resolve Managed publication",
-                    "operation result has no transaction",
-                ));
-            }
             return Ok(CommitOutcome::Absent);
         };
         let transaction_sha256 = sha256(&encode_cbor(
@@ -334,83 +392,13 @@ impl ObjectNamespace {
             &target,
             "resolve Managed publication",
         )?);
-        if let Some(result) = result {
-            if result.transaction_sha256 != transaction_sha256 {
-                return Err(corrupt(
-                    "resolve Managed publication",
-                    "operation result identifies another transaction",
-                ));
-            }
-            return match result.outcome {
-                StoredResultKind::Committed { cursor } => {
-                    Ok(CommitOutcome::Committed(cursor.into_cursor()?))
-                }
-                StoredResultKind::Conflict => Ok(CommitOutcome::Conflict {
-                    observed: self
-                        .observe()
-                        .await?
-                        .map_or(ChangeCursor::Genesis, |value| value.snapshot.cursor),
-                }),
-            };
-        }
-        let Some((bytes, _)) = self.read_head().await? else {
-            return Ok(CommitOutcome::Absent);
-        };
-        let head = decode_head(&bytes)?;
-        let snapshot = self.recover(&head).await?;
-        if self.transaction_is_committed(&head, operation).await? {
-            self.ensure_result(
-                operation,
-                transaction_sha256,
-                &CommitOutcome::Committed(target.cursor.into_cursor()?),
-            )
-            .await?;
-            return Ok(CommitOutcome::Committed(target.cursor.into_cursor()?));
-        }
+        require_same_operation(expected_sha256, transaction_sha256)?;
         let parent = target.parent.into_cursor()?;
-        if snapshot.cursor == parent || snapshot.cursor.sequence() <= parent.sequence() {
+        let current = head.cursor.into_cursor()?;
+        if current == parent || current.sequence() <= parent.sequence() {
             return Ok(CommitOutcome::Absent);
         }
-        Ok(CommitOutcome::Conflict {
-            observed: snapshot.cursor,
-        })
-    }
-
-    async fn transaction_is_committed(
-        &self,
-        head: &StoredHead,
-        operation: OperationId,
-    ) -> Result<bool, ManagedError> {
-        let target = self.required_transaction(operation).await?;
-        let target_cursor = target.cursor.into_cursor()?;
-        let target_parent = target.parent.into_cursor()?;
-        let head_cursor = head.cursor.into_cursor()?;
-        if head_cursor.sequence() < target_cursor.sequence() {
-            return Ok(false);
-        }
-
-        let mut current = self
-            .required_transaction(OperationId::from_bytes(head.latest_transaction))
-            .await?;
-        loop {
-            let cursor = current.cursor.into_cursor()?;
-            if current.operation == *operation.as_bytes() {
-                return Ok(true);
-            }
-            if cursor.sequence() <= target_parent.sequence() {
-                return Ok(false);
-            }
-            current = self
-                .required_transaction(OperationId::from_bytes(
-                    current.parent.operation.ok_or_else(|| {
-                        corrupt(
-                            "resolve Managed publication",
-                            "transaction history is incomplete",
-                        )
-                    })?,
-                ))
-                .await?;
-        }
+        Ok(CommitOutcome::Conflict { observed: current })
     }
 
     async fn outcome_after_race(
@@ -428,18 +416,7 @@ impl ObjectNamespace {
             .observe()
             .await?
             .map_or(ChangeCursor::Genesis, |value| value.snapshot.cursor);
-        let outcome = CommitOutcome::Conflict { observed };
-        if let Ok(Some(transaction)) = self.read_transaction(operation).await {
-            let bytes = encode_cbor(
-                TRANSACTION_MAGIC,
-                &transaction,
-                "resolve Managed publication",
-            )?;
-            let _ = self
-                .ensure_result(operation, sha256(&bytes), &outcome)
-                .await;
-        }
-        Ok(outcome)
+        Ok(CommitOutcome::Conflict { observed })
     }
 
     async fn ensure_transaction(
@@ -516,13 +493,19 @@ impl ObjectNamespace {
             .ok_or_else(|| corrupt("read Managed namespace", "transaction is missing"))
     }
 
-    async fn recover(&self, head: &StoredHead) -> Result<NamespaceSnapshot, ManagedError> {
+    async fn recover(
+        &self,
+        head: &StoredHead,
+    ) -> Result<(NamespaceSnapshot, StoredManifest, Vec<StoredTransaction>), ManagedError> {
         head.validate(self.volume_id)?;
         self.recover_bounded(head).await
     }
 
-    async fn recover_bounded(&self, head: &StoredHead) -> Result<NamespaceSnapshot, ManagedError> {
-        let checkpoint = self.read_checkpoint(&head.checkpoint).await?;
+    async fn recover_bounded(
+        &self,
+        head: &StoredHead,
+    ) -> Result<(NamespaceSnapshot, StoredManifest, Vec<StoredTransaction>), ManagedError> {
+        let checkpoint = self.read_manifest(&head.checkpoint).await?;
         if checkpoint.major != FORMAT_MAJOR
             || checkpoint.volume_id != *self.volume_id.as_bytes()
             || checkpoint.cursor != head.checkpoint_cursor
@@ -532,18 +515,19 @@ impl ObjectNamespace {
                 "checkpoint and HEAD disagree",
             ));
         }
-        let mut snapshot = self.read_snapshot(checkpoint).await?;
+        let mut snapshot = self.read_snapshot(checkpoint.clone()).await?;
         validate_snapshot(&snapshot)
             .map_err(|_| corrupt("read Managed namespace", "checkpoint is invalid"))?;
 
-        for transaction in self.read_tail(head).await? {
+        let wal = self.read_tail(head).await?;
+        for transaction in &wal {
             if transaction.parent.into_cursor()? != snapshot.cursor {
                 return Err(corrupt(
                     "read Managed namespace",
                     "transaction tail is not consecutive",
                 ));
             }
-            snapshot = apply_transaction(Some(snapshot), &transaction)?;
+            snapshot = apply_transaction(Some(snapshot), transaction)?;
         }
         if snapshot.cursor != head.cursor.into_cursor()? {
             return Err(corrupt(
@@ -551,7 +535,7 @@ impl ObjectNamespace {
                 "checkpoint and transaction tail do not reach HEAD",
             ));
         }
-        Ok(snapshot)
+        Ok((snapshot, checkpoint, wal))
     }
 
     async fn read_tail(&self, head: &StoredHead) -> Result<Vec<StoredTransaction>, ManagedError> {
@@ -589,369 +573,152 @@ impl ObjectNamespace {
     async fn checkpoint_full(
         &self,
         snapshot: &NamespaceSnapshot,
-    ) -> Result<StoredCheckpoint, ManagedError> {
+        committed: &BTreeMap<OperationId, StoredCommittedResult>,
+    ) -> Result<StoredManifest, ManagedError> {
         let scope = *self.volume_id.as_bytes();
-        let mut encoded = Vec::new();
-        encoded.extend(section::encode(
-            scope,
-            NODE_SECTION,
-            snapshot
-                .nodes
-                .values()
-                .map(|node| {
-                    Ok(SectionRecord {
-                        key: node.id.as_bytes().to_vec(),
-                        value: encode_section_value(
-                            &StoredNodeSection::from(node),
-                            "checkpoint Managed namespace",
-                        )?,
-                    })
-                })
-                .collect::<Result<_, ManagedError>>()?,
-            "checkpoint Managed namespace",
-        )?);
-        encoded.extend(section::encode(
-            scope,
-            DIRECTORY_SECTION,
-            snapshot
-                .directories
-                .values()
-                .map(|directory| {
-                    Ok(SectionRecord {
-                        key: directory.node.as_bytes().to_vec(),
-                        value: encode_section_value(
-                            &StoredDirectorySection::from(directory),
-                            "checkpoint Managed namespace",
-                        )?,
-                    })
-                })
-                .collect::<Result<_, ManagedError>>()?,
-            "checkpoint Managed namespace",
-        )?);
-        encoded.extend(section::encode(
-            scope,
-            DIRECTORY_ENTRY_SECTION,
-            snapshot
-                .directories
-                .values()
-                .flat_map(|directory| {
-                    directory.entries.iter().map(move |(name, entry)| {
-                        Ok(SectionRecord {
-                            key: directory_entry_key(directory.node, name),
-                            value: encode_section_value(
-                                &StoredDirectoryEntry::from(*entry),
-                                "checkpoint Managed namespace",
-                            )?,
-                        })
-                    })
-                })
-                .collect::<Result<_, ManagedError>>()?,
-            "checkpoint Managed namespace",
-        )?);
-        encoded.extend(section::encode(
-            scope,
-            FILE_VERSION_SECTION,
-            snapshot
-                .file_versions
-                .values()
-                .map(|version| {
-                    Ok(SectionRecord {
-                        key: version.id.as_bytes().to_vec(),
-                        value: encode_section_value(
-                            &StoredFileVersionSection::from(version),
-                            "checkpoint Managed namespace",
-                        )?,
-                    })
-                })
-                .collect::<Result<_, ManagedError>>()?,
-            "checkpoint Managed namespace",
-        )?);
-
-        let mut sections = self.persist_sections(encoded).await?;
-        sections.sort_by(|left, right| {
-            left.kind
-                .cmp(&right.kind)
-                .then_with(|| left.first_key.cmp(&right.first_key))
-        });
-        Ok(StoredCheckpoint {
+        let mut records = Vec::new();
+        for node in snapshot.nodes.values() {
+            records.push(TableRecord {
+                key: typed_key(NODE_PREFIX, node.id.as_bytes()),
+                value: encode_table_value(
+                    &SnapshotNodeRecord::from(node),
+                    "checkpoint Managed namespace",
+                )?,
+            });
+        }
+        for directory in snapshot.directories.values() {
+            records.push(TableRecord {
+                key: typed_key(DIRECTORY_PREFIX, directory.node.as_bytes()),
+                value: encode_table_value(
+                    &SnapshotDirectoryRecord::from(directory),
+                    "checkpoint Managed namespace",
+                )?,
+            });
+            for (name, entry) in &directory.entries {
+                records.push(TableRecord {
+                    key: directory_entry_key(directory.node, name),
+                    value: encode_table_value(
+                        &StoredDirectoryEntry::from(*entry),
+                        "checkpoint Managed namespace",
+                    )?,
+                });
+            }
+        }
+        for version in snapshot.file_versions.values() {
+            records.push(TableRecord {
+                key: typed_key(FILE_VERSION_PREFIX, version.id.as_bytes()),
+                value: encode_table_value(
+                    &SnapshotFileVersionRecord::from(version),
+                    "checkpoint Managed namespace",
+                )?,
+            });
+        }
+        for (operation, result) in committed {
+            records.push(TableRecord {
+                key: typed_key(OPERATION_RESULT_PREFIX, operation.as_bytes()),
+                value: encode_table_value(result, "checkpoint Managed namespace")?,
+            });
+        }
+        records.sort_by(|left, right| left.key.cmp(&right.key));
+        let encoded = sstable::build(scope, records, "checkpoint Managed namespace")?
+            .expect("a valid namespace contains at least its root node");
+        self.ensure_immutable(&sstable_key(&encoded.reference.id), &encoded.bytes)
+            .await?;
+        Ok(StoredManifest {
             major: FORMAT_MAJOR,
             volume_id: scope,
             cursor: snapshot.cursor.into(),
             root: *snapshot.root.as_bytes(),
-            sections,
+            tables: vec![encoded.reference],
         })
-    }
-
-    async fn checkpoint_incremental(
-        &self,
-        snapshot: &NamespaceSnapshot,
-        previous: &StoredCheckpoint,
-        transactions: &[StoredTransaction],
-    ) -> Result<StoredCheckpoint, ManagedError> {
-        validate_section_references(&previous.sections)?;
-        let mut cursor = previous.cursor.into_cursor()?;
-        for transaction in transactions {
-            if transaction.parent.into_cursor()? != cursor {
-                return Err(corrupt(
-                    "checkpoint Managed namespace",
-                    "checkpoint transactions are not consecutive",
-                ));
-            }
-            cursor = transaction.cursor.into_cursor()?;
-        }
-        if cursor != snapshot.cursor {
-            return Err(corrupt(
-                "checkpoint Managed namespace",
-                "checkpoint transactions do not reach the target",
-            ));
-        }
-        let sections = self
-            .rewrite_checkpoint_sections(&previous.sections, section_changes(transactions)?)
-            .await?;
-        Ok(StoredCheckpoint {
-            major: FORMAT_MAJOR,
-            volume_id: *self.volume_id.as_bytes(),
-            cursor: snapshot.cursor.into(),
-            root: *snapshot.root.as_bytes(),
-            sections,
-        })
-    }
-
-    async fn rewrite_checkpoint_sections(
-        &self,
-        previous: &[StoredSectionReference],
-        mut changes: CheckpointChanges,
-    ) -> Result<Vec<StoredSectionReference>, ManagedError> {
-        validate_section_references(previous)?;
-        let mut output = Vec::new();
-        let mut encoded = Vec::new();
-        for kind in [
-            NODE_SECTION,
-            DIRECTORY_SECTION,
-            DIRECTORY_ENTRY_SECTION,
-            FILE_VERSION_SECTION,
-        ] {
-            let pending = changes.records.entry(kind).or_default();
-            let mut unassigned = pending.keys().cloned().collect::<BTreeSet<_>>();
-            let mut affected = Vec::new();
-            for stored in previous.iter().filter(|section| section.kind == kind) {
-                let keys = unassigned
-                    .iter()
-                    .take_while(|key| key.as_slice() <= stored.last_key.as_slice())
-                    .cloned()
-                    .collect::<Vec<_>>();
-                for key in &keys {
-                    unassigned.remove(key);
-                }
-                let removes_directory = kind == DIRECTORY_ENTRY_SECTION
-                    && changes
-                        .removed_directories
-                        .iter()
-                        .any(|directory| section_may_contain_directory(stored, directory));
-                if !keys.is_empty() || removes_directory {
-                    affected.push(stored.clone());
-                }
-            }
-            let mut affected_records = self
-                .read_checkpoint_sections(&affected, "checkpoint Managed namespace")
-                .await?
-                .into_iter()
-                .map(|(stored, records)| ((stored.object, stored.offset), records))
-                .collect::<BTreeMap<_, _>>();
-            for stored in previous.iter().filter(|section| section.kind == kind) {
-                let keys = pending
-                    .keys()
-                    .take_while(|key| key.as_slice() <= stored.last_key.as_slice())
-                    .cloned()
-                    .collect::<Vec<_>>();
-                let removes_directory = kind == DIRECTORY_ENTRY_SECTION
-                    && changes
-                        .removed_directories
-                        .iter()
-                        .any(|directory| section_may_contain_directory(stored, directory));
-                if keys.is_empty() && !removes_directory {
-                    output.push(stored.clone());
-                    continue;
-                }
-                let mut records = affected_records
-                    .remove(&(stored.object, stored.offset))
-                    .expect("affected checkpoint section was read")
-                    .into_iter()
-                    .map(|record| (record.key, record.value))
-                    .collect::<BTreeMap<_, _>>();
-                let mut changed = false;
-                if removes_directory {
-                    let before = records.len();
-                    records.retain(|key, _| {
-                        !changes
-                            .removed_directories
-                            .iter()
-                            .any(|directory| key.starts_with(directory))
-                    });
-                    changed = records.len() != before;
-                }
-                for key in keys {
-                    match pending.remove(&key).expect("collected pending change") {
-                        Some(value) => {
-                            changed |= records.insert(key, value.clone()).as_ref() != Some(&value);
-                        }
-                        None => changed |= records.remove(&key).is_some(),
-                    }
-                }
-                if !changed {
-                    output.push(stored.clone());
-                    continue;
-                }
-                let records = records
-                    .into_iter()
-                    .map(|(key, value)| SectionRecord { key, value })
-                    .collect();
-                encoded.extend(section::encode(
-                    *self.volume_id.as_bytes(),
-                    kind,
-                    records,
-                    "checkpoint Managed namespace",
-                )?);
-            }
-            if !pending.is_empty() {
-                let records = std::mem::take(pending)
-                    .into_iter()
-                    .filter_map(|(key, value)| value.map(|value| SectionRecord { key, value }))
-                    .collect();
-                encoded.extend(section::encode(
-                    *self.volume_id.as_bytes(),
-                    kind,
-                    records,
-                    "checkpoint Managed namespace",
-                )?);
-            }
-        }
-        output.extend(self.persist_sections(encoded).await?);
-        output.sort_by(|left, right| {
-            left.kind
-                .cmp(&right.kind)
-                .then_with(|| left.first_key.cmp(&right.first_key))
-        });
-        validate_section_references(&output)?;
-        Ok(output)
-    }
-
-    async fn persist_sections(
-        &self,
-        encoded: Vec<section::Encoded>,
-    ) -> Result<Vec<StoredSectionReference>, ManagedError> {
-        let Some(object) = section::concatenate(encoded, "checkpoint Managed namespace")? else {
-            return Ok(Vec::new());
-        };
-        self.ensure_immutable(&section_key(&object.id), &object.bytes)
-            .await?;
-        Ok(object
-            .sections
-            .into_iter()
-            .map(|located| StoredSectionReference::from_located(object.id, located))
-            .collect())
-    }
-
-    async fn read_checkpoint_sections(
-        &self,
-        stored: &[StoredSectionReference],
-        action: &'static str,
-    ) -> Result<Vec<(StoredSectionReference, Vec<SectionRecord>)>, ManagedError> {
-        let mut objects = BTreeMap::<[u8; 32], Vec<StoredSectionReference>>::new();
-        for section in stored {
-            objects
-                .entry(section.object)
-                .or_default()
-                .push(section.clone());
-        }
-        let mut decoded = Vec::with_capacity(stored.len());
-        for (object, mut sections) in objects {
-            sections.sort_by_key(|section| section.offset);
-            let located = sections
-                .iter()
-                .map(StoredSectionReference::located)
-                .collect();
-            let fetched = section::fetch(
-                &self.operator,
-                &section_key(&object),
-                *self.volume_id.as_bytes(),
-                located,
-                action,
-            )
-            .await?;
-            for (stored, (_, records)) in sections.into_iter().zip(fetched) {
-                decoded.push((stored, records));
-            }
-        }
-        decoded.sort_by(|(left, _), (right, _)| {
-            left.kind
-                .cmp(&right.kind)
-                .then_with(|| left.first_key.cmp(&right.first_key))
-        });
-        Ok(decoded)
     }
 
     async fn read_snapshot(
         &self,
-        checkpoint: StoredCheckpoint,
+        checkpoint: StoredManifest,
     ) -> Result<NamespaceSnapshot, ManagedError> {
-        validate_section_references(&checkpoint.sections)?;
+        validate_tables(&checkpoint.tables)?;
         let mut nodes = BTreeMap::new();
         let mut directories = BTreeMap::new();
         let mut entries = Vec::new();
         let mut file_versions = BTreeMap::new();
-        for (stored, records) in self
-            .read_checkpoint_sections(&checkpoint.sections, "read Managed namespace")
-            .await?
-        {
-            let reference = stored.as_reference();
-            for record in records {
-                match reference.kind {
-                    NODE_SECTION => {
-                        let stored: StoredNodeSection =
-                            decode_section_value(&record.value, "read Managed namespace")?;
-                        let id = section_node_id(&record.key, "node section key is invalid")?;
-                        if nodes.contains_key(&id) {
+        for table in checkpoint.tables.iter().cloned() {
+            let lower = [NODE_PREFIX];
+            let upper = [OPERATION_RESULT_PREFIX];
+            let blocks = table
+                .blocks
+                .into_iter()
+                .filter(|block| {
+                    block.last_key.as_slice() >= lower.as_slice()
+                        && block.first_key.as_slice() < upper.as_slice()
+                })
+                .collect();
+            let records = sstable::fetch(
+                &self.operator,
+                &sstable_key(&table.id),
+                *self.volume_id.as_bytes(),
+                blocks,
+                "read Managed namespace",
+            )
+            .await?;
+            for (_, records) in records {
+                for record in records {
+                    let (&prefix, key) = record
+                        .key
+                        .split_first()
+                        .ok_or_else(|| corrupt("read Managed namespace", "SSTable key is empty"))?;
+                    match prefix {
+                        NODE_PREFIX => {
+                            let stored: SnapshotNodeRecord =
+                                decode_table_value(&record.value, "read Managed namespace")?;
+                            let id = table_node_id(key, "node table key is invalid")?;
+                            if nodes.contains_key(&id) {
+                                return Err(corrupt(
+                                    "read Managed namespace",
+                                    "node table key is invalid",
+                                ));
+                            }
+                            let node = stored.into_record(id);
+                            nodes.insert(node.id, node);
+                        }
+                        DIRECTORY_PREFIX => {
+                            let stored: SnapshotDirectoryRecord =
+                                decode_table_value(&record.value, "read Managed namespace")?;
+                            let node = table_node_id(key, "directory table key is invalid")?;
+                            let directory = stored.into_record(node);
+                            if directories.insert(directory.node, directory).is_some() {
+                                return Err(corrupt(
+                                    "read Managed namespace",
+                                    "duplicate directory record",
+                                ));
+                            }
+                        }
+                        DIRECTORY_ENTRY_PREFIX => {
+                            let stored: StoredDirectoryEntry =
+                                decode_table_value(&record.value, "read Managed namespace")?;
+                            let (directory, name) = table_directory_entry_key(key)?;
+                            entries.push((directory, name, stored));
+                        }
+                        FILE_VERSION_PREFIX => {
+                            let stored: SnapshotFileVersionRecord =
+                                decode_table_value(&record.value, "read Managed namespace")?;
+                            let id = table_file_version_id(key)?;
+                            let version = stored.into_record(id);
+                            if file_versions.insert(version.id, version).is_some() {
+                                return Err(corrupt(
+                                    "read Managed namespace",
+                                    "duplicate file version record",
+                                ));
+                            }
+                        }
+                        OPERATION_RESULT_PREFIX => continue,
+                        _ => {
                             return Err(corrupt(
                                 "read Managed namespace",
-                                "node section key is invalid",
-                            ));
-                        }
-                        let node = stored.into_record(id);
-                        nodes.insert(node.id, node);
-                    }
-                    DIRECTORY_SECTION => {
-                        let stored: StoredDirectorySection =
-                            decode_section_value(&record.value, "read Managed namespace")?;
-                        let node =
-                            section_node_id(&record.key, "directory section key is invalid")?;
-                        let directory = stored.into_record(node);
-                        if directories.insert(directory.node, directory).is_some() {
-                            return Err(corrupt(
-                                "read Managed namespace",
-                                "duplicate directory record",
+                                "SSTable key type is invalid",
                             ));
                         }
                     }
-                    DIRECTORY_ENTRY_SECTION => {
-                        let stored: StoredDirectoryEntry =
-                            decode_section_value(&record.value, "read Managed namespace")?;
-                        let (directory, name) = section_directory_entry_key(&record.key)?;
-                        entries.push((directory, name, stored));
-                    }
-                    FILE_VERSION_SECTION => {
-                        let stored: StoredFileVersionSection =
-                            decode_section_value(&record.value, "read Managed namespace")?;
-                        let id = section_file_version_id(&record.key)?;
-                        let version = stored.into_record(id);
-                        if file_versions.insert(version.id, version).is_some() {
-                            return Err(corrupt(
-                                "read Managed namespace",
-                                "duplicate file version record",
-                            ));
-                        }
-                    }
-                    _ => unreachable!("section reference kinds were validated"),
                 }
             }
         }
@@ -979,10 +746,10 @@ impl ObjectNamespace {
         })
     }
 
-    async fn read_checkpoint(&self, id: &[u8; 32]) -> Result<StoredCheckpoint, ManagedError> {
+    async fn read_manifest(&self, id: &[u8; 32]) -> Result<StoredManifest, ManagedError> {
         let bytes = self
             .operator
-            .read(&checkpoint_key(id))
+            .read(&manifest_key(id))
             .await
             .map_err(|error| {
                 if error.kind() == ErrorKind::NotFound {
@@ -998,54 +765,91 @@ impl ObjectNamespace {
                 "checkpoint key and content disagree",
             ));
         }
-        decode_cbor(CHECKPOINT_MAGIC, &bytes, "read Managed namespace")
+        decode_cbor(MANIFEST_MAGIC, &bytes, "read Managed namespace")
     }
 
-    async fn ensure_result(
+    async fn read_operation_results(
         &self,
-        operation: OperationId,
-        transaction_sha256: [u8; 32],
-        outcome: &CommitOutcome,
-    ) -> Result<(), ManagedError> {
-        let outcome = match outcome {
-            CommitOutcome::Committed(cursor) => StoredResultKind::Committed {
-                cursor: (*cursor).into(),
-            },
-            CommitOutcome::Conflict { .. } => StoredResultKind::Conflict,
-            CommitOutcome::Absent | CommitOutcome::Unknown => return Ok(()),
-        };
-        let result = StoredResult {
-            major: FORMAT_MAJOR,
-            operation: *operation.as_bytes(),
-            transaction_sha256,
-            outcome,
-        };
-        let bytes = encode_cbor(RESULT_MAGIC, &result, "write Managed operation result")?;
-        self.ensure_immutable(&result_key(operation), &bytes).await
-    }
-
-    async fn read_result(
-        &self,
-        operation: OperationId,
-    ) -> Result<Option<StoredResult>, ManagedError> {
-        match self.operator.read(&result_key(operation)).await {
-            Ok(bytes) => {
-                let result: StoredResult = decode_cbor(
-                    RESULT_MAGIC,
-                    &bytes.to_bytes(),
-                    "read Managed operation result",
-                )?;
-                if result.major != FORMAT_MAJOR || result.operation != *operation.as_bytes() {
-                    return Err(corrupt(
-                        "read Managed operation result",
-                        "operation result identity is invalid",
-                    ));
+        manifest: &StoredManifest,
+    ) -> Result<BTreeMap<OperationId, StoredCommittedResult>, ManagedError> {
+        validate_tables(&manifest.tables)?;
+        let lower = [OPERATION_RESULT_PREFIX];
+        let upper = [OPERATION_RESULT_PREFIX + 1];
+        let mut results = BTreeMap::new();
+        for table in &manifest.tables {
+            let blocks = table
+                .blocks
+                .iter()
+                .filter(|block| {
+                    block.last_key.as_slice() >= lower.as_slice()
+                        && block.first_key.as_slice() < upper.as_slice()
+                })
+                .cloned()
+                .collect();
+            for (_, records) in sstable::fetch(
+                &self.operator,
+                &sstable_key(&table.id),
+                *self.volume_id.as_bytes(),
+                blocks,
+                "read Managed operation results",
+            )
+            .await?
+            {
+                for record in records {
+                    if record.key.first() != Some(&OPERATION_RESULT_PREFIX) {
+                        continue;
+                    }
+                    let operation = operation_id_from_key(&record.key[1..])?;
+                    let result: StoredCommittedResult =
+                        decode_table_value(&record.value, "read Managed operation results")?;
+                    result.validate(operation)?;
+                    if results.insert(operation, result).is_some() {
+                        return Err(corrupt(
+                            "read Managed operation results",
+                            "duplicate operation result",
+                        ));
+                    }
                 }
-                Ok(Some(result))
             }
-            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-            Err(_) => Err(unavailable("read Managed operation result")),
         }
+        Ok(results)
+    }
+
+    async fn read_operation_result(
+        &self,
+        manifest: &StoredManifest,
+        operation: OperationId,
+    ) -> Result<Option<StoredCommittedResult>, ManagedError> {
+        validate_tables(&manifest.tables)?;
+        let key = typed_key(OPERATION_RESULT_PREFIX, operation.as_bytes());
+        for table in &manifest.tables {
+            let blocks = table
+                .blocks
+                .iter()
+                .filter(|block| {
+                    block.first_key.as_slice() <= key.as_slice()
+                        && key.as_slice() <= block.last_key.as_slice()
+                })
+                .cloned()
+                .collect();
+            for (_, records) in sstable::fetch(
+                &self.operator,
+                &sstable_key(&table.id),
+                *self.volume_id.as_bytes(),
+                blocks,
+                "resolve Managed publication",
+            )
+            .await?
+            {
+                if let Ok(index) = records.binary_search_by(|record| record.key.cmp(&key)) {
+                    let result: StoredCommittedResult =
+                        decode_table_value(&records[index].value, "resolve Managed publication")?;
+                    result.validate(operation)?;
+                    return Ok(Some(result));
+                }
+            }
+        }
+        Ok(None)
     }
 
     async fn read_head(&self) -> Result<Option<(Vec<u8>, String)>, ManagedError> {
@@ -1065,6 +869,14 @@ impl ObjectNamespace {
             .ok_or_else(|| unavailable("read Managed namespace"))?
             .to_owned();
         Ok(Some((bytes, revision)))
+    }
+
+    async fn read_current_head(&self) -> Result<Option<StoredHead>, ManagedError> {
+        match self.operator.read(HEAD_KEY).await {
+            Ok(bytes) => decode_head(&bytes.to_bytes()).map(Some),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(unavailable("read Managed namespace")),
+        }
     }
 
     async fn create_head(&self, bytes: Vec<u8>) -> Result<bool, ManagedError> {
@@ -1109,55 +921,69 @@ fn transaction_key(operation: OperationId) -> String {
     format!("{TRANSACTION_ROOT}/{}.ofs", hex(operation.as_bytes()))
 }
 
-fn result_key(operation: OperationId) -> String {
-    format!("{RESULT_ROOT}/{}.ofs", hex(operation.as_bytes()))
+fn manifest_key(id: &[u8; 32]) -> String {
+    format!("{MANIFEST_ROOT}/{}.ofs", hex(id))
 }
 
-fn checkpoint_key(id: &[u8; 32]) -> String {
-    format!("{CHECKPOINT_ROOT}/{}.ofs", hex(id))
-}
-
-fn section_key(id: &[u8; 32]) -> String {
+fn sstable_key(id: &[u8; 32]) -> String {
     let encoded = hex(id);
-    format!("{SECTION_ROOT}/{encoded}.ofs")
+    format!("{SSTABLE_ROOT}/{encoded}.sst")
 }
 
 fn directory_entry_key(directory: NodeId, name: &str) -> Vec<u8> {
-    let mut key = Vec::with_capacity(16 + name.len());
+    let mut key = Vec::with_capacity(1 + 16 + name.len());
+    key.push(DIRECTORY_ENTRY_PREFIX);
     key.extend_from_slice(directory.as_bytes());
     key.extend_from_slice(name.as_bytes());
     key
 }
 
-fn section_node_id(key: &[u8], message: &'static str) -> Result<NodeId, ManagedError> {
+fn typed_key(prefix: u8, body: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(1 + body.len());
+    key.push(prefix);
+    key.extend_from_slice(body);
+    key
+}
+
+fn operation_id_from_key(key: &[u8]) -> Result<OperationId, ManagedError> {
+    let bytes = key.try_into().map_err(|_| {
+        corrupt(
+            "read Managed operation results",
+            "operation result key is invalid",
+        )
+    })?;
+    Ok(OperationId::from_bytes(bytes))
+}
+
+fn table_node_id(key: &[u8], message: &'static str) -> Result<NodeId, ManagedError> {
     let bytes = key
         .try_into()
         .map_err(|_| corrupt("read Managed namespace", message))?;
     Ok(NodeId::from_bytes(bytes))
 }
 
-fn section_directory_entry_key(key: &[u8]) -> Result<(NodeId, String), ManagedError> {
+fn table_directory_entry_key(key: &[u8]) -> Result<(NodeId, String), ManagedError> {
     let (directory, name) = key.split_at_checked(16).ok_or_else(|| {
         corrupt(
             "read Managed namespace",
-            "directory entry section key is invalid",
+            "directory entry table key is invalid",
         )
     })?;
     let directory = NodeId::from_bytes(directory.try_into().expect("fixed key prefix"));
     let name = String::from_utf8(name.to_vec()).map_err(|_| {
         corrupt(
             "read Managed namespace",
-            "directory entry section key is invalid",
+            "directory entry table key is invalid",
         )
     })?;
     Ok((directory, name))
 }
 
-fn section_file_version_id(key: &[u8]) -> Result<FileVersionId, ManagedError> {
+fn table_file_version_id(key: &[u8]) -> Result<FileVersionId, ManagedError> {
     let bytes = key.try_into().map_err(|_| {
         corrupt(
             "read Managed namespace",
-            "file version section key is invalid",
+            "file version table key is invalid",
         )
     })?;
     Ok(FileVersionId::from_bytes(bytes))
@@ -1197,25 +1023,25 @@ fn encode_cbor<T: Serialize>(
     Ok(bytes)
 }
 
-fn encode_section_value<T: Serialize>(
+fn encode_table_value<T: Serialize>(
     value: &T,
     action: &'static str,
 ) -> Result<Vec<u8>, ManagedError> {
     let mut bytes = Vec::new();
     ciborium::ser::into_writer(value, &mut bytes)
-        .map_err(|_| invalid(action, "section record cannot be encoded"))?;
+        .map_err(|_| invalid(action, "SSTable record cannot be encoded"))?;
     Ok(bytes)
 }
 
-fn decode_section_value<T: DeserializeOwned>(
+fn decode_table_value<T: DeserializeOwned>(
     bytes: &[u8],
     action: &'static str,
 ) -> Result<T, ManagedError> {
     let mut input = Cursor::new(bytes);
     let value = ciborium::de::from_reader(&mut input)
-        .map_err(|_| corrupt(action, "section record cannot be decoded"))?;
+        .map_err(|_| corrupt(action, "SSTable record cannot be decoded"))?;
     if input.position() != bytes.len() as u64 {
-        return Err(corrupt(action, "section record has trailing bytes"));
+        return Err(corrupt(action, "SSTable record has trailing bytes"));
     }
     Ok(value)
 }
@@ -1254,6 +1080,20 @@ fn invalid(action: &'static str, message: &'static str) -> ManagedError {
 
 fn corrupt(action: &'static str, message: &'static str) -> ManagedError {
     ManagedError::new(ManagedErrorKind::Corrupt, action, message)
+}
+
+fn require_same_operation(
+    expected: Option<[u8; 32]>,
+    observed: [u8; 32],
+) -> Result<(), ManagedError> {
+    if expected.is_none_or(|expected| expected == observed) {
+        Ok(())
+    } else {
+        Err(conflict(
+            "publish Managed namespace",
+            "operation identity was reused with another payload",
+        ))
+    }
 }
 
 fn conflict(action: &'static str, message: &'static str) -> ManagedError {
@@ -1468,212 +1308,78 @@ struct StoredTransaction {
     remove_file_versions: Vec<[u8; 32]>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct StoredCheckpoint {
+struct StoredManifest {
     major: u16,
     volume_id: [u8; 16],
     cursor: StoredCursor,
     root: [u8; 16],
-    sections: Vec<StoredSectionReference>,
+    tables: Vec<TableRef>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct StoredSectionReference {
-    kind: u8,
-    id: [u8; 32],
-    object: [u8; 32],
-    offset: u64,
-    first_key: Vec<u8>,
-    last_key: Vec<u8>,
-    records: u32,
-    encoded_bytes: u64,
+struct StoredCommittedResult {
+    cursor: StoredCursor,
+    transaction_sha256: [u8; 32],
 }
 
-struct CheckpointChanges {
-    records: BTreeMap<u8, BTreeMap<Vec<u8>, Option<Vec<u8>>>>,
-    removed_directories: BTreeSet<[u8; 16]>,
-}
-
-impl StoredSectionReference {
-    fn from_located(object: [u8; 32], located: section::Located) -> Self {
-        let reference = located.reference;
-        Self {
-            kind: reference.kind,
-            id: reference.id,
-            object,
-            offset: located.offset,
-            first_key: reference.first_key,
-            last_key: reference.last_key,
-            records: reference.records,
-            encoded_bytes: reference.encoded_bytes,
-        }
+impl StoredCommittedResult {
+    fn from_transaction(transaction: &StoredTransaction) -> Result<Self, ManagedError> {
+        let bytes = encode_cbor(
+            TRANSACTION_MAGIC,
+            transaction,
+            "checkpoint Managed namespace",
+        )?;
+        Ok(Self {
+            cursor: transaction.cursor,
+            transaction_sha256: sha256(&bytes),
+        })
     }
 
-    fn as_reference(&self) -> SectionReference {
-        SectionReference {
-            kind: self.kind,
-            id: self.id,
-            first_key: self.first_key.clone(),
-            last_key: self.last_key.clone(),
-            records: self.records,
-            encoded_bytes: self.encoded_bytes,
+    fn validate(&self, operation: OperationId) -> Result<(), ManagedError> {
+        if self.cursor.into_cursor()?.operation() != Some(operation) {
+            return Err(corrupt(
+                "read Managed operation results",
+                "operation result cursor is invalid",
+            ));
         }
-    }
-
-    fn located(&self) -> section::Located {
-        section::Located {
-            reference: self.as_reference(),
-            offset: self.offset,
-        }
+        Ok(())
     }
 }
 
-fn validate_section_references(sections: &[StoredSectionReference]) -> Result<(), ManagedError> {
-    let mut previous: Option<&StoredSectionReference> = None;
-    let mut ranges = BTreeMap::<[u8; 32], Vec<(u64, u64)>>::new();
-    for section in sections {
-        let end = section.offset.checked_add(section.encoded_bytes);
-        if !matches!(
-            section.kind,
-            NODE_SECTION | DIRECTORY_SECTION | DIRECTORY_ENTRY_SECTION | FILE_VERSION_SECTION
-        ) || section.records == 0
-            || section.encoded_bytes == 0
-            || end.is_none()
-            || section.first_key > section.last_key
-            || previous.is_some_and(|previous| {
-                previous.kind > section.kind
-                    || previous.kind == section.kind && previous.last_key >= section.first_key
+fn validate_tables(tables: &[TableRef]) -> Result<(), ManagedError> {
+    let mut previous_last: Option<&[u8]> = None;
+    for table in tables {
+        if table.encoded_bytes == 0
+            || table.blocks.is_empty()
+            || table.blocks.iter().any(|block| {
+                block.records == 0 || block.encoded_bytes == 0 || block.first_key > block.last_key
             })
         {
             return Err(corrupt(
                 "read Managed namespace",
-                "checkpoint section references are invalid",
+                "manifest SSTable references are invalid",
             ));
         }
-        ranges
-            .entry(section.object)
-            .or_default()
-            .push((section.offset, end.expect("range end was validated")));
-        previous = Some(section);
-    }
-    for object_ranges in ranges.values_mut() {
-        object_ranges.sort_unstable();
-        if object_ranges.windows(2).any(|pair| pair[0].1 > pair[1].0) {
-            return Err(corrupt(
-                "read Managed namespace",
-                "checkpoint section ranges overlap",
-            ));
+        let mut end = 0_u64;
+        for block in &table.blocks {
+            if block.offset < end
+                || block.offset.checked_add(block.encoded_bytes).is_none()
+                || block.offset + block.encoded_bytes > table.encoded_bytes
+                || previous_last.is_some_and(|last| last >= block.first_key.as_slice())
+            {
+                return Err(corrupt(
+                    "read Managed namespace",
+                    "manifest SSTable block ranges are invalid",
+                ));
+            }
+            end = block.offset + block.encoded_bytes;
+            previous_last = Some(&block.last_key);
         }
     }
     Ok(())
-}
-
-fn section_changes(transactions: &[StoredTransaction]) -> Result<CheckpointChanges, ManagedError> {
-    let mut changes = CheckpointChanges {
-        records: BTreeMap::new(),
-        removed_directories: BTreeSet::new(),
-    };
-    for transaction in transactions {
-        let nodes = changes.records.entry(NODE_SECTION).or_default();
-        for node in &transaction.put_nodes {
-            nodes.insert(
-                node.id.to_vec(),
-                Some(encode_section_value(
-                    &StoredNodeSection {
-                        generation: node.generation,
-                        kind: node.kind,
-                        attributes: node.attributes,
-                        file_version: node.file_version,
-                    },
-                    "checkpoint Managed namespace",
-                )?),
-            );
-        }
-        for id in &transaction.remove_nodes {
-            nodes.insert(id.to_vec(), None);
-        }
-
-        let directories = changes.records.entry(DIRECTORY_SECTION).or_default();
-        for directory in &transaction.put_directories {
-            directories.insert(
-                directory.node.to_vec(),
-                Some(encode_section_value(
-                    &StoredDirectorySection {
-                        generation: directory.generation,
-                    },
-                    "checkpoint Managed namespace",
-                )?),
-            );
-        }
-        for id in &transaction.remove_directories {
-            directories.insert(id.to_vec(), None);
-            changes.removed_directories.insert(*id);
-        }
-
-        let entries = changes.records.entry(DIRECTORY_ENTRY_SECTION).or_default();
-        for id in &transaction.remove_directories {
-            entries.retain(|key, _| !key.starts_with(id));
-        }
-        for entry in &transaction.put_directory_entries {
-            entries.insert(
-                directory_entry_key(NodeId::from_bytes(entry.directory), &entry.name),
-                Some(encode_section_value(
-                    &entry.entry,
-                    "checkpoint Managed namespace",
-                )?),
-            );
-        }
-        for entry in &transaction.remove_directory_entries {
-            entries.insert(
-                directory_entry_key(NodeId::from_bytes(entry.directory), &entry.name),
-                None,
-            );
-        }
-
-        let versions = changes.records.entry(FILE_VERSION_SECTION).or_default();
-        for version in &transaction.put_file_versions {
-            versions.insert(
-                version.id.to_vec(),
-                Some(encode_section_value(
-                    &StoredFileVersionSection {
-                        logical_size: version.logical_size,
-                        logical_digest: version.logical_digest,
-                        layout: version.layout.clone(),
-                    },
-                    "checkpoint Managed namespace",
-                )?),
-            );
-        }
-        for id in &transaction.remove_file_versions {
-            versions.insert(id.to_vec(), None);
-        }
-    }
-    Ok(changes)
-}
-
-fn section_may_contain_directory(section: &StoredSectionReference, directory: &[u8; 16]) -> bool {
-    match (section.first_key.get(..16), section.last_key.get(..16)) {
-        (Some(first), Some(last)) => first <= directory.as_slice() && directory.as_slice() <= last,
-        _ => true,
-    }
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct StoredResult {
-    major: u16,
-    operation: [u8; 16],
-    transaction_sha256: [u8; 32],
-    outcome: StoredResultKind,
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
-enum StoredResultKind {
-    Committed { cursor: StoredCursor },
-    Conflict,
 }
 
 impl StoredTransaction {
@@ -1955,14 +1661,14 @@ impl StoredNode {
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct StoredNodeSection {
+struct SnapshotNodeRecord {
     generation: u64,
     kind: StoredNodeKind,
     attributes: StoredNodeAttributes,
     file_version: Option<[u8; 32]>,
 }
 
-impl From<&NodeRecord> for StoredNodeSection {
+impl From<&NodeRecord> for SnapshotNodeRecord {
     fn from(node: &NodeRecord) -> Self {
         Self {
             generation: managed_generation_number(&node.generation)
@@ -1974,7 +1680,7 @@ impl From<&NodeRecord> for StoredNodeSection {
     }
 }
 
-impl StoredNodeSection {
+impl SnapshotNodeRecord {
     fn into_record(self, id: NodeId) -> NodeRecord {
         NodeRecord {
             id,
@@ -2015,11 +1721,11 @@ impl StoredDirectoryHeader {
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct StoredDirectorySection {
+struct SnapshotDirectoryRecord {
     generation: u64,
 }
 
-impl From<&DirectoryRecord> for StoredDirectorySection {
+impl From<&DirectoryRecord> for SnapshotDirectoryRecord {
     fn from(directory: &DirectoryRecord) -> Self {
         Self {
             generation: managed_generation_number(&directory.generation)
@@ -2028,7 +1734,7 @@ impl From<&DirectoryRecord> for StoredDirectorySection {
     }
 }
 
-impl StoredDirectorySection {
+impl SnapshotDirectoryRecord {
     fn into_record(self, node: NodeId) -> DirectoryRecord {
         DirectoryRecord {
             node,
@@ -2131,7 +1837,7 @@ struct StoredFileVersion {
     id: [u8; 32],
     logical_size: u64,
     logical_digest: [u8; 32],
-    layout: FileVersionLayout,
+    extent_map: ExtentMap,
 }
 
 impl From<&FileVersionRecord> for StoredFileVersion {
@@ -2140,7 +1846,7 @@ impl From<&FileVersionRecord> for StoredFileVersion {
             id: *version.id.as_bytes(),
             logical_size: version.logical_size,
             logical_digest: version.logical_digest,
-            layout: version.layout.clone(),
+            extent_map: version.extent_map.clone(),
         }
     }
 }
@@ -2151,36 +1857,36 @@ impl StoredFileVersion {
             id: FileVersionId::from_bytes(self.id),
             logical_size: self.logical_size,
             logical_digest: self.logical_digest,
-            layout: self.layout,
+            extent_map: self.extent_map,
         })
     }
 }
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct StoredFileVersionSection {
+struct SnapshotFileVersionRecord {
     logical_size: u64,
     logical_digest: [u8; 32],
-    layout: FileVersionLayout,
+    extent_map: ExtentMap,
 }
 
-impl From<&FileVersionRecord> for StoredFileVersionSection {
+impl From<&FileVersionRecord> for SnapshotFileVersionRecord {
     fn from(version: &FileVersionRecord) -> Self {
         Self {
             logical_size: version.logical_size,
             logical_digest: version.logical_digest,
-            layout: version.layout.clone(),
+            extent_map: version.extent_map.clone(),
         }
     }
 }
 
-impl StoredFileVersionSection {
+impl SnapshotFileVersionRecord {
     fn into_record(self, id: FileVersionId) -> FileVersionRecord {
         FileVersionRecord {
             id,
             logical_size: self.logical_size,
             logical_digest: self.logical_digest,
-            layout: self.layout,
+            extent_map: self.extent_map,
         }
     }
 }
@@ -2272,29 +1978,6 @@ mod tests {
             )]),
             file_versions: BTreeMap::new(),
         }
-    }
-
-    #[test]
-    fn durable_cbor_is_deterministic_and_rejects_corruption() {
-        let operation = OperationId::from_bytes([7; 16]);
-        let result = StoredResult {
-            major: FORMAT_MAJOR,
-            operation: *operation.as_bytes(),
-            transaction_sha256: [9; 32],
-            outcome: StoredResultKind::Committed {
-                cursor: ChangeCursor::at(NonZeroU64::new(1).unwrap(), operation).into(),
-            },
-        };
-        let encoded = encode_cbor(RESULT_MAGIC, &result, "test").unwrap();
-        assert_eq!(encoded, encode_cbor(RESULT_MAGIC, &result, "test").unwrap());
-        assert_eq!(
-            hex(&sha256(&encoded)),
-            "142474aa1080f5ac4edc2708298130e4ca08a90d800f19c575d4283eede1362c"
-        );
-        let last = encoded.len() - 1;
-        let mut corrupt = encoded;
-        corrupt[last] ^= 1;
-        assert!(decode_cbor::<StoredResult>(RESULT_MAGIC, &corrupt, "test").is_err());
     }
 
     #[test]
@@ -2411,7 +2094,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_sections_round_trip_without_a_whole_snapshot_record() {
+    async fn manifest_sstables_round_trip_without_a_whole_snapshot_record() {
         let operation = OperationId::from_bytes([8; 16]);
         let cursor = ChangeCursor::at(NonZeroU64::new(1).unwrap(), operation);
         let mut snapshot = root_snapshot(cursor);
@@ -2432,248 +2115,98 @@ mod tests {
             volume_id: snapshot.volume_id,
             operator: operator.clone(),
         };
-        let checkpoint = namespace.checkpoint_full(&snapshot).await.unwrap();
-        assert!(
-            checkpoint
-                .sections
-                .iter()
-                .any(|section| section.kind == DIRECTORY_ENTRY_SECTION)
-        );
-        assert!(
-            checkpoint
-                .sections
-                .iter()
-                .all(|section| section.object == checkpoint.sections[0].object)
-        );
-        let mut ranges = checkpoint
-            .sections
-            .iter()
-            .map(|section| (section.offset, section.encoded_bytes))
-            .collect::<Vec<_>>();
-        ranges.sort_unstable();
-        assert!(
-            ranges
-                .windows(2)
-                .all(|pair| pair[0].0 + pair[0].1 == pair[1].0)
-        );
-        let missing = section_key(&checkpoint.sections[0].object);
+        let checkpoint = namespace
+            .checkpoint_full(&snapshot, &BTreeMap::new())
+            .await
+            .unwrap();
+        assert_eq!(checkpoint.tables.len(), 1);
+        assert!(!checkpoint.tables[0].blocks.is_empty());
+        let missing = sstable_key(&checkpoint.tables[0].id);
         operator.delete(&missing).await.unwrap();
-        let checkpoint = namespace.checkpoint_full(&snapshot).await.unwrap();
+        let checkpoint = namespace
+            .checkpoint_full(&snapshot, &BTreeMap::new())
+            .await
+            .unwrap();
         assert!(operator.stat(&missing).await.is_ok());
         let recovered = namespace.read_snapshot(checkpoint).await.unwrap();
         assert_eq!(recovered, snapshot);
     }
 
     #[tokio::test]
-    async fn incremental_checkpoint_rewrites_only_the_affected_section() {
-        let scope = [21; 16];
-        let operator = Operator::new(Memory::default()).unwrap().finish();
-        let namespace = ObjectNamespace {
-            volume_id: VolumeId::from_bytes(scope),
-            operator,
-        };
-        let records = (0_u32..80)
-            .map(|index| SectionRecord {
-                key: index.to_be_bytes().to_vec(),
-                value: vec![index as u8; 32],
-            })
-            .collect::<Vec<_>>();
-        let encoded =
-            section::encode_for_test(scope, NODE_SECTION, records.clone(), 256, 512, 2048).unwrap();
-        assert!(encoded.len() > 2);
-        let previous = namespace.persist_sections(encoded).await.unwrap();
-        let changed_key = 40_u32.to_be_bytes().to_vec();
-        let changed_section = previous
-            .iter()
-            .find(|section| {
-                section.first_key.as_slice() <= changed_key.as_slice()
-                    && changed_key.as_slice() <= section.last_key.as_slice()
-            })
-            .unwrap()
-            .id;
-        let previous_ids = previous
-            .iter()
-            .map(|section| section.id)
-            .collect::<std::collections::BTreeSet<_>>();
-        let mut changes = CheckpointChanges {
-            records: BTreeMap::new(),
-            removed_directories: BTreeSet::new(),
-        };
-        changes
-            .records
-            .entry(NODE_SECTION)
-            .or_default()
-            .insert(changed_key.clone(), Some(b"changed".to_vec()));
-
-        let rewritten = namespace
-            .rewrite_checkpoint_sections(&previous, changes)
-            .await
-            .unwrap();
-        let rewritten_ids = rewritten
-            .iter()
-            .map(|section| section.id)
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(
-            previous_ids.intersection(&rewritten_ids).count(),
-            previous.len() - 1
-        );
-        assert!(!rewritten_ids.contains(&changed_section));
-
-        let mut recovered = BTreeMap::new();
-        for (_, records) in namespace
-            .read_checkpoint_sections(&rewritten, "test")
-            .await
-            .unwrap()
-        {
-            for record in records {
-                recovered.insert(record.key, record.value);
-            }
-        }
-        let mut expected = records
-            .into_iter()
-            .map(|record| (record.key, record.value))
-            .collect::<BTreeMap<_, _>>();
-        expected.insert(changed_key, b"changed".to_vec());
-        assert_eq!(recovered, expected);
-    }
-
-    #[tokio::test]
-    async fn incremental_checkpoint_removes_a_directory_entry_range() {
-        let scope = [22; 16];
-        let operator = Operator::new(Memory::default()).unwrap().finish();
-        let namespace = ObjectNamespace {
-            volume_id: VolumeId::from_bytes(scope),
-            operator,
-        };
-        let removed = [2; 16];
-        let records = [([1; 16], 30_u8), (removed, 60_u8), ([3; 16], 90_u8)]
-            .into_iter()
-            .flat_map(|(directory, end)| {
-                (end - 30..end).map(move |index| SectionRecord {
-                    key: directory_entry_key(
-                        NodeId::from_bytes(directory),
-                        &format!("entry-{index:03}"),
-                    ),
-                    value: vec![index; 32],
-                })
-            })
-            .collect::<Vec<_>>();
-        let encoded =
-            section::encode_for_test(scope, DIRECTORY_ENTRY_SECTION, records, 256, 512, 2048)
-                .unwrap();
-        let previous = namespace.persist_sections(encoded).await.unwrap();
-        let changes = CheckpointChanges {
-            records: BTreeMap::new(),
-            removed_directories: BTreeSet::from([removed]),
-        };
-
-        let rewritten = namespace
-            .rewrite_checkpoint_sections(&previous, changes)
-            .await
-            .unwrap();
-        let mut recovered = Vec::new();
-        for (_, records) in namespace
-            .read_checkpoint_sections(&rewritten, "test")
-            .await
-            .unwrap()
-        {
-            recovered.extend(records);
-        }
-        assert_eq!(recovered.len(), 60);
-        assert!(
-            recovered
-                .iter()
-                .all(|record| !record.key.starts_with(&removed))
-        );
-    }
-
-    #[tokio::test]
-    async fn incremental_checkpoint_drops_entries_for_a_directory_created_and_deleted_in_tail() {
-        let first = OperationId::from_bytes([31; 16]);
+    async fn committed_operations_resolve_from_manifest_then_wal() {
+        let first = OperationId::from_bytes([41; 16]);
         let first_cursor = ChangeCursor::at(NonZeroU64::new(1).unwrap(), first);
-        let base = root_snapshot(first_cursor);
+        let first_snapshot = root_snapshot(first_cursor);
+        let first_publication = NamespacePublication {
+            operation: first,
+            parent: ChangeCursor::Genesis,
+            expected_nodes: vec![NodePrecondition {
+                node: first_snapshot.root,
+                expected_generation: None,
+            }],
+            expected_directories: vec![DirectoryPrecondition {
+                directory: first_snapshot.root,
+                expected_generation: None,
+            }],
+            target: first_snapshot.clone(),
+        };
         let operator = Operator::new(Memory::default()).unwrap().finish();
         let namespace = ObjectNamespace {
-            volume_id: base.volume_id,
+            volume_id: first_snapshot.volume_id,
             operator,
         };
-        let previous = namespace.checkpoint_full(&base).await.unwrap();
+        assert_eq!(
+            namespace.publish(None, &first_publication).await.unwrap(),
+            CommitOutcome::Committed(first_cursor)
+        );
+        assert_eq!(
+            namespace.resolve(first).await.unwrap(),
+            CommitOutcome::Committed(first_cursor)
+        );
 
-        let second = OperationId::from_bytes([32; 16]);
+        let first_head = namespace.read_current_head().await.unwrap().unwrap();
+        let second = OperationId::from_bytes([42; 16]);
         let second_cursor = ChangeCursor::at(NonZeroU64::new(2).unwrap(), second);
-        let child = NodeId::from_bytes([9; 16]);
-        let mut created = base.clone();
-        created.cursor = second_cursor;
-        created.nodes.insert(
-            child,
-            NodeRecord {
-                id: child,
-                generation: managed_generation(1),
-                kind: NodeKind::Directory,
-                attributes: NodeAttributes::default(),
-                file_version: None,
-            },
-        );
-        created.directories.insert(
-            child,
-            DirectoryRecord {
-                node: child,
-                generation: managed_generation(1),
-                entries: BTreeMap::from([(
-                    "entry".to_owned(),
-                    DirectoryEntry {
-                        node: base.root,
-                        kind: NodeKind::Directory,
-                    },
-                )]),
-            },
-        );
-        created
-            .directories
-            .get_mut(&created.root)
-            .unwrap()
-            .entries
-            .insert(
-                "child".to_owned(),
-                DirectoryEntry {
-                    node: child,
-                    kind: NodeKind::Directory,
-                },
-            );
-        let create = StoredTransaction::from_publication(
-            &NamespacePublication {
-                operation: second,
-                parent: first_cursor,
-                expected_nodes: Vec::new(),
-                expected_directories: Vec::new(),
-                target: created.clone(),
-            },
-            Some(&base),
-        );
-
-        let third = OperationId::from_bytes([33; 16]);
-        let mut removed = base.clone();
-        removed.cursor = ChangeCursor::at(NonZeroU64::new(3).unwrap(), third);
-        let remove = StoredTransaction::from_publication(
-            &NamespacePublication {
-                operation: third,
-                parent: second_cursor,
-                expected_nodes: Vec::new(),
-                expected_directories: Vec::new(),
-                target: removed.clone(),
-            },
-            Some(&created),
-        );
-
-        let checkpoint = namespace
-            .checkpoint_incremental(&removed, &previous, &[create, remove])
+        let mut second_snapshot = first_snapshot.clone();
+        second_snapshot.cursor = second_cursor;
+        let second_publication = NamespacePublication {
+            operation: second,
+            parent: first_cursor,
+            expected_nodes: Vec::new(),
+            expected_directories: Vec::new(),
+            target: second_snapshot,
+        };
+        let stored =
+            StoredTransaction::from_publication(&second_publication, Some(&first_snapshot));
+        let bytes = encode_cbor(TRANSACTION_MAGIC, &stored, "test").unwrap();
+        namespace.ensure_transaction(second, &bytes).await.unwrap();
+        let head = StoredHead::new(
+            namespace.volume_id,
+            stored.cursor,
+            stored.operation,
+            sha256(&bytes),
+            first_head.checkpoint,
+            first_head.checkpoint_cursor,
+            1,
+        )
+        .unwrap();
+        namespace
+            .operator
+            .write(HEAD_KEY, encode_head(&head).unwrap())
             .await
             .unwrap();
-        assert_eq!(namespace.read_snapshot(checkpoint).await.unwrap(), removed);
+        assert_eq!(
+            namespace.resolve(second).await.unwrap(),
+            CommitOutcome::Committed(second_cursor)
+        );
+        assert_eq!(
+            namespace.resolve(first).await.unwrap(),
+            CommitOutcome::Committed(first_cursor)
+        );
     }
 
     #[tokio::test]
-    async fn missing_checkpoint_section_is_reported_as_corruption() {
+    async fn missing_manifest_sstable_is_reported_as_corruption() {
         let operation = OperationId::from_bytes([10; 16]);
         let cursor = ChangeCursor::at(NonZeroU64::new(1).unwrap(), operation);
         let snapshot = root_snapshot(cursor);
@@ -2701,12 +2234,12 @@ mod tests {
         );
         let head = operator.read(HEAD_KEY).await.unwrap().to_bytes();
         let head = decode_head(&head).unwrap();
-        let checkpoint = namespace.read_checkpoint(&head.checkpoint).await.unwrap();
+        let checkpoint = namespace.read_manifest(&head.checkpoint).await.unwrap();
         operator
-            .delete(&section_key(&checkpoint.sections[0].object))
+            .delete(&sstable_key(&checkpoint.tables[0].id))
             .await
             .unwrap();
-        let error = namespace.recover(&head).await.unwrap_err();
+        let error = namespace.recover(&head).await.err().unwrap();
         assert_eq!(error.kind(), ManagedErrorKind::Corrupt);
     }
 }

@@ -272,7 +272,7 @@ mod tests {
 
     use super::*;
     use crate::filesystem::{DirectoryEntry, OperationId, VolumeId};
-    use crate::managed::namespace::FileVersionRecord;
+    use crate::managed::metadata::namespace::FileVersionRecord;
 
     const ROOT: NodeId = NodeId::from_bytes([1; 16]);
     const FILE: NodeId = NodeId::from_bytes([2; 16]);

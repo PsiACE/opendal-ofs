@@ -18,7 +18,7 @@
 use opendal::{ErrorKind, Operator};
 
 use super::require_same_format;
-use crate::managed::format::SUPERBLOCK_KEY;
+use crate::managed::metadata::superblock::SUPERBLOCK_KEY;
 use crate::managed::{ManagedError, ManagedErrorKind, ManagedFormat};
 
 /// Managed metadata stored beside data through OpenDAL.
@@ -36,7 +36,6 @@ impl ObjectMetadata {
         &self,
         desired: &ManagedFormat,
     ) -> Result<ManagedFormat, ManagedError> {
-        desired.validate_for_write()?;
         if !self
             .operator
             .info()
