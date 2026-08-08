@@ -20,6 +20,8 @@ The documentation is split by purpose:
   integration.
 - [Managed storage format](managed-storage-format.md) specifies the persistent
   namespace and data layout for `managed/1`.
+- [Managed branches](managed-branches.md) explains named current and historical
+  states, backend semantics, garbage collection, and capability limits.
 
 The architectural definitions for volume and access models are in
 [RFC 016](../rfcs/0016_filesystem_architecture.md).

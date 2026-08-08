@@ -34,6 +34,10 @@ same remote volume under different names. See the
 [Managed Sync documentation](docs/managed-sync.md) for the workflow,
 architecture, and storage format.
 
+Managed volumes can also enable durable named branches for isolated current or
+historical states. See [Managed branches](docs/managed-branches.md) for the
+user workflow, storage semantics, and capability limits.
+
 ## How to use `ofs`
 
 ### Install `FUSE` on Linux
