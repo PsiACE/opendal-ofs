@@ -38,7 +38,8 @@ OFS_METADATA_URL=<credential-free D1 URL>
 must not appear in JSON status output. The script deliberately leaves its case
 directory intact on failure so the caller can inspect the user-visible state.
 
-The workflow accepts volume create/reopen, explicit publication, empty and cold
+The workflow accepts registration of one remote volume under different
+client-local aliases, explicit publication from those clients, empty and cold
 materialization, disjoint merge, retained conflict candidates, explicit
 resolution, no-op sync, structured status, and absence of credentials. It does
 not inspect object keys, metadata rows, state-file contents, private call order,

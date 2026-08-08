@@ -55,24 +55,31 @@ impl ObjectMetadata {
             .if_not_exists(true)
             .await
         {
-            Ok(_) => {}
+            Ok(_) => Ok(desired.clone()),
             Err(error)
                 if matches!(
                     error.kind(),
                     ErrorKind::AlreadyExists | ErrorKind::ConditionNotMatch
-                ) => {}
-            Err(_) => return Err(unavailable("create Managed format")),
+                ) =>
+            {
+                require_same_format(desired, self.read_format().await?)
+            }
+            Err(_) => Err(unavailable("create Managed format")),
         }
-        require_same_format(desired, self.read_format().await?)
     }
 
     pub async fn read_format(&self) -> Result<ManagedFormat, ManagedError> {
-        let bytes = self
-            .operator
-            .read(SUPERBLOCK_KEY)
-            .await
-            .map_err(|_| unavailable("read Managed format"))?;
-        ManagedFormat::decode(&bytes.to_bytes())
+        self.read_format_optional()
+            .await?
+            .ok_or_else(|| unavailable("read Managed format"))
+    }
+
+    pub async fn read_format_optional(&self) -> Result<Option<ManagedFormat>, ManagedError> {
+        match self.operator.read(SUPERBLOCK_KEY).await {
+            Ok(bytes) => ManagedFormat::decode(&bytes.to_bytes()).map(Some),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(unavailable("read Managed format")),
+        }
     }
 }
 

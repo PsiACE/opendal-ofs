@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::fmt;
 use std::num::NonZeroU64;
 
 macro_rules! fixed_identity {
@@ -44,6 +45,15 @@ fixed_identity!(
 impl VolumeId {
     pub fn generate() -> Self {
         Self::from_bytes(*uuid::Uuid::new_v4().as_bytes())
+    }
+}
+
+impl fmt::Display for VolumeId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.as_bytes() {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
     }
 }
 

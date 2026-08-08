@@ -122,56 +122,84 @@ impl D1Metadata {
                 "format is not UTF-8 JSON",
             )
         })?;
-        self.session
+        let results = self
+            .session
             .query(
                 vec![
-            statement(
-                format!(
-                    "CREATE TABLE IF NOT EXISTS {FORMAT_TABLE} (store_key TEXT PRIMARY KEY, record_json TEXT NOT NULL)"
-                ),
-                Vec::new(),
-            ),
-            statement(
-                format!(
-                    "INSERT OR IGNORE INTO {FORMAT_TABLE} (store_key, record_json) VALUES (?, ?)"
-                ),
-                vec![self.session.store_key().to_owned().into(), record.into()],
-            ),
+                    statement(
+                        format!(
+                            "CREATE TABLE IF NOT EXISTS {FORMAT_TABLE} (store_key TEXT PRIMARY KEY, record_json TEXT NOT NULL)"
+                        ),
+                        Vec::new(),
+                    ),
+                    statement(
+                        format!(
+                            "INSERT OR IGNORE INTO {FORMAT_TABLE} (store_key, record_json) VALUES (?, ?)"
+                        ),
+                        vec![self.session.store_key().to_owned().into(), record.into()],
+                    ),
+                    statement(
+                        format!("SELECT record_json FROM {FORMAT_TABLE} WHERE store_key = ?"),
+                        vec![self.session.store_key().to_owned().into()],
+                    ),
                 ],
                 "create Managed format",
             )
             .await?;
-        require_same_format(desired, self.read_format().await?)
+        let observed =
+            decode_format_result(&results)?.ok_or_else(|| unavailable("create Managed format"))?;
+        require_same_format(desired, observed)
     }
 
     pub async fn read_format(&self) -> Result<ManagedFormat, ManagedError> {
+        self.read_format_optional()
+            .await?
+            .ok_or_else(|| unavailable("read Managed format"))
+    }
+
+    pub async fn read_format_optional(&self) -> Result<Option<ManagedFormat>, ManagedError> {
         let results = self
             .session
             .query(
-                vec![statement(
-                    format!("SELECT record_json FROM {FORMAT_TABLE} WHERE store_key = ?"),
-                    vec![self.session.store_key().to_owned().into()],
-                )],
+                vec![
+                    statement(
+                        format!(
+                            "CREATE TABLE IF NOT EXISTS {FORMAT_TABLE} (store_key TEXT PRIMARY KEY, record_json TEXT NOT NULL)"
+                        ),
+                        Vec::new(),
+                    ),
+                    statement(
+                        format!("SELECT record_json FROM {FORMAT_TABLE} WHERE store_key = ?"),
+                        vec![self.session.store_key().to_owned().into()],
+                    ),
+                ],
                 "read Managed format",
             )
             .await?;
-        let rows = &results
-            .first()
-            .ok_or_else(|| corrupt("read Managed format", "D1 omitted the query result"))?
-            .results;
-        let [row] = rows.as_slice() else {
-            return Err(if rows.is_empty() {
-                unavailable("read Managed format")
-            } else {
-                corrupt("read Managed format", "D1 returned duplicate formats")
-            });
-        };
-        let record = row
-            .get("record_json")
-            .and_then(Value::as_str)
-            .ok_or_else(|| corrupt("read Managed format", "D1 format row is invalid"))?;
-        ManagedFormat::decode(record.as_bytes())
+        decode_format_result(&results)
     }
+}
+
+fn decode_format_result(results: &[D1Result]) -> Result<Option<ManagedFormat>, ManagedError> {
+    let rows = &results
+        .last()
+        .ok_or_else(|| corrupt("read Managed format", "D1 omitted the query result"))?
+        .results;
+    let [row] = rows.as_slice() else {
+        return if rows.is_empty() {
+            Ok(None)
+        } else {
+            Err(corrupt(
+                "read Managed format",
+                "D1 returned duplicate formats",
+            ))
+        };
+    };
+    let record = row
+        .get("record_json")
+        .and_then(Value::as_str)
+        .ok_or_else(|| corrupt("read Managed format", "D1 format row is invalid"))?;
+    ManagedFormat::decode(record.as_bytes()).map(Some)
 }
 
 impl D1Session {

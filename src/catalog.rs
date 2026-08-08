@@ -111,12 +111,21 @@ impl Catalog {
                 stored.schema_major
             );
         }
-        let mut volumes = BTreeMap::new();
+        let mut volumes: BTreeMap<String, VolumeDefinition> = BTreeMap::new();
         for (alias, stored) in stored.volumes {
             if alias.is_empty() {
                 bail!("volume alias is empty");
             }
-            volumes.insert(alias, stored.try_into()?);
+            let definition: VolumeDefinition = stored.try_into()?;
+            if let Some((existing, _)) = volumes
+                .iter()
+                .find(|(_, current)| current.volume_id == definition.volume_id)
+            {
+                bail!(
+                    "volume aliases {existing:?} and {alias:?} refer to the same volume identity"
+                );
+            }
+            volumes.insert(alias, definition);
         }
         Ok(Self { path, volumes })
     }
@@ -132,8 +141,8 @@ impl Catalog {
             .map(|(alias, definition)| (alias.as_str(), definition))
     }
 
-    /// Returns true when a new binding was added and false for an idempotent reopen.
-    pub fn create(&mut self, alias: &str, definition: VolumeDefinition) -> Result<bool> {
+    /// Returns true when a new local binding was added and false when it already exists.
+    pub fn register(&mut self, alias: &str, definition: VolumeDefinition) -> Result<bool> {
         if alias.is_empty() {
             bail!("volume alias is empty");
         }
@@ -141,6 +150,9 @@ impl Catalog {
             Some(existing) if existing == &definition => Ok(false),
             Some(_) => bail!("volume alias {alias:?} conflicts with its existing configuration"),
             None => {
+                if let Some((existing, _)) = self.find_by_id(definition.volume_id) {
+                    bail!("this volume identity is already registered as local alias {existing:?}");
+                }
                 self.volumes.insert(alias.into(), definition);
                 Ok(true)
             }

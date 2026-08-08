@@ -57,6 +57,15 @@ impl MetadataAuthority {
         }
     }
 
+    async fn read_format_optional(
+        &self,
+    ) -> Result<Option<ManagedFormat>, ofs::managed::ManagedError> {
+        match self {
+            Self::Object(metadata) => metadata.read_format_optional().await,
+            Self::D1(metadata) => metadata.read_format_optional().await,
+        }
+    }
+
     fn validate_volume(
         &self,
         format: ManagedFormat,
@@ -171,28 +180,39 @@ async fn create_volume(config: &Path, mut args: VolumeCreateArgs) -> Result<()> 
     let data = open_operator(&args.storage, NonZeroUsize::MIN)?;
     let metadata = open_metadata(data.clone(), args.metadata.as_ref())?;
     let desired = ManagedFormat::v1(provisional_id, metadata.metadata_format());
-    metadata.validate_volume(desired.clone(), data)?;
-    let format = match metadata.create_format(&desired).await {
-        Ok(format) => format,
-        Err(error) if configured.is_none() && error.kind() == ManagedErrorKind::Conflict => {
+    let format = match configured {
+        Some(_) => {
             let observed = metadata.read_format().await?;
-            let expected = ManagedFormat::v1(observed.volume_id(), metadata.metadata_format());
-            if observed != expected {
-                return Err(error.into());
+            if observed != desired {
+                bail!("volume catalog and Managed format v1 binding disagree");
             }
             observed
         }
-        Err(error) => return Err(error.into()),
+        None => match metadata.read_format_optional().await? {
+            Some(observed) => observed,
+            None => match metadata.create_format(&desired).await {
+                Ok(created) => created,
+                Err(error) if error.kind() == ManagedErrorKind::Conflict => {
+                    metadata.read_format().await?
+                }
+                Err(error) => return Err(error.into()),
+            },
+        },
     };
-    let definition = VolumeDefinition::managed(format.volume_id(), args.storage, args.metadata)?;
-    let created = catalog.create(&args.alias, definition)?;
+    metadata.validate_volume(format.clone(), data)?;
+    let volume_id = format.volume_id();
+    let definition = VolumeDefinition::managed(volume_id, args.storage, args.metadata)?;
+    let registered = catalog.register(&args.alias, definition)?;
 
     catalog
         .save()
         .context("the remote format is ready but the local catalog could not be saved; fix the catalog path and repeat the same command")?;
 
-    let action = if created { "created" } else { "opened" };
-    println!("{action} managed volume {:?} with format v1", args.alias);
+    let action = if registered { "registered" } else { "verified" };
+    println!(
+        "{action} managed volume alias {:?} for volume {volume_id} with format v1",
+        args.alias,
+    );
     Ok(())
 }
 
@@ -211,13 +231,16 @@ fn create_direct_volume(
         .context("cannot configure the Direct volume storage")?;
     let definition = VolumeDefinition::direct(volume_id, args.storage)
         .context("volume URLs must be credential-free; supply credentials through provider environment variables")?;
-    let created = catalog.create(&args.alias, definition)?;
+    let registered = catalog.register(&args.alias, definition)?;
     catalog.save().context(
         "the Direct volume binding could not be saved; fix the catalog path and repeat the command",
     )?;
 
-    let action = if created { "created" } else { "opened" };
-    println!("{action} direct volume {:?}", args.alias);
+    let action = if registered { "registered" } else { "verified" };
+    println!(
+        "{action} direct volume alias {:?} for volume {volume_id}",
+        args.alias
+    );
     Ok(())
 }
 
@@ -267,7 +290,8 @@ fn status(config: &Path, args: StatusArgs) -> Result<()> {
         .managed_settings()
         .context("replica state is not bound to a Managed volume")?;
     let value = serde_json::json!({
-        "volume": alias,
+        "volume_alias": alias,
+        "volume_id": state.volume.to_string(),
         "volume_model": "managed",
         "access_model": "sync",
         "common_sequence": state.common.sequence(),
@@ -278,7 +302,8 @@ fn status(config: &Path, args: StatusArgs) -> Result<()> {
         println!("{}", serde_json::to_string(&value)?);
     } else {
         println!(
-            "managed sync at change {}, {} pending, {} conflict(s)",
+            "managed sync alias {alias:?} for volume {} at change {}, {} pending, {} conflict(s)",
+            state.volume,
             state.common.sequence(),
             usize::from(state.pending.is_some()),
             state.conflicts.len()
