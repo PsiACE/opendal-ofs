@@ -146,14 +146,22 @@ impl PackReadSession {
         id: PackId,
         entries: &[(ContentRef, PackLocation)],
     ) -> Result<Vec<Vec<u8>>, ManagedError> {
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
         let mut ranges = Vec::with_capacity(entries.len());
         for (content, location) in entries {
             validate_indexed_range(*content, *location, id)?;
             ranges.push(location.offset..location.offset + location.stored_length);
         }
+        let first = ranges.iter().map(|range| range.start).min().unwrap_or(0);
+        let last = ranges.iter().map(|range| range.end).max().unwrap_or(first);
+        let gap = usize::try_from(last - first)
+            .map_err(|_| invalid("read pack content", "pack range exceeds this platform"))?;
         let reader = self
             .operator
-            .reader(&pack_key(id))
+            .reader_with(&pack_key(id))
+            .gap(gap)
             .await
             .map_err(|_| unavailable("read pack content", "pack is unavailable"))?;
         let buffers = reader

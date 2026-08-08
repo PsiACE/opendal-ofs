@@ -107,6 +107,13 @@ impl FileLayoutPolicy {
     }
 }
 
+#[derive(Clone, Copy)]
+struct FastCdcSizes {
+    minimum: u32,
+    target: u32,
+    maximum: u32,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct Digest([u8; 32]);
 
@@ -183,16 +190,20 @@ impl ManagedData {
                 target_size,
                 maximum_size,
             } => {
-                if frozen_size(local, frozen_path).await? < minimum_file_size {
+                let size = frozen_size(local, frozen_path).await?;
+                if size < minimum_file_size {
                     self.seal_whole_file_with_known_content(local, frozen_path, known)
                         .await
                 } else {
                     self.seal_fastcdc(
                         local,
                         frozen_path,
-                        minimum_size,
-                        target_size,
-                        maximum_size,
+                        size,
+                        FastCdcSizes {
+                            minimum: minimum_size,
+                            target: target_size,
+                            maximum: maximum_size,
+                        },
                         known,
                     )
                     .await
@@ -230,14 +241,18 @@ impl ManagedData {
         }
         let key = loose_key(content);
 
-        match self.operator.writer_with(&key).if_not_exists(true).await {
-            Err(error) if already_exists(&error) => {}
+        let created = match self.operator.writer_with(&key).if_not_exists(true).await {
+            Err(error) if already_exists(&error) => false,
             Err(_) => return Err(unavailable("create loose data")),
             Ok(mut writer) => {
                 let observed =
                     match digest_and_copy(local, frozen_path, size, Some(&mut writer)).await {
                         Ok(observed) => observed,
-                        Err(error) if already_exists(&error) => digest,
+                        Err(error) if already_exists(&error) => {
+                            let _ = writer.abort().await;
+                            self.verify(&version).await?;
+                            return Ok(version);
+                        }
                         Err(_) => {
                             let _ = writer.abort().await;
                             return Err(unavailable("write loose data"));
@@ -250,15 +265,17 @@ impl ManagedData {
                         "frozen input changed while it was being sealed",
                     ));
                 }
-                if let Err(error) = writer.close().await {
-                    if !already_exists(&error) {
-                        return Err(unavailable("commit loose data"));
-                    }
+                match writer.close().await {
+                    Ok(_) => true,
+                    Err(error) if already_exists(&error) => false,
+                    Err(_) => return Err(unavailable("commit loose data")),
                 }
             }
-        }
+        };
 
-        self.verify(&version).await?;
+        if !created {
+            self.verify(&version).await?;
+        }
         Ok(version)
     }
 
@@ -266,12 +283,10 @@ impl ManagedData {
         &self,
         local: &Operator,
         path: &str,
-        minimum_size: u32,
-        target_size: u32,
-        maximum_size: u32,
+        size: u64,
+        sizes: FastCdcSizes,
         known: &AuthorityKnownContent,
     ) -> Result<FileVersionRecord, ManagedError> {
-        let size = frozen_size(local, path).await?;
         if size == 0 {
             return Ok(FileVersionRecord::whole(0, Sha256::digest([]).into()));
         }
@@ -282,7 +297,7 @@ impl ManagedData {
             .into_futures_async_read(..)
             .await
             .map_err(|_| unavailable("read frozen file"))?;
-        let mut chunker = AsyncStreamCDC::new(reader, minimum_size, target_size, maximum_size);
+        let mut chunker = AsyncStreamCDC::new(reader, sizes.minimum, sizes.target, sizes.maximum);
         let chunks = chunker.as_stream();
         futures::pin_mut!(chunks);
         let mut logical = Sha256::new();
@@ -302,9 +317,9 @@ impl ManagedData {
             logical.finalize().into(),
             FileVersionLayout::FastCdc {
                 revision: 1,
-                minimum_size: u64::from(minimum_size),
-                target_size: u64::from(target_size),
-                maximum_size: u64::from(maximum_size),
+                minimum_size: u64::from(sizes.minimum),
+                target_size: u64::from(sizes.target),
+                maximum_size: u64::from(sizes.maximum),
                 chunks: spans,
             },
         )
@@ -461,7 +476,7 @@ impl ManagedData {
             .if_not_exists(true)
             .await
         {
-            Ok(_) => {}
+            Ok(_) => return Ok(content),
             Err(error) if already_exists(&error) => {}
             Err(_) => return Err(unavailable("write loose data")),
         }
