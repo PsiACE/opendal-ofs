@@ -31,7 +31,7 @@ pub(crate) fn run(mut arguments: impl Iterator<Item = String>) -> Result<(), Str
         "bub" => optional_output(arguments, run_bub),
         "-h" | "--help" => {
             println!(
-                "Usage: cargo x managed-sync <doctor|up|down|test workflow object|d1|test staging|perf [OUTPUT]|bub [OUTPUT]>"
+                "Usage: cargo x managed-sync <doctor|up|down|test workflow object|d1|test branch object|d1|test staging|perf [OUTPUT]|bub [OUTPUT]>"
             );
             Ok(())
         }
@@ -129,27 +129,29 @@ fn no_arguments(
 fn test(mut arguments: impl Iterator<Item = String>) -> Result<(), String> {
     let kind = arguments
         .next()
-        .ok_or_else(|| "expected `test workflow object|d1` or `test staging`".to_string())?;
-    let metadata = match kind.as_str() {
-        "workflow" => {
+        .ok_or_else(|| "expected `test workflow|branch object|d1` or `test staging`".to_string())?;
+    let test = match kind.as_str() {
+        "workflow" | "branch" => {
             let metadata = arguments
                 .next()
-                .ok_or_else(|| "workflow requires object or d1 metadata".to_string())?;
+                .ok_or_else(|| format!("{kind} requires object or d1 metadata"))?;
             if !matches!(metadata.as_str(), "object" | "d1") {
-                return Err("workflow metadata must be object or d1".into());
+                return Err(format!("{kind} metadata must be object or d1"));
             }
-            Some(metadata)
+            Some((kind, metadata))
         }
         "staging" => None,
-        _ => return Err("expected `test workflow object|d1` or `test staging`".into()),
+        _ => {
+            return Err("expected `test workflow|branch object|d1` or `test staging`".into());
+        }
     };
     if let Some(argument) = arguments.next() {
         return Err(format!("unexpected argument {argument:?}"));
     }
 
     up()?;
-    let result = match metadata {
-        Some(metadata) => run_workflow(&metadata),
+    let result = match test {
+        Some((kind, metadata)) => run_acceptance(&kind, &metadata),
         None => run_staging_regression(),
     };
     let cleanup = down();
@@ -193,21 +195,29 @@ fn run_staging_regression() -> Result<(), String> {
         std::fs::remove_dir_all(&run_root)
             .map_err(|error| format!("could not remove staging regression directory: {error}"))?;
     } else {
-        eprintln!("Managed Sync evidence retained at {}", run_root.display());
+        eprintln!(
+            "Managed Sync staging evidence retained at {}",
+            run_root.display()
+        );
     }
     result
 }
 
-fn run_workflow(metadata: &str) -> Result<(), String> {
+fn run_acceptance(suite: &str, metadata: &str) -> Result<(), String> {
+    let script = match suite {
+        "workflow" => "tests/behavior/managed-sync/workflow.sh",
+        "branch" => "tests/behavior/managed-branch/workflow.sh",
+        _ => return Err(format!("unknown acceptance suite {suite:?}")),
+    };
     run_command(
         Command::new("cargo")
             .current_dir(workspace_root())
             .args(["build", "--locked"]),
-        "build ofs for Managed Sync acceptance",
+        "build ofs for acceptance",
     )?;
 
     let run_root = env::temp_dir().join(format!(
-        "ofs-managed-sync-{}-{}",
+        "ofs-managed-{suite}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -225,7 +235,7 @@ fn run_workflow(metadata: &str) -> Result<(), String> {
     let mut workflow = Command::new("bash");
     workflow
         .current_dir(workspace_root())
-        .arg("tests/behavior/managed-sync/workflow.sh")
+        .arg(script)
         .env("OFS_BIN", binary)
         .env("OFS_CASE_ROOT", &case_root)
         .env("OFS_STORAGE_URL", storage)
@@ -238,16 +248,19 @@ fn run_workflow(metadata: &str) -> Result<(), String> {
         workflow
             .env(
                 "OFS_METADATA_URL",
-                format!("d1://local/managed-sync/acceptance?api_base={api_base}"),
+                format!("d1://local/managed-sync/{case_id}?api_base={api_base}"),
             )
             .env("OFS_D1_TOKEN", "local-d1-token");
     }
-    let result = run_command(&mut workflow, "run Managed Sync acceptance");
+    let result = run_command(&mut workflow, &format!("run Managed {suite} acceptance"));
     if result.is_ok() {
         std::fs::remove_dir_all(&run_root)
             .map_err(|error| format!("could not remove acceptance directory: {error}"))?;
     } else {
-        eprintln!("Managed Sync evidence retained at {}", run_root.display());
+        eprintln!(
+            "Managed {suite} evidence retained at {}",
+            run_root.display()
+        );
     }
     result
 }
