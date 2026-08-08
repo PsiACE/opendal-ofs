@@ -13,6 +13,11 @@ Pass `--candidate PATH_OR_REF` to compare two supplied binaries or refs.
 `cargo x managed-sync perf [OUTPUT_DIRECTORY]` remains the short form using the
 archived default baseline and current `HEAD`.
 
+Pass `--pack` for a separate maintenance scenario that packs eligible blobs
+before a new empty replica is reconstructed and the lagging replica catches up.
+Use it only when both compared releases expose `ofs volume pack`; the default
+scenario measures the authoritative data format without a disposable index.
+
 Both binaries use the same host, one long-running local MinIO, and separate
 object roots. Samples run in the fixed order baseline, candidate, candidate,
 baseline, baseline, candidate.
