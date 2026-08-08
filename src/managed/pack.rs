@@ -772,26 +772,29 @@ struct IndexCheckpoint {
 struct StoredIndexSectionReference {
     kind: u8,
     id: [u8; 32],
+    object: [u8; 32],
+    offset: u64,
     first_key: Vec<u8>,
     last_key: Vec<u8>,
     records: u32,
     encoded_bytes: u64,
 }
 
-impl From<SectionReference> for StoredIndexSectionReference {
-    fn from(reference: SectionReference) -> Self {
+impl StoredIndexSectionReference {
+    fn from_located(object: [u8; 32], located: section::Located) -> Self {
+        let reference = located.reference;
         Self {
             kind: reference.kind,
             id: reference.id,
+            object,
+            offset: located.offset,
             first_key: reference.first_key,
             last_key: reference.last_key,
             records: reference.records,
             encoded_bytes: reference.encoded_bytes,
         }
     }
-}
 
-impl StoredIndexSectionReference {
     fn as_reference(&self) -> SectionReference {
         SectionReference {
             kind: self.kind,
@@ -823,6 +826,27 @@ impl IndexCheckpoint {
             );
         }
         let mut sections = Vec::new();
+        let mut encoded = Vec::new();
+        let mut unassigned = changes.keys().cloned().collect::<BTreeSet<_>>();
+        let mut affected = Vec::new();
+        for stored in previous {
+            let keys = unassigned
+                .iter()
+                .take_while(|key| key.as_slice() <= stored.last_key.as_slice())
+                .cloned()
+                .collect::<Vec<_>>();
+            for key in &keys {
+                unassigned.remove(key);
+            }
+            if !keys.is_empty() {
+                affected.push(stored.clone());
+            }
+        }
+        let mut affected_records = read_index_sections(operator, &affected, "persist pack index")
+            .await?
+            .into_iter()
+            .map(|(stored, records)| ((stored.object, stored.offset), records))
+            .collect::<BTreeMap<_, _>>();
         for stored in previous {
             let keys = changes
                 .keys()
@@ -833,14 +857,9 @@ impl IndexCheckpoint {
                 sections.push(stored.clone());
                 continue;
             }
-            let reference = stored.as_reference();
-            let bytes = read_required(
-                operator,
-                &index_section_key(reference.id),
-                "persist pack index",
-            )
-            .await?;
-            let mut records = section::decode(&reference, [0; 16], &bytes, "persist pack index")?
+            let mut records = affected_records
+                .remove(&(stored.object, stored.offset))
+                .expect("affected pack index section was read")
                 .into_iter()
                 .map(|record| (record.key, record.value))
                 .collect::<BTreeMap<_, _>>();
@@ -857,35 +876,30 @@ impl IndexCheckpoint {
                 sections.push(stored.clone());
                 continue;
             }
-            sections.extend(
-                persist_index_sections(
-                    operator,
-                    section::encode(
-                        [0; 16],
-                        INDEX_SECTION,
-                        records
-                            .into_iter()
-                            .map(|(key, value)| SectionRecord { key, value })
-                            .collect(),
-                        "persist pack index",
-                    )?,
-                )
-                .await?,
-            );
+            encoded.extend(section::encode(
+                [0; 16],
+                INDEX_SECTION,
+                records
+                    .into_iter()
+                    .map(|(key, value)| SectionRecord { key, value })
+                    .collect(),
+                "persist pack index",
+            )?);
         }
         if !changes.is_empty() {
             let records = changes
                 .into_iter()
                 .filter_map(|(key, value)| value.map(|value| SectionRecord { key, value }))
                 .collect();
-            sections.extend(
-                persist_index_sections(
-                    operator,
-                    section::encode([0; 16], INDEX_SECTION, records, "persist pack index")?,
-                )
-                .await?,
-            );
+            encoded.extend(section::encode(
+                [0; 16],
+                INDEX_SECTION,
+                records,
+                "persist pack index",
+            )?);
         }
+        sections.extend(persist_index_sections(operator, encoded).await?);
+        sections.sort_by(|left, right| left.first_key.cmp(&right.first_key));
         validate_index_sections(&sections, "persist pack index")?;
         Ok(Self {
             magic: CHECKPOINT_MAGIC.to_owned(),
@@ -901,15 +915,9 @@ impl IndexCheckpoint {
         validate_index_sections(&self.sections, "open pack index")?;
         let mut output = BTreeMap::new();
         let mut previous = None;
-        for stored in &self.sections {
-            let reference = stored.as_reference();
-            let bytes = read_required(
-                operator,
-                &index_section_key(reference.id),
-                "open pack index",
-            )
-            .await?;
-            for record in section::decode(&reference, [0; 16], &bytes, "open pack index")? {
+        for (_, records) in read_index_sections(operator, &self.sections, "open pack index").await?
+        {
+            for record in records {
                 let content = content_from_key(&record.key)
                     .ok_or_else(|| corrupt("open pack index", "index section key is invalid"))?;
                 let locations: Vec<PackLocation> = decode(&record.value, "open pack index")?;
@@ -930,6 +938,66 @@ impl IndexCheckpoint {
     }
 }
 
+async fn read_index_sections(
+    operator: &Operator,
+    stored: &[StoredIndexSectionReference],
+    action: &'static str,
+) -> Result<Vec<(StoredIndexSectionReference, Vec<SectionRecord>)>, ManagedError> {
+    let mut objects = BTreeMap::<[u8; 32], Vec<StoredIndexSectionReference>>::new();
+    for section in stored {
+        objects
+            .entry(section.object)
+            .or_default()
+            .push(section.clone());
+    }
+    let mut decoded = Vec::with_capacity(stored.len());
+    for (object, mut sections) in objects {
+        sections.sort_by_key(|section| section.offset);
+        let first = sections
+            .first()
+            .expect("section object is non-empty")
+            .offset;
+        let end = sections.iter().try_fold(first, |end, section| {
+            section
+                .offset
+                .checked_add(section.encoded_bytes)
+                .map(|section_end| end.max(section_end))
+                .ok_or_else(|| corrupt(action, "index section range is invalid"))
+        })?;
+        let bytes = operator
+            .read_with(&index_section_key(object))
+            .range(first..end)
+            .await
+            .map_err(|error| {
+                if error.kind() == ErrorKind::NotFound {
+                    corrupt(action, "index section data object is missing")
+                } else {
+                    unavailable(action, "pack index storage is unavailable")
+                }
+            })?
+            .to_bytes();
+        for section in sections {
+            let start = usize::try_from(section.offset - first)
+                .map_err(|_| corrupt(action, "index section range is invalid"))?;
+            let length = usize::try_from(section.encoded_bytes)
+                .map_err(|_| corrupt(action, "index section range is invalid"))?;
+            let section_end = start
+                .checked_add(length)
+                .filter(|section_end| *section_end <= bytes.len())
+                .ok_or_else(|| corrupt(action, "index section range is invalid"))?;
+            let records = section::decode(
+                &section.as_reference(),
+                [0; 16],
+                &bytes[start..section_end],
+                action,
+            )?;
+            decoded.push((section, records));
+        }
+    }
+    decoded.sort_by(|(left, _), (right, _)| left.first_key.cmp(&right.first_key));
+    Ok(decoded)
+}
+
 fn validate_index_sections(
     sections: &[StoredIndexSectionReference],
     action: &'static str,
@@ -937,12 +1005,30 @@ fn validate_index_sections(
     if sections.iter().any(|section| {
         section.kind != INDEX_SECTION
             || section.records == 0
+            || section.encoded_bytes == 0
+            || section.offset.checked_add(section.encoded_bytes).is_none()
             || section.first_key > section.last_key
     }) || sections
         .windows(2)
         .any(|pair| pair[0].last_key >= pair[1].first_key)
     {
         return Err(corrupt(action, "index section references are invalid"));
+    }
+    let mut ranges = BTreeMap::<[u8; 32], Vec<(u64, u64)>>::new();
+    for section in sections {
+        ranges.entry(section.object).or_default().push((
+            section.offset,
+            section
+                .offset
+                .checked_add(section.encoded_bytes)
+                .expect("section range was validated"),
+        ));
+    }
+    for object_ranges in ranges.values_mut() {
+        object_ranges.sort_unstable();
+        if object_ranges.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+            return Err(corrupt(action, "index section ranges overlap"));
+        }
     }
     Ok(())
 }
@@ -951,18 +1037,21 @@ async fn persist_index_sections(
     operator: &Operator,
     encoded: Vec<section::Encoded>,
 ) -> Result<Vec<StoredIndexSectionReference>, ManagedError> {
-    let mut sections = Vec::with_capacity(encoded.len());
-    for section in encoded {
-        create_immutable(
-            operator,
-            &index_section_key(section.reference.id),
-            &section.bytes,
-            "persist pack index",
-        )
-        .await?;
-        sections.push(section.reference.into());
-    }
-    Ok(sections)
+    let Some(object) = section::concatenate(encoded, "persist pack index")? else {
+        return Ok(Vec::new());
+    };
+    create_immutable(
+        operator,
+        &index_section_key(object.id),
+        &object.bytes,
+        "persist pack index",
+    )
+    .await?;
+    Ok(object
+        .sections
+        .into_iter()
+        .map(|located| StoredIndexSectionReference::from_located(object.id, located))
+        .collect())
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1293,6 +1382,11 @@ mod tests {
         .await
         .unwrap();
         assert!(previous.len() > 2);
+        assert!(
+            previous
+                .iter()
+                .all(|section| section.object == previous[0].object)
+        );
         let changed = *locations.keys().nth(40).unwrap();
         locations.get_mut(&changed).unwrap()[0].offset += 1;
 

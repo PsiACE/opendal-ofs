@@ -53,6 +53,53 @@ pub(crate) struct Encoded {
     pub(crate) bytes: Vec<u8>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct Located {
+    pub(crate) reference: Reference,
+    pub(crate) offset: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DataObject {
+    pub(crate) id: [u8; 32],
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) sections: Vec<Located>,
+}
+
+/// Concatenate independently verifiable sections into one immutable object.
+/// Readers can fetch one section by range or coalesce adjacent referenced
+/// ranges into one object request.
+pub(crate) fn concatenate(
+    encoded: Vec<Encoded>,
+    action: &'static str,
+) -> Result<Option<DataObject>, ManagedError> {
+    if encoded.is_empty() {
+        return Ok(None);
+    }
+    let total_bytes = encoded.iter().try_fold(0_usize, |total, section| {
+        total
+            .checked_add(section.bytes.len())
+            .ok_or_else(|| invalid(action, "section data object is too large"))
+    })?;
+    let mut bytes = Vec::with_capacity(total_bytes);
+    let mut sections = Vec::with_capacity(encoded.len());
+    for section in encoded {
+        let offset = u64::try_from(bytes.len())
+            .map_err(|_| invalid(action, "section data object is too large"))?;
+        sections.push(Located {
+            reference: section.reference,
+            offset,
+        });
+        bytes.extend_from_slice(&section.bytes);
+    }
+    let id = Sha256::digest(&bytes).into();
+    Ok(Some(DataObject {
+        id,
+        bytes,
+        sections,
+    }))
+}
+
 pub(crate) fn encode(
     scope: [u8; 16],
     kind: u8,

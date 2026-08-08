@@ -731,6 +731,7 @@ impl ObjectNamespace {
     ) -> Result<Vec<StoredSectionReference>, ManagedError> {
         validate_section_references(previous)?;
         let mut output = Vec::new();
+        let mut encoded = Vec::new();
         for kind in [
             NODE_SECTION,
             DIRECTORY_SECTION,
@@ -738,6 +739,32 @@ impl ObjectNamespace {
             FILE_VERSION_SECTION,
         ] {
             let pending = changes.records.entry(kind).or_default();
+            let mut unassigned = pending.keys().cloned().collect::<BTreeSet<_>>();
+            let mut affected = Vec::new();
+            for stored in previous.iter().filter(|section| section.kind == kind) {
+                let keys = unassigned
+                    .iter()
+                    .take_while(|key| key.as_slice() <= stored.last_key.as_slice())
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for key in &keys {
+                    unassigned.remove(key);
+                }
+                let removes_directory = kind == DIRECTORY_ENTRY_SECTION
+                    && changes
+                        .removed_directories
+                        .iter()
+                        .any(|directory| section_may_contain_directory(stored, directory));
+                if !keys.is_empty() || removes_directory {
+                    affected.push(stored.clone());
+                }
+            }
+            let mut affected_records = self
+                .read_checkpoint_sections(&affected, "checkpoint Managed namespace")
+                .await?
+                .into_iter()
+                .map(|(stored, records)| ((stored.object, stored.offset), records))
+                .collect::<BTreeMap<_, _>>();
             for stored in previous.iter().filter(|section| section.kind == kind) {
                 let keys = pending
                     .keys()
@@ -753,10 +780,9 @@ impl ObjectNamespace {
                     output.push(stored.clone());
                     continue;
                 }
-                let reference = stored.as_reference();
-                let mut records = self
-                    .read_section_records(&reference, "checkpoint Managed namespace")
-                    .await?
+                let mut records = affected_records
+                    .remove(&(stored.object, stored.offset))
+                    .expect("affected checkpoint section was read")
                     .into_iter()
                     .map(|record| (record.key, record.value))
                     .collect::<BTreeMap<_, _>>();
@@ -787,67 +813,115 @@ impl ObjectNamespace {
                     .into_iter()
                     .map(|(key, value)| SectionRecord { key, value })
                     .collect();
-                output.extend(
-                    self.persist_sections(section::encode(
-                        *self.volume_id.as_bytes(),
-                        kind,
-                        records,
-                        "checkpoint Managed namespace",
-                    )?)
-                    .await?,
-                );
+                encoded.extend(section::encode(
+                    *self.volume_id.as_bytes(),
+                    kind,
+                    records,
+                    "checkpoint Managed namespace",
+                )?);
             }
             if !pending.is_empty() {
                 let records = std::mem::take(pending)
                     .into_iter()
                     .filter_map(|(key, value)| value.map(|value| SectionRecord { key, value }))
                     .collect();
-                output.extend(
-                    self.persist_sections(section::encode(
-                        *self.volume_id.as_bytes(),
-                        kind,
-                        records,
-                        "checkpoint Managed namespace",
-                    )?)
-                    .await?,
-                );
+                encoded.extend(section::encode(
+                    *self.volume_id.as_bytes(),
+                    kind,
+                    records,
+                    "checkpoint Managed namespace",
+                )?);
             }
         }
+        output.extend(self.persist_sections(encoded).await?);
+        output.sort_by(|left, right| {
+            left.kind
+                .cmp(&right.kind)
+                .then_with(|| left.first_key.cmp(&right.first_key))
+        });
         validate_section_references(&output)?;
         Ok(output)
-    }
-
-    async fn read_section_records(
-        &self,
-        reference: &SectionReference,
-        action: &'static str,
-    ) -> Result<Vec<SectionRecord>, ManagedError> {
-        let bytes = self
-            .operator
-            .read(&section_key(&reference.id))
-            .await
-            .map_err(|error| {
-                if error.kind() == ErrorKind::NotFound {
-                    corrupt(action, "checkpoint section is missing")
-                } else {
-                    unavailable(action)
-                }
-            })?
-            .to_bytes();
-        section::decode(reference, *self.volume_id.as_bytes(), &bytes, action)
     }
 
     async fn persist_sections(
         &self,
         encoded: Vec<section::Encoded>,
     ) -> Result<Vec<StoredSectionReference>, ManagedError> {
-        let mut references = Vec::with_capacity(encoded.len());
-        for section in encoded {
-            self.ensure_immutable(&section_key(&section.reference.id), &section.bytes)
-                .await?;
-            references.push(section.reference.into());
+        let Some(object) = section::concatenate(encoded, "checkpoint Managed namespace")? else {
+            return Ok(Vec::new());
+        };
+        self.ensure_immutable(&section_key(&object.id), &object.bytes)
+            .await?;
+        Ok(object
+            .sections
+            .into_iter()
+            .map(|located| StoredSectionReference::from_located(object.id, located))
+            .collect())
+    }
+
+    async fn read_checkpoint_sections(
+        &self,
+        stored: &[StoredSectionReference],
+        action: &'static str,
+    ) -> Result<Vec<(StoredSectionReference, Vec<SectionRecord>)>, ManagedError> {
+        let mut objects = BTreeMap::<[u8; 32], Vec<StoredSectionReference>>::new();
+        for section in stored {
+            objects
+                .entry(section.object)
+                .or_default()
+                .push(section.clone());
         }
-        Ok(references)
+        let mut decoded = Vec::with_capacity(stored.len());
+        for (object, mut sections) in objects {
+            sections.sort_by_key(|section| section.offset);
+            let first = sections
+                .first()
+                .expect("section object is non-empty")
+                .offset;
+            let end = sections.iter().try_fold(first, |end, section| {
+                section
+                    .offset
+                    .checked_add(section.encoded_bytes)
+                    .map(|section_end| end.max(section_end))
+                    .ok_or_else(|| corrupt(action, "checkpoint section range is invalid"))
+            })?;
+            let bytes = self
+                .operator
+                .read_with(&section_key(&object))
+                .range(first..end)
+                .await
+                .map_err(|error| {
+                    if error.kind() == ErrorKind::NotFound {
+                        corrupt(action, "checkpoint section data object is missing")
+                    } else {
+                        unavailable(action)
+                    }
+                })?
+                .to_bytes();
+            for section in sections {
+                let start = usize::try_from(section.offset - first)
+                    .map_err(|_| corrupt(action, "checkpoint section range is invalid"))?;
+                let length = usize::try_from(section.encoded_bytes)
+                    .map_err(|_| corrupt(action, "checkpoint section range is invalid"))?;
+                let section_end = start
+                    .checked_add(length)
+                    .filter(|section_end| *section_end <= bytes.len())
+                    .ok_or_else(|| corrupt(action, "checkpoint section range is invalid"))?;
+                let records = section::decode(
+                    &section.as_reference(),
+                    *self.volume_id.as_bytes(),
+                    &bytes[start..section_end],
+                    action,
+                )?;
+                decoded.push((section, records));
+            }
+        }
+        decoded.sort_by(|(left, _), (right, _)| {
+            left.kind
+                .cmp(&right.kind)
+                .then_with(|| left.first_key.cmp(&right.first_key))
+        });
+        Ok(decoded)
     }
 
     async fn read_snapshot(
@@ -859,12 +933,12 @@ impl ObjectNamespace {
         let mut directories = BTreeMap::new();
         let mut entries = Vec::new();
         let mut file_versions = BTreeMap::new();
-        for stored in checkpoint.sections {
+        for (stored, records) in self
+            .read_checkpoint_sections(&checkpoint.sections, "read Managed namespace")
+            .await?
+        {
             let reference = stored.as_reference();
-            for record in self
-                .read_section_records(&reference, "read Managed namespace")
-                .await?
-            {
+            for record in records {
                 match reference.kind {
                     NODE_SECTION => {
                         let stored: StoredNodeSection =
@@ -1442,6 +1516,8 @@ struct StoredCheckpoint {
 struct StoredSectionReference {
     kind: u8,
     id: [u8; 32],
+    object: [u8; 32],
+    offset: u64,
     first_key: Vec<u8>,
     last_key: Vec<u8>,
     records: u32,
@@ -1453,20 +1529,21 @@ struct CheckpointChanges {
     removed_directories: BTreeSet<[u8; 16]>,
 }
 
-impl From<SectionReference> for StoredSectionReference {
-    fn from(reference: SectionReference) -> Self {
+impl StoredSectionReference {
+    fn from_located(object: [u8; 32], located: section::Located) -> Self {
+        let reference = located.reference;
         Self {
             kind: reference.kind,
             id: reference.id,
+            object,
+            offset: located.offset,
             first_key: reference.first_key,
             last_key: reference.last_key,
             records: reference.records,
             encoded_bytes: reference.encoded_bytes,
         }
     }
-}
 
-impl StoredSectionReference {
     fn as_reference(&self) -> SectionReference {
         SectionReference {
             kind: self.kind,
@@ -1481,11 +1558,15 @@ impl StoredSectionReference {
 
 fn validate_section_references(sections: &[StoredSectionReference]) -> Result<(), ManagedError> {
     let mut previous: Option<&StoredSectionReference> = None;
+    let mut ranges = BTreeMap::<[u8; 32], Vec<(u64, u64)>>::new();
     for section in sections {
+        let end = section.offset.checked_add(section.encoded_bytes);
         if !matches!(
             section.kind,
             NODE_SECTION | DIRECTORY_SECTION | DIRECTORY_ENTRY_SECTION | FILE_VERSION_SECTION
         ) || section.records == 0
+            || section.encoded_bytes == 0
+            || end.is_none()
             || section.first_key > section.last_key
             || previous.is_some_and(|previous| {
                 previous.kind > section.kind
@@ -1497,7 +1578,20 @@ fn validate_section_references(sections: &[StoredSectionReference]) -> Result<()
                 "checkpoint section references are invalid",
             ));
         }
+        ranges
+            .entry(section.object)
+            .or_default()
+            .push((section.offset, end.expect("range end was validated")));
         previous = Some(section);
+    }
+    for object_ranges in ranges.values_mut() {
+        object_ranges.sort_unstable();
+        if object_ranges.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+            return Err(corrupt(
+                "read Managed namespace",
+                "checkpoint section ranges overlap",
+            ));
+        }
     }
     Ok(())
 }
@@ -2371,7 +2465,24 @@ mod tests {
                 .iter()
                 .any(|section| section.kind == DIRECTORY_ENTRY_SECTION)
         );
-        let missing = section_key(&checkpoint.sections[0].id);
+        assert!(
+            checkpoint
+                .sections
+                .iter()
+                .all(|section| section.object == checkpoint.sections[0].object)
+        );
+        let mut ranges = checkpoint
+            .sections
+            .iter()
+            .map(|section| (section.offset, section.encoded_bytes))
+            .collect::<Vec<_>>();
+        ranges.sort_unstable();
+        assert!(
+            ranges
+                .windows(2)
+                .all(|pair| pair[0].0 + pair[0].1 == pair[1].0)
+        );
+        let missing = section_key(&checkpoint.sections[0].object);
         operator.delete(&missing).await.unwrap();
         let checkpoint = namespace.checkpoint_full(&snapshot).await.unwrap();
         assert!(operator.stat(&missing).await.is_ok());
@@ -2435,12 +2546,12 @@ mod tests {
         assert!(!rewritten_ids.contains(&changed_section));
 
         let mut recovered = BTreeMap::new();
-        for stored in &rewritten {
-            for record in namespace
-                .read_section_records(&stored.as_reference(), "test")
-                .await
-                .unwrap()
-            {
+        for (_, records) in namespace
+            .read_checkpoint_sections(&rewritten, "test")
+            .await
+            .unwrap()
+        {
+            for record in records {
                 recovered.insert(record.key, record.value);
             }
         }
@@ -2487,13 +2598,12 @@ mod tests {
             .await
             .unwrap();
         let mut recovered = Vec::new();
-        for stored in &rewritten {
-            recovered.extend(
-                namespace
-                    .read_section_records(&stored.as_reference(), "test")
-                    .await
-                    .unwrap(),
-            );
+        for (_, records) in namespace
+            .read_checkpoint_sections(&rewritten, "test")
+            .await
+            .unwrap()
+        {
+            recovered.extend(records);
         }
         assert_eq!(recovered.len(), 60);
         assert!(
@@ -2619,7 +2729,7 @@ mod tests {
         let head = decode_head(&head).unwrap();
         let checkpoint = namespace.read_checkpoint(&head.checkpoint).await.unwrap();
         operator
-            .delete(&section_key(&checkpoint.sections[0].id))
+            .delete(&section_key(&checkpoint.sections[0].object))
             .await
             .unwrap();
         let error = namespace.recover(&head).await.unwrap_err();
