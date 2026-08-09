@@ -28,7 +28,9 @@ use crate::managed::metadata::namespace::{
     history_key,
 };
 use crate::managed::metadata::record::{RecordBackend, Revision};
-use crate::managed::{ManagedData, ManagedError, ManagedErrorKind, SegmentGcMaintenance};
+use crate::managed::{
+    ManagedData, ManagedError, ManagedErrorKind, ManagedVolume, SegmentGcMaintenance,
+};
 use opendal::Operator;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -43,21 +45,6 @@ pub struct BranchStore {
     pub(crate) volume_id: VolumeId,
     pub(crate) backend: RecordBackend,
     data: Operator,
-}
-
-/// A branch incarnation bound to the shared Managed namespace state machine.
-pub struct BoundNamespace(pub(crate) NamespaceStore);
-
-impl BoundNamespace {
-    pub fn binding(&self) -> &BranchBinding {
-        self.0
-            .binding()
-            .expect("a bound branch namespace has a branch identity")
-    }
-
-    pub fn volume_id(&self) -> VolumeId {
-        self.0.volume_id()
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -269,23 +256,25 @@ impl BranchStore {
         Ok(info(name.clone(), id, &head, registry.default_branch))
     }
 
-    pub async fn bind(&self, name: &BranchName) -> Result<BoundNamespace, ManagedError> {
+    pub async fn open(&self, name: &BranchName) -> Result<ManagedVolume, ManagedError> {
         let (registry, _) = self.registry().await?;
         let id = registry
             .branch_id(name)
-            .ok_or_else(|| not_found("bind Managed branch"))?;
-        Ok(BoundNamespace(self.namespace(BranchBinding {
+            .ok_or_else(|| not_found("open Managed branch"))?;
+        let namespace = self.namespace(BranchBinding {
             name: name.clone(),
             id,
-        })))
+        });
+        ManagedVolume::bound(self.data.clone(), namespace)
     }
 
-    pub async fn bind_default(&self) -> Result<BoundNamespace, ManagedError> {
+    pub async fn open_default(&self) -> Result<ManagedVolume, ManagedError> {
         let (registry, _) = self.registry().await?;
         let binding = registry
             .default_binding()
-            .ok_or_else(|| corrupt("bind default Managed branch", "default branch is missing"))?;
-        Ok(BoundNamespace(self.namespace(binding)))
+            .ok_or_else(|| corrupt("open default Managed branch", "default branch is missing"))?;
+        let namespace = self.namespace(binding);
+        ManagedVolume::bound(self.data.clone(), namespace)
     }
 
     pub async fn delete(&self, name: &BranchName) -> Result<(), ManagedError> {

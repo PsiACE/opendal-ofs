@@ -21,4 +21,4 @@ pub(crate) mod records;
 mod store;
 
 pub use records::{BranchInfo, BranchLifecycle, ForkPoint};
-pub use store::{BoundNamespace, BranchStore};
+pub use store::BranchStore;

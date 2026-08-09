@@ -205,14 +205,12 @@ async fn open_managed_volume(
     } = open_managed_context(config, alias, transfer_concurrency).await?;
     #[cfg(feature = "managed-branch")]
     if format.requires_extension(ofs::managed::ManagedExtension::BranchV1) {
-        let branches = metadata.branches(&format, data.clone())?;
-        let namespace = match branch {
-            Some(name) => branches.bind(&parse_branch_name(name)?).await?,
-            None => branches.bind_default().await?,
+        let branches = metadata.branches(&format, data)?;
+        let volume = match branch {
+            Some(name) => branches.open(&parse_branch_name(name)?).await?,
+            None => branches.open_default().await?,
         };
-        return metadata
-            .open_branch_volume(format, data, namespace)
-            .map_err(Into::into);
+        return Ok(volume);
     }
     if branch.is_some() {
         bail!("Managed volume does not enable branch/v1");

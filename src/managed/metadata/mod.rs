@@ -30,7 +30,7 @@ use record::RecordBackend;
 use superblock::SUPERBLOCK_KEY;
 
 #[cfg(feature = "managed-branch")]
-use super::extensions::branch::{BoundNamespace, BranchStore};
+use super::extensions::branch::BranchStore;
 use super::{ManagedError, ManagedVolume};
 /// The selected format and sole mutable-record authority for one Managed volume.
 pub struct ManagedMetadata {
@@ -103,26 +103,6 @@ impl ManagedMetadata {
         }
         let volume_id = format.volume_id();
         ManagedVolume::new(volume_id, data, self.backend.clone())
-    }
-
-    #[cfg(feature = "managed-branch")]
-    pub fn open_branch_volume(
-        &self,
-        format: ManagedFormat,
-        data: Operator,
-        namespace: BoundNamespace,
-    ) -> Result<ManagedVolume, ManagedError> {
-        self.require_backend_format(&format)?;
-        if !format.requires_extension(ManagedExtension::BranchV1)
-            || namespace.volume_id() != format.volume_id()
-        {
-            return Err(ManagedError::new(
-                super::ManagedErrorKind::Invalid,
-                "open Managed volume",
-                "branch namespace does not match the Managed format",
-            ));
-        }
-        ManagedVolume::bound(format.volume_id(), data, namespace.0)
     }
 
     #[cfg(feature = "managed-branch")]

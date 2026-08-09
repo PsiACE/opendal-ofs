@@ -39,7 +39,6 @@ use crate::filesystem::{
 
 #[derive(Clone)]
 pub struct ManagedVolume {
-    volume_id: VolumeId,
     namespace: NamespaceStore,
     data: ManagedData,
 }
@@ -63,7 +62,6 @@ impl ManagedVolume {
         backend: RecordBackend,
     ) -> Result<Self, ManagedError> {
         Ok(Self {
-            volume_id,
             namespace: NamespaceStore::new(volume_id, data_operator.clone(), backend),
             data: ManagedData::new(data_operator)?,
         })
@@ -71,12 +69,10 @@ impl ManagedVolume {
 
     #[cfg(feature = "managed-branch")]
     pub(crate) fn bound(
-        volume_id: VolumeId,
         data_operator: Operator,
         namespace: NamespaceStore,
     ) -> Result<Self, ManagedError> {
         Ok(Self {
-            volume_id,
             namespace,
             data: ManagedData::new(data_operator)?,
         })
@@ -171,13 +167,13 @@ impl Volume for ManagedVolume {
     type Observation = ManagedObservation;
 
     fn id(&self) -> VolumeId {
-        self.volume_id
+        self.namespace.volume_id()
     }
 
     fn authority(&self) -> AuthorityIdentity {
         self.namespace.binding().map_or_else(
-            || AuthorityIdentity::base(self.volume_id),
-            |binding| AuthorityIdentity::branch(self.volume_id, binding.clone()),
+            || AuthorityIdentity::base(self.id()),
+            |binding| AuthorityIdentity::branch(self.id(), binding.clone()),
         )
     }
 

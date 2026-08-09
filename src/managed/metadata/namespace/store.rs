@@ -133,7 +133,6 @@ impl NamespaceStore {
         }
     }
 
-    #[cfg(feature = "managed-branch")]
     pub(crate) fn volume_id(&self) -> VolumeId {
         self.volume_id
     }
