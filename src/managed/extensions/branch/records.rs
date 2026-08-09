@@ -173,7 +173,7 @@ impl StoredNamespaceState {
 pub(crate) struct StoredCheckpoint {
     pub(crate) major: u16,
     pub(crate) volume_id: [u8; 16],
-    snapshot: StoredSnapshot,
+    pub(crate) snapshot: StoredSnapshot,
     pub(crate) results: Vec<StoredCommittedResult>,
 }
 
@@ -385,12 +385,12 @@ impl StoredHistory {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct StoredSnapshot {
-    cursor: StoredCursor,
-    root: [u8; 16],
-    nodes: Vec<StoredNode>,
-    directories: Vec<StoredDirectory>,
-    file_versions: Vec<StoredFileVersion>,
+pub(crate) struct StoredSnapshot {
+    pub(crate) cursor: StoredCursor,
+    pub(crate) root: [u8; 16],
+    pub(crate) nodes: Vec<StoredNode>,
+    pub(crate) directories: Vec<StoredDirectory>,
+    pub(crate) file_versions: Vec<StoredFileVersion>,
 }
 
 impl StoredSnapshot {
@@ -565,12 +565,12 @@ impl StoredDelta {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct StoredNode {
-    id: [u8; 16],
-    generation: u64,
-    kind: StoredNodeKind,
-    executable: bool,
-    file_version: Option<[u8; 32]>,
+pub(crate) struct StoredNode {
+    pub(crate) id: [u8; 16],
+    pub(crate) generation: u64,
+    pub(crate) kind: StoredNodeKind,
+    pub(crate) executable: bool,
+    pub(crate) file_version: Option<[u8; 32]>,
 }
 
 impl StoredNode {
@@ -599,7 +599,7 @@ impl StoredNode {
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum StoredNodeKind {
+pub(crate) enum StoredNodeKind {
     Directory,
     RegularFile,
 }
@@ -624,10 +624,10 @@ impl From<StoredNodeKind> for NodeKind {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct StoredDirectory {
-    node: [u8; 16],
-    generation: u64,
-    entries: BTreeMap<String, StoredDirectoryEntry>,
+pub(crate) struct StoredDirectory {
+    pub(crate) node: [u8; 16],
+    pub(crate) generation: u64,
+    pub(crate) entries: BTreeMap<String, StoredDirectoryEntry>,
 }
 
 impl StoredDirectory {
@@ -658,9 +658,9 @@ impl StoredDirectory {
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct StoredDirectoryEntry {
-    node: [u8; 16],
-    kind: StoredNodeKind,
+pub(crate) struct StoredDirectoryEntry {
+    pub(crate) node: [u8; 16],
+    pub(crate) kind: StoredNodeKind,
 }
 
 impl From<DirectoryEntry> for StoredDirectoryEntry {
@@ -683,11 +683,11 @@ impl From<StoredDirectoryEntry> for DirectoryEntry {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct StoredFileVersion {
-    id: [u8; 32],
-    logical_size: u64,
-    logical_digest: [u8; 32],
-    extent_map: ExtentMap,
+pub(crate) struct StoredFileVersion {
+    pub(crate) id: [u8; 32],
+    pub(crate) logical_size: u64,
+    pub(crate) logical_digest: [u8; 32],
+    pub(crate) extent_map: ExtentMap,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -813,6 +813,8 @@ pub(crate) struct StoredBranchHead {
     pub(crate) state: Option<StoredNamespaceState>,
     pub(crate) maintenance_epoch: u64,
     pub(crate) maintenance_active: bool,
+    #[serde(default)]
+    pub(crate) maintenance_owner: Option<[u8; 16]>,
 }
 
 impl StoredBranchHead {
@@ -825,6 +827,7 @@ impl StoredBranchHead {
             state: None,
             maintenance_epoch: 0,
             maintenance_active: false,
+            maintenance_owner: None,
         }
     }
 
@@ -839,7 +842,9 @@ impl StoredBranchHead {
         {
             return Err(corrupt("branch HEAD identity is invalid"));
         }
-        if self.maintenance_active && self.maintenance_epoch == 0 {
+        if self.maintenance_active
+            && (self.maintenance_epoch == 0 || self.maintenance_owner.is_none())
+        {
             return Err(corrupt("branch HEAD maintenance state is invalid"));
         }
         if let Some(state) = &self.state {
@@ -864,6 +869,8 @@ pub(crate) struct StoredBranchRegistry {
     pub(crate) branches: BTreeMap<BranchName, [u8; 16]>,
     pub(crate) maintenance_epoch: u64,
     pub(crate) maintenance_active: bool,
+    #[serde(default)]
+    pub(crate) maintenance_owner: Option<[u8; 16]>,
 }
 
 impl StoredBranchRegistry {
@@ -879,6 +886,7 @@ impl StoredBranchRegistry {
             branches: BTreeMap::from([(default_name, *default_id.as_bytes())]),
             maintenance_epoch: 0,
             maintenance_active: false,
+            maintenance_owner: None,
         }
     }
 
@@ -891,7 +899,8 @@ impl StoredBranchRegistry {
                 .branches
                 .values()
                 .any(|branch| branch == &self.default_branch)
-            || self.maintenance_active && self.maintenance_epoch == 0
+            || self.maintenance_active
+                && (self.maintenance_epoch == 0 || self.maintenance_owner.is_none())
         {
             return Err(corrupt("branch registry is invalid"));
         }

@@ -23,6 +23,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sha2::{Digest as _, Sha256};
 
+use super::record_set::{CheckpointRoot, PartRef, PendingCheckpoint};
 use super::records::{
     BranchInfo, BranchLifecycle, ForkPoint, MAX_TAIL_BYTES, MAX_TAIL_TRANSACTIONS,
     StoredBranchHead, StoredBranchRegistry, StoredCheckpoint, StoredCommittedResult, StoredHistory,
@@ -40,10 +41,14 @@ const REGISTRY_KEY: &str = ".ofs/managed/metadata/v1/extensions/branch/v1/regist
 const REGISTRY_MAGIC: &[u8; 8] = b"OFS1BRG1";
 const HEAD_MAGIC: &[u8; 8] = b"OFS1BRH1";
 const CHECKPOINT_MAGIC: &[u8; 8] = b"OFS1BRC1";
+const CHECKPOINT_PART_MAGIC: &[u8; 8] = b"OFS1BRP1";
 const HISTORY_MAGIC: &[u8; 8] = b"OFS1BRY1";
-const MAX_REGISTRY_BYTES: usize = 1024 * 1024;
+// The registry remains the small mutable branch authority. Its actual backend
+// write is the limit; unlike checkpoint data, it has no format-level byte cap.
+const MAX_REGISTRY_BYTES: usize = usize::MAX;
 const MAX_HEAD_BYTES: usize = 256 * 1024;
-const MAX_CHECKPOINT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_CHECKPOINT_ROOT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_CHECKPOINT_PART_BYTES: usize = 2 * 1024 * 1024;
 const MAX_HISTORY_BYTES: usize = 512 * 1024;
 
 #[derive(Clone)]
@@ -69,12 +74,24 @@ pub struct ObjectBranchObservation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ObjectBranchGcFence {
     epoch: u64,
+    owner: [u8; 16],
+}
+
+impl ObjectBranchGcFence {
+    fn owns_registry(self, registry: &StoredBranchRegistry) -> bool {
+        registry.maintenance_epoch == self.epoch && registry.maintenance_owner == Some(self.owner)
+    }
+
+    fn owns_head(self, head: &StoredBranchHead) -> bool {
+        head.maintenance_epoch == self.epoch && head.maintenance_owner == Some(self.owner)
+    }
 }
 
 struct ObjectGcRoots {
     snapshots: Vec<NamespaceSnapshot>,
     heads: BTreeSet<String>,
     checkpoints: BTreeSet<String>,
+    checkpoint_parts: BTreeSet<String>,
     histories: BTreeSet<String>,
 }
 
@@ -225,6 +242,7 @@ impl ObjectBoundNamespace {
             state: Some(state),
             maintenance_epoch: head.maintenance_epoch,
             maintenance_active: head.maintenance_active,
+            maintenance_owner: head.maintenance_owner,
         };
         let bytes = encode(HEAD_MAGIC, &next, MAX_HEAD_BYTES, "publish Managed branch")?;
         match self
@@ -573,7 +591,9 @@ impl ObjectBranchStore {
             registry.maintenance_active = true;
             let fence = ObjectBranchGcFence {
                 epoch: registry.maintenance_epoch,
+                owner: *OperationId::generate().as_bytes(),
             };
+            registry.maintenance_owner = Some(fence.owner);
             let bytes = encode(
                 REGISTRY_MAGIC,
                 &registry,
@@ -616,11 +636,12 @@ impl ObjectBranchStore {
                             .await?;
                         continue 'registry;
                     }
-                    if head.maintenance_active && head.maintenance_epoch == fence.epoch {
+                    if head.maintenance_active && fence.owns_head(&head) {
                         break;
                     }
                     head.maintenance_epoch = fence.epoch;
                     head.maintenance_active = true;
+                    head.maintenance_owner = Some(fence.owner);
                     let bytes = encode(HEAD_MAGIC, &head, MAX_HEAD_BYTES, action)?;
                     match self
                         .replace(&head_key(branch_id), &revision, bytes, action)
@@ -634,7 +655,7 @@ impl ObjectBranchStore {
             }
 
             let (observed, _) = self.registry().await?;
-            if !observed.maintenance_active || observed.maintenance_epoch != fence.epoch {
+            if !observed.maintenance_active || !fence.owns_registry(&observed) {
                 return Err(conflict(action, "GC fence changed while fixing roots"));
             }
             if observed.branches != fixed.branches {
@@ -656,7 +677,7 @@ impl ObjectBranchStore {
     ) -> Result<StoredBranchRegistry, ManagedError> {
         loop {
             let (mut registry, revision) = self.registry().await?;
-            if !registry.maintenance_active || registry.maintenance_epoch != fence.epoch {
+            if !registry.maintenance_active || !fence.owns_registry(&registry) {
                 return Err(conflict(action, "GC fence changed while fixing roots"));
             }
             if !remove_sealed_incarnation(&mut registry, &name, branch_id, action)? {
@@ -673,7 +694,7 @@ impl ObjectBranchStore {
 
     async fn gc_roots(&self, fence: ObjectBranchGcFence) -> Result<ObjectGcRoots, ManagedError> {
         let (registry, registry_revision) = self.registry().await?;
-        if !registry.maintenance_active || registry.maintenance_epoch != fence.epoch {
+        if !registry.maintenance_active || !fence.owns_registry(&registry) {
             return Err(conflict(
                 "mark Managed branch GC roots",
                 "GC fence does not match the registry",
@@ -683,6 +704,7 @@ impl ObjectBranchStore {
             snapshots: Vec::new(),
             heads: BTreeSet::new(),
             checkpoints: BTreeSet::new(),
+            checkpoint_parts: BTreeSet::new(),
             histories: BTreeSet::new(),
         };
         for branch in registry.branches.values() {
@@ -696,7 +718,7 @@ impl ObjectBranchStore {
             })?;
             if head.lifecycle != BranchLifecycle::Active
                 || !head.maintenance_active
-                || head.maintenance_epoch != fence.epoch
+                || !fence.owns_head(&head)
             {
                 return Err(conflict(
                     "mark Managed branch GC roots",
@@ -707,21 +729,30 @@ impl ObjectBranchStore {
                 continue;
             };
             roots.checkpoints.insert(checkpoint_key(state.checkpoint));
+            roots.checkpoint_parts.extend(
+                self.read_checkpoint_root(state.checkpoint)
+                    .await?
+                    .parts
+                    .into_iter()
+                    .map(|part| checkpoint_part_key(part.id)),
+            );
             roots
                 .snapshots
                 .extend(self.snapshots_for_state(&state).await?);
             let mut history_id = state.previous_history;
             let mut chain = BTreeSet::new();
             while let Some(id) = history_id {
-                if !chain.insert(id) {
-                    return Err(corrupt(
-                        "mark Managed branch GC roots",
-                        "branch history contains a cycle",
-                    ));
-                }
+                visit_history(&mut chain, id, "mark Managed branch GC roots")?;
                 roots.histories.insert(history_key(id));
                 let history = self.read_history(id).await?;
                 roots.checkpoints.insert(checkpoint_key(history.checkpoint));
+                roots.checkpoint_parts.extend(
+                    self.read_checkpoint_root(history.checkpoint)
+                        .await?
+                        .parts
+                        .into_iter()
+                        .map(|part| checkpoint_part_key(part.id)),
+                );
                 let historical = StoredNamespaceState {
                     checkpoint: history.checkpoint,
                     checkpoint_cursor: history.checkpoint_cursor,
@@ -737,6 +768,7 @@ impl ObjectBranchStore {
         let (after, after_revision) = self.registry().await?;
         if !after.maintenance_active
             || after.maintenance_epoch != fence.epoch
+            || after.maintenance_owner != Some(fence.owner)
             || after_revision != registry_revision
             || after.branches != registry.branches
         {
@@ -752,7 +784,7 @@ impl ObjectBranchStore {
         let branches = loop {
             let (mut registry, revision) = self.registry().await?;
             if !registry.maintenance_active {
-                if registry.maintenance_epoch != fence.epoch {
+                if !fence.owns_registry(&registry) {
                     return Err(conflict(
                         "finish Managed branch GC",
                         "GC fence does not match the registry",
@@ -760,7 +792,7 @@ impl ObjectBranchStore {
                 }
                 break registry.branches;
             }
-            if registry.maintenance_epoch != fence.epoch {
+            if !fence.owns_registry(&registry) {
                 return Err(conflict(
                     "finish Managed branch GC",
                     "GC fence does not match the registry",
@@ -790,7 +822,7 @@ impl ObjectBranchStore {
                 let Some((mut head, revision)) = self.read_head(branch_id).await? else {
                     break;
                 };
-                if !head.maintenance_active || head.maintenance_epoch != fence.epoch {
+                if !head.maintenance_active || !fence.owns_head(&head) {
                     break;
                 }
                 head.maintenance_active = false;
@@ -834,7 +866,7 @@ impl ObjectBranchStore {
         &self,
         data_operator: Operator,
     ) -> Result<SegmentGcMaintenance, ManagedError> {
-        let (registry, _) = self.registry().await?;
+        let (registry, revision) = self.registry().await?;
         if !registry.maintenance_active {
             return Err(conflict(
                 "resume Managed branch GC",
@@ -843,8 +875,26 @@ impl ObjectBranchStore {
         }
         let fence = ObjectBranchGcFence {
             epoch: registry.maintenance_epoch,
+            owner: *OperationId::generate().as_bytes(),
         };
-        self.fix_gc_heads(&registry, fence, "resume Managed branch GC")
+        let mut resumed = registry.clone();
+        resumed.maintenance_owner = Some(fence.owner);
+        let bytes = encode(
+            REGISTRY_MAGIC,
+            &resumed,
+            MAX_REGISTRY_BYTES,
+            "resume Managed branch GC",
+        )?;
+        if !self
+            .replace(REGISTRY_KEY, &revision, bytes, "resume Managed branch GC")
+            .await?
+        {
+            return Err(conflict(
+                "resume Managed branch GC",
+                "branch registry changed",
+            ));
+        }
+        self.fix_gc_heads(&resumed, fence, "resume Managed branch GC")
             .await?;
         self.collect_with_fence(data_operator, fence).await
     }
@@ -877,12 +927,16 @@ impl ObjectBranchStore {
         let checkpoints = self
             .metadata_candidates(&format!("{ROOT}/checkpoints/sha256/"), 32)
             .await?;
+        let checkpoint_parts = self
+            .metadata_candidates(&format!("{ROOT}/checkpoint-parts/sha256/"), 32)
+            .await?;
         let histories = self
             .metadata_candidates(&format!("{ROOT}/history/sha256/"), 32)
             .await?;
         let unreachable = heads
             .difference(&roots.heads)
             .chain(checkpoints.difference(&roots.checkpoints))
+            .chain(checkpoint_parts.difference(&roots.checkpoint_parts))
             .chain(histories.difference(&roots.histories))
             .cloned()
             .collect::<Vec<_>>();
@@ -923,7 +977,7 @@ impl ObjectBranchStore {
         action: &'static str,
     ) -> Result<(), ManagedError> {
         let (registry, _) = self.registry().await?;
-        if registry.maintenance_active && registry.maintenance_epoch == fence.epoch {
+        if registry.maintenance_active && fence.owns_registry(&registry) {
             Ok(())
         } else {
             Err(conflict(action, "GC fence changed during metadata sweep"))
@@ -997,6 +1051,7 @@ impl ObjectBranchStore {
             state,
             maintenance_epoch: 0,
             maintenance_active: false,
+            maintenance_owner: None,
         };
         let bytes = encode(
             HEAD_MAGIC,
@@ -1058,7 +1113,9 @@ impl ObjectBranchStore {
         mut history_id: Option<[u8; 32]>,
         sequence: u64,
     ) -> Result<Option<StoredNamespaceState>, ManagedError> {
+        let mut chain = BTreeSet::new();
         while let Some(id) = history_id {
+            visit_history(&mut chain, id, "read Managed branch history")?;
             let history = self.read_history(id).await?;
             if let Some(state) = history.state_at(sequence) {
                 return Ok(Some(state));
@@ -1068,7 +1125,7 @@ impl ObjectBranchStore {
         Ok(None)
     }
 
-    async fn read_checkpoint(&self, id: [u8; 32]) -> Result<StoredCheckpoint, ManagedError> {
+    async fn read_checkpoint_root(&self, id: [u8; 32]) -> Result<CheckpointRoot, ManagedError> {
         let bytes = self
             .operator
             .read(&checkpoint_key(id))
@@ -1087,22 +1144,83 @@ impl ObjectBranchStore {
                 "branch checkpoint identity is invalid",
             ));
         }
-        decode(
+        let root: CheckpointRoot = decode(
             CHECKPOINT_MAGIC,
             &bytes,
-            MAX_CHECKPOINT_BYTES,
+            MAX_CHECKPOINT_ROOT_BYTES,
             "read Managed branch",
-        )
+        )?;
+        if root.volume_id != *self.volume_id.as_bytes() {
+            return Err(corrupt(
+                "read Managed branch",
+                "branch checkpoint volume is invalid",
+            ));
+        }
+        Ok(root)
+    }
+
+    async fn read_checkpoint(&self, id: [u8; 32]) -> Result<StoredCheckpoint, ManagedError> {
+        let root = self.read_checkpoint_root(id).await?;
+        let mut parts = Vec::with_capacity(root.parts.len());
+        for reference in &root.parts {
+            let bytes = self
+                .operator
+                .read(&checkpoint_part_key(reference.id))
+                .await
+                .map_err(|error| {
+                    if error.kind() == ErrorKind::NotFound {
+                        corrupt("read Managed branch", "branch checkpoint part is missing")
+                    } else {
+                        unavailable("read Managed branch")
+                    }
+                })?
+                .to_bytes();
+            if Sha256::digest(&bytes).as_slice() != reference.id {
+                return Err(corrupt(
+                    "read Managed branch",
+                    "branch checkpoint part identity is invalid",
+                ));
+            }
+            parts.push(decode(
+                CHECKPOINT_PART_MAGIC,
+                &bytes,
+                MAX_CHECKPOINT_PART_BYTES,
+                "read Managed branch",
+            )?);
+        }
+        root.recover(parts)
     }
 
     async fn write_checkpoint(
         &self,
         checkpoint: &StoredCheckpoint,
     ) -> Result<[u8; 32], ManagedError> {
+        let pending = PendingCheckpoint::from_checkpoint(checkpoint)?;
+        let mut references = Vec::with_capacity(pending.parts.len());
+        for part in &pending.parts {
+            let bytes = encode(
+                CHECKPOINT_PART_MAGIC,
+                part,
+                MAX_CHECKPOINT_PART_BYTES,
+                "checkpoint Managed branch",
+            )?;
+            let id: [u8; 32] = Sha256::digest(&bytes).into();
+            self.ensure_immutable(
+                &checkpoint_part_key(id),
+                &bytes,
+                "checkpoint Managed branch",
+            )
+            .await?;
+            references.push(PartRef {
+                id,
+                records: part.records.len() as u32,
+            });
+        }
+        let root = pending.finish(references)?;
         let bytes = encode(
             CHECKPOINT_MAGIC,
-            checkpoint,
-            MAX_CHECKPOINT_BYTES,
+            &root,
+            MAX_CHECKPOINT_ROOT_BYTES,
             "checkpoint Managed branch",
         )?;
         let id: [u8; 32] = Sha256::digest(&bytes).into();
@@ -1304,6 +1422,10 @@ fn checkpoint_key(id: [u8; 32]) -> String {
     format!("{ROOT}/checkpoints/sha256/{}.ofs", hex(&id))
 }
 
+fn checkpoint_part_key(id: [u8; 32]) -> String {
+    format!("{ROOT}/checkpoint-parts/sha256/{}.ofs", hex(&id))
+}
+
 fn history_key(id: [u8; 32]) -> String {
     format!("{ROOT}/history/sha256/{}.ofs", hex(&id))
 }
@@ -1401,9 +1523,178 @@ fn unavailable(action: &'static str) -> ManagedError {
     )
 }
 
+fn visit_history(
+    chain: &mut BTreeSet<[u8; 32]>,
+    id: [u8; 32],
+    action: &'static str,
+) -> Result<(), ManagedError> {
+    if chain.insert(id) {
+        Ok(())
+    } else {
+        Err(corrupt(action, "branch history contains a cycle"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
+    use opendal::services::Memory;
+
+    use crate::filesystem::{DirectoryEntry, NodeAttributes, NodeKind};
+    use crate::managed::metadata::namespace::{
+        DirectoryRecord, NamespaceSnapshot, NodeRecord, managed_generation,
+    };
+
+    fn checkpoint_snapshot(entries: usize) -> NamespaceSnapshot {
+        let volume_id = VolumeId::from_bytes([9; 16]);
+        let root = crate::filesystem::NodeId::from_bytes([8; 16]);
+        let operation = OperationId::from_bytes([7; 16]);
+        let cursor = ChangeCursor::at(std::num::NonZeroU64::new(1).unwrap(), operation);
+        let entries = (0..entries)
+            .map(|index| {
+                (
+                    format!("{index:08}-{}", "x".repeat(96)),
+                    DirectoryEntry {
+                        node: root,
+                        kind: NodeKind::Directory,
+                    },
+                )
+            })
+            .collect();
+        NamespaceSnapshot {
+            volume_id,
+            cursor,
+            root,
+            nodes: BTreeMap::from([(
+                root,
+                NodeRecord {
+                    id: root,
+                    generation: managed_generation(1),
+                    kind: NodeKind::Directory,
+                    attributes: NodeAttributes::default(),
+                    file_version: None,
+                },
+            )]),
+            directories: BTreeMap::from([(
+                root,
+                DirectoryRecord {
+                    node: root,
+                    generation: managed_generation(1),
+                    entries,
+                },
+            )]),
+            file_versions: BTreeMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_parts_round_trip_and_a_missing_part_is_corrupt() {
+        let snapshot = checkpoint_snapshot(5_000);
+        let operator = Operator::new(Memory::default()).unwrap().finish();
+        let store = ObjectBranchStore {
+            volume_id: snapshot.volume_id,
+            operator: operator.clone(),
+        };
+        let checkpoint = StoredCheckpoint::new(&snapshot, BTreeMap::new()).unwrap();
+        let id = store.write_checkpoint(&checkpoint).await.unwrap();
+        let root = store.read_checkpoint_root(id).await.unwrap();
+        assert!(root.parts.len() > 1);
+        let recovered = store
+            .read_checkpoint(id)
+            .await
+            .unwrap()
+            .recover(snapshot.volume_id)
+            .unwrap()
+            .0;
+        assert_eq!(recovered, snapshot);
+
+        operator
+            .delete(&checkpoint_part_key(root.parts[0].id))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.read_checkpoint(id).await.unwrap_err().kind(),
+            ManagedErrorKind::Corrupt
+        );
+    }
+
+    #[test]
+    fn durable_takeover_revokes_the_previous_gc_owner() {
+        let volume = VolumeId::from_bytes([1; 16]);
+        let branch = BranchId::from_bytes([2; 16]);
+        let main = BranchName::parse("main").unwrap();
+        let old = ObjectBranchGcFence {
+            epoch: 1,
+            owner: [3; 16],
+        };
+        let current = ObjectBranchGcFence {
+            epoch: 1,
+            owner: [4; 16],
+        };
+        let mut registry = StoredBranchRegistry::initial(volume, main, branch);
+        registry.maintenance_epoch = current.epoch;
+        registry.maintenance_active = true;
+        registry.maintenance_owner = Some(current.owner);
+
+        let bytes = encode(
+            REGISTRY_MAGIC,
+            &registry,
+            MAX_REGISTRY_BYTES,
+            "test branch GC",
+        )
+        .unwrap();
+        let recovered: StoredBranchRegistry =
+            decode(REGISTRY_MAGIC, &bytes, MAX_REGISTRY_BYTES, "test branch GC").unwrap();
+        assert!(!old.owns_registry(&recovered));
+        assert!(current.owns_registry(&recovered));
+    }
+
+    #[test]
+    fn registry_authority_has_no_format_level_one_mib_limit() {
+        let volume = VolumeId::from_bytes([1; 16]);
+        let default = BranchId::from_bytes([2; 16]);
+        let mut registry =
+            StoredBranchRegistry::initial(volume, BranchName::parse("main").unwrap(), default);
+        for index in 0_u64..40_000 {
+            let mut id = [0; 16];
+            id[..8].copy_from_slice(&index.to_be_bytes());
+            id[8..].copy_from_slice(&index.to_be_bytes());
+            registry
+                .branches
+                .insert(BranchName::parse(format!("branch-{index:08}")).unwrap(), id);
+        }
+
+        let bytes = encode(
+            REGISTRY_MAGIC,
+            &registry,
+            MAX_REGISTRY_BYTES,
+            "test large branch registry",
+        )
+        .unwrap();
+        assert!(bytes.len() > 1024 * 1024);
+        let recovered: StoredBranchRegistry = decode(
+            REGISTRY_MAGIC,
+            &bytes,
+            MAX_REGISTRY_BYTES,
+            "test large branch registry",
+        )
+        .unwrap();
+        assert_eq!(recovered.branches.len(), registry.branches.len());
+    }
+
+    #[test]
+    fn repeated_history_identity_is_a_cycle() {
+        let mut chain = BTreeSet::new();
+        visit_history(&mut chain, [1; 32], "test branch history").unwrap();
+        assert_eq!(
+            visit_history(&mut chain, [1; 32], "test branch history")
+                .unwrap_err()
+                .kind(),
+            ManagedErrorKind::Corrupt
+        );
+    }
 
     #[test]
     fn sealed_cleanup_is_exact_and_preserves_a_replacement() {

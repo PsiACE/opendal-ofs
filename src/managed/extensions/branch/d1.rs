@@ -25,6 +25,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
+use super::record_set::{CheckpointPart, CheckpointRoot, PartRef, PendingCheckpoint};
 use super::records::{
     BranchInfo, BranchLifecycle, ForkPoint, StoredBranchHead, StoredBranchRegistry, StoredChange,
     StoredCheckpoint, StoredCommittedResult, StoredHistory, StoredNamespaceState, info,
@@ -42,13 +43,18 @@ use crate::managed::{
 const REGISTRY: &str = "ofs_managed_branch_v1_registry";
 const HEADS: &str = "ofs_managed_branch_v1_heads";
 const CHECKPOINTS: &str = "ofs_managed_branch_v1_checkpoints";
+const CHECKPOINT_PARTS: &str = "ofs_managed_branch_v1_checkpoint_parts";
 const HISTORY: &str = "ofs_managed_branch_v1_history";
-const SCHEMA_RESULTS: usize = 4;
-const MAX_REGISTRY_BYTES: usize = 1024 * 1024;
-const MAX_HEAD_BYTES: usize = 1024 * 1024;
-const MAX_CHECKPOINT_BYTES: usize = 64 * 1024 * 1024;
-const MAX_HISTORY_BYTES: usize = 1024 * 1024;
-const CHECKPOINT_PART_BYTES: usize = 512 * 1024;
+const SCHEMA_RESULTS: usize = 5;
+// D1 imposes this value boundary. It is a provider constraint, not a separate
+// branch-format policy; checkpoint contents are split before reaching it.
+const MAX_D1_VALUE_BYTES: usize = 2_000_000;
+const MAX_REGISTRY_BYTES: usize = MAX_D1_VALUE_BYTES;
+const MAX_HEAD_BYTES: usize = MAX_D1_VALUE_BYTES;
+const MAX_CHECKPOINT_ROOT_BYTES: usize = MAX_D1_VALUE_BYTES;
+const MAX_CHECKPOINT_PART_BYTES: usize = MAX_D1_VALUE_BYTES;
+const MAX_HISTORY_BYTES: usize = MAX_D1_VALUE_BYTES;
+const CHECKPOINT_READ_PAGE: usize = 32;
 const METADATA_PAGE_SIZE: usize = 1000;
 const MAX_DELETE_IDS_BYTES: usize = 96 * 1024;
 
@@ -76,6 +82,17 @@ pub struct D1BranchObservation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct D1BranchGcFence {
     epoch: u64,
+    owner: [u8; 16],
+}
+
+impl D1BranchGcFence {
+    fn owns_registry(self, registry: &StoredBranchRegistry) -> bool {
+        registry.maintenance_epoch == self.epoch && registry.maintenance_owner == Some(self.owner)
+    }
+
+    fn owns_head(self, head: &StoredBranchHead) -> bool {
+        head.maintenance_epoch == self.epoch && head.maintenance_owner == Some(self.owner)
+    }
 }
 
 impl D1BoundNamespace {
@@ -236,6 +253,7 @@ impl D1BoundNamespace {
             state: Some(state),
             maintenance_epoch: head.maintenance_epoch,
             maintenance_active: head.maintenance_active,
+            maintenance_owner: head.maintenance_owner,
         };
         match self
             .store
@@ -345,6 +363,7 @@ struct D1GcRoots {
     snapshots: Vec<NamespaceSnapshot>,
     heads: BTreeSet<String>,
     checkpoints: BTreeSet<String>,
+    checkpoint_parts: BTreeSet<String>,
     histories: BTreeSet<String>,
 }
 
@@ -381,7 +400,7 @@ impl D1BranchStore {
             ),
             statement(
                 format!(
-                    "INSERT OR IGNORE INTO {REGISTRY} (store_key, volume_id, revision, maintenance_epoch, maintenance_state, record_json) VALUES (?, ?, 1, 0, 'idle', ?)"
+                    "INSERT OR IGNORE INTO {REGISTRY} (store_key, volume_id, revision, maintenance_epoch, maintenance_state, maintenance_owner, record_json) VALUES (?, ?, 1, 0, 'idle', NULL, ?)"
                 ),
                 vec![
                     self.store_key().into(),
@@ -391,7 +410,7 @@ impl D1BranchStore {
             ),
             statement(
                 format!(
-                    "SELECT revision, volume_id, maintenance_epoch, maintenance_state, record_json FROM {REGISTRY} WHERE store_key = ?"
+                    "SELECT revision, volume_id, maintenance_epoch, maintenance_state, maintenance_owner, record_json FROM {REGISTRY} WHERE store_key = ?"
                 ),
                 vec![self.store_key().into()],
             ),
@@ -541,6 +560,7 @@ impl D1BranchStore {
             state: target_state,
             maintenance_epoch: source.maintenance_epoch,
             maintenance_active: source.maintenance_active,
+            maintenance_owner: source.maintenance_owner,
         };
         target.validate(self.volume_id, target_id)?;
         registry
@@ -731,14 +751,17 @@ impl D1BranchStore {
             .checked_add(1)
             .ok_or_else(|| invalid("begin Managed branch GC", "maintenance epoch is exhausted"))?;
         registry.maintenance_active = true;
+        let owner = *OperationId::generate().as_bytes();
+        registry.maintenance_owner = Some(owner);
         let registry_json = encode(&registry, MAX_REGISTRY_BYTES, "begin Managed branch GC")?;
         let mut batch = schema_statements();
         batch.push(statement(
             format!(
-                "UPDATE {REGISTRY} SET revision = revision + 1, maintenance_epoch = ?, maintenance_state = 'sweeping', record_json = ? WHERE store_key = ? AND revision = ? AND maintenance_state = 'idle' RETURNING maintenance_epoch"
+                "UPDATE {REGISTRY} SET revision = revision + 1, maintenance_epoch = ?, maintenance_state = 'sweeping', maintenance_owner = ?, record_json = ? WHERE store_key = ? AND revision = ? AND maintenance_state = 'idle' RETURNING maintenance_epoch"
             ),
             vec![
                 sqlite_integer(registry.maintenance_epoch, "begin Managed branch GC")?.into(),
+                encode_owner(owner).into(),
                 registry_json.into(),
                 self.store_key().into(),
                 sqlite_integer(registry_revision, "begin Managed branch GC")?.into(),
@@ -747,9 +770,13 @@ impl D1BranchStore {
         let results = self.session.query(batch, "begin Managed branch GC").await?;
         let changed = rows(&results, SCHEMA_RESULTS, "begin Managed branch GC")?;
         if let [row] = changed {
-            return Ok(D1BranchGcFence {
+            let fence = D1BranchGcFence {
                 epoch: integer(row, "maintenance_epoch", "begin Managed branch GC")?,
-            });
+                owner,
+            };
+            self.fix_gc_heads(&registry, fence, "begin Managed branch GC")
+                .await?;
+            return Ok(fence);
         }
         if !changed.is_empty() {
             return Err(corrupt(
@@ -771,12 +798,117 @@ impl D1BranchStore {
         }
     }
 
+    async fn fix_gc_heads(
+        &self,
+        registry: &StoredBranchRegistry,
+        fence: D1BranchGcFence,
+        action: &'static str,
+    ) -> Result<(), ManagedError> {
+        for branch in registry.branches.values() {
+            let branch_id = BranchId::from_bytes(*branch);
+            let (mut head, revision) = self
+                .read_head(branch_id)
+                .await?
+                .ok_or_else(|| corrupt(action, "registered branch HEAD is missing"))?;
+            if head.lifecycle != BranchLifecycle::Active {
+                return Err(corrupt(action, "registered branch HEAD is not active"));
+            }
+            if head.maintenance_active && fence.owns_head(&head) {
+                continue;
+            }
+            head.maintenance_epoch = fence.epoch;
+            head.maintenance_active = true;
+            head.maintenance_owner = Some(fence.owner);
+            if !self
+                .replace_gc_head(branch_id, revision, &head, fence, true, action)
+                .await?
+            {
+                return Err(conflict(action, "GC fence changed while fixing roots"));
+            }
+        }
+        let (current, _) = self.registry().await?;
+        if current.maintenance_active && fence.owns_registry(&current) {
+            Ok(())
+        } else {
+            Err(conflict(action, "GC fence changed while fixing roots"))
+        }
+    }
+
+    async fn clear_gc_heads(
+        &self,
+        registry: &StoredBranchRegistry,
+        fence: D1BranchGcFence,
+    ) -> Result<(), ManagedError> {
+        for branch in registry.branches.values() {
+            let branch_id = BranchId::from_bytes(*branch);
+            let Some((mut head, revision)) = self.read_head(branch_id).await? else {
+                continue;
+            };
+            if !head.maintenance_active || !fence.owns_head(&head) {
+                continue;
+            }
+            head.maintenance_active = false;
+            if !self
+                .replace_gc_head(
+                    branch_id,
+                    revision,
+                    &head,
+                    fence,
+                    false,
+                    "finish Managed branch GC",
+                )
+                .await?
+            {
+                return Err(conflict(
+                    "finish Managed branch GC",
+                    "GC fence changed while releasing roots",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    async fn replace_gc_head(
+        &self,
+        branch_id: BranchId,
+        revision: u64,
+        head: &StoredBranchHead,
+        fence: D1BranchGcFence,
+        active: bool,
+        action: &'static str,
+    ) -> Result<bool, ManagedError> {
+        let encoded = encode(head, MAX_HEAD_BYTES, action)?;
+        let state = if active { "sweeping" } else { "idle" };
+        let mut batch = schema_statements();
+        batch.push(statement(
+            format!(
+                "UPDATE {HEADS} SET revision = revision + 1, record_json = ? WHERE store_key = ? AND branch_id = ? AND revision = ? AND lifecycle = 'active' AND EXISTS (SELECT 1 FROM {REGISTRY} WHERE store_key = ? AND maintenance_epoch = ? AND maintenance_owner = ? AND maintenance_state = ?) RETURNING revision"
+            ),
+            vec![
+                encoded.into(),
+                self.store_key().into(),
+                branch_id.to_string().into(),
+                sqlite_integer(revision, action)?.into(),
+                self.store_key().into(),
+                sqlite_integer(fence.epoch, action)?.into(),
+                encode_owner(fence.owner).into(),
+                state.into(),
+            ],
+        ));
+        let results = self.session.query(batch, action).await?;
+        let changed = rows(&results, SCHEMA_RESULTS, action)?;
+        if changed.len() > 1 {
+            return Err(corrupt(action, "D1 returned duplicate branch HEADs"));
+        }
+        Ok(changed.len() == 1)
+    }
+
     async fn finish_gc(&self, fence: D1BranchGcFence) -> Result<(), ManagedError> {
         let (mut registry, registry_revision) = self.registry().await?;
-        if !registry.maintenance_active && registry.maintenance_epoch == fence.epoch {
-            return Ok(());
+        if !registry.maintenance_active && fence.owns_registry(&registry) {
+            return self.clear_gc_heads(&registry, fence).await;
         }
-        if !registry.maintenance_active || registry.maintenance_epoch != fence.epoch {
+        if !registry.maintenance_active || !fence.owns_registry(&registry) {
             return Err(conflict(
                 "finish Managed branch GC",
                 "GC fence does not match the registry",
@@ -787,13 +919,14 @@ impl D1BranchStore {
         let mut batch = schema_statements();
         batch.push(statement(
             format!(
-                "UPDATE {REGISTRY} SET revision = revision + 1, maintenance_state = 'idle', record_json = ? WHERE store_key = ? AND revision = ? AND maintenance_epoch = ? AND maintenance_state = 'sweeping' RETURNING revision"
+                "UPDATE {REGISTRY} SET revision = revision + 1, maintenance_state = 'idle', record_json = ? WHERE store_key = ? AND revision = ? AND maintenance_epoch = ? AND maintenance_owner = ? AND maintenance_state = 'sweeping' RETURNING revision"
             ),
             vec![
                 registry_json.into(),
                 self.store_key().into(),
                 sqlite_integer(registry_revision, "finish Managed branch GC")?.into(),
                 sqlite_integer(fence.epoch, "finish Managed branch GC")?.into(),
+                encode_owner(fence.owner).into(),
             ],
         ));
         let results = self
@@ -802,7 +935,7 @@ impl D1BranchStore {
             .await?;
         let changed = rows(&results, SCHEMA_RESULTS, "finish Managed branch GC")?;
         if changed.len() == 1 {
-            return Ok(());
+            return self.clear_gc_heads(&registry, fence).await;
         }
         if changed.len() > 1 {
             return Err(corrupt(
@@ -811,8 +944,8 @@ impl D1BranchStore {
             ));
         }
         let (current, _) = self.registry().await?;
-        if !current.maintenance_active && current.maintenance_epoch == fence.epoch {
-            Ok(())
+        if !current.maintenance_active && fence.owns_registry(&current) {
+            self.clear_gc_heads(&current, fence).await
         } else {
             Err(conflict(
                 "finish Managed branch GC",
@@ -841,7 +974,7 @@ impl D1BranchStore {
         data_operator: Operator,
     ) -> Result<SegmentGcMaintenance, ManagedError> {
         let data = ManagedData::new(data_operator)?;
-        let (registry, _) = self.registry().await?;
+        let (registry, registry_revision) = self.registry().await?;
         if !registry.maintenance_active {
             return Err(conflict(
                 "resume Managed branch GC",
@@ -850,7 +983,44 @@ impl D1BranchStore {
         }
         let fence = D1BranchGcFence {
             epoch: registry.maintenance_epoch,
+            owner: *OperationId::generate().as_bytes(),
         };
+        let mut resumed = registry;
+        resumed.maintenance_owner = Some(fence.owner);
+        let registry_json = encode(&resumed, MAX_REGISTRY_BYTES, "resume Managed branch GC")?;
+        let mut batch = schema_statements();
+        batch.push(statement(
+            format!(
+                "UPDATE {REGISTRY} SET revision = revision + 1, maintenance_owner = ?, record_json = ? WHERE store_key = ? AND revision = ? AND maintenance_epoch = ? AND maintenance_state = 'sweeping' RETURNING revision"
+            ),
+            vec![
+                encode_owner(fence.owner).into(),
+                registry_json.into(),
+                self.store_key().into(),
+                sqlite_integer(registry_revision, "resume Managed branch GC")?.into(),
+                sqlite_integer(fence.epoch, "resume Managed branch GC")?.into(),
+            ],
+        ));
+        let results = self
+            .session
+            .query(batch, "resume Managed branch GC")
+            .await?;
+        let changed = rows(&results, SCHEMA_RESULTS, "resume Managed branch GC")?;
+        if changed.len() != 1 {
+            return if changed.is_empty() {
+                Err(conflict(
+                    "resume Managed branch GC",
+                    "branch registry changed",
+                ))
+            } else {
+                Err(corrupt(
+                    "resume Managed branch GC",
+                    "D1 returned duplicate registries",
+                ))
+            };
+        }
+        self.fix_gc_heads(&resumed, fence, "resume Managed branch GC")
+            .await?;
         self.collect_with_fence(fence, &data).await
     }
 
@@ -870,7 +1040,7 @@ impl D1BranchStore {
 
     async fn gc_roots(&self, fence: D1BranchGcFence) -> Result<D1GcRoots, ManagedError> {
         let (registry, registry_revision) = self.registry().await?;
-        if !registry.maintenance_active || registry.maintenance_epoch != fence.epoch {
+        if !registry.maintenance_active || !fence.owns_registry(&registry) {
             return Err(conflict(
                 "mark Managed branch GC roots",
                 "GC fence does not match the registry",
@@ -880,6 +1050,7 @@ impl D1BranchStore {
             snapshots: Vec::new(),
             heads: BTreeSet::new(),
             checkpoints: BTreeSet::new(),
+            checkpoint_parts: BTreeSet::new(),
             histories: BTreeSet::new(),
         };
         for branch in registry.branches.values() {
@@ -897,25 +1068,40 @@ impl D1BranchStore {
                     "registered branch HEAD is not active",
                 ));
             }
+            if !head.maintenance_active || !fence.owns_head(&head) {
+                return Err(conflict(
+                    "mark Managed branch GC roots",
+                    "branch HEAD is not fixed by this GC fence",
+                ));
+            }
             let Some(state) = head.state else {
                 continue;
             };
             roots.checkpoints.insert(encode_id(state.checkpoint));
+            roots.checkpoint_parts.extend(
+                self.read_checkpoint_root(state.checkpoint)
+                    .await?
+                    .parts
+                    .into_iter()
+                    .map(|part| encode_id(part.id)),
+            );
             roots
                 .snapshots
                 .extend(self.snapshots_for_state(&state).await?);
             let mut history_id = state.previous_history;
             let mut chain = BTreeSet::new();
             while let Some(id) = history_id {
-                if !chain.insert(id) {
-                    return Err(corrupt(
-                        "mark Managed branch GC roots",
-                        "branch history contains a cycle",
-                    ));
-                }
+                visit_history(&mut chain, id, "mark Managed branch GC roots")?;
                 roots.histories.insert(encode_id(id));
                 let history = self.read_history(id).await?;
                 roots.checkpoints.insert(encode_id(history.checkpoint));
+                roots.checkpoint_parts.extend(
+                    self.read_checkpoint_root(history.checkpoint)
+                        .await?
+                        .parts
+                        .into_iter()
+                        .map(|part| encode_id(part.id)),
+                );
                 let historical = StoredNamespaceState {
                     checkpoint: history.checkpoint,
                     checkpoint_cursor: history.checkpoint_cursor,
@@ -933,6 +1119,7 @@ impl D1BranchStore {
         let (after, after_revision) = self.registry().await?;
         if !after.maintenance_active
             || after.maintenance_epoch != fence.epoch
+            || after.maintenance_owner != Some(fence.owner)
             || after_revision != registry_revision
             || after.branches != registry.branches
         {
@@ -964,6 +1151,11 @@ impl D1BranchStore {
                 "SELECT history_id AS metadata_id FROM {HISTORY} WHERE store_key = ? AND history_id > ? ORDER BY history_id LIMIT {METADATA_PAGE_SIZE}"
             ))
             .await?;
+        let checkpoint_parts = self
+            .metadata_ids(format!(
+                "SELECT part_id AS metadata_id FROM {CHECKPOINT_PARTS} WHERE store_key = ? AND part_id > ? ORDER BY part_id LIMIT {METADATA_PAGE_SIZE}"
+            ))
+            .await?;
 
         self.delete_metadata(HEADS, "branch_id", heads.difference(&roots.heads), fence)
             .await?;
@@ -971,6 +1163,13 @@ impl D1BranchStore {
             CHECKPOINTS,
             "checkpoint_id",
             checkpoints.difference(&roots.checkpoints),
+            fence,
+        )
+        .await?;
+        self.delete_metadata(
+            CHECKPOINT_PARTS,
+            "part_id",
+            checkpoint_parts.difference(&roots.checkpoint_parts),
             fence,
         )
         .await?;
@@ -1030,22 +1229,24 @@ impl D1BranchStore {
             batch.extend([
                 statement(
                     format!(
-                        "DELETE FROM {table} WHERE store_key = ? AND {key} IN (SELECT value FROM json_each(?)) AND EXISTS (SELECT 1 FROM {REGISTRY} WHERE store_key = ? AND maintenance_epoch = ? AND maintenance_state = 'sweeping')"
+                        "DELETE FROM {table} WHERE store_key = ? AND {key} IN (SELECT value FROM json_each(?)) AND EXISTS (SELECT 1 FROM {REGISTRY} WHERE store_key = ? AND maintenance_epoch = ? AND maintenance_owner = ? AND maintenance_state = 'sweeping')"
                     ),
                     vec![
                         self.store_key().into(),
                         encoded.into(),
                         self.store_key().into(),
                         sqlite_integer(fence.epoch, action)?.into(),
+                        encode_owner(fence.owner).into(),
                     ],
                 ),
                 statement(
                     format!(
-                        "SELECT maintenance_epoch FROM {REGISTRY} WHERE store_key = ? AND maintenance_epoch = ? AND maintenance_state = 'sweeping'"
+                        "SELECT maintenance_epoch, maintenance_owner FROM {REGISTRY} WHERE store_key = ? AND maintenance_epoch = ? AND maintenance_owner = ? AND maintenance_state = 'sweeping'"
                     ),
                     vec![
                         self.store_key().into(),
                         sqlite_integer(fence.epoch, action)?.into(),
+                        encode_owner(fence.owner).into(),
                     ],
                 ),
             ]);
@@ -1058,7 +1259,9 @@ impl D1BranchStore {
                     Err(corrupt(action, "D1 returned duplicate registries"))
                 };
             };
-            if integer(row, "maintenance_epoch", action)? != fence.epoch {
+            if integer(row, "maintenance_epoch", action)? != fence.epoch
+                || text(row, "maintenance_owner", action)? != encode_owner(fence.owner)
+            {
                 return Err(conflict(action, "GC fence changed during metadata sweep"));
             }
         }
@@ -1091,7 +1294,9 @@ impl D1BranchStore {
         mut history_id: Option<[u8; 32]>,
         sequence: u64,
     ) -> Result<Option<StoredNamespaceState>, ManagedError> {
+        let mut chain = BTreeSet::new();
         while let Some(id) = history_id {
+            visit_history(&mut chain, id, "read Managed branch history")?;
             let history = self.read_history(id).await?;
             if let Some(state) = history.state_at(sequence) {
                 return Ok(Some(state));
@@ -1101,75 +1306,183 @@ impl D1BranchStore {
         Ok(None)
     }
 
-    async fn read_checkpoint(&self, id: [u8; 32]) -> Result<StoredCheckpoint, ManagedError> {
+    async fn read_checkpoint_root(&self, id: [u8; 32]) -> Result<CheckpointRoot, ManagedError> {
         let mut batch = schema_statements();
         batch.push(statement(
             format!(
-                "SELECT part_index, part_count, total_bytes, record_part FROM {CHECKPOINTS} WHERE store_key = ? AND checkpoint_id = ? ORDER BY part_index"
+                "SELECT record_json FROM {CHECKPOINTS} WHERE store_key = ? AND checkpoint_id = ?"
             ),
             vec![self.store_key().into(), encode_id(id).into()],
         ));
         let results = self.session.query(batch, "read Managed branch").await?;
-        decode_checkpoint_rows(
-            rows(&results, SCHEMA_RESULTS, "read Managed branch")?,
-            id,
-            "read Managed branch",
-        )
+        let rows = rows(&results, SCHEMA_RESULTS, "read Managed branch")?;
+        let [row] = rows else {
+            return if rows.is_empty() {
+                Err(corrupt(
+                    "read Managed branch",
+                    "branch checkpoint is missing",
+                ))
+            } else {
+                Err(corrupt(
+                    "read Managed branch",
+                    "D1 returned duplicate branch checkpoints",
+                ))
+            };
+        };
+        let encoded = text(row, "record_json", "read Managed branch")?;
+        if Sha256::digest(encoded.as_bytes()).as_slice() != id {
+            return Err(corrupt(
+                "read Managed branch",
+                "branch checkpoint identity is invalid",
+            ));
+        }
+        let root: CheckpointRoot =
+            decode(encoded, MAX_CHECKPOINT_ROOT_BYTES, "read Managed branch")?;
+        if root.volume_id != *self.volume_id.as_bytes() {
+            return Err(corrupt(
+                "read Managed branch",
+                "branch checkpoint volume is invalid",
+            ));
+        }
+        Ok(root)
+    }
+
+    async fn read_checkpoint(&self, id: [u8; 32]) -> Result<StoredCheckpoint, ManagedError> {
+        let root = self.read_checkpoint_root(id).await?;
+        let mut decoded = BTreeMap::<String, CheckpointPart>::new();
+        for page in root.parts.chunks(CHECKPOINT_READ_PAGE) {
+            let ids = serde_json::to_string(
+                &page
+                    .iter()
+                    .map(|part| encode_id(part.id))
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(|_| corrupt("read Managed branch", "checkpoint part page is invalid"))?;
+            let mut batch = schema_statements();
+            batch.push(statement(
+                format!(
+                    "SELECT part_id, record_json FROM {CHECKPOINT_PARTS} WHERE store_key = ? AND part_id IN (SELECT value FROM json_each(?))"
+                ),
+                vec![self.store_key().into(), ids.into()],
+            ));
+            let results = self.session.query(batch, "read Managed branch").await?;
+            for row in rows(&results, SCHEMA_RESULTS, "read Managed branch")? {
+                let part_id = text(row, "part_id", "read Managed branch")?.to_owned();
+                let encoded = text(row, "record_json", "read Managed branch")?;
+                let expected = page
+                    .iter()
+                    .find(|part| encode_id(part.id) == part_id)
+                    .ok_or_else(|| corrupt("read Managed branch", "unexpected checkpoint part"))?;
+                if Sha256::digest(encoded.as_bytes()).as_slice() != expected.id {
+                    return Err(corrupt(
+                        "read Managed branch",
+                        "branch checkpoint part identity is invalid",
+                    ));
+                }
+                let part = decode(encoded, MAX_CHECKPOINT_PART_BYTES, "read Managed branch")?;
+                if decoded.insert(part_id, part).is_some() {
+                    return Err(corrupt(
+                        "read Managed branch",
+                        "D1 returned duplicate checkpoint parts",
+                    ));
+                }
+            }
+        }
+        let parts = root
+            .parts
+            .iter()
+            .map(|part| {
+                decoded.remove(&encode_id(part.id)).ok_or_else(|| {
+                    corrupt("read Managed branch", "branch checkpoint part is missing")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        root.recover(parts)
     }
 
     async fn write_checkpoint(
         &self,
         checkpoint: &StoredCheckpoint,
     ) -> Result<[u8; 32], ManagedError> {
+        let pending = PendingCheckpoint::from_checkpoint(checkpoint)?;
+        let mut references = Vec::with_capacity(pending.parts.len());
+        for part in &pending.parts {
+            let encoded = encode(part, MAX_CHECKPOINT_PART_BYTES, "checkpoint Managed branch")?;
+            let id: [u8; 32] = Sha256::digest(encoded.as_bytes()).into();
+            let mut batch = schema_statements();
+            batch.extend([
+                statement(
+                    format!(
+                        "INSERT OR IGNORE INTO {CHECKPOINT_PARTS} (store_key, part_id, record_json) VALUES (?, ?, ?)"
+                    ),
+                    vec![self.store_key().into(), encode_id(id).into(), encoded.clone().into()],
+                ),
+                statement(
+                    format!(
+                        "SELECT record_json FROM {CHECKPOINT_PARTS} WHERE store_key = ? AND part_id = ?"
+                    ),
+                    vec![self.store_key().into(), encode_id(id).into()],
+                ),
+            ]);
+            let results = self
+                .session
+                .query(batch, "checkpoint Managed branch")
+                .await?;
+            let observed = rows(&results, SCHEMA_RESULTS + 1, "checkpoint Managed branch")?;
+            let [row] = observed else {
+                return Err(corrupt(
+                    "checkpoint Managed branch",
+                    "D1 omitted immutable branch checkpoint part",
+                ));
+            };
+            if text(row, "record_json", "checkpoint Managed branch")? != encoded {
+                return Err(corrupt(
+                    "checkpoint Managed branch",
+                    "immutable branch checkpoint part changed",
+                ));
+            }
+            references.push(PartRef {
+                id,
+                records: part.records.len() as u32,
+            });
+        }
+        let root = pending.finish(references)?;
         let encoded = encode(
-            checkpoint,
-            MAX_CHECKPOINT_BYTES,
+            &root,
+            MAX_CHECKPOINT_ROOT_BYTES,
             "checkpoint Managed branch",
         )?;
         let id: [u8; 32] = Sha256::digest(encoded.as_bytes()).into();
-        let parts = Self::checkpoint_parts(&encoded);
-        let part_count = parts.len() as u64;
-        let total_bytes = encoded.len() as u64;
         let mut batch = schema_statements();
-        for (index, part) in parts.iter().enumerate() {
-            batch.push(statement(
+        batch.extend([
+            statement(
                 format!(
-                    "INSERT OR IGNORE INTO {CHECKPOINTS} (store_key, checkpoint_id, part_index, part_count, total_bytes, record_part) VALUES (?, ?, ?, ?, ?, ?)"
+                    "INSERT OR IGNORE INTO {CHECKPOINTS} (store_key, checkpoint_id, record_json) VALUES (?, ?, ?)"
                 ),
-                vec![
-                    self.store_key().into(),
-                    encode_id(id).into(),
-                    (index as u64).into(),
-                    part_count.into(),
-                    total_bytes.into(),
-                    (*part).to_owned().into(),
-                ],
-            ));
-        }
-        batch.push(statement(
-            format!(
-                "SELECT part_index, part_count, total_bytes, record_part FROM {CHECKPOINTS} WHERE store_key = ? AND checkpoint_id = ? ORDER BY part_index"
+                vec![self.store_key().into(), encode_id(id).into(), encoded.clone().into()],
             ),
-            vec![self.store_key().into(), encode_id(id).into()],
-        ));
+            statement(
+                format!(
+                    "SELECT record_json FROM {CHECKPOINTS} WHERE store_key = ? AND checkpoint_id = ?"
+                ),
+                vec![self.store_key().into(), encode_id(id).into()],
+            ),
+        ]);
         let results = self
             .session
             .query(batch, "checkpoint Managed branch")
             .await?;
-        let observed = decode_checkpoint_rows(
-            rows(
-                &results,
-                SCHEMA_RESULTS + parts.len(),
-                "checkpoint Managed branch",
-            )?,
-            id,
-            "checkpoint Managed branch",
-        )?;
-        let observed = encode(&observed, MAX_CHECKPOINT_BYTES, "checkpoint Managed branch")?;
-        if observed != encoded {
+        let observed = rows(&results, SCHEMA_RESULTS + 1, "checkpoint Managed branch")?;
+        let [row] = observed else {
             return Err(corrupt(
                 "checkpoint Managed branch",
-                "immutable branch checkpoint changed",
+                "D1 omitted immutable branch checkpoint root",
+            ));
+        };
+        if text(row, "record_json", "checkpoint Managed branch")? != encoded {
+            return Err(corrupt(
+                "checkpoint Managed branch",
+                "immutable branch checkpoint root changed",
             ));
         }
         Ok(id)
@@ -1297,7 +1610,7 @@ impl D1BranchStore {
         let mut batch = schema_statements();
         batch.push(statement(
             format!(
-                "SELECT revision, volume_id, maintenance_epoch, maintenance_state, record_json FROM {REGISTRY} WHERE store_key = ?"
+                "SELECT revision, volume_id, maintenance_epoch, maintenance_state, maintenance_owner, record_json FROM {REGISTRY} WHERE store_key = ?"
             ),
             vec![self.store_key().into()],
         ));
@@ -1353,28 +1666,13 @@ impl D1BranchStore {
     fn store_key(&self) -> String {
         self.session.store_key().to_owned()
     }
-
-    /// Split one immutable checkpoint into rows below D1's 2 MB row limit.
-    fn checkpoint_parts(bytes: &str) -> Vec<&str> {
-        let mut parts = Vec::new();
-        let mut start = 0;
-        while start < bytes.len() {
-            let mut end = (start + CHECKPOINT_PART_BYTES).min(bytes.len());
-            while !bytes.is_char_boundary(end) {
-                end -= 1;
-            }
-            parts.push(&bytes[start..end]);
-            start = end;
-        }
-        parts
-    }
 }
 
 fn schema_statements() -> Vec<D1Statement> {
     vec![
         statement(
             format!(
-                "CREATE TABLE IF NOT EXISTS {REGISTRY} (store_key TEXT PRIMARY KEY, volume_id TEXT NOT NULL, revision INTEGER NOT NULL, maintenance_epoch INTEGER NOT NULL, maintenance_state TEXT NOT NULL CHECK (maintenance_state IN ('idle', 'sweeping')), record_json TEXT NOT NULL)"
+                "CREATE TABLE IF NOT EXISTS {REGISTRY} (store_key TEXT PRIMARY KEY, volume_id TEXT NOT NULL, revision INTEGER NOT NULL, maintenance_epoch INTEGER NOT NULL, maintenance_state TEXT NOT NULL CHECK (maintenance_state IN ('idle', 'sweeping')), maintenance_owner TEXT, record_json TEXT NOT NULL)"
             ),
             Vec::new(),
         ),
@@ -1386,7 +1684,13 @@ fn schema_statements() -> Vec<D1Statement> {
         ),
         statement(
             format!(
-                "CREATE TABLE IF NOT EXISTS {CHECKPOINTS} (store_key TEXT NOT NULL, checkpoint_id TEXT NOT NULL, part_index INTEGER NOT NULL, part_count INTEGER NOT NULL, total_bytes INTEGER NOT NULL, record_part TEXT NOT NULL, PRIMARY KEY (store_key, checkpoint_id, part_index))"
+                "CREATE TABLE IF NOT EXISTS {CHECKPOINTS} (store_key TEXT NOT NULL, checkpoint_id TEXT NOT NULL, record_json TEXT NOT NULL, PRIMARY KEY (store_key, checkpoint_id))"
+            ),
+            Vec::new(),
+        ),
+        statement(
+            format!(
+                "CREATE TABLE IF NOT EXISTS {CHECKPOINT_PARTS} (store_key TEXT NOT NULL, part_id TEXT NOT NULL, record_json TEXT NOT NULL, PRIMARY KEY (store_key, part_id))"
             ),
             Vec::new(),
         ),
@@ -1397,38 +1701,6 @@ fn schema_statements() -> Vec<D1Statement> {
             Vec::new(),
         ),
     ]
-}
-
-fn decode_checkpoint_rows(
-    rows: &[Value],
-    id: [u8; 32],
-    action: &'static str,
-) -> Result<StoredCheckpoint, ManagedError> {
-    if rows.is_empty() {
-        return Err(corrupt(action, "branch checkpoint is missing"));
-    }
-    let part_count = integer(&rows[0], "part_count", action)?;
-    let total_bytes = integer(&rows[0], "total_bytes", action)?;
-    if part_count == 0
-        || part_count as usize != rows.len()
-        || total_bytes as usize > MAX_CHECKPOINT_BYTES
-    {
-        return Err(corrupt(action, "branch checkpoint parts are invalid"));
-    }
-    let mut encoded = String::with_capacity(total_bytes as usize);
-    for (index, row) in rows.iter().enumerate() {
-        if integer(row, "part_index", action)? != index as u64
-            || integer(row, "part_count", action)? != part_count
-            || integer(row, "total_bytes", action)? != total_bytes
-        {
-            return Err(corrupt(action, "branch checkpoint parts are invalid"));
-        }
-        encoded.push_str(text(row, "record_part", action)?);
-    }
-    if encoded.len() as u64 != total_bytes || Sha256::digest(encoded.as_bytes()).as_slice() != id {
-        return Err(corrupt(action, "branch checkpoint identity is invalid"));
-    }
-    decode(&encoded, MAX_CHECKPOINT_BYTES, action)
 }
 
 fn decode_registry_row(
@@ -1454,8 +1726,14 @@ fn decode_registry_row(
     registry.validate(volume_id)?;
     let maintenance = text(row, "maintenance_state", action)?;
     let epoch = integer(row, "maintenance_epoch", action)?;
+    let owner = match row.get("maintenance_owner") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(owner)) => Some(decode_owner(owner, action)?),
+        _ => return Err(corrupt(action, "branch registry owner is invalid")),
+    };
     if registry.maintenance_epoch != epoch
         || registry.maintenance_active != (maintenance == "sweeping")
+        || registry.maintenance_owner != owner
         || !matches!(maintenance, "idle" | "sweeping")
     {
         return Err(corrupt(
@@ -1536,6 +1814,22 @@ fn encode_id(id: [u8; 32]) -> String {
     id.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+fn encode_owner(owner: [u8; 16]) -> String {
+    owner.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn decode_owner(encoded: &str, action: &'static str) -> Result<[u8; 16], ManagedError> {
+    if encoded.len() != 32 {
+        return Err(corrupt(action, "branch registry owner is invalid"));
+    }
+    let mut owner = [0; 16];
+    for (index, byte) in owner.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&encoded[index * 2..index * 2 + 2], 16)
+            .map_err(|_| corrupt(action, "branch registry owner is invalid"))?;
+    }
+    Ok(owner)
+}
+
 fn position_not_retained() -> ManagedError {
     ManagedError::new(
         ManagedErrorKind::Invalid,
@@ -1566,4 +1860,16 @@ fn unavailable(action: &'static str) -> ManagedError {
         action,
         "D1 branch metadata is unavailable",
     )
+}
+
+fn visit_history(
+    chain: &mut BTreeSet<[u8; 32]>,
+    id: [u8; 32],
+    action: &'static str,
+) -> Result<(), ManagedError> {
+    if chain.insert(id) {
+        Ok(())
+    } else {
+        Err(corrupt(action, "branch history contains a cycle"))
+    }
 }

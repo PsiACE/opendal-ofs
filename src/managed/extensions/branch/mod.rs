@@ -19,6 +19,7 @@
 
 mod d1;
 mod object;
+mod record_set;
 pub(crate) mod records;
 
 pub use d1::{D1BoundNamespace, D1BranchObservation, D1BranchStore};

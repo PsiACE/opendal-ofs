@@ -49,6 +49,7 @@ case "$OFS_METADATA_MODE" in
 esac
 
 config="$OFS_CASE_ROOT/client/config.json"
+observed_config="$OFS_CASE_ROOT/observed-client/config.json"
 main_replica="$OFS_CASE_ROOT/main"
 experiment_replica="$OFS_CASE_ROOT/experiment"
 main_cold="$OFS_CASE_ROOT/main-cold"
@@ -63,7 +64,8 @@ state_root="$OFS_CASE_ROOT/state"
 main_state="$state_root/main.json"
 experiment_state="$state_root/experiment.json"
 
-mkdir -p "$(dirname "$config")" "$main_replica" "$experiment_replica" \
+mkdir -p "$(dirname "$config")" "$(dirname "$observed_config")" \
+  "$main_replica" "$experiment_replica" \
   "$main_cold" "$experiment_cold" "$rewind_replica" "$new_experiment" \
   "$empty_replica" "$rewind_after_gc" "$large_replica" "$large_parent" \
   "$state_root"
@@ -91,6 +93,21 @@ value = json.load(sys.stdin)
 assert value["default_branch"] == "main"
 assert [branch["name"] for branch in value["branches"]] == ["main"]
 ' <<<"$branches" || fail 'new branching volume did not expose only default branch main'
+
+observed_options=(--model managed --storage "$OFS_STORAGE_URL")
+if [[ "$OFS_METADATA_MODE" == d1 ]]; then
+  observed_options+=(--metadata "$OFS_METADATA_URL")
+fi
+OFS_CONFIG="$observed_config" "$OFS_BIN" volume create observed-workspace \
+  "${observed_options[@]}"
+observed_branches=$(OFS_CONFIG="$observed_config" "$OFS_BIN" branch list observed-workspace --json)
+python3 -c '
+import json, sys
+value = json.load(sys.stdin)
+assert value["default_branch"] == "main"
+assert [branch["name"] for branch in value["branches"]] == ["main"]
+' <<<"$observed_branches" || \
+  fail 'a new client did not honor observed branch/v1 metadata without --enable'
 
 printf '%s\n' 'anchor state' >"$main_replica/shared.txt"
 OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$main_replica" --state "$main_state"
@@ -120,7 +137,7 @@ OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$experiment_cold" \
 grep -Fxq 'main state' "$main_cold/shared.txt" || fail 'main observed another branch publication'
 grep -Fxq 'experiment state' "$experiment_cold/shared.txt" || fail 'experiment observed main publication'
 
-printf '%s\n' 'acceptance: retain a position across checkpoint rotation and fork it'
+printf '%s\n' 'acceptance: fork an old published position after a long branch history'
 for generation in $(seq 1 66); do
   printf 'main generation %s\n' "$generation" >"$main_replica/history.txt"
   OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$main_replica" \
@@ -182,7 +199,7 @@ for name in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN OFS_D1_TOK
   fi
 done
 
-printf '%s\n' 'acceptance: publish a large namespace change and retain its parent'
+printf '%s\n' 'scale regression: publish a large namespace change and retain its parent'
 OFS_CONFIG="$config" "$OFS_BIN" branch create workspace large --from main --at 0
 printf '%s\n' seed >"$large_replica/seed.txt"
 OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$large_replica" \
