@@ -45,7 +45,7 @@ const FORMAT_MAJOR: u16 = 1;
 const HEADER_LENGTH: u64 = 10;
 const TRAILER_LENGTH: u64 = 56;
 const REQUEST_EQUIVALENT_BYTES: u64 = 4 * 1024;
-const RANGE_FETCH_GAP: usize = 256 * 1024;
+const RANGE_FETCH_GAP: usize = 512 * 1024;
 // Placement policy. These values are not part of the durable format.
 const TARGET_SEGMENT_SIZE: u64 = 16 * 1024 * 1024;
 const MATERIALIZE_WINDOW_BYTES: u64 = TARGET_SEGMENT_SIZE;
@@ -228,108 +228,118 @@ impl ManagedData {
         known: &AuthorityKnownContent,
         concurrency: NonZeroUsize,
     ) -> Result<BTreeMap<String, FileVersionRecord>, ManagedError> {
-        let (sender, mut receiver) = mpsc::channel(concurrency.get().saturating_mul(2).max(1));
-        let producer_source = source.clone();
-        let producer_staging = staging.clone();
-        let producer_sender = sender.clone();
-        let producers = stream::iter(paths)
-            .map(move |path| {
-                let source = producer_source.clone();
-                let staging = producer_staging.clone();
-                let sender = producer_sender.clone();
-                async move { stream_file(&source, &staging, path, &sender).await }
-            })
+        let mut paths = paths;
+        paths.sort();
+        if paths.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(invalid("stage Managed files", "input path is repeated"));
+        }
+        // Keep file production concurrent but consume the bounded streams in path order.
+        // Segment placement is then stable without retaining complete files in memory.
+        let mut producer_tasks = Vec::with_capacity(paths.len());
+        let mut receivers = Vec::with_capacity(paths.len());
+        for path in paths {
+            let source = source.clone();
+            let staging = staging.clone();
+            let (sender, receiver) = mpsc::channel(2);
+            producer_tasks.push(async move { stream_file(&source, &staging, path, &sender).await });
+            receivers.push(receiver);
+        }
+        let producers = stream::iter(producer_tasks)
             .buffer_unordered(concurrency.get())
             .try_collect::<Vec<_>>();
-        drop(sender);
 
         let collect = async {
             let mut files = BTreeMap::<String, PreparedFile>::new();
             let mut new_content = BTreeMap::<ContentRef, Vec<u8>>::new();
             let mut pending_bytes = 0_u64;
             let mut created = BTreeMap::new();
-            while let Some(event) = receiver.recv().await {
-                match event {
-                    PreparedEvent::Start { path, logical_size } => {
-                        if files
-                            .insert(
-                                path,
-                                PreparedFile {
-                                    logical_size,
-                                    logical_digest: None,
-                                    extents: Vec::new(),
-                                },
-                            )
-                            .is_some()
-                        {
-                            return Err(invalid("stage Managed files", "input path is repeated"));
-                        }
-                    }
-                    PreparedEvent::Extent {
-                        path,
-                        extent,
-                        bytes,
-                    } => {
-                        let file = files.get_mut(&path).ok_or_else(|| {
-                            corrupt(
-                                "stage Managed files",
-                                "file extent arrived before its start",
-                            )
-                        })?;
-                        if file.logical_digest.is_some() {
-                            return Err(corrupt(
-                                "stage Managed files",
-                                "file extent arrived after its finish",
-                            ));
-                        }
-                        if known.get(&extent.content).is_none()
-                            && !created.contains_key(&extent.content)
-                        {
-                            match new_content.entry(extent.content) {
-                                std::collections::btree_map::Entry::Vacant(entry) => {
-                                    entry.insert(bytes);
-                                    pending_bytes = pending_bytes
-                                        .checked_add(extent.content.length)
-                                        .ok_or_else(|| {
-                                            invalid(
-                                                "stage Managed files",
-                                                "pending segment bytes overflow",
-                                            )
-                                        })?;
-                                }
-                                std::collections::btree_map::Entry::Occupied(entry)
-                                    if entry.get() != &bytes =>
-                                {
-                                    return Err(corrupt(
-                                        "stage Managed files",
-                                        "equal content references contain different bytes",
-                                    ));
-                                }
-                                std::collections::btree_map::Entry::Occupied(_) => {}
+            for mut receiver in receivers {
+                while let Some(event) = receiver.recv().await {
+                    match event {
+                        PreparedEvent::Start { path, logical_size } => {
+                            if files
+                                .insert(
+                                    path,
+                                    PreparedFile {
+                                        logical_size,
+                                        logical_digest: None,
+                                        extents: Vec::new(),
+                                    },
+                                )
+                                .is_some()
+                            {
+                                return Err(invalid(
+                                    "stage Managed files",
+                                    "input path is repeated",
+                                ));
                             }
                         }
-                        file.extents.push(extent);
-                    }
-                    PreparedEvent::Finish {
-                        path,
-                        logical_digest,
-                    } => {
-                        let file = files.get_mut(&path).ok_or_else(|| {
-                            corrupt("stage Managed files", "file finished before its start")
-                        })?;
-                        if file.logical_digest.replace(logical_digest).is_some() {
-                            return Err(corrupt(
-                                "stage Managed files",
-                                "file finished more than once",
-                            ));
+                        PreparedEvent::Extent {
+                            path,
+                            extent,
+                            bytes,
+                        } => {
+                            let file = files.get_mut(&path).ok_or_else(|| {
+                                corrupt(
+                                    "stage Managed files",
+                                    "file extent arrived before its start",
+                                )
+                            })?;
+                            if file.logical_digest.is_some() {
+                                return Err(corrupt(
+                                    "stage Managed files",
+                                    "file extent arrived after its finish",
+                                ));
+                            }
+                            if known.get(&extent.content).is_none()
+                                && !created.contains_key(&extent.content)
+                            {
+                                match new_content.entry(extent.content) {
+                                    std::collections::btree_map::Entry::Vacant(entry) => {
+                                        entry.insert(bytes);
+                                        pending_bytes = pending_bytes
+                                            .checked_add(extent.content.length)
+                                            .ok_or_else(|| {
+                                                invalid(
+                                                    "stage Managed files",
+                                                    "pending segment bytes overflow",
+                                                )
+                                            })?;
+                                    }
+                                    std::collections::btree_map::Entry::Occupied(entry)
+                                        if entry.get() != &bytes =>
+                                    {
+                                        return Err(corrupt(
+                                            "stage Managed files",
+                                            "equal content references contain different bytes",
+                                        ));
+                                    }
+                                    std::collections::btree_map::Entry::Occupied(_) => {}
+                                }
+                            }
+                            file.extents.push(extent);
+                        }
+                        PreparedEvent::Finish {
+                            path,
+                            logical_digest,
+                        } => {
+                            let file = files.get_mut(&path).ok_or_else(|| {
+                                corrupt("stage Managed files", "file finished before its start")
+                            })?;
+                            if file.logical_digest.replace(logical_digest).is_some() {
+                                return Err(corrupt(
+                                    "stage Managed files",
+                                    "file finished more than once",
+                                ));
+                            }
                         }
                     }
-                }
 
-                while pending_bytes >= TARGET_SEGMENT_SIZE {
-                    let contents = take_segment_contents(&mut new_content)?;
-                    pending_bytes -= contents.keys().map(|content| content.length).sum::<u64>();
-                    created.extend(self.create_segment(seal_segment(contents)?).await?);
+                    while pending_bytes >= TARGET_SEGMENT_SIZE {
+                        let contents = take_segment_contents(&mut new_content)?;
+                        pending_bytes -= contents.keys().map(|content| content.length).sum::<u64>();
+                        created.extend(self.create_segment(seal_segment(contents)?).await?);
+                    }
                 }
             }
 

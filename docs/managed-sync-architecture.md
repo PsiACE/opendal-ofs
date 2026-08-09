@@ -150,7 +150,7 @@ layer merges concurrent cold reads and handles eviction. Backends without
 `stat` use the coalesced-range path instead. Each sparse range is fetched once,
 shared by every planned consumer across file windows, and released after its
 last consumer. Sparse segment ranges are submitted together through OpenDAL
-`Reader::fetch`; OpenDAL removes overlap, coalesces nearby ranges with a 256 KiB
+`Reader::fetch`; OpenDAL removes overlap, coalesces nearby ranges with a 512 KiB
 gap, and returns zero-copy slices. File writes remain windowed at 16 MiB.
 The operator's OpenDAL concurrency and retry layers govern remote transfers.
 OFS verifies segment structure, every returned content digest, logical length,
