@@ -114,23 +114,27 @@ for another payload is a conflict.
 
 ## Data path
 
-Sync freezes changed files into a reconstructable local cache before remote
-mutation. Reading the live file once to create that cache and reading the cache
-to stage immutable data are distinct durability steps: publication never
-depends on a live path that may change or disappear. Files below the chunking
-threshold produce one content extent. Larger files use FastCDC. These are
-placement policies, not different storage formats.
+Sync reads each changed live file once. The same bounded stream writes the
+reconstructable local cache and feeds the volume-owned file-version builder.
+The builder returns an opaque descriptor containing the logical digest and
+extent plan; Sync persists that descriptor in the staging manifest. A retry or
+process restart therefore does not read and hash the cached file again.
+Namespace publication never depends on a live path that may change or
+disappear. Files below the chunking threshold produce one content extent.
+Larger files use FastCDC. These are placement policies, not different storage
+formats.
 
 Staging performs the following work:
 
-1. Concurrent readers stream chunks from frozen files into a bounded channel.
+1. Concurrent readers tee source bytes to local staging and stream chunks into
+   a bounded channel.
 2. One segment builder reuses content referenced by the fixed authority
    snapshot and deduplicates new content across the publication.
 3. The builder seals a segment as soon as its placement target is reached and
    uploads it with create-only semantics.
 4. File completion records supply the logical length and whole-file digest.
 5. The builder returns file versions with complete logical-to-physical extent
-   maps.
+   maps, which the staging manifest stores without interpreting.
 
 Backpressure bounds buffered file data to the active segment, the channel, and
 at most one chunk held by each reader; only the resulting extent metadata grows
@@ -233,15 +237,13 @@ resolve pending operation, if any
        |
 observe one authority snapshot
        |
-freeze and scan the local tree into a reconstructable cache
+freeze changed files, stage immutable data, and save opaque file versions
        |
 three-way reconcile(base, local, remote)
        |
        +--> conflicts: retain local candidates and stop
        |
 save pending OperationId
-       |
-stage immutable segments
        |
 publish metadata with generation preconditions
        |
@@ -255,11 +257,11 @@ has not been staged. A failed metadata commit may leave unreachable immutable
 segments. It cannot create another namespace authority.
 
 The pending cache is stored beside replica state by relative name. It is not
-authority. If it is missing before commit, Sync scans and freezes the local
-tree again. If the operation committed, Sync reconstructs from the
-authoritative snapshot when doing so cannot overwrite a local change. Replica
-state formats with the old absolute cache path are rebased beside the state
-file when read.
+authority. Its manifest contains the already verified opaque file versions;
+an absent or malformed current-format manifest invalidates the pending attempt
+instead of selecting a compatibility path. If the operation committed, Sync
+reconstructs from the authoritative snapshot when doing so cannot overwrite a
+local change.
 
 Directory presence is merged per path. Additions and deletions in disjoint
 subtrees converge. Deleting a directory while the other side changes its
@@ -284,11 +286,13 @@ Foreground publication and materialization do not list the data prefix.
 ## Extensions
 
 A Managed extension adds authority semantics without adding another filesystem
-model. Branch binding selects a base or branch authority before Sync calls the
-same `Volume` contract. Branch snapshots and publications use the shared node,
-directory, precondition, and Managed file-version records. Object and D1 may
-encode their authority mechanics differently, but both preserve the same
-branch identity, ancestry, operation-id, fork, deletion, and fencing behavior.
+model. A branch binding wraps a backend-native authority behind one
+`BoundNamespace<S>` state machine before Sync calls the same `Volume` contract.
+Observe, publication validation, receipt resolution, tail rotation, and
+unknown-commit recovery are shared. Object implements conditional object
+replacement; D1 implements its native transactional predicate. Branch
+snapshots and publications use the shared node, directory, precondition, and
+Managed file-version records.
 
 The branch feature controls commands and extension code only. It does not
 change `managed/1` base-volume readability or create an alternate data plane.

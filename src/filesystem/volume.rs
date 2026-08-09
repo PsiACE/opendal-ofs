@@ -316,6 +316,7 @@ pub trait Volume: Clone + Send + Sync {
     async fn stage_files(
         &self,
         source: &Operator,
+        staging: &Operator,
         paths: Vec<String>,
         authority: Option<&VolumeSnapshot>,
         concurrency: NonZeroUsize,

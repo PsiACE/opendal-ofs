@@ -223,18 +223,21 @@ impl ManagedData {
     pub(crate) async fn stage_files(
         &self,
         source: &Operator,
+        staging: &Operator,
         paths: Vec<String>,
         known: &AuthorityKnownContent,
         concurrency: NonZeroUsize,
     ) -> Result<BTreeMap<String, FileVersionRecord>, ManagedError> {
         let (sender, mut receiver) = mpsc::channel(concurrency.get().saturating_mul(2).max(1));
         let producer_source = source.clone();
+        let producer_staging = staging.clone();
         let producer_sender = sender.clone();
         let producers = stream::iter(paths)
             .map(move |path| {
                 let source = producer_source.clone();
+                let staging = producer_staging.clone();
                 let sender = producer_sender.clone();
-                async move { stream_file(&source, path, &sender).await }
+                async move { stream_file(&source, &staging, path, &sender).await }
             })
             .buffer_unordered(concurrency.get())
             .try_collect::<Vec<_>>();
@@ -911,6 +914,7 @@ fn prefer_complete_segment(segment: SegmentRef, demands: &SegmentDemand, full_tr
 
 async fn stream_file(
     source: &Operator,
+    staging: &Operator,
     path: String,
     sender: &mpsc::Sender<PreparedEvent>,
 ) -> Result<(), ManagedError> {
@@ -931,6 +935,10 @@ async fn stream_file(
     )
     .await?;
     if size == 0 {
+        staging
+            .write(&path, Vec::<u8>::new())
+            .await
+            .map_err(|_| unavailable("write frozen file"))?;
         return send_prepared(
             sender,
             PreparedEvent::Finish {
@@ -953,6 +961,10 @@ async fn stream_file(
                 "frozen input changed while it was being staged",
             ));
         }
+        staging
+            .write(&path, bytes.clone())
+            .await
+            .map_err(|_| unavailable("write frozen file"))?;
         let content = content_ref(&bytes);
         send_prepared(
             sender,
@@ -978,6 +990,7 @@ async fn stream_file(
 
     stream_fastcdc(
         source,
+        staging,
         path,
         size,
         FastCdcSizes {
@@ -992,6 +1005,7 @@ async fn stream_file(
 
 async fn stream_fastcdc(
     source: &Operator,
+    staging: &Operator,
     path: String,
     size: u64,
     sizes: FastCdcSizes,
@@ -1001,9 +1015,41 @@ async fn stream_fastcdc(
         .reader(&path)
         .await
         .map_err(|_| unavailable("read frozen file"))?
-        .into_futures_async_read(..)
+        .into_bytes_stream(..)
         .await
         .map_err(|_| unavailable("read frozen file"))?;
+    let writer = staging
+        .writer(&path)
+        .await
+        .map_err(|_| unavailable("write frozen file"))?;
+    let reader: std::pin::Pin<Box<dyn futures::Stream<Item = std::io::Result<Vec<u8>>> + Send>> =
+        Box::pin(stream::try_unfold(
+            (Box::pin(reader), Some(writer)),
+            |(mut reader, mut writer)| async move {
+                match reader.next().await {
+                    Some(Ok(buffer)) => {
+                        writer
+                            .as_mut()
+                            .expect("writer remains open while input has data")
+                            .write(buffer.clone())
+                            .await
+                            .map_err(std::io::Error::other)?;
+                        Ok(Some((buffer.to_vec(), (reader, writer))))
+                    }
+                    Some(Err(error)) => Err(std::io::Error::other(error)),
+                    None => {
+                        writer
+                            .take()
+                            .expect("writer closes exactly once")
+                            .close()
+                            .await
+                            .map_err(std::io::Error::other)?;
+                        Ok(None)
+                    }
+                }
+            },
+        ));
+    let reader = reader.into_async_read();
     let mut chunker = AsyncStreamCDC::new(reader, sizes.minimum, sizes.target, sizes.maximum);
     let chunks = chunker.as_stream();
     futures::pin_mut!(chunks);
@@ -1421,6 +1467,7 @@ mod tests {
     #[tokio::test]
     async fn stages_and_materializes_whole_and_chunked_files() {
         let source = memory();
+        let staging = memory();
         let storage = memory();
         let target = memory();
         let small = b"portable segment".to_vec();
@@ -1434,6 +1481,7 @@ mod tests {
         let staged = data
             .stage_files(
                 &source,
+                &staging,
                 vec!["small".to_owned(), "large".to_owned()],
                 &AuthorityKnownContent::default(),
                 NonZeroUsize::new(2).unwrap(),

@@ -100,13 +100,8 @@ impl<V: Volume> SyncEngine<V> {
                         false
                     };
                     let safe_to_install = target_is_live
-                        || committed_tree_is_safe(
-                            &state,
-                            replica_path,
-                            observed.snapshot(),
-                            state_path,
-                        )
-                        .await?;
+                        || committed_tree_is_safe(&state, replica_path, observed.snapshot())
+                            .await?;
                     if !target_is_live && !safe_to_install {
                         state.pending = None;
                         state.install(state_path)?;
@@ -174,8 +169,15 @@ impl<V: Volume> SyncEngine<V> {
                 }
                 let staging_path = fresh_sibling(state_path, "publish");
                 let known_digests = known_local_digests(&local, &state);
-                let staged =
-                    StagedTree::prepare_known(&local, &staging_path, &known_digests).await?;
+                let staged = StagedTree::prepare_for_publish(
+                    &local,
+                    &staging_path,
+                    &known_digests,
+                    &self.volume,
+                    remote,
+                    self.transfer_concurrency,
+                )
+                .await?;
                 (local, staging_path, staged)
             }
         };
@@ -339,10 +341,13 @@ impl<V: Volume> SyncEngine<V> {
                 .collect(),
         );
         let requires_materialization = !merged_input.same_content(&frozen_input);
-        let frozen = fs_operator(staged.root())?;
         let remote_files = remote.map(snapshot_files).transpose()?.unwrap_or_default();
-        let mut prepared = BTreeMap::new();
-        let mut changed = Vec::new();
+        let mut prepared = staged
+            .prepared()
+            .iter()
+            .filter(|(path, _)| merged.entries().contains_key(*path))
+            .map(|(path, version)| (path.clone(), version.clone()))
+            .collect::<BTreeMap<_, _>>();
         for (path, _) in merged
             .entries()
             .iter()
@@ -352,14 +357,10 @@ impl<V: Volume> SyncEngine<V> {
                 (Some(digest), Some(version)) if *digest == version.logical_digest => {
                     prepared.insert(path.clone(), version.clone());
                 }
-                _ => changed.push(path.clone()),
+                _ if prepared.contains_key(path) => {}
+                _ => bail!("staged file {path:?} has no prepared volume version"),
             }
         }
-        prepared.extend(
-            self.volume
-                .stage_files(&frozen, changed, remote, self.transfer_concurrency)
-                .await?,
-        );
 
         let mut publication_state = state.clone();
         publication_state.common = remote.map_or(ChangeCursor::Genesis, |snapshot| snapshot.cursor);
@@ -484,11 +485,9 @@ async fn committed_tree_is_safe(
     state: &ReplicaState,
     replica: &Path,
     committed: &VolumeSnapshot,
-    anchor: &Path,
 ) -> Result<bool> {
     let local = LocalTree::scan(replica).await?;
-    let staging_path = fresh_sibling(anchor, "recovery-compare");
-    let staged = StagedTree::prepare(&local, &staging_path).await?;
+    let staged = StagedTree::inspect(&local).await?;
     let safe = match reconcile(state, &staged, committed) {
         Ok(plan) => {
             let files_are_safe = plan.actions.iter().all(|action| {
@@ -506,7 +505,6 @@ async fn committed_tree_is_safe(
         }
         Err(_) => false,
     };
-    remove_tree(&staging_path)?;
     Ok(safe)
 }
 

@@ -23,17 +23,15 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sha2::{Digest as _, Sha256};
 
+use super::ObjectBoundNamespace;
+use super::namespace::BranchNamespaceStore;
 use super::record_set::{CheckpointRoot, PartRef, PendingCheckpoint};
 use super::records::{
-    BranchInfo, BranchLifecycle, ForkPoint, MAX_TAIL_BYTES, MAX_TAIL_TRANSACTIONS,
-    StoredBranchHead, StoredBranchRegistry, StoredCheckpoint, StoredCommittedResult, StoredHistory,
-    StoredNamespaceState, info, recover_namespace, recover_retained, require_request_digest,
-    results_for_rotation,
+    BranchInfo, BranchLifecycle, ForkPoint, StoredBranchHead, StoredBranchRegistry,
+    StoredCheckpoint, StoredHistory, StoredNamespaceState, info, recover_retained,
 };
-use crate::filesystem::{
-    BranchBinding, BranchId, BranchName, ChangeCursor, CommitOutcome, OperationId, VolumeId,
-};
-use crate::managed::metadata::namespace::{NamespacePublication, NamespaceSnapshot};
+use crate::filesystem::{BranchBinding, BranchId, BranchName, OperationId, VolumeId};
+use crate::managed::metadata::namespace::NamespaceSnapshot;
 use crate::managed::metadata::object;
 use crate::managed::{ManagedData, ManagedError, ManagedErrorKind, SegmentGcMaintenance};
 
@@ -56,20 +54,6 @@ const MAX_HISTORY_BYTES: usize = 512 * 1024;
 pub struct ObjectBranchStore {
     volume_id: VolumeId,
     operator: Operator,
-}
-
-#[derive(Clone)]
-pub struct ObjectBoundNamespace {
-    store: ObjectBranchStore,
-    binding: BranchBinding,
-}
-
-#[derive(Clone, Debug)]
-pub struct ObjectBranchObservation {
-    pub(crate) snapshot: NamespaceSnapshot,
-    revision: String,
-    head: StoredBranchHead,
-    checkpoint: StoredCheckpoint,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -96,235 +80,20 @@ struct ObjectGcRoots {
     histories: BTreeSet<String>,
 }
 
-impl ObjectBoundNamespace {
-    pub fn binding(&self) -> &BranchBinding {
-        &self.binding
-    }
+impl BranchNamespaceStore for ObjectBranchStore {
+    type Revision = String;
 
-    pub fn volume_id(&self) -> VolumeId {
-        self.store.volume_id
-    }
-
-    pub(crate) async fn observe(&self) -> Result<Option<ObjectBranchObservation>, ManagedError> {
-        let (head, revision) = self.current_head("read Managed branch").await?;
-        let Some(state) = &head.state else {
-            return Ok(None);
-        };
-        let checkpoint = self.store.read_checkpoint(state.checkpoint).await?;
-        let snapshot = recover_namespace(checkpoint.clone(), state, self.store.volume_id)?;
-        Ok(Some(ObjectBranchObservation {
-            snapshot,
-            revision,
-            head,
-            checkpoint,
-        }))
-    }
-
-    pub(crate) async fn observe_from(
-        &self,
-        _base: &NamespaceSnapshot,
-    ) -> Result<Option<ObjectBranchObservation>, ManagedError> {
-        self.observe().await
-    }
-
-    pub(crate) async fn publish(
-        &self,
-        observed: Option<&ObjectBranchObservation>,
-        publication: &NamespacePublication,
-    ) -> Result<CommitOutcome, ManagedError> {
-        let branch_id = self.binding.id;
-        if publication.target.volume_id != self.store.volume_id {
-            return Err(invalid(
-                "publish Managed branch",
-                "publication belongs to another volume",
-            ));
-        }
-        let (head, revision, base, checkpoint) = match observed {
-            Some(observed) => {
-                observed.head.validate(self.store.volume_id, branch_id)?;
-                if observed.head.lifecycle != BranchLifecycle::Active
-                    || observed.head.maintenance_active
-                {
-                    return Err(conflict(
-                        "publish Managed branch",
-                        "branch is sealed for deletion",
-                    ));
-                }
-                (
-                    observed.head.clone(),
-                    observed.revision.clone(),
-                    Some(&observed.snapshot),
-                    Some(observed.checkpoint.clone()),
-                )
-            }
-            None => {
-                let (head, revision) = self.current_head("publish Managed branch").await?;
-                if head.state.is_some() {
-                    return self.outcome_after_race(publication.operation).await;
-                }
-                (head, revision, None, None)
-            }
-        };
-        let (change, valid) = super::records::StoredChange::prepare(branch_id, publication, base)?;
-        if !valid {
-            if matches!(
-                self.resolve_known(publication.operation, Some(change.request_digest()?))
-                    .await?,
-                CommitOutcome::Committed(_)
-            ) {
-                return Ok(CommitOutcome::Committed(publication.target.cursor));
-            }
-            return Ok(CommitOutcome::Conflict {
-                observed: base.map_or(ChangeCursor::Genesis, |snapshot| snapshot.cursor),
-            });
-        }
-        let request_digest = change.request_digest()?;
-        if let CommitOutcome::Committed(cursor) = self
-            .resolve_known(publication.operation, Some(request_digest))
-            .await?
-        {
-            return Ok(CommitOutcome::Committed(cursor));
-        }
-
-        let state = match (&head.state, checkpoint) {
-            (None, None) => {
-                let mut results = std::collections::BTreeMap::new();
-                let result = StoredCommittedResult::from_change(&change)?;
-                results.insert((branch_id, publication.operation), result);
-                let checkpoint = StoredCheckpoint::new(&publication.target, results)?;
-                let checkpoint_id = self.store.write_checkpoint(&checkpoint).await?;
-                StoredNamespaceState {
-                    checkpoint: checkpoint_id,
-                    checkpoint_cursor: publication.target.cursor.into(),
-                    tail: Vec::new(),
-                    previous_history: None,
-                }
-            }
-            (Some(current), Some(checkpoint)) => {
-                let appended_bytes = current
-                    .tail
-                    .iter()
-                    .map(|change| change.payload.len())
-                    .sum::<usize>()
-                    + change.payload.len();
-                if current.tail.len() + 1 >= MAX_TAIL_TRANSACTIONS
-                    || appended_bytes > MAX_TAIL_BYTES
-                {
-                    let history = StoredHistory::new(self.store.volume_id, branch_id, current)?;
-                    let history_id = self.store.write_history(&history).await?;
-                    let results =
-                        results_for_rotation(checkpoint, current, &change, self.store.volume_id)?;
-                    let checkpoint = StoredCheckpoint::new(&publication.target, results)?;
-                    let checkpoint_id = self.store.write_checkpoint(&checkpoint).await?;
-                    StoredNamespaceState {
-                        checkpoint: checkpoint_id,
-                        checkpoint_cursor: publication.target.cursor.into(),
-                        tail: Vec::new(),
-                        previous_history: Some(history_id),
-                    }
-                } else {
-                    let mut next = current.clone();
-                    next.tail.push(change);
-                    next
-                }
-            }
-            _ => {
-                return Err(corrupt(
-                    "publish Managed branch",
-                    "branch observation and checkpoint disagree",
-                ));
-            }
-        };
-        let next = StoredBranchHead {
-            major: head.major,
-            volume_id: head.volume_id,
-            branch_id: head.branch_id,
-            lifecycle: head.lifecycle,
-            state: Some(state),
-            maintenance_epoch: head.maintenance_epoch,
-            maintenance_active: head.maintenance_active,
-            maintenance_owner: head.maintenance_owner,
-        };
-        let bytes = encode(HEAD_MAGIC, &next, MAX_HEAD_BYTES, "publish Managed branch")?;
-        match self
-            .store
-            .replace(
-                &head_key(branch_id),
-                &revision,
-                bytes,
-                "publish Managed branch",
-            )
-            .await
-        {
-            Ok(true) => Ok(CommitOutcome::Committed(publication.target.cursor)),
-            Ok(false) => self.outcome_after_race(publication.operation).await,
-            Err(_) => match self.resolve(publication.operation).await {
-                Ok(CommitOutcome::Committed(cursor)) => Ok(CommitOutcome::Committed(cursor)),
-                _ => Ok(CommitOutcome::Unknown),
-            },
-        }
-    }
-
-    pub(crate) async fn resolve(
-        &self,
-        operation: OperationId,
-    ) -> Result<CommitOutcome, ManagedError> {
-        match self.resolve_known(operation, None).await {
-            Err(error) if error.kind() == ManagedErrorKind::Unavailable => {
-                Ok(CommitOutcome::Unknown)
-            }
-            result => result,
-        }
-    }
-
-    async fn resolve_known(
-        &self,
-        operation: OperationId,
-        expected: Option<[u8; 32]>,
-    ) -> Result<CommitOutcome, ManagedError> {
-        let (head, _) = self
-            .current_head("resolve Managed branch publication")
-            .await?;
-        let Some(state) = head.state else {
-            return Ok(CommitOutcome::Absent);
-        };
-        if let Some(change) = state.tail.iter().find(|change| {
-            change.origin_branch == *self.binding.id.as_bytes()
-                && change.operation == *operation.as_bytes()
-        }) {
-            require_request_digest(expected, change.request_digest()?)?;
-            return Ok(CommitOutcome::Committed(change.cursor.decode()?));
-        }
-        let checkpoint = self.store.read_checkpoint(state.checkpoint).await?;
-        let Some(result) = checkpoint.resolve(self.binding.id, operation)? else {
-            return Ok(CommitOutcome::Absent);
-        };
-        require_request_digest(expected, result.request_sha256)?;
-        Ok(CommitOutcome::Committed(result.cursor.decode()?))
-    }
-
-    async fn outcome_after_race(
-        &self,
-        operation: OperationId,
-    ) -> Result<CommitOutcome, ManagedError> {
-        match self.resolve(operation).await? {
-            result @ (CommitOutcome::Committed(_) | CommitOutcome::Unknown) => Ok(result),
-            _ => Ok(CommitOutcome::Conflict {
-                observed: self
-                    .observe()
-                    .await?
-                    .map_or(ChangeCursor::Genesis, |value| value.snapshot.cursor),
-            }),
-        }
+    fn volume_id(&self) -> VolumeId {
+        self.volume_id
     }
 
     async fn current_head(
         &self,
+        binding: &BranchBinding,
         action: &'static str,
-    ) -> Result<(StoredBranchHead, String), ManagedError> {
+    ) -> Result<(StoredBranchHead, Self::Revision), ManagedError> {
         let (head, revision) = self
-            .store
-            .read_head(self.binding.id)
+            .read_head(binding.id)
             .await?
             .ok_or_else(|| conflict(action, "branch incarnation no longer exists"))?;
         if head.lifecycle != BranchLifecycle::Active {
@@ -334,6 +103,32 @@ impl ObjectBoundNamespace {
             return Err(conflict(action, "branch maintenance is active"));
         }
         Ok((head, revision))
+    }
+
+    async fn replace_head(
+        &self,
+        branch: BranchId,
+        revision: &Self::Revision,
+        head: &StoredBranchHead,
+    ) -> Result<bool, ManagedError> {
+        let bytes = encode(HEAD_MAGIC, head, MAX_HEAD_BYTES, "publish Managed branch")?;
+        self.replace(&head_key(branch), revision, bytes, "publish Managed branch")
+            .await
+    }
+
+    async fn read_checkpoint(&self, id: [u8; 32]) -> Result<StoredCheckpoint, ManagedError> {
+        ObjectBranchStore::read_checkpoint(self, id).await
+    }
+
+    async fn write_checkpoint(
+        &self,
+        checkpoint: &StoredCheckpoint,
+    ) -> Result<[u8; 32], ManagedError> {
+        ObjectBranchStore::write_checkpoint(self, checkpoint).await
+    }
+
+    async fn write_history(&self, history: &StoredHistory) -> Result<[u8; 32], ManagedError> {
+        ObjectBranchStore::write_history(self, history).await
     }
 }
 
@@ -1467,7 +1262,7 @@ mod tests {
     use super::*;
     use opendal::services::Memory;
 
-    use crate::filesystem::{DirectoryEntry, NodeAttributes, NodeKind};
+    use crate::filesystem::{ChangeCursor, DirectoryEntry, NodeAttributes, NodeKind};
     use crate::managed::format::ExtentMap;
     use crate::managed::metadata::namespace::{
         DirectoryRecord, FileVersionRecord, NamespaceSnapshot, NodeRecord, managed_generation,

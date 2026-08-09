@@ -486,6 +486,7 @@ impl Volume for ManagedVolume {
     async fn stage_files(
         &self,
         source: &Operator,
+        staging: &Operator,
         paths: Vec<String>,
         authority: Option<&VolumeSnapshot>,
         concurrency: NonZeroUsize,
@@ -498,7 +499,7 @@ impl Volume for ManagedVolume {
             .transpose()?
             .unwrap_or_default();
         self.data
-            .stage_files(source, paths, &known, concurrency)
+            .stage_files(source, staging, paths, &known, concurrency)
             .await?
             .into_iter()
             .map(|(path, version)| Ok((path, encode_file_version(&version)?)))

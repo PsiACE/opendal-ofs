@@ -18,12 +18,18 @@
 //! Durable named branches for Managed metadata.
 
 mod d1;
+mod namespace;
 mod object;
 mod record_set;
 pub(crate) mod records;
 
-pub use d1::{D1BoundNamespace, D1BranchObservation, D1BranchStore};
-pub use object::{ObjectBoundNamespace, ObjectBranchObservation, ObjectBranchStore};
+pub use d1::D1BranchStore;
+pub use namespace::{BoundNamespace, BranchObservation};
+pub use object::ObjectBranchStore;
+pub type ObjectBoundNamespace = BoundNamespace<ObjectBranchStore>;
+pub type ObjectBranchObservation = BranchObservation<String>;
+pub type D1BoundNamespace = BoundNamespace<D1BranchStore>;
+pub type D1BranchObservation = BranchObservation<(u64, u64)>;
 pub use records::{BranchInfo, BranchLifecycle, ForkPoint};
 
 /// Required Managed superblock extension implemented by this module.

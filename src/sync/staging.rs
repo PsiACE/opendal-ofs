@@ -9,11 +9,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write as _};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use futures::{StreamExt as _, TryStreamExt as _, stream};
-use opendal::{Operator, raw::Timestamp};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -21,11 +21,12 @@ use super::local::{
     LocalEntry, LocalKind, LocalTree, NativeIdentity, entry_at, fs_operator, native_identity_at,
     set_executable,
 };
+use crate::filesystem::{FileVersion, Volume, VolumeSnapshot};
 
 const COPY_CHUNK: usize = 1024 * 1024;
 const COPY_CONCURRENCY: usize = 8;
 const MANIFEST_FORMAT: &str = "ofs-staged-tree";
-const MANIFEST_MAJOR: u16 = 2;
+const MANIFEST_MAJOR: u16 = 3;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -41,17 +42,75 @@ pub(crate) struct StagedTree {
     logical: LocalTree,
     files: BTreeMap<String, StagedFile>,
     content_paths: BTreeSet<String>,
+    prepared: BTreeMap<String, FileVersion>,
 }
 
 impl StagedTree {
-    pub(crate) async fn prepare(tree: &LocalTree, root: impl AsRef<Path>) -> Result<Self> {
-        Self::prepare_known(tree, root, &BTreeMap::new()).await
+    pub(crate) async fn inspect(tree: &LocalTree) -> Result<Self> {
+        let source = tree.operator()?;
+        let files = stream::iter(
+            tree.entries()
+                .iter()
+                .filter(|(_, expected)| expected.kind == LocalKind::File)
+                .map(|(path, expected)| {
+                    let source = source.clone();
+                    let path = path.clone();
+                    let expected = expected.clone();
+                    async move {
+                        let reader = source
+                            .reader_with(&path)
+                            .chunk(COPY_CHUNK)
+                            .await
+                            .with_context(|| format!("open source file {path:?}"))?;
+                        let mut input = reader
+                            .into_bytes_stream(..)
+                            .await
+                            .with_context(|| format!("stream source file {path:?}"))?;
+                        let mut digest = Sha256::new();
+                        let mut size = 0_u64;
+                        while let Some(bytes) = input.next().await {
+                            let bytes =
+                                bytes.with_context(|| format!("read source file {path:?}"))?;
+                            size = size
+                                .checked_add(bytes.len() as u64)
+                                .with_context(|| format!("source file {path:?} is too large"))?;
+                            digest.update(&bytes);
+                        }
+                        if size != expected.size {
+                            bail!("source file {path:?} changed while it was inspected");
+                        }
+                        Ok::<_, anyhow::Error>((
+                            path,
+                            StagedFile {
+                                size,
+                                digest: digest.finalize().into(),
+                            },
+                        ))
+                    }
+                }),
+        )
+        .buffer_unordered(COPY_CONCURRENCY)
+        .try_collect::<BTreeMap<_, _>>()
+        .await?;
+        for (path, entry) in tree.entries() {
+            require_same_identity(tree.root(), path, entry.kind, entry.native_identity)?;
+        }
+        Ok(Self {
+            root: tree.root().to_owned(),
+            logical: tree.clone(),
+            files,
+            content_paths: BTreeSet::new(),
+            prepared: BTreeMap::new(),
+        })
     }
 
-    pub(crate) async fn prepare_known(
+    pub(crate) async fn prepare_for_publish<V: Volume>(
         tree: &LocalTree,
         root: impl AsRef<Path>,
         known_digests: &BTreeMap<String, [u8; 32]>,
+        volume: &V,
+        authority: Option<&VolumeSnapshot>,
+        concurrency: NonZeroUsize,
     ) -> Result<Self> {
         let root = root.as_ref();
         prepare_root(tree.root(), root).await?;
@@ -66,44 +125,72 @@ impl StagedTree {
                     .with_context(|| format!("create staging directory {path:?}"))?;
             }
         }
-        let prepared = stream::iter(
-            tree.entries()
-                .iter()
-                .filter(|(_, expected)| expected.kind == LocalKind::File)
-                .map(|(path, expected)| {
-                    let source = source.clone();
-                    let staged = staged.clone();
-                    let source_root = tree.root().to_owned();
-                    let staging_root = root.to_owned();
-                    let path = path.clone();
-                    let expected = expected.clone();
-                    let known_digest = known_digests.get(&path).copied();
-                    async move {
-                        let file = stage_file(
-                            &source,
-                            &staged,
-                            &source_root,
-                            &staging_root,
-                            &path,
-                            &expected,
-                            known_digest,
-                        )
-                        .await?;
-                        Ok::<_, anyhow::Error>((path, file, known_digest.is_none()))
-                    }
-                }),
-        )
-        .buffer_unordered(COPY_CONCURRENCY)
-        .try_collect::<Vec<_>>()
-        .await?
-        .into_iter();
+
+        let changed = tree
+            .entries()
+            .iter()
+            .filter(|(path, entry)| {
+                entry.kind == LocalKind::File && !known_digests.contains_key(*path)
+            })
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        let prepared = volume
+            .stage_files(&source, &staged, changed.clone(), authority, concurrency)
+            .await
+            .map_err(anyhow::Error::new)?;
+        if prepared.len() != changed.len()
+            || changed.iter().any(|path| !prepared.contains_key(path))
+        {
+            bail!("volume did not prepare every changed file exactly once");
+        }
+
         let mut files = BTreeMap::new();
         let mut content_paths = BTreeSet::new();
-        for (path, file, has_content) in prepared {
-            if has_content {
-                content_paths.insert(path.clone());
-            }
-            files.insert(path, file);
+        for (path, expected) in tree
+            .entries()
+            .iter()
+            .filter(|(_, entry)| entry.kind == LocalKind::File)
+        {
+            let file = match prepared.get(path) {
+                Some(version) => {
+                    if version.logical_size != expected.size {
+                        bail!("volume returned the wrong size for staged file {path:?}");
+                    }
+                    let after = source
+                        .stat(path)
+                        .await
+                        .with_context(|| format!("inspect source file {path:?} after staging"))?;
+                    require_same(path, expected.size, &expected.modified, &after)?;
+                    let attributes =
+                        fs::symlink_metadata(tree.root().join(path)).with_context(|| {
+                            format!("inspect source file attributes for {path:?} after staging")
+                        })?;
+                    require_same_file_attributes(path, expected, &attributes)?;
+                    set_executable(&root.join(path), expected.executable)
+                        .with_context(|| format!("preserve executable bit for {path:?}"))?;
+                    let staged_metadata = staged
+                        .stat(path)
+                        .await
+                        .with_context(|| format!("verify staging file {path:?}"))?;
+                    if !staged_metadata.is_file()
+                        || staged_metadata.content_length() != expected.size
+                    {
+                        bail!("staging file {path:?} is incomplete; retry sync");
+                    }
+                    content_paths.insert(path.clone());
+                    StagedFile {
+                        size: version.logical_size,
+                        digest: version.logical_digest,
+                    }
+                }
+                None => StagedFile {
+                    size: expected.size,
+                    digest: *known_digests
+                        .get(path)
+                        .with_context(|| format!("unchanged file {path:?} has no known digest"))?,
+                },
+            };
+            files.insert(path.clone(), file);
         }
         for (path, entry) in tree.entries() {
             require_same_identity(tree.root(), path, entry.kind, entry.native_identity)?;
@@ -113,6 +200,7 @@ impl StagedTree {
             logical: LocalTree::from_entries(root, tree.entries().clone()),
             files,
             content_paths,
+            prepared,
         };
         staged.save_manifest()?;
         Ok(staged)
@@ -138,6 +226,11 @@ impl StagedTree {
             logical: LocalTree::from_entries(root, stored.entries),
             files: stored.files,
             content_paths: stored.content_paths,
+            prepared: stored
+                .prepared
+                .into_iter()
+                .map(|(path, version)| (path, version.into()))
+                .collect(),
         };
         staged.validate()?;
         Ok(staged)
@@ -149,6 +242,10 @@ impl StagedTree {
 
     pub(crate) fn files(&self) -> &BTreeMap<String, StagedFile> {
         &self.files
+    }
+
+    pub(crate) fn prepared(&self) -> &BTreeMap<String, FileVersion> {
+        &self.prepared
     }
 
     pub(crate) fn logical(&self) -> &LocalTree {
@@ -233,6 +330,7 @@ impl StagedTree {
             },
         );
         self.content_paths.insert(path.clone());
+        self.prepared.remove(&path);
         self.logical.insert(path, entry);
         Ok(())
     }
@@ -248,6 +346,7 @@ impl StagedTree {
         }
         self.files.remove(&path);
         self.content_paths.remove(&path);
+        self.prepared.remove(&path);
         self.logical.insert(path, entry);
         Ok(())
     }
@@ -256,6 +355,7 @@ impl StagedTree {
         self.logical.remove(path);
         self.files.remove(path);
         self.content_paths.remove(path);
+        self.prepared.remove(path);
         self.remove_descendants(path);
     }
 
@@ -276,6 +376,7 @@ impl StagedTree {
             self.logical.remove(&descendant);
             self.files.remove(&descendant);
             self.content_paths.remove(&descendant);
+            self.prepared.remove(&descendant);
         }
     }
 
@@ -301,6 +402,18 @@ impl StagedTree {
                 bail!("staged content {path:?} is incomplete");
             }
         }
+        for (path, version) in &self.prepared {
+            let file = self
+                .files
+                .get(path)
+                .with_context(|| format!("prepared file {path:?} is not a logical file"))?;
+            if !self.content_paths.contains(path)
+                || file.size != version.logical_size
+                || file.digest != version.logical_digest
+            {
+                bail!("prepared file {path:?} disagrees with staged content");
+            }
+        }
         Ok(())
     }
 }
@@ -313,6 +426,38 @@ struct StoredStagedTree {
     entries: BTreeMap<String, LocalEntry>,
     files: BTreeMap<String, StagedFile>,
     content_paths: BTreeSet<String>,
+    prepared: BTreeMap<String, StoredFileVersion>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StoredFileVersion {
+    id: [u8; 32],
+    logical_size: u64,
+    logical_digest: [u8; 32],
+    descriptor: Vec<u8>,
+}
+
+impl From<&FileVersion> for StoredFileVersion {
+    fn from(version: &FileVersion) -> Self {
+        Self {
+            id: *version.id.as_bytes(),
+            logical_size: version.logical_size,
+            logical_digest: version.logical_digest,
+            descriptor: version.descriptor().to_vec(),
+        }
+    }
+}
+
+impl From<StoredFileVersion> for FileVersion {
+    fn from(version: StoredFileVersion) -> Self {
+        Self::from_parts(
+            crate::filesystem::FileVersionId::from_bytes(version.id),
+            version.logical_size,
+            version.logical_digest,
+            version.descriptor,
+        )
+    }
 }
 
 impl From<&StagedTree> for StoredStagedTree {
@@ -323,106 +468,13 @@ impl From<&StagedTree> for StoredStagedTree {
             entries: staged.logical.entries().clone(),
             files: staged.files.clone(),
             content_paths: staged.content_paths.clone(),
+            prepared: staged
+                .prepared
+                .iter()
+                .map(|(path, version)| (path.clone(), version.into()))
+                .collect(),
         }
     }
-}
-
-async fn stage_file(
-    source: &Operator,
-    staged: &Operator,
-    source_root: &Path,
-    staging_root: &Path,
-    path: &str,
-    expected: &LocalEntry,
-    known_digest: Option<[u8; 32]>,
-) -> Result<StagedFile> {
-    if let Some(digest) = known_digest {
-        let metadata = fs::symlink_metadata(source_root.join(path))
-            .with_context(|| format!("inspect unchanged source file {path:?}"))?;
-        require_same_file_attributes(path, expected, &metadata)?;
-        let modified = Timestamp::try_from(
-            metadata
-                .modified()
-                .with_context(|| format!("read unchanged source file mtime for {path:?}"))?,
-        )
-        .with_context(|| format!("normalize unchanged source file mtime for {path:?}"))?;
-        if metadata.len() != expected.size || modified.to_string() != expected.modified {
-            bail!("source file {path:?} changed while preparing publication; retry sync");
-        }
-        return Ok(StagedFile {
-            size: expected.size,
-            digest,
-        });
-    }
-
-    let before = source
-        .stat(path)
-        .await
-        .with_context(|| format!("inspect source file {path:?} before staging"))?;
-    require_same(path, expected.size, &expected.modified, &before)?;
-    let before_attributes = fs::symlink_metadata(source_root.join(path))
-        .with_context(|| format!("inspect source file attributes for {path:?} before staging"))?;
-    require_same_file_attributes(path, expected, &before_attributes)?;
-
-    let reader = source
-        .reader_with(path)
-        .chunk(COPY_CHUNK)
-        .await
-        .with_context(|| format!("open source file {path:?}"))?;
-    let mut input = reader
-        .into_bytes_stream(..)
-        .await
-        .with_context(|| format!("stream stable source file {path:?}"))?;
-    let mut writer = staged
-        .writer(path)
-        .await
-        .with_context(|| format!("open staging file {path:?}"))?;
-    let mut digest = Sha256::new();
-    let mut copied = 0_u64;
-    while let Some(bytes) = input.next().await {
-        let bytes = bytes.with_context(|| format!("read stable source file {path:?}"))?;
-        copied = copied
-            .checked_add(bytes.len() as u64)
-            .with_context(|| format!("source file {path:?} exceeds supported length"))?;
-        if copied > expected.size {
-            bail!("source file {path:?} returned more data than expected; retry sync");
-        }
-        digest.update(&bytes);
-        writer
-            .write(bytes)
-            .await
-            .with_context(|| format!("write staging file {path:?}"))?;
-    }
-    if copied != expected.size {
-        bail!("source file {path:?} returned a short read; retry sync");
-    }
-    writer
-        .close()
-        .await
-        .with_context(|| format!("finish staging file {path:?}"))?;
-    let digest = digest.finalize().into();
-
-    let after = source
-        .stat(path)
-        .await
-        .with_context(|| format!("inspect source file {path:?} after staging"))?;
-    require_same(path, expected.size, &expected.modified, &after)?;
-    let after_attributes = fs::symlink_metadata(source_root.join(path))
-        .with_context(|| format!("inspect source file attributes for {path:?} after staging"))?;
-    require_same_file_attributes(path, expected, &after_attributes)?;
-    set_executable(&staging_root.join(path), expected.executable)
-        .with_context(|| format!("preserve executable bit for {path:?}"))?;
-    let staged_metadata = staged
-        .stat(path)
-        .await
-        .with_context(|| format!("verify staging file {path:?}"))?;
-    if staged_metadata.content_length() != expected.size {
-        bail!("staging file {path:?} is incomplete; retry sync");
-    }
-    Ok(StagedFile {
-        size: expected.size,
-        digest,
-    })
 }
 
 #[cfg(unix)]
