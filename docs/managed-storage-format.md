@@ -238,9 +238,9 @@ record. A directory record includes its complete entry map and a file-version
 record includes its complete extent list. The checkpoint format does not add a
 second header/entry/extent model.
 
-Records are split at a target encoded size. The target and I/O concurrency are
-write policy, not persisted limits. A natural record is never split merely to
-meet the target. Each part has this envelope:
+Records are split at a target encoded size. The target is write policy, not a
+persisted limit. A natural record is never split merely to meet the target.
+Each part has this envelope:
 
 ```text
 "OFS1CPP1"
@@ -251,8 +251,9 @@ SHA-256 of preceding bytes
 Recovery reads every referenced part, verifies its digest, encoded length,
 format major, and volume scope, rejects missing or duplicate natural records,
 validates the resulting snapshot, and applies no overlay or tombstones. A new
-checkpoint never depends on an older checkpoint. Readers and writers process
-independent parts through the metadata backend with bounded concurrency.
+checkpoint never depends on an older checkpoint. The checkpoint codec submits
+parts through the metadata backend without defining another concurrency
+policy; configured backend and OpenDAL layers remain authoritative.
 
 ## Transactional Metadata layout
 

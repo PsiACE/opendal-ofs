@@ -526,8 +526,9 @@ Retaining every historical position retains its metadata and referenced data.
 Historical lookup is linear in the number of archived history segments. A
 disposable index may improve lookup without becoming authority.
 
-Checkpoint storage is split and provider requests are bounded, but recovery
-still constructs one in-memory `NamespaceSnapshot`. This is suitable for Sync,
+Checkpoint storage is split and provider requests remain governed by the
+configured backend layers, but recovery still constructs one in-memory
+`NamespaceSnapshot`. This is suitable for Sync,
 but it is below lakeFS's range-indexed metadata lookup for very large
 namespaces. The checkpoint root can later point to indexed ranges without
 changing registry, head, history, or branch binding semantics.

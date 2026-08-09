@@ -20,7 +20,6 @@
 use std::collections::BTreeMap;
 use std::io::Cursor;
 
-use futures::{StreamExt as _, TryStreamExt as _, stream};
 use opendal::Operator;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -52,8 +51,6 @@ const MAX_TAIL_TRANSACTIONS: u16 = 32;
 const MAX_TAIL_BYTES: usize = 128 * 1024;
 const MAX_HEAD_BYTES: usize = 256 * 1024;
 const HEAD_COMPRESSION_LEVEL: i32 = 3;
-const MAX_CHECKPOINT_READS: usize = 8;
-const MAX_CHECKPOINT_WRITES: usize = 8;
 
 #[derive(Clone, Debug)]
 pub(crate) struct NamespaceObservation<R = String> {
@@ -495,20 +492,17 @@ impl<B: RecordBackend> NamespaceStore<B> {
     ) -> Result<[u8; 32], ManagedError> {
         let results = results.values().cloned().collect::<Vec<_>>();
         let pending = PendingCheckpoint::new(snapshot, &results)?;
-        stream::iter(&pending.parts)
-            .map(Ok::<_, ManagedError>)
-            .try_for_each_concurrent(MAX_CHECKPOINT_WRITES, |part| async move {
-                ensure_immutable(
-                    &self.operator,
-                    &checkpoint_part_key(&part.reference.id),
-                    &part.bytes,
-                    "publish Managed namespace",
-                    ManagedErrorKind::Conflict,
-                    "operation identity was reused with another payload",
-                )
-                .await
-            })
+        for part in &pending.parts {
+            ensure_immutable(
+                &self.operator,
+                &checkpoint_part_key(&part.reference.id),
+                &part.bytes,
+                "publish Managed namespace",
+                ManagedErrorKind::Conflict,
+                "operation identity was reused with another payload",
+            )
             .await?;
+        }
         let root = pending.finish();
         let bytes = root.encode()?;
         let id = sha256(&bytes);
@@ -535,20 +529,17 @@ impl<B: RecordBackend> NamespaceStore<B> {
         )
         .await?;
         let root = CheckpointRoot::decode(&bytes)?;
-        let parts = stream::iter(root.parts.iter().cloned())
-            .map(|reference| async move {
-                let bytes = object::read(
-                    &self.operator,
-                    &checkpoint_part_key(&reference.id),
-                    "read Managed namespace",
-                )
-                .await?
-                .ok_or_else(|| corrupt("read Managed namespace", "checkpoint part is missing"))?;
-                Ok(CheckpointPart { reference, bytes })
-            })
-            .buffered(MAX_CHECKPOINT_READS)
-            .try_collect()
-            .await?;
+        let mut parts = Vec::with_capacity(root.parts.len());
+        for reference in root.parts.iter().copied() {
+            let bytes = object::read(
+                &self.operator,
+                &checkpoint_part_key(&reference.id),
+                "read Managed namespace",
+            )
+            .await?
+            .ok_or_else(|| corrupt("read Managed namespace", "checkpoint part is missing"))?;
+            parts.push(CheckpointPart { reference, bytes });
+        }
         let (snapshot, results) = root.recover::<StoredCommittedResult>(parts)?;
         let mut indexed = BTreeMap::new();
         for result in results {

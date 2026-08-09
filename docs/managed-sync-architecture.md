@@ -183,8 +183,8 @@ expose a partial checkpoint.
 
 An established replica reuses its verified common snapshot when its cursor is
 still covered by the HEAD tail. A cold reader loads the checkpoint root and all
-parts needed to reconstruct the snapshot. Independent part reads and writes
-run with bounded concurrency.
+parts needed to reconstruct the snapshot. Part I/O uses the metadata backend
+without adding a checkpoint-specific concurrency default.
 
 ### Transactional Metadata
 

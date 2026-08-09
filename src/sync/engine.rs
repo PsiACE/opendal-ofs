@@ -41,16 +41,11 @@ pub struct SyncEngine<V> {
 }
 
 impl<V: Volume> SyncEngine<V> {
-    pub fn new(volume: V) -> Self {
+    pub fn new(volume: V, transfer_concurrency: NonZeroUsize) -> Self {
         Self {
             volume,
-            transfer_concurrency: NonZeroUsize::new(4).expect("default concurrency is non-zero"),
+            transfer_concurrency,
         }
-    }
-
-    pub fn with_transfer_concurrency(mut self, concurrency: NonZeroUsize) -> Self {
-        self.transfer_concurrency = concurrency;
-        self
     }
 
     pub async fn sync(

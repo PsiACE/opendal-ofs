@@ -585,7 +585,7 @@ async fn sync_volume(config: &Path, args: SyncArgs) -> Result<()> {
         .as_ref()
         .map(|branch| format!(" branch {:?}", branch.name.as_str()))
         .unwrap_or_default();
-    let engine = SyncEngine::new(volume).with_transfer_concurrency(transfer_concurrency);
+    let engine = SyncEngine::new(volume, transfer_concurrency);
     let result = engine
         .sync(&args.replica, &args.state, &args.resolve)
         .await?;

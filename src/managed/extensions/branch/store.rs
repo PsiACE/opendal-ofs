@@ -20,7 +20,6 @@
 use std::collections::BTreeSet;
 use std::io::Cursor;
 
-use futures::{StreamExt as _, TryStreamExt as _, stream};
 use opendal::Operator;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -49,7 +48,6 @@ const HISTORY_MAGIC: &[u8; 8] = b"OFS1BRY1";
 const MAX_REGISTRY_BYTES: usize = usize::MAX;
 const MAX_HEAD_BYTES: usize = 256 * 1024;
 const MAX_HISTORY_BYTES: usize = 512 * 1024;
-const MAX_CHECKPOINT_IO: usize = 8;
 
 #[derive(Clone)]
 pub struct BranchStore<B> {
@@ -925,20 +923,17 @@ impl<B: BranchRecordBackend> BranchStore<B> {
 
     async fn read_checkpoint(&self, id: [u8; 32]) -> Result<StoredCheckpoint, ManagedError> {
         let root = self.read_checkpoint_root(id).await?;
-        let parts = stream::iter(root.parts.iter().cloned())
-            .map(|reference| async move {
-                let bytes = self
-                    .backend
-                    .read_bytes(&checkpoint_part_key(reference.id), "read Managed branch")
-                    .await?
-                    .ok_or_else(|| {
-                        corrupt("read Managed branch", "branch checkpoint part is missing")
-                    })?;
-                Ok(CheckpointPart { reference, bytes })
-            })
-            .buffered(MAX_CHECKPOINT_IO)
-            .try_collect()
-            .await?;
+        let mut parts = Vec::with_capacity(root.parts.len());
+        for reference in root.parts.iter().copied() {
+            let bytes = self
+                .backend
+                .read_bytes(&checkpoint_part_key(reference.id), "read Managed branch")
+                .await?
+                .ok_or_else(|| {
+                    corrupt("read Managed branch", "branch checkpoint part is missing")
+                })?;
+            parts.push(CheckpointPart { reference, bytes });
+        }
         let (snapshot, results) = root.recover(parts)?;
         Ok(StoredCheckpoint { snapshot, results })
     }
@@ -948,17 +943,14 @@ impl<B: BranchRecordBackend> BranchStore<B> {
         checkpoint: &StoredCheckpoint,
     ) -> Result<[u8; 32], ManagedError> {
         let pending = PendingCheckpoint::new(&checkpoint.snapshot, &checkpoint.results)?;
-        stream::iter(&pending.parts)
-            .map(Ok::<_, ManagedError>)
-            .try_for_each_concurrent(MAX_CHECKPOINT_IO, |part| async move {
-                self.ensure_immutable(
-                    &checkpoint_part_key(part.reference.id),
-                    &part.bytes,
-                    "checkpoint Managed branch",
-                )
-                .await
-            })
+        for part in &pending.parts {
+            self.ensure_immutable(
+                &checkpoint_part_key(part.reference.id),
+                &part.bytes,
+                "checkpoint Managed branch",
+            )
             .await?;
+        }
         let root = pending.finish();
         let bytes = root.encode()?;
         let id: [u8; 32] = Sha256::digest(&bytes).into();
