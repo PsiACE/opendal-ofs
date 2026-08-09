@@ -24,8 +24,8 @@ use serde::de::DeserializeOwned;
 use sha2::{Digest as _, Sha256};
 
 use super::ObjectBoundNamespace;
+use super::checkpoint::{CheckpointPart, CheckpointRoot, PendingCheckpoint};
 use super::namespace::BranchNamespaceStore;
-use super::record_set::{CheckpointRoot, PartRef, PendingCheckpoint};
 use super::records::{
     BranchInfo, BranchLifecycle, ForkPoint, StoredBranchHead, StoredBranchRegistry,
     StoredCheckpoint, StoredHistory, StoredNamespaceState, info, recover_retained,
@@ -40,14 +40,12 @@ const REGISTRY_KEY: &str = ".ofs/managed/metadata/v1/extensions/branch/v1/regist
 const REGISTRY_MAGIC: &[u8; 8] = b"OFS1BRG1";
 const HEAD_MAGIC: &[u8; 8] = b"OFS1BRH1";
 const CHECKPOINT_MAGIC: &[u8; 8] = b"OFS1BRC1";
-const CHECKPOINT_PART_MAGIC: &[u8; 8] = b"OFS1BRP1";
 const HISTORY_MAGIC: &[u8; 8] = b"OFS1BRY1";
 // The registry remains the small mutable branch authority. Its actual backend
 // write is the limit; unlike checkpoint data, it has no format-level byte cap.
 const MAX_REGISTRY_BYTES: usize = usize::MAX;
 const MAX_HEAD_BYTES: usize = 256 * 1024;
 const MAX_CHECKPOINT_ROOT_BYTES: usize = 4 * 1024 * 1024;
-const MAX_CHECKPOINT_PART_BYTES: usize = 2 * 1024 * 1024;
 const MAX_HISTORY_BYTES: usize = 512 * 1024;
 
 #[derive(Clone)]
@@ -953,21 +951,17 @@ impl ObjectBranchStore {
         let root = self.read_checkpoint_root(id).await?;
         let mut parts = Vec::with_capacity(root.parts.len());
         for reference in &root.parts {
-            let bytes = object::read_content_addressed(
+            let bytes = object::read(
                 &self.operator,
                 &checkpoint_part_key(reference.id),
-                &reference.id,
                 "read Managed branch",
-                "branch checkpoint part is missing",
-                "branch checkpoint part identity is invalid",
             )
-            .await?;
-            parts.push(decode(
-                CHECKPOINT_PART_MAGIC,
-                &bytes,
-                MAX_CHECKPOINT_PART_BYTES,
-                "read Managed branch",
-            )?);
+            .await?
+            .ok_or_else(|| corrupt("read Managed branch", "branch checkpoint part is missing"))?;
+            parts.push(CheckpointPart {
+                reference: reference.clone(),
+                bytes,
+            });
         }
         root.recover(parts)
     }
@@ -977,27 +971,15 @@ impl ObjectBranchStore {
         checkpoint: &StoredCheckpoint,
     ) -> Result<[u8; 32], ManagedError> {
         let pending = PendingCheckpoint::from_checkpoint(checkpoint)?;
-        let mut references = Vec::with_capacity(pending.parts.len());
         for part in &pending.parts {
-            let bytes = encode(
-                CHECKPOINT_PART_MAGIC,
-                part,
-                MAX_CHECKPOINT_PART_BYTES,
-                "checkpoint Managed branch",
-            )?;
-            let id: [u8; 32] = Sha256::digest(&bytes).into();
             self.ensure_immutable(
-                &checkpoint_part_key(id),
-                &bytes,
+                &checkpoint_part_key(part.reference.id),
+                &part.bytes,
                 "checkpoint Managed branch",
             )
             .await?;
-            references.push(PartRef {
-                id,
-                records: part.records.len() as u32,
-            });
         }
-        let root = pending.finish(references)?;
+        let root = pending.finish();
         let bytes = encode(
             CHECKPOINT_MAGIC,
             &root,
@@ -1143,7 +1125,7 @@ fn checkpoint_key(id: [u8; 32]) -> String {
 }
 
 fn checkpoint_part_key(id: [u8; 32]) -> String {
-    format!("{ROOT}/checkpoint-parts/sha256/{}.ofs", hex(&id))
+    format!("{ROOT}/checkpoint-parts/sha256/{}.sst", hex(&id))
 }
 
 fn history_key(id: [u8; 32]) -> String {

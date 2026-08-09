@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Concrete, provider-neutral record sets for branch checkpoints.
+//! Branch checkpoint records stored in the shared Managed SSTable format.
 //!
 //! The storage providers own only the immutable-part I/O.  Record boundaries,
 //! paging, reconstruction, and validation stay here so Object and D1 cannot
@@ -29,13 +29,13 @@ use super::records::{
     FORMAT_MAJOR, StoredCheckpoint, StoredCommittedResult, StoredDirectory, StoredDirectoryEntry,
     StoredFileVersion, StoredNode, StoredSnapshot,
 };
-use crate::managed::format::{Extent, ExtentMap};
+use crate::managed::format::{Extent, ExtentMap, sstable};
 use crate::managed::{ManagedError, ManagedErrorKind};
 
 /// Keeps D1 values comfortably below its row/request limits while producing
 /// reasonably sized immutable Object writes. This is a target, not a limit on
 /// the complete checkpoint or on a single natural record.
-const TARGET_PART_BYTES: usize = 256 * 1024;
+const TARGET_PART_BYTES: usize = 512 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -44,22 +44,13 @@ pub(crate) struct CheckpointRoot {
     pub(crate) volume_id: [u8; 16],
     pub(crate) cursor: super::records::StoredCursor,
     pub(crate) root: [u8; 16],
-    pub(crate) parts: Vec<PartRef>,
+    pub(crate) parts: Vec<sstable::TableRef>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct PartRef {
-    pub(crate) id: [u8; 32],
-    pub(crate) records: u32,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug)]
 pub(crate) struct CheckpointPart {
-    pub(crate) major: u16,
-    pub(crate) volume_id: [u8; 16],
-    pub(crate) records: Vec<CheckpointRecord>,
+    pub(crate) reference: sstable::TableRef,
+    pub(crate) bytes: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -144,34 +135,54 @@ impl PendingCheckpoint {
                 .map(CheckpointRecord::Receipt),
         );
 
-        let mut parts = Vec::new();
-        let mut current = Vec::new();
+        let mut batches = Vec::new();
+        let mut current = Vec::<sstable::Record>::new();
         let mut current_bytes = 0_usize;
-        for record in records {
-            let record_bytes = serde_json::to_vec(&record)
-                .map_err(|_| invalid("checkpoint record cannot be encoded"))?
-                .len();
+        for (ordinal, record) in records.into_iter().enumerate() {
+            let mut value = Vec::new();
+            ciborium::into_writer(&record, &mut value)
+                .map_err(|_| invalid("checkpoint record cannot be encoded"))?;
+            let record_bytes = value.len();
             if !current.is_empty() && current_bytes.saturating_add(record_bytes) > TARGET_PART_BYTES
             {
-                parts.push(CheckpointPart {
-                    major: FORMAT_MAJOR,
-                    volume_id: checkpoint.volume_id,
-                    records: std::mem::take(&mut current),
-                });
+                batches.push(std::mem::take(&mut current));
                 current_bytes = 0;
             }
             current_bytes = current_bytes.saturating_add(record_bytes);
-            current.push(record);
-        }
-        if !current.is_empty() {
-            parts.push(CheckpointPart {
-                major: FORMAT_MAJOR,
-                volume_id: checkpoint.volume_id,
-                records: current,
+            current.push(sstable::Record {
+                key: (ordinal as u64).to_be_bytes().to_vec(),
+                value,
             });
         }
-        if parts.is_empty() {
+        if !current.is_empty() {
+            batches.push(current);
+        }
+        if batches.is_empty() {
             return Err(invalid("branch checkpoint has no records"));
+        }
+        let mut parts = Vec::with_capacity(batches.len());
+        for records in batches {
+            let partition_key = records
+                .first()
+                .expect("checkpoint batch is not empty")
+                .key
+                .clone();
+            let tables = sstable::build_set(
+                checkpoint.volume_id,
+                vec![sstable::RecordGroup {
+                    partition_key,
+                    records,
+                }],
+                "checkpoint Managed branch",
+            )?;
+            if tables.len() != 1 {
+                return Err(invalid("checkpoint batch produced more than one SSTable"));
+            }
+            let table = tables.into_iter().next().expect("one table was produced");
+            parts.push(CheckpointPart {
+                reference: table.reference,
+                bytes: table.bytes,
+            });
         }
         Ok(Self {
             major: checkpoint.major,
@@ -182,23 +193,14 @@ impl PendingCheckpoint {
         })
     }
 
-    pub(crate) fn finish(self, parts: Vec<PartRef>) -> Result<CheckpointRoot, ManagedError> {
-        if parts.len() != self.parts.len()
-            || parts.iter().any(|part| part.records == 0)
-            || parts
-                .iter()
-                .zip(&self.parts)
-                .any(|(reference, part)| reference.records as usize != part.records.len())
-        {
-            return Err(invalid("branch checkpoint part references are invalid"));
-        }
-        Ok(CheckpointRoot {
+    pub(crate) fn finish(self) -> CheckpointRoot {
+        CheckpointRoot {
             major: self.major,
             volume_id: self.volume_id,
             cursor: self.cursor,
             root: self.root,
-            parts,
-        })
+            parts: self.parts.into_iter().map(|part| part.reference).collect(),
+        }
     }
 }
 
@@ -216,13 +218,17 @@ impl CheckpointRoot {
         let mut file_versions = BTreeMap::<[u8; 32], PendingFileVersion>::new();
         let mut results = Vec::new();
         for (reference, part) in self.parts.iter().zip(parts) {
-            if part.major != FORMAT_MAJOR
-                || part.volume_id != self.volume_id
-                || reference.records as usize != part.records.len()
-            {
+            if reference != &part.reference {
                 return Err(corrupt("branch checkpoint part is invalid"));
             }
-            for record in part.records {
+            for record in sstable::decode(
+                reference,
+                &part.bytes,
+                self.volume_id,
+                "read Managed branch",
+            )? {
+                let record: CheckpointRecord = ciborium::from_reader(record.value.as_slice())
+                    .map_err(|_| corrupt("branch checkpoint record is invalid"))?;
                 match record {
                     CheckpointRecord::Node(node) => nodes.push(node),
                     CheckpointRecord::Directory { node, generation } => {
@@ -360,9 +366,12 @@ mod tests {
                 operation: None,
             },
             root: [2; 16],
-            parts: vec![PartRef {
+            parts: vec![sstable::TableRef {
                 id: [3; 32],
-                records: 1,
+                encoded_bytes: 1,
+                first_partition_key: vec![0],
+                last_partition_key: vec![0],
+                blocks: Vec::new(),
             }],
         };
         assert!(root.recover(Vec::new()).is_err());

@@ -17,10 +17,10 @@
 
 //! Durable named branches for Managed metadata.
 
+mod checkpoint;
 mod d1;
 mod namespace;
 mod object;
-mod record_set;
 pub(crate) mod records;
 
 pub use d1::D1BranchStore;

@@ -26,8 +26,8 @@ use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
 use super::D1BoundNamespace;
+use super::checkpoint::{CheckpointPart, CheckpointRoot, PendingCheckpoint};
 use super::namespace::BranchNamespaceStore;
-use super::record_set::{CheckpointPart, CheckpointRoot, PartRef, PendingCheckpoint};
 use super::records::{
     BranchInfo, BranchLifecycle, ForkPoint, StoredBranchHead, StoredBranchRegistry,
     StoredCheckpoint, StoredHistory, StoredNamespaceState, info,
@@ -1155,13 +1155,19 @@ impl D1BranchStore {
                     .iter()
                     .find(|part| encode_id(part.id) == part_id)
                     .ok_or_else(|| corrupt("read Managed branch", "unexpected checkpoint part"))?;
-                if Sha256::digest(encoded.as_bytes()).as_slice() != expected.id {
+                let bytes = decode_blob(encoded, "read Managed branch")?;
+                if bytes.len() < 32
+                    || Sha256::digest(&bytes[..bytes.len() - 32]).as_slice() != expected.id
+                {
                     return Err(corrupt(
                         "read Managed branch",
                         "branch checkpoint part identity is invalid",
                     ));
                 }
-                let part = decode(encoded, MAX_CHECKPOINT_PART_BYTES, "read Managed branch")?;
+                let part = CheckpointPart {
+                    reference: expected.clone(),
+                    bytes,
+                };
                 if decoded.insert(part_id, part).is_some() {
                     return Err(corrupt(
                         "read Managed branch",
@@ -1187,10 +1193,9 @@ impl D1BranchStore {
         checkpoint: &StoredCheckpoint,
     ) -> Result<[u8; 32], ManagedError> {
         let pending = PendingCheckpoint::from_checkpoint(checkpoint)?;
-        let mut references = Vec::with_capacity(pending.parts.len());
         for part in &pending.parts {
-            let encoded = encode(part, MAX_CHECKPOINT_PART_BYTES, "checkpoint Managed branch")?;
-            let id: [u8; 32] = Sha256::digest(encoded.as_bytes()).into();
+            let encoded = encode_blob(&part.bytes, "checkpoint Managed branch")?;
+            let id = part.reference.id;
             let mut batch = schema_statements();
             batch.extend([
                 statement(
@@ -1223,12 +1228,8 @@ impl D1BranchStore {
                     "immutable branch checkpoint part changed",
                 ));
             }
-            references.push(PartRef {
-                id,
-                records: part.records.len() as u32,
-            });
         }
-        let root = pending.finish(references)?;
+        let root = pending.finish();
         let encoded = encode(
             &root,
             MAX_CHECKPOINT_ROOT_BYTES,
@@ -1594,6 +1595,32 @@ fn decode<T: DeserializeOwned>(
 
 fn encode_id(id: [u8; 32]) -> String {
     id.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn encode_blob(bytes: &[u8], action: &'static str) -> Result<String, ManagedError> {
+    if bytes.len().saturating_mul(2) > MAX_CHECKPOINT_PART_BYTES {
+        return Err(invalid(
+            action,
+            "branch checkpoint SSTable exceeds the D1 value limit",
+        ));
+    }
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn decode_blob(encoded: &str, action: &'static str) -> Result<Vec<u8>, ManagedError> {
+    if encoded.len() > MAX_CHECKPOINT_PART_BYTES || encoded.len() % 2 != 0 {
+        return Err(corrupt(
+            action,
+            "branch checkpoint SSTable encoding is invalid",
+        ));
+    }
+    (0..encoded.len())
+        .step_by(2)
+        .map(|index| {
+            u8::from_str_radix(&encoded[index..index + 2], 16)
+                .map_err(|_| corrupt(action, "branch checkpoint SSTable encoding is invalid"))
+        })
+        .collect()
 }
 
 fn encode_owner(owner: [u8; 16]) -> String {

@@ -291,8 +291,11 @@ model. A branch binding wraps a backend-native authority behind one
 Observe, publication validation, receipt resolution, tail rotation, and
 unknown-commit recovery are shared. Object implements conditional object
 replacement; D1 implements its native transactional predicate. Branch
-snapshots and publications use the shared node, directory, precondition, and
-Managed file-version records.
+checkpoints use the same checksummed Managed SSTable builder and decoder as
+Object namespace checkpoints. Object stores the table bytes directly, while
+D1 stores those immutable bytes under its native transactional authority.
+Branch snapshots and publications use the shared node, directory,
+precondition, and Managed file-version records.
 
 The branch feature controls commands and extension code only. It does not
 change `managed/1` base-volume readability or create an alternate data plane.

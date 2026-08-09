@@ -314,6 +314,44 @@ pub(crate) async fn fetch(
         .collect()
 }
 
+/// Decode a complete content-addressed table already loaded by its authority.
+#[cfg(feature = "managed-branch")]
+pub(crate) fn decode(
+    table: &TableRef,
+    bytes: &[u8],
+    scope: [u8; 16],
+    action: &'static str,
+) -> Result<Vec<Record>, ManagedError> {
+    if bytes.len() < 32
+        || bytes.len() as u64 != table.encoded_bytes
+        || Sha256::digest(&bytes[..bytes.len() - 32]).as_slice() != table.id
+        || !bytes.ends_with(&table.id)
+    {
+        return Err(corrupt(action, "SSTable identity is invalid"));
+    }
+    let mut next = 0_u64;
+    let mut records = Vec::new();
+    for block in &table.blocks {
+        if block.offset != next {
+            return Err(corrupt(action, "SSTable block layout is invalid"));
+        }
+        let end = block
+            .offset
+            .checked_add(block.encoded_bytes)
+            .and_then(|end| usize::try_from(end).ok())
+            .filter(|end| *end <= bytes.len())
+            .ok_or_else(|| corrupt(action, "SSTable block range is invalid"))?;
+        let start = usize::try_from(block.offset)
+            .map_err(|_| corrupt(action, "SSTable block range is invalid"))?;
+        records.extend(decode_block(block, scope, &bytes[start..end], action)?);
+        next = end as u64;
+    }
+    if records.is_empty() || records.windows(2).any(|pair| pair[0].key >= pair[1].key) {
+        return Err(corrupt(action, "SSTable records are invalid"));
+    }
+    Ok(records)
+}
+
 fn encode_record(record: &Record) -> Result<Vec<u8>, ManagedError> {
     let key = u32::try_from(record.key.len())
         .map_err(|_| invalid("encode Managed SSTable", "SSTable key is too long"))?;
