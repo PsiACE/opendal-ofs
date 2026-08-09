@@ -467,7 +467,7 @@ impl NamespaceStore {
                     "transaction tail is not consecutive",
                 ));
             }
-            snapshot = apply_transaction(Some(snapshot), transaction)?;
+            snapshot = transaction.apply(Some(snapshot))?;
         }
         if snapshot.cursor != head.cursor {
             return Err(corrupt(
@@ -944,13 +944,6 @@ fn transaction_sha256(
     encode_table_value(transaction, action).map(|bytes| sha256(&bytes))
 }
 
-fn apply_transaction(
-    base: Option<NamespaceSnapshot>,
-    transaction: &NamespaceChange,
-) -> Result<NamespaceSnapshot, ManagedError> {
-    transaction.apply(base)
-}
-
 fn replay_tail_from(
     base: &NamespaceSnapshot,
     head: &StoredHead,
@@ -977,7 +970,7 @@ fn replay_tail_from(
                 "transaction tail is not consecutive",
             ));
         }
-        snapshot = apply_transaction(Some(snapshot), transaction)?;
+        snapshot = transaction.apply(Some(snapshot))?;
     }
     if snapshot.cursor != target {
         return Err(corrupt(
@@ -1074,11 +1067,9 @@ mod tests {
             }],
             target: first_snapshot.clone(),
         };
-        let checkpoint = apply_transaction(
-            None,
-            &NamespaceChange::from_publication(&first_publication, None),
-        )
-        .unwrap();
+        let checkpoint = NamespaceChange::from_publication(&first_publication, None)
+            .apply(None)
+            .unwrap();
         let second = OperationId::from_bytes([5; 16]);
         let mut target = checkpoint.clone();
         target.cursor = ChangeCursor::at(NonZeroU64::new(2).unwrap(), second);
@@ -1089,11 +1080,9 @@ mod tests {
             expected_directories: Vec::new(),
             target: target.clone(),
         };
-        let recovered = apply_transaction(
-            Some(checkpoint),
-            &NamespaceChange::from_publication(&publication, Some(&first_snapshot)),
-        )
-        .unwrap();
+        let recovered = NamespaceChange::from_publication(&publication, Some(&first_snapshot))
+            .apply(Some(checkpoint))
+            .unwrap();
         assert_eq!(recovered, target);
     }
 

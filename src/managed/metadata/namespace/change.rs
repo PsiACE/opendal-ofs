@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use super::validation::validate_publication_parts;
+use super::validation::validate_transition;
 use super::{
     DirectoryPrecondition, DirectoryRecord, FileVersionRecord, NamespacePublication,
     NamespaceSnapshot, NodePrecondition, NodeRecord,
@@ -168,11 +168,12 @@ impl NamespaceChange {
         }
     }
 
+    /// Apply a change after its containing HEAD/state or source publication
+    /// has established operation and cursor ancestry.
     pub(crate) fn apply(
         &self,
         base: Option<NamespaceSnapshot>,
     ) -> Result<NamespaceSnapshot, ManagedError> {
-        self.validate(self.volume_id)?;
         let mut target = match &base {
             Some(base) if base.volume_id == self.volume_id && base.cursor == self.parent => {
                 base.clone()
@@ -221,9 +222,7 @@ impl NamespaceChange {
         target.root = self.root;
         target.cursor = self.cursor;
 
-        if !validate_publication_parts(
-            self.operation,
-            self.parent,
+        if !validate_transition(
             &self.expected_nodes,
             &self.expected_directories,
             &target,

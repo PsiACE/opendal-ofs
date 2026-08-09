@@ -29,9 +29,20 @@ pub(crate) fn validate_publication(
     publication: &NamespacePublication,
     base: Option<&NamespaceSnapshot>,
 ) -> Result<bool, ManagedError> {
-    validate_publication_parts(
-        publication.operation,
-        publication.parent,
+    if publication.target.cursor.operation() != Some(publication.operation)
+        || publication.parent.sequence().checked_add(1)
+            != Some(publication.target.cursor.sequence())
+        || base.is_some_and(|state| {
+            state.volume_id != publication.target.volume_id || state.cursor != publication.parent
+        })
+        || base.is_none() && publication.parent != ChangeCursor::Genesis
+    {
+        return Err(invalid(
+            "publish Managed namespace",
+            "publication ancestry is invalid",
+        ));
+    }
+    validate_transition(
         &publication.expected_nodes,
         &publication.expected_directories,
         &publication.target,
@@ -39,26 +50,13 @@ pub(crate) fn validate_publication(
     )
 }
 
-pub(crate) fn validate_publication_parts(
-    operation: crate::filesystem::OperationId,
-    parent: ChangeCursor,
+pub(crate) fn validate_transition(
     expected_nodes: &[NodePrecondition],
     expected_directories: &[DirectoryPrecondition],
     target: &NamespaceSnapshot,
     base: Option<&NamespaceSnapshot>,
 ) -> Result<bool, ManagedError> {
     validate_snapshot(target)?;
-    if target.cursor.operation() != Some(operation)
-        || parent.sequence().checked_add(1) != Some(target.cursor.sequence())
-        || base.is_some_and(|state| state.volume_id != target.volume_id || state.cursor != parent)
-        || base.is_none() && parent != ChangeCursor::Genesis
-    {
-        return Err(invalid(
-            "publish Managed namespace",
-            "publication ancestry is invalid",
-        ));
-    }
-
     let empty_nodes = BTreeMap::new();
     let empty_directories = BTreeMap::new();
     let nodes = base.map_or(&empty_nodes, |state| &state.nodes);

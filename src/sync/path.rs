@@ -19,15 +19,6 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::Result;
-
-use crate::filesystem::{NodeId, VolumeSnapshot};
-
-/// Builds the one path index reused throughout a Sync pass.
-pub(crate) fn snapshot_paths(snapshot: &VolumeSnapshot) -> Result<BTreeMap<String, NodeId>> {
-    snapshot.paths().map_err(Into::into)
-}
-
 /// Returns the entries below `directory`, excluding the directory itself.
 ///
 /// Sync paths are canonical relative paths separated by `/`. Their descendants

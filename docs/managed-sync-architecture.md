@@ -185,14 +185,20 @@ receipt lookup before CAS. Receipt resolution belongs only to pending-intent
 recovery, invalid retries, CAS races, and unknown commit results.
 
 Tail replay applies each stored delta to one next snapshot. Validation borrows
-the old and next snapshots; it does not clone either graph into a temporary
-publication, and the same replay path is used by base and branch authorities.
+the old and next snapshots; the enclosing HEAD validates cursor ancestry once,
+while delta application validates the reconstructed namespace, generations,
+preconditions, and immutable file versions. It does not clone either graph
+into a temporary publication, and the same replay path is used by base and
+branch authorities.
 
 ## Metadata authorities
 
 Object or D1 selection is bound once as `ManagedMetadata`. Format creation,
-volume opening, and branch-store opening pass through that authority; the CLI
-and Sync engine do not dispatch on provider types.
+volume opening, and branch-store opening pass through that authority. A branch
+store cannot be opened without the matching format and its `branch/v1`
+requirement. New-volume creation goes directly through the provider's
+idempotent create operation instead of probing for absence first. The CLI and
+Sync engine do not dispatch on provider types.
 
 ### Object Metadata
 

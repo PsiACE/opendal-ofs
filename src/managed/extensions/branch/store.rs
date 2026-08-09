@@ -110,18 +110,19 @@ impl BranchStore {
         head: &StoredBranchHead,
     ) -> Result<bool, ManagedError> {
         let bytes = encode(HEAD_MAGIC, head, MAX_HEAD_BYTES, "publish Managed branch")?;
-        self.replace(&head_key(branch), revision, bytes, "publish Managed branch")
+        self.backend
+            .replace(&head_key(branch), revision, bytes, "publish Managed branch")
             .await
     }
 
-    pub fn object(volume_id: VolumeId, operator: Operator) -> Result<Self, ManagedError> {
+    pub(crate) fn object(volume_id: VolumeId, operator: Operator) -> Result<Self, ManagedError> {
         Ok(Self {
             volume_id,
             backend: RecordBackend::object(operator, "open Managed branches")?,
         })
     }
 
-    pub fn d1(volume_id: VolumeId, metadata: D1Metadata) -> Self {
+    pub(crate) fn d1(volume_id: VolumeId, metadata: D1Metadata) -> Self {
         Self {
             volume_id,
             backend: RecordBackend::d1(volume_id, metadata),
@@ -151,6 +152,7 @@ impl BranchStore {
         let head = StoredBranchHead::unborn(self.volume_id, branch_id);
         let encoded_head = encode(HEAD_MAGIC, &head, MAX_HEAD_BYTES, "create Managed branch")?;
         let _ = self
+            .backend
             .create(&head_key(branch_id), encoded_head, "create Managed branch")
             .await?;
         let registry =
@@ -162,6 +164,7 @@ impl BranchStore {
             "initialize Managed branches",
         )?;
         if !self
+            .backend
             .create(
                 REGISTRY_KEY,
                 encoded_registry,
@@ -299,6 +302,7 @@ impl BranchStore {
             head.lifecycle = BranchLifecycle::Sealed;
             let bytes = encode(HEAD_MAGIC, &head, MAX_HEAD_BYTES, "delete Managed branch")?;
             match self
+                .backend
                 .replace(
                     &head_key(branch_id),
                     &revision,
@@ -345,6 +349,7 @@ impl BranchStore {
                 "delete Managed branch",
             )?;
             match self
+                .backend
                 .replace(REGISTRY_KEY, &revision, bytes, "delete Managed branch")
                 .await
             {
@@ -387,6 +392,7 @@ impl BranchStore {
                 "begin Managed branch GC",
             )?;
             match self
+                .backend
                 .replace(REGISTRY_KEY, &revision, bytes, "begin Managed branch GC")
                 .await
             {
@@ -430,6 +436,7 @@ impl BranchStore {
                     head.maintenance_owner = Some(fence.owner);
                     let bytes = encode(HEAD_MAGIC, &head, MAX_HEAD_BYTES, action)?;
                     match self
+                        .backend
                         .replace(&head_key(branch_id), &revision, bytes, action)
                         .await
                     {
@@ -470,7 +477,11 @@ impl BranchStore {
                 return Ok(registry);
             }
             let bytes = encode(REGISTRY_MAGIC, &registry, MAX_REGISTRY_BYTES, action)?;
-            match self.replace(REGISTRY_KEY, &revision, bytes, action).await {
+            match self
+                .backend
+                .replace(REGISTRY_KEY, &revision, bytes, action)
+                .await
+            {
                 Ok(true) => return Ok(registry),
                 Ok(false) => continue,
                 Err(error) => return Err(error),
@@ -573,6 +584,7 @@ impl BranchStore {
                 "finish Managed branch GC",
             )?;
             match self
+                .backend
                 .replace(REGISTRY_KEY, &revision, bytes, "finish Managed branch GC")
                 .await
             {
@@ -599,6 +611,7 @@ impl BranchStore {
                     "finish Managed branch GC",
                 )?;
                 match self
+                    .backend
                     .replace(
                         &head_key(branch_id),
                         &revision,
@@ -652,6 +665,7 @@ impl BranchStore {
             "resume Managed branch GC",
         )?;
         if !self
+            .backend
             .replace(REGISTRY_KEY, &revision, bytes, "resume Managed branch GC")
             .await?
         {
@@ -813,6 +827,7 @@ impl BranchStore {
             "fork Managed branch",
         )?;
         if !self
+            .backend
             .create(&head_key(target_id), bytes, "fork Managed branch")
             .await?
         {
@@ -829,6 +844,7 @@ impl BranchStore {
             "fork Managed branch",
         )?;
         match self
+            .backend
             .replace(REGISTRY_KEY, &revision, bytes, "fork Managed branch")
             .await
         {
@@ -1052,27 +1068,6 @@ impl BranchStore {
         head.validate(self.volume_id, branch_id)?;
         Ok(Some((head, revision)))
     }
-
-    async fn create(
-        &self,
-        key: &str,
-        bytes: Vec<u8>,
-        action: &'static str,
-    ) -> Result<bool, ManagedError> {
-        self.backend.create(key, bytes, action).await
-    }
-
-    async fn replace(
-        &self,
-        key: &str,
-        expected_revision: &Revision,
-        bytes: Vec<u8>,
-        action: &'static str,
-    ) -> Result<bool, ManagedError> {
-        self.backend
-            .replace(key, expected_revision, bytes, action)
-            .await
-    }
 }
 
 fn remove_sealed_incarnation(
@@ -1295,7 +1290,10 @@ mod tests {
             volume_id: snapshot.volume_id,
             backend: RecordBackend::test_object(operator.clone()),
         };
-        let checkpoint = StoredCheckpoint::new(&snapshot, BTreeMap::new()).unwrap();
+        let checkpoint = StoredCheckpoint {
+            snapshot: snapshot.clone(),
+            results: Vec::new(),
+        };
         let id = store.write_checkpoint(&checkpoint).await.unwrap();
         let root = store.read_checkpoint_root(id).await.unwrap();
         assert!(root.parts.len() > 1);

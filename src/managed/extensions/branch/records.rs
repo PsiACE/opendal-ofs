@@ -172,17 +172,6 @@ pub(crate) struct StoredCheckpoint {
 }
 
 impl StoredCheckpoint {
-    pub(crate) fn new(
-        snapshot: &NamespaceSnapshot,
-        results: StoredResults,
-    ) -> Result<Self, ManagedError> {
-        validate_snapshot(snapshot)?;
-        Ok(Self {
-            snapshot: snapshot.clone(),
-            results: results.into_values().collect(),
-        })
-    }
-
     pub(crate) fn recover(
         self,
         volume_id: VolumeId,
@@ -614,11 +603,10 @@ mod tests {
         let (first_change, valid) = StoredChange::prepare(branch, &first, None).unwrap();
         assert!(valid);
         let first_result = StoredCommittedResult::from_change(&first_change).unwrap();
-        let checkpoint = StoredCheckpoint::new(
-            &first.target,
-            BTreeMap::from([((branch, first_operation), first_result)]),
-        )
-        .unwrap();
+        let checkpoint = StoredCheckpoint {
+            snapshot: first.target.clone(),
+            results: vec![first_result],
+        };
         let mut state = StoredNamespaceState {
             checkpoint: [5; 32],
             checkpoint_cursor: first.target.cursor,
@@ -657,14 +645,10 @@ mod tests {
         let publication = publication(volume, ChangeCursor::Genesis, operation, root);
         let (change, valid) = StoredChange::prepare(source, &publication, None).unwrap();
         assert!(valid);
-        let checkpoint = StoredCheckpoint::new(
-            &publication.target,
-            BTreeMap::from([(
-                (source, operation),
-                StoredCommittedResult::from_change(&change).unwrap(),
-            )]),
-        )
-        .unwrap();
+        let checkpoint = StoredCheckpoint {
+            snapshot: publication.target.clone(),
+            results: vec![StoredCommittedResult::from_change(&change).unwrap()],
+        };
 
         assert!(checkpoint.resolve(source, operation).unwrap().is_some());
         assert!(checkpoint.resolve(target, operation).unwrap().is_none());
@@ -710,14 +694,10 @@ mod tests {
         let initial_operation = OperationId::from_bytes([22; 16]);
         let initial = publication(volume, ChangeCursor::Genesis, initial_operation, root);
         let (initial_change, _) = StoredChange::prepare(first_branch, &initial, None).unwrap();
-        let checkpoint = StoredCheckpoint::new(
-            &initial.target,
-            BTreeMap::from([(
-                (first_branch, initial_operation),
-                StoredCommittedResult::from_change(&initial_change).unwrap(),
-            )]),
-        )
-        .unwrap();
+        let checkpoint = StoredCheckpoint {
+            snapshot: initial.target.clone(),
+            results: vec![StoredCommittedResult::from_change(&initial_change).unwrap()],
+        };
         let base = StoredNamespaceState {
             checkpoint: [23; 32],
             checkpoint_cursor: initial.target.cursor,

@@ -20,7 +20,7 @@ use super::local::{NativeIdentity, fs_operator, set_executable};
 use super::path::subtree;
 use super::{
     ConflictRecord, InstalledEntry, LocalKind, LocalTree, PendingIntent, ReconcileAction,
-    ReplicaState, StagedTree, build_publication, reconcile, snapshot_paths,
+    ReplicaState, StagedTree, build_publication, reconcile,
 };
 use crate::filesystem::{
     ChangeCursor, CommitOutcome, FileVersion, MaterializeRequest, NodeId, NodeKind, OperationId,
@@ -64,7 +64,7 @@ impl<V: Volume> SyncEngine<V> {
         if state.volume != volume_id {
             bail!("replica state belongs to another volume");
         }
-        if state.authority_identity() != authority_identity {
+        if state.branch != authority_identity.branch {
             bail!("replica state belongs to another branch incarnation");
         }
         tokio::fs::create_dir_all(replica_path)
@@ -155,10 +155,13 @@ impl<V: Volume> SyncEngine<V> {
         let base_paths = state
             .authority
             .as_ref()
-            .map(snapshot_paths)
+            .map(VolumeSnapshot::paths)
             .transpose()?
             .unwrap_or_default();
-        let remote_paths = remote.map(snapshot_paths).transpose()?.unwrap_or_default();
+        let remote_paths = remote
+            .map(VolumeSnapshot::paths)
+            .transpose()?
+            .unwrap_or_default();
 
         let (local, staging_path, mut staged) = match prior_staging.as_ref() {
             Some(path) => {
@@ -428,7 +431,7 @@ async fn advance_common_base(
     state_path: &Path,
     previous: &ReplicaState,
 ) -> Result<ReplicaState> {
-    let paths = snapshot_paths(snapshot)?;
+    let paths = snapshot.paths()?;
     let state = state_from_snapshot(snapshot, &paths, replica, previous).await?;
     state.install(state_path)?;
     Ok(state)
@@ -517,10 +520,10 @@ async fn committed_tree_is_safe(
     let base_paths = state
         .authority
         .as_ref()
-        .map(snapshot_paths)
+        .map(VolumeSnapshot::paths)
         .transpose()?
         .unwrap_or_default();
-    let committed_paths = snapshot_paths(committed)?;
+    let committed_paths = committed.paths()?;
     let safe = match reconcile(state, &staged, committed, &base_paths, &committed_paths) {
         Ok(plan) => {
             let files_are_safe = plan.actions.iter().all(|action| {
@@ -628,8 +631,7 @@ async fn state_from_snapshot(
     previous: &ReplicaState,
 ) -> Result<ReplicaState> {
     let local = LocalTree::scan(replica).await?;
-    let mut state = ReplicaState::empty(snapshot.volume_id);
-    state.branch = previous.branch.clone();
+    let mut state = ReplicaState::empty_for(previous.authority_identity());
     state.authority = Some(snapshot.clone());
     for (path, node) in paths {
         let record = &snapshot.nodes[node];
@@ -840,7 +842,7 @@ async fn materialize_tree<V: Volume>(
     let target = Operator::new(services::Fs::default().root(root))?.finish();
     let result = async {
         let mut files = Vec::new();
-        for (path, node) in snapshot_paths(snapshot)? {
+        for (path, node) in snapshot.paths()? {
             let record = &snapshot.nodes[&node];
             match record.kind {
                 NodeKind::Directory => target.create_dir(&format!("{path}/")).await?,

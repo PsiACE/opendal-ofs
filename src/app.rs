@@ -164,7 +164,7 @@ async fn gc_volume(config: &Path, args: VolumeGcArgs) -> Result<()> {
             metadata,
         } = open_managed_context(config, &args.alias, args.runtime.transfer_concurrency).await?;
         if format.requires_extension(ofs::managed::ManagedExtension::BranchV1) {
-            let branches = metadata.branches(format.volume_id(), data.clone())?;
+            let branches = metadata.branches(&format, data.clone())?;
             let collected = if args.resume {
                 branches.resume_garbage_collect(data).await?
             } else {
@@ -211,7 +211,7 @@ async fn open_managed_volume(
     } = open_managed_context(config, alias, transfer_concurrency).await?;
     #[cfg(feature = "managed-branch")]
     if format.requires_extension(ofs::managed::ManagedExtension::BranchV1) {
-        let branches = metadata.branches(format.volume_id(), data.clone())?;
+        let branches = metadata.branches(&format, data.clone())?;
         let namespace = match branch {
             Some(name) => branches.bind(&parse_branch_name(name)?).await?,
             None => branches.bind_default().await?,
@@ -237,10 +237,7 @@ async fn open_branch_authority(
         data,
         metadata,
     } = open_managed_context(config, alias, transfer_concurrency).await?;
-    if !format.requires_extension(ofs::managed::ManagedExtension::BranchV1) {
-        bail!("Managed volume does not enable branch/v1");
-    }
-    Ok(metadata.branches(format.volume_id(), data)?)
+    Ok(metadata.branches(&format, data)?)
 }
 
 async fn open_managed_context(
@@ -324,17 +321,16 @@ async fn create_volume(config: &Path, mut args: VolumeCreateArgs) -> Result<()> 
     } else {
         desired
     };
-    let observed = metadata.read_format_optional().await?;
-    let format = match observed {
-        Some(observed) => observed,
-        None if configured.is_some() => metadata.read_format().await?,
-        None => match metadata.create_format(&desired).await {
+    let format = if configured.is_some() {
+        metadata.read_format().await?
+    } else {
+        match metadata.create_format(&desired).await {
             Ok(created) => created,
             Err(error) if error.kind() == ManagedErrorKind::Conflict => {
                 metadata.read_format().await?
             }
             Err(error) => return Err(error.into()),
-        },
+        }
     };
     if configured
         .as_ref()
@@ -349,7 +345,7 @@ async fn create_volume(config: &Path, mut args: VolumeCreateArgs) -> Result<()> 
     #[cfg(feature = "managed-branch")]
     if format.requires_extension(ofs::managed::ManagedExtension::BranchV1) {
         metadata
-            .branches(format.volume_id(), data.clone())?
+            .branches(&format, data.clone())?
             .initialize(BranchName::parse("main").expect("main is a valid branch name"))
             .await?;
     } else {

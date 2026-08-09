@@ -89,7 +89,7 @@ impl D1Config {
 
 /// Managed metadata stored through the D1 Query API.
 #[derive(Clone)]
-pub struct D1Metadata {
+pub(crate) struct D1Metadata {
     session: D1Session,
 }
 
@@ -100,7 +100,7 @@ pub(crate) struct D1Session {
 }
 
 impl D1Metadata {
-    pub fn new(config: D1Config) -> Result<Self, ManagedError> {
+    pub(crate) fn new(config: D1Config) -> Result<Self, ManagedError> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
@@ -114,7 +114,7 @@ impl D1Metadata {
         self.session.clone()
     }
 
-    pub async fn create_format(
+    pub(crate) async fn create_format(
         &self,
         desired: &ManagedFormat,
     ) -> Result<ManagedFormat, ManagedError> {
@@ -154,13 +154,7 @@ impl D1Metadata {
         require_same_format(desired, observed)
     }
 
-    pub async fn read_format(&self) -> Result<ManagedFormat, ManagedError> {
-        self.read_format_optional()
-            .await?
-            .ok_or_else(|| unavailable("read Managed format"))
-    }
-
-    pub async fn read_format_optional(&self) -> Result<Option<ManagedFormat>, ManagedError> {
+    pub(crate) async fn read_format_optional(&self) -> Result<Option<ManagedFormat>, ManagedError> {
         let results = self
             .session
             .query(

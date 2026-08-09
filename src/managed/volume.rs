@@ -30,7 +30,7 @@ use super::metadata::namespace::{
     NamespaceWitness,
 };
 use super::{
-    AuthorityKnownContent, D1Metadata, ManagedData, ManagedError, ManagedErrorKind, ManagedFormat,
+    AuthorityKnownContent, D1Metadata, ManagedData, ManagedError, ManagedErrorKind,
     SegmentGcMaintenance,
 };
 use crate::filesystem::{AuthorityIdentity, CommitOutcome, OperationId, VolumeId};
@@ -78,10 +78,9 @@ impl ManagedObservation {
 
 impl ManagedVolume {
     pub(crate) fn object(
-        format: ManagedFormat,
+        volume_id: VolumeId,
         data_operator: Operator,
     ) -> Result<Self, ManagedError> {
-        let volume_id = base_volume_id(&format)?;
         Ok(Self {
             volume_id,
             namespace: NamespaceAuthority::Base(NamespaceStore::object(
@@ -94,32 +93,22 @@ impl ManagedVolume {
 
     #[cfg(feature = "managed-branch")]
     pub(crate) fn branch(
-        format: ManagedFormat,
+        volume_id: VolumeId,
         data_operator: Operator,
         namespace: BoundNamespace,
     ) -> Result<Self, ManagedError> {
-        if !format.requires_extension(super::ManagedExtension::BranchV1)
-            || namespace.volume_id() != format.volume_id()
-        {
-            return Err(ManagedError::new(
-                ManagedErrorKind::Invalid,
-                "open Managed volume",
-                "branch namespace does not match the Managed format",
-            ));
-        }
         Ok(Self {
-            volume_id: format.volume_id(),
+            volume_id,
             namespace: NamespaceAuthority::Branch(namespace),
             data: ManagedData::new(data_operator)?,
         })
     }
 
     pub(crate) fn d1(
-        format: ManagedFormat,
+        volume_id: VolumeId,
         data_operator: Operator,
         metadata: D1Metadata,
     ) -> Result<Self, ManagedError> {
-        let volume_id = base_volume_id(&format)?;
         Ok(Self {
             volume_id,
             namespace: NamespaceAuthority::Base(NamespaceStore::d1(
@@ -205,14 +194,6 @@ impl ManagedVolume {
                 "publish Managed namespace",
                 "observation belongs to another metadata authority",
             )),
-        }
-    }
-
-    async fn resolve(&self, operation: OperationId) -> Result<CommitOutcome, ManagedError> {
-        match &self.namespace {
-            NamespaceAuthority::Base(namespace) => namespace.resolve(operation).await,
-            #[cfg(feature = "managed-branch")]
-            NamespaceAuthority::Branch(namespace) => namespace.resolve(operation).await,
         }
     }
 
@@ -307,39 +288,10 @@ impl ManagedVolume {
     }
 }
 
-fn base_volume_id(format: &ManagedFormat) -> Result<VolumeId, ManagedError> {
-    if !format.required_extensions().is_empty() {
-        return Err(ManagedError::new(
-            ManagedErrorKind::Invalid,
-            "open Managed volume",
-            "base namespace does not accept Managed extensions",
-        ));
-    }
-    Ok(format.volume_id())
-}
-
 impl VolumeObservation for ManagedObservation {
     fn snapshot(&self) -> &VolumeSnapshot {
         &self.filesystem_snapshot
     }
-}
-
-async fn materialize_managed_files(
-    volume: &ManagedVolume,
-    target: &Operator,
-    requests: Vec<MaterializeRequest>,
-    full_tree: bool,
-    concurrency: NonZeroUsize,
-) -> Result<(), VolumeError> {
-    let decoded = requests
-        .into_iter()
-        .map(|request| Ok((request.path, decode_file_version(&request.version)?)))
-        .collect::<Result<Vec<_>, VolumeError>>()?;
-    volume
-        .data
-        .materialize(target, decoded, full_tree, concurrency)
-        .await
-        .map_err(Into::into)
 }
 
 impl Volume for ManagedVolume {
@@ -417,9 +369,12 @@ impl Volume for ManagedVolume {
     }
 
     async fn resolve(&self, operation: OperationId) -> Result<CommitOutcome, VolumeError> {
-        ManagedVolume::resolve(self, operation)
-            .await
-            .map_err(Into::into)
+        match &self.namespace {
+            NamespaceAuthority::Base(namespace) => namespace.resolve(operation).await,
+            #[cfg(feature = "managed-branch")]
+            NamespaceAuthority::Branch(namespace) => namespace.resolve(operation).await,
+        }
+        .map_err(Into::into)
     }
 
     async fn materialize(
@@ -429,7 +384,14 @@ impl Volume for ManagedVolume {
         full_tree: bool,
         concurrency: NonZeroUsize,
     ) -> Result<(), VolumeError> {
-        materialize_managed_files(self, target, requests, full_tree, concurrency).await
+        let decoded = requests
+            .into_iter()
+            .map(|request| Ok((request.path, decode_file_version(&request.version)?)))
+            .collect::<Result<Vec<_>, VolumeError>>()?;
+        self.data
+            .materialize(target, decoded, full_tree, concurrency)
+            .await
+            .map_err(Into::into)
     }
 }
 

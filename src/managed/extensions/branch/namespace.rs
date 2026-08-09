@@ -122,7 +122,6 @@ impl BoundNamespace {
         }
         let (head, revision, base, checkpoint_results) = match observed {
             Some((witness, snapshot)) => {
-                witness.head.validate(self.store.volume_id(), branch)?;
                 if witness.head.lifecycle != BranchLifecycle::Active
                     || witness.head.maintenance_active
                 {
@@ -164,7 +163,10 @@ impl BoundNamespace {
             (None, None) => {
                 let result = StoredCommittedResult::from_change(&change)?;
                 let results = BTreeMap::from([((branch, publication.operation), result)]);
-                let checkpoint = StoredCheckpoint::new(&publication.target, results)?;
+                let checkpoint = StoredCheckpoint {
+                    snapshot: publication.target.clone(),
+                    results: results.into_values().collect(),
+                };
                 StoredNamespaceState {
                     checkpoint: self.store.write_checkpoint(&checkpoint).await?,
                     checkpoint_cursor: publication.target.cursor,
@@ -198,7 +200,10 @@ impl BoundNamespace {
                     let history = StoredHistory::new(self.store.volume_id(), branch, current)?;
                     let history = self.store.write_history(&history).await?;
                     let results = results_for_rotation(checkpoint_results, current, &change)?;
-                    let checkpoint = StoredCheckpoint::new(&publication.target, results)?;
+                    let checkpoint = StoredCheckpoint {
+                        snapshot: publication.target.clone(),
+                        results: results.into_values().collect(),
+                    };
                     StoredNamespaceState {
                         checkpoint: self.store.write_checkpoint(&checkpoint).await?,
                         checkpoint_cursor: publication.target.cursor,

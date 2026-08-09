@@ -24,16 +24,16 @@ use crate::managed::{ManagedError, ManagedErrorKind, ManagedFormat};
 
 /// Managed metadata stored beside data through OpenDAL.
 #[derive(Clone)]
-pub struct ObjectMetadata {
+pub(crate) struct ObjectMetadata {
     operator: Operator,
 }
 
 impl ObjectMetadata {
-    pub const fn new(operator: Operator) -> Self {
+    pub(crate) const fn new(operator: Operator) -> Self {
         Self { operator }
     }
 
-    pub async fn create_format(
+    pub(crate) async fn create_format(
         &self,
         desired: &ManagedFormat,
     ) -> Result<ManagedFormat, ManagedError> {
@@ -60,17 +60,15 @@ impl ObjectMetadata {
         {
             Ok(desired.clone())
         } else {
-            require_same_format(desired, self.read_format().await?)
+            let observed = self
+                .read_format_optional()
+                .await?
+                .ok_or_else(|| unavailable("create Managed format"))?;
+            require_same_format(desired, observed)
         }
     }
 
-    pub async fn read_format(&self) -> Result<ManagedFormat, ManagedError> {
-        self.read_format_optional()
-            .await?
-            .ok_or_else(|| unavailable("read Managed format"))
-    }
-
-    pub async fn read_format_optional(&self) -> Result<Option<ManagedFormat>, ManagedError> {
+    pub(crate) async fn read_format_optional(&self) -> Result<Option<ManagedFormat>, ManagedError> {
         read(&self.operator, SUPERBLOCK_KEY, "read Managed format")
             .await?
             .map(|bytes| ManagedFormat::decode(&bytes))

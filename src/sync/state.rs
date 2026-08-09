@@ -61,10 +61,6 @@ pub struct ReplicaState {
 }
 
 impl ReplicaState {
-    pub(crate) fn empty(volume: VolumeId) -> Self {
-        Self::empty_for(AuthorityIdentity::base(volume))
-    }
-
     pub(crate) fn empty_for(authority: AuthorityIdentity) -> Self {
         Self {
             volume: authority.volume,
@@ -272,7 +268,9 @@ impl StoredSnapshot {
             directories,
             file_versions,
         };
-        validate_snapshot(&snapshot).context("replica authority snapshot is invalid")?;
+        snapshot
+            .validate_structure()
+            .context("replica authority snapshot is invalid")?;
         Ok(snapshot)
     }
 }
@@ -314,10 +312,6 @@ fn validate_installed(
         }
     }
     Ok(())
-}
-
-fn validate_snapshot(snapshot: &VolumeSnapshot) -> Result<()> {
-    snapshot.validate_structure().map_err(Into::into)
 }
 
 #[cfg(unix)]

@@ -20,7 +20,6 @@ pub use engine::{SyncEngine, SyncResult};
 pub use state::{ConflictRecord, PendingIntent, ReplicaState};
 
 pub(crate) use local::{LocalKind, LocalTree};
-pub(crate) use path::snapshot_paths;
 pub(crate) use publication::build_publication;
 pub(crate) use reconcile::{ReconcileAction, reconcile};
 pub(crate) use staging::StagedTree;

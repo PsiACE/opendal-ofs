@@ -22,19 +22,17 @@ pub(crate) mod object;
 pub mod record;
 mod superblock;
 
-pub use d1::{D1Config, D1Metadata};
+pub use d1::D1Config;
+pub(crate) use d1::D1Metadata;
 pub use namespace::NamespaceGcSweep;
-pub use object::ObjectMetadata;
 pub use superblock::{ManagedExtension, ManagedFormat, MetadataFormat};
 
+use object::ObjectMetadata;
 use opendal::Operator;
 
 #[cfg(feature = "managed-branch")]
 use super::extensions::branch::{BoundNamespace, BranchStore};
 use super::{ManagedError, ManagedVolume};
-#[cfg(feature = "managed-branch")]
-use crate::filesystem::VolumeId;
-
 /// The metadata authority selected for one Managed volume.
 ///
 /// Backend selection ends here. Callers open formats, volumes, and optional
@@ -75,15 +73,17 @@ impl ManagedMetadata {
     }
 
     pub async fn read_format(&self) -> Result<ManagedFormat, ManagedError> {
-        let format = match &self.0 {
-            MetadataBackend::Object(metadata) => metadata.read_format().await,
-            MetadataBackend::D1(metadata) => metadata.read_format().await,
-        }?;
-        self.require_backend_format(&format)?;
+        let format = self.read_format_optional().await?.ok_or_else(|| {
+            ManagedError::new(
+                super::ManagedErrorKind::Unavailable,
+                "read Managed format",
+                "Managed format does not exist",
+            )
+        })?;
         Ok(format)
     }
 
-    pub async fn read_format_optional(&self) -> Result<Option<ManagedFormat>, ManagedError> {
+    async fn read_format_optional(&self) -> Result<Option<ManagedFormat>, ManagedError> {
         let format = match &self.0 {
             MetadataBackend::Object(metadata) => metadata.read_format_optional().await,
             MetadataBackend::D1(metadata) => metadata.read_format_optional().await,
@@ -100,9 +100,17 @@ impl ManagedMetadata {
         data: Operator,
     ) -> Result<ManagedVolume, ManagedError> {
         self.require_backend_format(&format)?;
+        if !format.required_extensions().is_empty() {
+            return Err(ManagedError::new(
+                super::ManagedErrorKind::Invalid,
+                "open Managed volume",
+                "base namespace does not accept Managed extensions",
+            ));
+        }
+        let volume_id = format.volume_id();
         match &self.0 {
-            MetadataBackend::Object(_) => ManagedVolume::object(format, data),
-            MetadataBackend::D1(metadata) => ManagedVolume::d1(format, data, metadata.clone()),
+            MetadataBackend::Object(_) => ManagedVolume::object(volume_id, data),
+            MetadataBackend::D1(metadata) => ManagedVolume::d1(volume_id, data, metadata.clone()),
         }
     }
 
@@ -114,15 +122,33 @@ impl ManagedMetadata {
         namespace: BoundNamespace,
     ) -> Result<ManagedVolume, ManagedError> {
         self.require_backend_format(&format)?;
-        ManagedVolume::branch(format, data, namespace)
+        if !format.requires_extension(ManagedExtension::BranchV1)
+            || namespace.volume_id() != format.volume_id()
+        {
+            return Err(ManagedError::new(
+                super::ManagedErrorKind::Invalid,
+                "open Managed volume",
+                "branch namespace does not match the Managed format",
+            ));
+        }
+        ManagedVolume::branch(format.volume_id(), data, namespace)
     }
 
     #[cfg(feature = "managed-branch")]
     pub fn branches(
         &self,
-        volume_id: VolumeId,
+        format: &ManagedFormat,
         data: Operator,
     ) -> Result<BranchStore, ManagedError> {
+        self.require_backend_format(format)?;
+        if !format.requires_extension(ManagedExtension::BranchV1) {
+            return Err(ManagedError::new(
+                super::ManagedErrorKind::Invalid,
+                "open Managed branches",
+                "Managed format does not enable branch/v1",
+            ));
+        }
+        let volume_id = format.volume_id();
         match &self.0 {
             MetadataBackend::Object(_) => BranchStore::object(volume_id, data),
             MetadataBackend::D1(metadata) => Ok(BranchStore::d1(volume_id, metadata.clone())),
