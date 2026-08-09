@@ -17,7 +17,7 @@
   under the License.
 -->
 
-# Managed Sync acceptance
+# Managed acceptance
 
 `workflow.sh` is the public Managed Sync contract. It invokes only the `ofs`
 CLI and inspects ordinary replica files plus `ofs status`. Object metadata and
@@ -49,3 +49,16 @@ The same workflow also checks the shared command surface: a Direct volume can
 be created and reopened by name, `mount` and `sync` are separate access
 commands, and unavailable Direct Sync or Managed Mount combinations fail before
 changing local or remote state. It does not start a FUSE session.
+
+`../managed-branch/workflow.sh` is the corresponding user-visible `branch/v1`
+contract. It covers the default branch, current, historical, and genesis forks,
+independent publication, deletion and name reuse, stale replica fencing,
+multi-root garbage collection, and a retained large-namespace parent. It uses
+the same provider inputs and likewise inspects only CLI output and ordinary
+replica files.
+
+Run the complete provider matrix and the staging/cache-loss regression with:
+
+```text
+cargo x managed-sync test all
+```

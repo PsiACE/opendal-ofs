@@ -363,19 +363,6 @@ def main() -> None:
     (directory / "results.json").write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
-    (directory / "comparison.json").write_text(
-        json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
-    with (directory / "requests.tsv").open("w", encoding="utf-8") as output:
-        output.write(
-            "run\tphase\tmethod\tstatus\tobject_class\trange\tcount\tbytes_in\tbytes_out\n"
-        )
-        for row in requests:
-            output.write("\t".join(str(row[key]) for key in row) + "\n")
-    with (directory / "objects.tsv").open("w", encoding="utf-8") as output:
-        output.write("run\trelease\tobject_class\tobjects\tbytes\n")
-        for row in object_inventory:
-            output.write("\t".join(str(row[key]) for key in row) + "\n")
     print(json.dumps({"verdict": verdict, **summary, "gates": gates}, indent=2))
     raise SystemExit(verdict != "pass")
 

@@ -7,32 +7,34 @@
 // with the License.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Write as _};
+use std::fs;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use futures::{StreamExt as _, TryStreamExt as _, stream};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 
 use super::local::{
     LocalEntry, LocalKind, LocalTree, NativeIdentity, entry_at, fs_operator, native_identity_at,
     set_executable,
 };
 use super::path::descendants;
-use crate::filesystem::{FileVersion, Volume, VolumeSnapshot};
-
-const COPY_CHUNK: usize = 1024 * 1024;
-const MANIFEST_FORMAT: &str = "ofs-staged-tree";
-const MANIFEST_MAJOR: u16 = 1;
+use super::state::PendingIntent;
+use crate::filesystem::{FileVersion, OperationId, Volume, VolumeSnapshot};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct StagedFile {
     pub size: u64,
     pub digest: [u8; 32],
+    content: bool,
+    prepared: Option<FileVersion>,
+}
+
+impl StagedFile {
+    pub(crate) fn prepared(&self) -> Option<&FileVersion> {
+        self.prepared.as_ref()
+    }
 }
 
 /// Immutable input for a later volume file-version builder.
@@ -41,69 +43,9 @@ pub(crate) struct StagedTree {
     root: PathBuf,
     logical: LocalTree,
     files: BTreeMap<String, StagedFile>,
-    content_paths: BTreeSet<String>,
-    prepared: BTreeMap<String, FileVersion>,
 }
 
 impl StagedTree {
-    pub(crate) async fn inspect(tree: &LocalTree, concurrency: NonZeroUsize) -> Result<Self> {
-        let source = tree.operator()?;
-        let files = stream::iter(
-            tree.entries()
-                .iter()
-                .filter(|(_, expected)| expected.kind == LocalKind::File)
-                .map(|(path, expected)| {
-                    let source = source.clone();
-                    let path = path.clone();
-                    let expected = expected.clone();
-                    async move {
-                        let reader = source
-                            .reader_with(&path)
-                            .chunk(COPY_CHUNK)
-                            .await
-                            .with_context(|| format!("open source file {path:?}"))?;
-                        let mut input = reader
-                            .into_bytes_stream(..)
-                            .await
-                            .with_context(|| format!("stream source file {path:?}"))?;
-                        let mut digest = Sha256::new();
-                        let mut size = 0_u64;
-                        while let Some(bytes) = input.next().await {
-                            let bytes =
-                                bytes.with_context(|| format!("read source file {path:?}"))?;
-                            size = size
-                                .checked_add(bytes.len() as u64)
-                                .with_context(|| format!("source file {path:?} is too large"))?;
-                            digest.update(&bytes);
-                        }
-                        if size != expected.size {
-                            bail!("source file {path:?} changed while it was inspected");
-                        }
-                        Ok::<_, anyhow::Error>((
-                            path,
-                            StagedFile {
-                                size,
-                                digest: digest.finalize().into(),
-                            },
-                        ))
-                    }
-                }),
-        )
-        .buffer_unordered(concurrency.get())
-        .try_collect::<BTreeMap<_, _>>()
-        .await?;
-        for (path, entry) in tree.entries() {
-            require_same_identity(tree.root(), path, entry.kind, entry.native_identity)?;
-        }
-        Ok(Self {
-            root: tree.root().to_owned(),
-            logical: tree.clone(),
-            files,
-            content_paths: BTreeSet::new(),
-            prepared: BTreeMap::new(),
-        })
-    }
-
     pub(crate) async fn prepare_for_publish<V: Volume>(
         tree: &LocalTree,
         root: impl AsRef<Path>,
@@ -145,7 +87,6 @@ impl StagedTree {
         }
 
         let mut files = BTreeMap::new();
-        let mut content_paths = BTreeSet::new();
         for (path, expected) in tree
             .entries()
             .iter()
@@ -177,10 +118,11 @@ impl StagedTree {
                     {
                         bail!("staging file {path:?} is incomplete; retry sync");
                     }
-                    content_paths.insert(path.clone());
                     StagedFile {
                         size: version.logical_size,
                         digest: version.logical_digest,
+                        content: true,
+                        prepared: Some(version.clone()),
                     }
                 }
                 None => StagedFile {
@@ -188,6 +130,8 @@ impl StagedTree {
                     digest: *known_digests
                         .get(path)
                         .with_context(|| format!("unchanged file {path:?} has no known digest"))?,
+                    content: false,
+                    prepared: None,
                 },
             };
             files.insert(path.clone(), file);
@@ -199,37 +143,36 @@ impl StagedTree {
             root: root.to_owned(),
             logical: LocalTree::from_entries(root, tree.entries().clone()),
             files,
-            content_paths,
-            prepared,
         };
-        staged.save_manifest()?;
         Ok(staged)
     }
 
-    pub(crate) fn load(root: impl AsRef<Path>) -> Result<Self> {
-        let root = root.as_ref();
-        let path = Self::manifest_path(root);
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                return Err(error).context("staged tree manifest is missing");
-            }
-            Err(error) => return Err(error).context("read staged tree manifest"),
-        };
-        let stored: StoredStagedTree =
-            serde_json::from_slice(&bytes).context("parse staged tree manifest")?;
-        if stored.format != MANIFEST_FORMAT || stored.major != MANIFEST_MAJOR {
-            bail!("staged tree manifest has an unsupported format");
+    pub(crate) fn recover(intent: &PendingIntent) -> Result<Self> {
+        let root = &intent.staging;
+        if !root.is_dir() {
+            bail!("staging cache is missing");
         }
         let staged = Self {
             root: root.to_owned(),
-            logical: LocalTree::from_entries(root, stored.entries),
-            files: stored.files,
-            content_paths: stored.content_paths,
-            prepared: stored.prepared,
+            logical: LocalTree::from_entries(root, intent.entries.clone()),
+            files: intent.files.clone(),
         };
         staged.validate()?;
         Ok(staged)
+    }
+
+    pub(crate) fn pending(
+        &self,
+        operation: OperationId,
+        renames: BTreeMap<String, String>,
+    ) -> PendingIntent {
+        PendingIntent {
+            operation,
+            staging: self.root.clone(),
+            renames,
+            entries: self.logical.entries().clone(),
+            files: self.files.clone(),
+        }
     }
 
     pub(crate) fn root(&self) -> &Path {
@@ -240,71 +183,15 @@ impl StagedTree {
         &self.files
     }
 
-    pub(crate) fn prepared(&self) -> &BTreeMap<String, FileVersion> {
-        &self.prepared
-    }
-
     pub(crate) fn logical(&self) -> &LocalTree {
         &self.logical
     }
 
-    pub(crate) fn has_content(&self, path: &str) -> bool {
-        self.content_paths.contains(path)
-    }
-
     pub(crate) fn content_path(&self, path: &str) -> Option<PathBuf> {
-        self.has_content(path).then(|| self.root.join(path))
-    }
-
-    pub(crate) fn manifest_path(root: &Path) -> PathBuf {
-        let parent = root
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        let name = root
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("staging");
-        parent.join(format!(".{name}.ofs-staged-tree.json"))
-    }
-
-    pub(crate) fn save_manifest(&self) -> Result<()> {
-        self.validate()?;
-        let path = Self::manifest_path(&self.root);
-        let parent = path.parent().unwrap_or(Path::new("."));
-        fs::create_dir_all(parent).context("create staged tree manifest directory")?;
-        let temporary = parent.join(format!(".ofs-staged-tree-{}.tmp", uuid::Uuid::new_v4()));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        let stored = StoredStagedTree::from(self);
-        let result = (|| -> Result<()> {
-            let mut file = options.open(&temporary)?;
-            serde_json::to_writer(&mut file, &stored)?;
-            file.write_all(b"\n")?;
-            file.sync_all()?;
-            drop(file);
-            fs::rename(&temporary, &path)?;
-            sync_directory(parent)?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
-        result.context("install staged tree manifest")
-    }
-
-    pub(crate) fn remove_manifest(root: &Path) -> Result<()> {
-        let path = Self::manifest_path(root);
-        match fs::remove_file(&path) {
-            Ok(()) => sync_directory(path.parent().unwrap_or(Path::new("."))),
-            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error).context("remove staged tree manifest"),
-        }
+        self.files
+            .get(path)
+            .is_some_and(|file| file.content)
+            .then(|| self.root.join(path))
     }
 
     pub(crate) async fn record_materialized_file(
@@ -323,10 +210,10 @@ impl StagedTree {
             StagedFile {
                 size: entry.size,
                 digest,
+                content: true,
+                prepared: None,
             },
         );
-        self.content_paths.insert(path.clone());
-        self.prepared.remove(&path);
         self.logical.insert(path, entry);
         Ok(())
     }
@@ -341,8 +228,6 @@ impl StagedTree {
             bail!("materialized path {path:?} is not a directory");
         }
         self.files.remove(&path);
-        self.content_paths.remove(&path);
-        self.prepared.remove(&path);
         self.logical.insert(path, entry);
         Ok(())
     }
@@ -373,8 +258,6 @@ impl StagedTree {
     pub(crate) fn remove_logical_path(&mut self, path: &str) {
         self.logical.remove(path);
         self.files.remove(path);
-        self.content_paths.remove(path);
-        self.prepared.remove(path);
         self.remove_descendants(path);
     }
 
@@ -390,8 +273,6 @@ impl StagedTree {
         for descendant in descendants {
             self.logical.remove(&descendant);
             self.files.remove(&descendant);
-            self.content_paths.remove(&descendant);
-            self.prepared.remove(&descendant);
         }
     }
 
@@ -404,67 +285,29 @@ impl StagedTree {
             .map(|(path, _)| path)
             .collect::<BTreeSet<_>>();
         if logical_files != self.files.keys().collect() {
-            bail!("staged tree manifest does not describe one complete logical tree");
+            bail!("staged state does not describe one complete logical tree");
         }
-        for path in &self.content_paths {
-            let file = self
-                .files
-                .get(path)
-                .with_context(|| format!("staged content {path:?} is not a logical file"))?;
-            let metadata = fs::symlink_metadata(self.root.join(path))
-                .with_context(|| format!("inspect staged content {path:?}"))?;
-            if !metadata.file_type().is_file() || metadata.len() != file.size {
-                bail!("staged content {path:?} is incomplete");
+        for (path, file) in &self.files {
+            if self.logical.entries()[path].size != file.size {
+                bail!("staged file {path:?} has the wrong size");
             }
-        }
-        for (path, version) in &self.prepared {
-            let file = self
-                .files
-                .get(path)
-                .with_context(|| format!("prepared file {path:?} is not a logical file"))?;
-            if !self.content_paths.contains(path)
-                || file.size != version.logical_size
-                || file.digest != version.logical_digest
-            {
+            if file.content {
+                let metadata = fs::symlink_metadata(self.root.join(path))
+                    .with_context(|| format!("inspect staged content {path:?}"))?;
+                if !metadata.file_type().is_file() || metadata.len() != file.size {
+                    bail!("staged content {path:?} is incomplete");
+                }
+            }
+            if file.prepared.as_ref().is_some_and(|version| {
+                !file.content
+                    || file.size != version.logical_size
+                    || file.digest != version.logical_digest
+            }) {
                 bail!("prepared file {path:?} disagrees with staged content");
             }
         }
         Ok(())
     }
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct StoredStagedTree {
-    format: String,
-    major: u16,
-    entries: BTreeMap<String, LocalEntry>,
-    files: BTreeMap<String, StagedFile>,
-    content_paths: BTreeSet<String>,
-    prepared: BTreeMap<String, FileVersion>,
-}
-
-impl From<&StagedTree> for StoredStagedTree {
-    fn from(staged: &StagedTree) -> Self {
-        Self {
-            format: MANIFEST_FORMAT.to_owned(),
-            major: MANIFEST_MAJOR,
-            entries: staged.logical.entries().clone(),
-            files: staged.files.clone(),
-            content_paths: staged.content_paths.clone(),
-            prepared: staged.prepared.clone(),
-        }
-    }
-}
-
-#[cfg(unix)]
-fn sync_directory(path: &Path) -> Result<()> {
-    File::open(path)?.sync_all().map_err(Into::into)
-}
-
-#[cfg(not(unix))]
-fn sync_directory(_: &Path) -> Result<()> {
-    Ok(())
 }
 
 fn require_same_identity(

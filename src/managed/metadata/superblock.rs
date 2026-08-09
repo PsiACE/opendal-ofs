@@ -22,10 +22,7 @@ use crate::managed::{ManagedError, ManagedErrorKind};
 
 pub(crate) const SUPERBLOCK_KEY: &str = ".ofs/managed/metadata/v1/superblock.json";
 
-const SPECIFICATION: &str = "managed/1";
-const NAMING_POLICY: &str = "portable-utf8/1";
-const FILE_VERSION_FORMAT: &str = "extent-map/1";
-const DATA_FORMAT: &str = "segment/1";
+const VERSION: u8 = 1;
 
 /// Physical format of the authoritative Managed metadata store.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -61,15 +58,15 @@ impl ManagedExtension {
 impl MetadataFormat {
     const fn identifier(self) -> &'static str {
         match self {
-            Self::ObjectV1 => "object/1",
-            Self::TransactionalV1 => "transactional/1",
+            Self::ObjectV1 => "object",
+            Self::TransactionalV1 => "transactional",
         }
     }
 
     fn parse(value: &str) -> Result<Self, ManagedError> {
         match value {
-            "object/1" => Ok(Self::ObjectV1),
-            "transactional/1" => Ok(Self::TransactionalV1),
+            "object" => Ok(Self::ObjectV1),
+            "transactional" => Ok(Self::TransactionalV1),
             _ => Err(unsupported("metadata format is unsupported")),
         }
     }
@@ -129,35 +126,22 @@ impl ManagedFormat {
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, ManagedError> {
         let wire: SuperblockWire = serde_json::from_slice(bytes)
             .map_err(|_| corrupt("superblock is not strict UTF-8 JSON"))?;
-        if wire
-            .required_extensions
-            .windows(2)
-            .any(|pair| pair[0] >= pair[1])
-        {
+        if wire.extensions.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err(corrupt(
                 "required extensions are not strictly ordered or contain duplicates",
             ));
         }
-        if wire.specification != SPECIFICATION {
-            return Err(unsupported("Managed specification is unsupported"));
-        }
-        if wire.naming_policy != NAMING_POLICY {
-            return Err(unsupported("naming policy is unsupported"));
-        }
-        if wire.file_version_format != FILE_VERSION_FORMAT {
-            return Err(unsupported("file version format is unsupported"));
-        }
-        if wire.data_format != DATA_FORMAT {
-            return Err(unsupported("data format is unsupported"));
+        if wire.version != VERSION {
+            return Err(unsupported("Managed format version is unsupported"));
         }
         let required_extensions = wire
-            .required_extensions
+            .extensions
             .iter()
             .map(|value| ManagedExtension::parse(value))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             volume_id: decode_volume_id(&wire.volume_id)?,
-            metadata_format: MetadataFormat::parse(&wire.metadata_format)?,
+            metadata_format: MetadataFormat::parse(&wire.metadata)?,
             required_extensions,
         })
     }
@@ -182,25 +166,19 @@ fn corrupt(message: &'static str) -> ManagedError {
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct SuperblockWire {
-    specification: String,
+    version: u8,
     volume_id: String,
-    naming_policy: String,
-    metadata_format: String,
-    file_version_format: String,
-    data_format: String,
-    required_extensions: Vec<String>,
+    metadata: String,
+    extensions: Vec<String>,
 }
 
 impl From<&ManagedFormat> for SuperblockWire {
     fn from(format: &ManagedFormat) -> Self {
         Self {
-            specification: SPECIFICATION.to_owned(),
+            version: VERSION,
             volume_id: encode_hex(format.volume_id.as_bytes()),
-            naming_policy: NAMING_POLICY.to_owned(),
-            metadata_format: format.metadata_format.identifier().to_owned(),
-            file_version_format: FILE_VERSION_FORMAT.to_owned(),
-            data_format: DATA_FORMAT.to_owned(),
-            required_extensions: format
+            metadata: format.metadata_format.identifier().to_owned(),
+            extensions: format
                 .required_extensions
                 .iter()
                 .map(|extension| extension.identifier().to_owned())
@@ -244,28 +222,13 @@ mod tests {
         assert_eq!(ManagedFormat::decode(&encoded).unwrap(), format);
         assert_eq!(
             std::str::from_utf8(&encoded).unwrap(),
-            r#"{"specification":"managed/1","volume_id":"01010101010101010101010101010101","naming_policy":"portable-utf8/1","metadata_format":"object/1","file_version_format":"extent-map/1","data_format":"segment/1","required_extensions":[]}"#
-        );
-    }
-
-    #[test]
-    fn transactional_metadata_format_round_trips() {
-        let format = ManagedFormat::v1(
-            VolumeId::from_bytes([2; 16]),
-            MetadataFormat::TransactionalV1,
-        );
-        let encoded = format.encode().unwrap();
-        assert_eq!(ManagedFormat::decode(&encoded).unwrap(), format);
-        assert!(
-            std::str::from_utf8(&encoded)
-                .unwrap()
-                .contains(r#""metadata_format":"transactional/1""#)
+            r#"{"version":1,"volume_id":"01010101010101010101010101010101","metadata":"object","extensions":[]}"#
         );
     }
 
     #[test]
     fn unknown_required_extension_is_rejected_before_open() {
-        let unknown = br#"{"specification":"managed/1","volume_id":"01010101010101010101010101010101","naming_policy":"portable-utf8/1","metadata_format":"object/1","file_version_format":"extent-map/1","data_format":"segment/1","required_extensions":["future/1"]}"#;
+        let unknown = br#"{"version":1,"volume_id":"01010101010101010101010101010101","metadata":"object","extensions":["future/1"]}"#;
         assert_eq!(
             ManagedFormat::decode(unknown).unwrap_err().kind(),
             ManagedErrorKind::UnsupportedFormat
@@ -274,7 +237,7 @@ mod tests {
 
     #[test]
     fn required_extensions_must_be_strictly_ordered() {
-        let duplicate = br#"{"specification":"managed/1","volume_id":"01010101010101010101010101010101","naming_policy":"portable-utf8/1","metadata_format":"object/1","file_version_format":"extent-map/1","data_format":"segment/1","required_extensions":["future/1","future/1"]}"#;
+        let duplicate = br#"{"version":1,"volume_id":"01010101010101010101010101010101","metadata":"object","extensions":["future/1","future/1"]}"#;
         assert_eq!(
             ManagedFormat::decode(duplicate).unwrap_err().kind(),
             ManagedErrorKind::Corrupt
@@ -283,7 +246,7 @@ mod tests {
 
     #[test]
     fn unknown_superblock_field_is_rejected() {
-        let unknown = br#"{"specification":"managed/1","volume_id":"01010101010101010101010101010101","naming_policy":"portable-utf8/1","metadata_format":"object/1","file_version_format":"extent-map/1","data_format":"segment/1","required_extensions":[],"policy":"fastcdc"}"#;
+        let unknown = br#"{"version":1,"volume_id":"01010101010101010101010101010101","metadata":"object","extensions":[],"policy":"fastcdc"}"#;
         assert_eq!(
             ManagedFormat::decode(unknown).unwrap_err().kind(),
             ManagedErrorKind::Corrupt
@@ -292,7 +255,7 @@ mod tests {
 
     #[test]
     fn uppercase_volume_identity_is_rejected() {
-        let bytes = br#"{"specification":"managed/1","volume_id":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","naming_policy":"portable-utf8/1","metadata_format":"object/1","file_version_format":"extent-map/1","data_format":"segment/1","required_extensions":[]}"#;
+        let bytes = br#"{"version":1,"volume_id":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","metadata":"object","extensions":[]}"#;
         assert_eq!(
             ManagedFormat::decode(bytes).unwrap_err().kind(),
             ManagedErrorKind::Corrupt

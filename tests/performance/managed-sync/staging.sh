@@ -16,6 +16,33 @@ fail() {
   exit 1
 }
 
+pause_when_pending() {
+  python3 - "$1" "$2" <<'PY'
+import json
+import os
+import pathlib
+import signal
+import sys
+import time
+
+state = pathlib.Path(sys.argv[1])
+pid = int(sys.argv[2])
+deadline = time.monotonic() + 10
+while time.monotonic() < deadline:
+    try:
+        if json.loads(state.read_text()).get("pending") is not None:
+            os.kill(pid, signal.SIGSTOP)
+            raise SystemExit(0)
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        break
+raise SystemExit(1)
+PY
+}
+
 catalog="$OFS_CASE_ROOT/catalog.json"
 replica="$OFS_CASE_ROOT/replica"
 state="$OFS_CASE_ROOT/state/replica.json"
@@ -37,21 +64,8 @@ done
 
 OFS_CONFIG="$catalog" "$OFS_BIN" sync staging "$replica" --state "$state" >/dev/null &
 sync_pid=$!
-stopped=false
-for _ in $(seq 1 300); do
-  if ! kill -0 "$sync_pid" 2>/dev/null; then
-    break
-  fi
-  status=$(OFS_CONFIG="$catalog" "$OFS_BIN" status --state "$state" --json 2>/dev/null || true)
-  if grep -Eq '"pending"[[:space:]]*:[[:space:]]*true' <<<"$status"; then
-    if kill -STOP "$sync_pid" 2>/dev/null; then
-      stopped=true
-    fi
-    break
-  fi
-  sleep 0.01
-done
-[[ $stopped == true ]] || fail 'could not pause sync with a durable publication intent'
+pause_when_pending "$state" "$sync_pid" || \
+  fail 'could not pause sync with a durable publication intent'
 
 staging=$(python3 - "$state" <<'PY'
 import json
@@ -97,21 +111,8 @@ for index in $(seq -w 1 128); do
 done
 OFS_CONFIG="$catalog" "$OFS_BIN" sync staging "$replica" --state "$state" >/dev/null &
 sync_pid=$!
-stopped=false
-for _ in $(seq 1 300); do
-  if ! kill -0 "$sync_pid" 2>/dev/null; then
-    break
-  fi
-  status=$(OFS_CONFIG="$catalog" "$OFS_BIN" status --state "$state" --json 2>/dev/null || true)
-  if grep -Eq '"pending"[[:space:]]*:[[:space:]]*true' <<<"$status"; then
-    if kill -STOP "$sync_pid" 2>/dev/null; then
-      stopped=true
-    fi
-    break
-  fi
-  sleep 0.01
-done
-[[ $stopped == true ]] || fail 'could not preserve a pending state before commit'
+pause_when_pending "$state" "$sync_pid" || \
+  fail 'could not preserve a pending state before commit'
 pending_state="$OFS_CASE_ROOT/pending-before-commit.json"
 cp "$state" "$pending_state"
 kill -CONT "$sync_pid"

@@ -19,7 +19,8 @@ use crate::filesystem::{
     AuthorityIdentity, BranchBinding, ChangeCursor, DirectoryRecord, FileVersion, NodeId,
     NodeRecord, OperationId, VolumeId, VolumeSnapshot,
 };
-use crate::sync::local::NativeIdentity;
+use crate::sync::local::{LocalEntry, LocalKind};
+use crate::sync::staging::StagedFile;
 
 const STATE_FORMAT: &str = "ofs-sync-replica";
 const STATE_MAJOR: u16 = 1;
@@ -27,19 +28,12 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct InstalledEntry {
-    pub local_identity: Option<NativeIdentity>,
-    pub local_size: Option<u64>,
-    pub local_modified: Option<String>,
-    pub local_executable: Option<bool>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct PendingIntent {
     pub operation: OperationId,
     pub staging: PathBuf,
     pub renames: BTreeMap<String, String>,
+    pub(crate) entries: BTreeMap<String, LocalEntry>,
+    pub(crate) files: BTreeMap<String, StagedFile>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -55,7 +49,7 @@ pub struct ReplicaState {
     pub volume: VolumeId,
     pub branch: Option<BranchBinding>,
     pub(crate) authority: Option<VolumeSnapshot>,
-    pub(crate) installed: BTreeMap<String, InstalledEntry>,
+    pub(crate) installed: BTreeMap<String, LocalEntry>,
     pub pending: Option<PendingIntent>,
     pub conflicts: Vec<ConflictRecord>,
 }
@@ -84,6 +78,22 @@ impl ReplicaState {
             .as_ref()
             .map(|snapshot| snapshot.cursor)
             .unwrap_or(ChangeCursor::Genesis)
+    }
+
+    pub(crate) fn at_common(
+        identity: AuthorityIdentity,
+        authority: VolumeSnapshot,
+        installed: BTreeMap<String, LocalEntry>,
+    ) -> Result<Self> {
+        validate_installed(&authority, &installed)?;
+        Ok(Self {
+            volume: identity.volume,
+            branch: identity.branch,
+            authority: Some(authority),
+            installed,
+            pending: None,
+            conflicts: Vec::new(),
+        })
     }
 
     pub fn load(path: impl AsRef<Path>) -> Result<Option<Self>> {
@@ -159,7 +169,7 @@ struct StoredState {
     volume: VolumeId,
     branch: Option<BranchBinding>,
     authority: Option<StoredSnapshot>,
-    installed: BTreeMap<String, InstalledEntry>,
+    installed: BTreeMap<String, LocalEntry>,
     pending: Option<PendingIntent>,
     conflicts: Vec<ConflictRecord>,
 }
@@ -183,14 +193,13 @@ impl From<&ReplicaState> for StoredState {
             branch: state.branch.clone(),
             authority: state.authority.as_ref().map(StoredSnapshot::from),
             installed: state.installed.clone(),
-            pending: state.pending.as_ref().map(|intent| PendingIntent {
-                operation: intent.operation,
-                staging: intent
+            pending: state.pending.clone().map(|mut intent| {
+                intent.staging = intent
                     .staging
                     .file_name()
                     .map(PathBuf::from)
-                    .expect("pending cache is a named sibling of replica state"),
-                renames: intent.renames.clone(),
+                    .expect("pending cache is a named sibling of replica state");
+                intent
             }),
             conflicts: state.conflicts.clone(),
         }
@@ -277,25 +286,9 @@ impl StoredSnapshot {
 
 fn validate_installed(
     snapshot: &VolumeSnapshot,
-    installed: &BTreeMap<String, InstalledEntry>,
+    installed: &BTreeMap<String, LocalEntry>,
 ) -> Result<()> {
-    let mut expected = BTreeMap::new();
-    let mut pending = vec![(String::new(), snapshot.root)];
-    while let Some((path, node)) = pending.pop() {
-        if !path.is_empty() {
-            expected.insert(path.clone(), node);
-        }
-        if let Some(directory) = snapshot.directories.get(&node) {
-            for (name, entry) in &directory.entries {
-                let child = if path.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{path}/{name}")
-                };
-                pending.push((child, entry.node));
-            }
-        }
-    }
+    let expected = snapshot.paths()?;
     if expected.len() != installed.len() {
         bail!("replica base and authority snapshot contain different paths");
     }
@@ -305,8 +298,13 @@ fn validate_installed(
             .with_context(|| format!("replica base is missing {path:?}"))?;
         let record = &snapshot.nodes[&node];
         let version = record.file_version.map(|id| &snapshot.file_versions[&id]);
-        if saved.local_executable != Some(record.attributes.executable)
-            || version.is_some_and(|version| saved.local_size != Some(version.logical_size))
+        let kind = match record.kind {
+            crate::filesystem::NodeKind::Directory => LocalKind::Directory,
+            crate::filesystem::NodeKind::RegularFile => LocalKind::File,
+        };
+        if saved.kind != kind
+            || saved.executable != record.attributes.executable
+            || version.is_some_and(|version| saved.size != version.logical_size)
         {
             bail!("replica base disagrees with authority snapshot at {path:?}");
         }

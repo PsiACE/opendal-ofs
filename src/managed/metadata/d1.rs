@@ -20,10 +20,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::require_same_format;
-use crate::managed::{ManagedError, ManagedErrorKind, ManagedFormat};
-
-const FORMAT_TABLE: &str = "ofs_managed_v1_formats";
+use crate::managed::{ManagedError, ManagedErrorKind};
 
 /// Connection scope for the D1 Query API.
 #[derive(Clone)]
@@ -87,119 +84,21 @@ impl D1Config {
     }
 }
 
-/// Managed metadata stored through the D1 Query API.
-#[derive(Clone)]
-pub(crate) struct D1Metadata {
-    session: D1Session,
-}
-
 #[derive(Clone)]
 pub(crate) struct D1Session {
     client: reqwest::Client,
     config: D1Config,
 }
 
-impl D1Metadata {
+impl D1Session {
     pub(crate) fn new(config: D1Config) -> Result<Self, ManagedError> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(|_| unavailable("open D1 metadata"))?;
-        Ok(Self {
-            session: D1Session { client, config },
-        })
+        Ok(Self { client, config })
     }
 
-    pub(crate) fn session(&self) -> D1Session {
-        self.session.clone()
-    }
-
-    pub(crate) async fn create_format(
-        &self,
-        desired: &ManagedFormat,
-    ) -> Result<ManagedFormat, ManagedError> {
-        let record = String::from_utf8(desired.encode()?).map_err(|_| {
-            ManagedError::new(
-                ManagedErrorKind::Invalid,
-                "create Managed format",
-                "format is not UTF-8 JSON",
-            )
-        })?;
-        let results = self
-            .session
-            .query(
-                vec![
-                    statement(
-                        format!(
-                            "CREATE TABLE IF NOT EXISTS {FORMAT_TABLE} (store_key TEXT PRIMARY KEY, record_json TEXT NOT NULL)"
-                        ),
-                        Vec::new(),
-                    ),
-                    statement(
-                        format!(
-                            "INSERT OR IGNORE INTO {FORMAT_TABLE} (store_key, record_json) VALUES (?, ?)"
-                        ),
-                        vec![self.session.store_key().to_owned().into(), record.into()],
-                    ),
-                    statement(
-                        format!("SELECT record_json FROM {FORMAT_TABLE} WHERE store_key = ?"),
-                        vec![self.session.store_key().to_owned().into()],
-                    ),
-                ],
-                "create Managed format",
-            )
-            .await?;
-        let observed =
-            decode_format_result(&results)?.ok_or_else(|| unavailable("create Managed format"))?;
-        require_same_format(desired, observed)
-    }
-
-    pub(crate) async fn read_format_optional(&self) -> Result<Option<ManagedFormat>, ManagedError> {
-        let results = self
-            .session
-            .query(
-                vec![
-                    statement(
-                        format!(
-                            "CREATE TABLE IF NOT EXISTS {FORMAT_TABLE} (store_key TEXT PRIMARY KEY, record_json TEXT NOT NULL)"
-                        ),
-                        Vec::new(),
-                    ),
-                    statement(
-                        format!("SELECT record_json FROM {FORMAT_TABLE} WHERE store_key = ?"),
-                        vec![self.session.store_key().to_owned().into()],
-                    ),
-                ],
-                "read Managed format",
-            )
-            .await?;
-        decode_format_result(&results)
-    }
-}
-
-fn decode_format_result(results: &[D1Result]) -> Result<Option<ManagedFormat>, ManagedError> {
-    let rows = &results
-        .last()
-        .ok_or_else(|| corrupt("read Managed format", "D1 omitted the query result"))?
-        .results;
-    let [row] = rows.as_slice() else {
-        return if rows.is_empty() {
-            Ok(None)
-        } else {
-            Err(corrupt(
-                "read Managed format",
-                "D1 returned duplicate formats",
-            ))
-        };
-    };
-    let record = row
-        .get("record_json")
-        .and_then(Value::as_str)
-        .ok_or_else(|| corrupt("read Managed format", "D1 format row is invalid"))?;
-    ManagedFormat::decode(record.as_bytes()).map(Some)
-}
-
-impl D1Session {
     pub(crate) fn store_key(&self) -> &str {
         &self.config.store_key
     }
@@ -209,6 +108,7 @@ impl D1Session {
         statements: Vec<D1Statement>,
         action: &'static str,
     ) -> Result<Vec<D1Result>, ManagedError> {
+        let expected_results = statements.len();
         let endpoint = format!(
             "{}/accounts/{}/d1/database/{}/query",
             self.config.api_base.trim_end_matches('/'),
@@ -238,6 +138,9 @@ impl D1Session {
         {
             return Err(unavailable(action));
         }
+        if reply.result.len() != expected_results {
+            return Err(corrupt(action, "D1 returned an invalid result count"));
+        }
         Ok(reply.result)
     }
 }
@@ -261,12 +164,8 @@ struct D1Request {
 
 #[derive(Serialize)]
 pub(crate) struct D1Statement {
-    sql: String,
-    params: Vec<Value>,
-}
-
-pub(crate) fn statement(sql: String, params: Vec<Value>) -> D1Statement {
-    D1Statement { sql, params }
+    pub(crate) sql: String,
+    pub(crate) params: Vec<Value>,
 }
 
 #[derive(Deserialize)]
@@ -280,9 +179,17 @@ struct D1Reply {
 pub(crate) struct D1Result {
     success: bool,
     #[serde(default)]
-    pub(crate) results: Vec<Value>,
+    pub(crate) results: Vec<D1Row>,
     #[serde(default)]
     meta: D1Meta,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct D1Row {
+    pub(crate) value_hex: Option<String>,
+    pub(crate) revision: Option<u64>,
+    #[cfg(feature = "managed-branch")]
+    pub(crate) record_key: Option<String>,
 }
 
 #[derive(Default, Deserialize)]

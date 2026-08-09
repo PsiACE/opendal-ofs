@@ -19,6 +19,67 @@
 
 use std::collections::BTreeMap;
 
+use anyhow::{Context, Result, bail};
+
+use crate::filesystem::{
+    DirectoryRecord, FileVersion, NodeId, NodeKind, NodeRecord, VolumeSnapshot,
+};
+
+/// One validated, path-sorted view over an immutable namespace snapshot.
+pub(crate) struct SnapshotTree<'a> {
+    snapshot: &'a VolumeSnapshot,
+    paths: BTreeMap<String, NodeId>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SnapshotEntry<'a> {
+    pub node: &'a NodeRecord,
+    pub directory: Option<&'a DirectoryRecord>,
+    pub file: Option<&'a FileVersion>,
+}
+
+impl<'a> SnapshotTree<'a> {
+    pub(crate) fn new(snapshot: &'a VolumeSnapshot) -> Result<Self> {
+        let paths = snapshot.paths()?;
+        for (path, id) in &paths {
+            let node = snapshot
+                .nodes
+                .get(id)
+                .with_context(|| format!("snapshot path {path:?} references a missing node"))?;
+            match node.kind {
+                NodeKind::Directory if snapshot.directories.contains_key(id) => {}
+                NodeKind::RegularFile
+                    if node
+                        .file_version
+                        .is_some_and(|version| snapshot.file_versions.contains_key(&version)) => {}
+                NodeKind::Directory => bail!("snapshot directory {path:?} has no record"),
+                NodeKind::RegularFile => bail!("snapshot file {path:?} has no version"),
+            }
+        }
+        Ok(Self { snapshot, paths })
+    }
+
+    pub(crate) fn snapshot(&self) -> &'a VolumeSnapshot {
+        self.snapshot
+    }
+
+    pub(crate) fn paths(&self) -> &BTreeMap<String, NodeId> {
+        &self.paths
+    }
+
+    pub(crate) fn get(&self, path: &str) -> Option<SnapshotEntry<'a>> {
+        let id = self.paths.get(path)?;
+        let node = &self.snapshot.nodes[id];
+        Some(SnapshotEntry {
+            node,
+            directory: self.snapshot.directories.get(id),
+            file: node
+                .file_version
+                .map(|version| &self.snapshot.file_versions[&version]),
+        })
+    }
+}
+
 /// Returns the entries below `directory`, excluding the directory itself.
 ///
 /// Sync paths are canonical relative paths separated by `/`. Their descendants

@@ -16,65 +16,10 @@
 // under the License.
 
 use opendal::{ErrorKind, Operator};
+#[cfg(feature = "managed-branch")]
 use sha2::{Digest as _, Sha256};
 
-use super::require_same_format;
-use crate::managed::metadata::superblock::SUPERBLOCK_KEY;
-use crate::managed::{ManagedError, ManagedErrorKind, ManagedFormat};
-
-/// Managed metadata stored beside data through OpenDAL.
-#[derive(Clone)]
-pub(crate) struct ObjectMetadata {
-    operator: Operator,
-}
-
-impl ObjectMetadata {
-    pub(crate) const fn new(operator: Operator) -> Self {
-        Self { operator }
-    }
-
-    pub(crate) async fn create_format(
-        &self,
-        desired: &ManagedFormat,
-    ) -> Result<ManagedFormat, ManagedError> {
-        if !self
-            .operator
-            .info()
-            .full_capability()
-            .write_with_if_not_exists
-        {
-            return Err(ManagedError::new(
-                ManagedErrorKind::Invalid,
-                "create Managed format",
-                "object metadata requires create-only write",
-            ));
-        }
-        let encoded = desired.encode()?;
-        if create(
-            &self.operator,
-            SUPERBLOCK_KEY,
-            encoded,
-            "create Managed format",
-        )
-        .await?
-        {
-            Ok(desired.clone())
-        } else {
-            let observed = self
-                .read_format_optional()
-                .await?
-                .ok_or_else(|| unavailable("create Managed format"))?;
-            require_same_format(desired, observed)
-        }
-    }
-
-    pub(crate) async fn read_format_optional(&self) -> Result<Option<ManagedFormat>, ManagedError> {
-        read(&self.operator, SUPERBLOCK_KEY, "read Managed format")
-            .await?
-            .map(|bytes| ManagedFormat::decode(&bytes))
-            .transpose()
-    }
-}
+use crate::managed::{ManagedError, ManagedErrorKind};
 
 pub(crate) async fn read(
     operator: &Operator,
@@ -111,6 +56,7 @@ pub(crate) async fn read_with_revision(
     Ok(Some((bytes, revision)))
 }
 
+#[cfg(feature = "managed-branch")]
 pub(crate) async fn read_content_addressed(
     operator: &Operator,
     key: &str,

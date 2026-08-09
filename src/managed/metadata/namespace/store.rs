@@ -1,56 +1,48 @@
 // Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
+// or more contributor license agreements. See the NOTICE file
 // distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
+// regarding copyright ownership. The ASF licenses this file
 // to you under the Apache License, Version 2.0 (the
 // "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
-//
-//   http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+// with the License.
 
-//! Namespace authority over native revision-CAS records.
+//! One namespace authority state machine over a bound revision-CAS HEAD.
 
-use std::collections::BTreeMap;
+#[cfg(feature = "managed-branch")]
+use std::collections::BTreeSet;
 use std::io::Cursor;
 
-use opendal::Operator;
+use opendal::{ErrorKind, Operator};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use super::change::NamespaceChange;
-use super::validation::{validate_publication, validate_snapshot};
 use super::{
-    CheckpointPart, CheckpointRoot, NamespaceGcSweep, NamespacePublication, NamespaceSnapshot,
-    PendingCheckpoint,
+    NamespaceChange, NamespaceGcSweep, NamespacePublication, NamespaceSnapshot, StoredChange,
+    StoredCheckpoint, StoredCommittedResult, StoredHistory, StoredNamespaceState, StoredResults,
+    recover_namespace, replay_tail_from, require_request_digest, results_for_rotation,
+    validate_publication,
 };
-use crate::filesystem::{ChangeCursor, CommitOutcome, OperationId, VolumeId};
-use crate::managed::metadata::object::{self, ensure_immutable, read_content_addressed};
-use crate::managed::metadata::record::{RecordBackend, Revision};
-use crate::managed::{D1Metadata, ManagedError, ManagedErrorKind};
-
-#[cfg(test)]
 use crate::filesystem::{
-    DirectoryPrecondition, DirectoryRecord, NodeAttributes, NodeId, NodeKind, NodePrecondition,
-    NodeRecord,
+    BranchBinding, BranchId, ChangeCursor, CommitOutcome, OperationId, VolumeId,
 };
+use crate::managed::metadata::object::ensure_immutable;
+#[cfg(feature = "managed-branch")]
+use crate::managed::metadata::object::read_content_addressed;
+use crate::managed::metadata::record::{RecordBackend, Revision};
+use crate::managed::{ManagedError, ManagedErrorKind};
 
-const HEAD_KEY: &str = ".ofs/managed/metadata/v1/head.ofs";
+const BASE_HEAD_KEY: &str = ".ofs/managed/metadata/v1/head.ofs";
 const CHECKPOINT_ROOT: &str = ".ofs/managed/metadata/v1/checkpoints/sha256";
-const CHECKPOINT_PART_ROOT: &str = ".ofs/managed/metadata/v1/checkpoint-parts/sha256";
+const HISTORY_ROOT: &str = ".ofs/managed/metadata/v1/extensions/branch/v1/history/sha256";
 const HEAD_MAGIC: &[u8; 8] = b"OFS1HDZ1";
-const FORMAT_MAJOR: u16 = 1;
-const MAX_TAIL_TRANSACTIONS: u16 = 32;
-const MAX_TAIL_BYTES: usize = 128 * 1024;
+const CHECKPOINT_MAGIC: &[u8; 8] = b"OFS1CKZ1";
+const HISTORY_MAGIC: &[u8; 8] = b"OFS1HST1";
 const MAX_HEAD_BYTES: usize = 256 * 1024;
-const HEAD_COMPRESSION_LEVEL: i32 = 3;
+const MAX_CHECKPOINT_ENCODED_BYTES: usize = 256 * 1024 * 1024;
+const MAX_CHECKPOINT_DECODED_BYTES: usize = 256 * 1024 * 1024;
+const MAX_HISTORY_BYTES: usize = 512 * 1024;
+const COMPRESSION_LEVEL: i32 = 3;
 
 #[derive(Clone, Debug)]
 pub(crate) struct NamespaceObservation {
@@ -60,8 +52,9 @@ pub(crate) struct NamespaceObservation {
 
 #[derive(Clone, Debug)]
 pub(crate) struct NamespaceWitness {
-    revision: Revision,
-    authority: Box<ObservationAuthority>,
+    pub(crate) revision: Revision,
+    pub(crate) head: StoredHead,
+    checkpoint_results: Option<StoredResults>,
 }
 
 impl NamespaceObservation {
@@ -72,105 +65,127 @@ impl NamespaceObservation {
 
 impl NamespaceWitness {
     pub(crate) fn gc_sweep(&self) -> Option<NamespaceGcSweep> {
-        self.authority
-            .head
+        self.head
             .gc_sweep()
             .expect("observed HEAD has valid maintenance state")
     }
 }
 
-#[derive(Clone)]
-struct ObservationAuthority {
-    head: StoredHead,
-    checkpoint_results: Option<BTreeMap<OperationId, StoredCommittedResult>>,
+#[derive(Clone, Debug)]
+enum NamespaceAuthority {
+    Base,
+    #[cfg(feature = "managed-branch")]
+    Branch(BranchBinding),
 }
 
-impl std::fmt::Debug for ObservationAuthority {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ObservationAuthority")
-            .field("head", &self.head)
-            .field("checkpoint_loaded", &self.checkpoint_results.is_some())
-            .field("tail_changes", &self.head.tail.len())
-            .finish()
+impl NamespaceAuthority {
+    fn branch_id(&self) -> Option<BranchId> {
+        match self {
+            Self::Base => None,
+            #[cfg(feature = "managed-branch")]
+            Self::Branch(binding) => Some(binding.id),
+        }
+    }
+
+    fn binding(&self) -> Option<&BranchBinding> {
+        match self {
+            Self::Base => None,
+            #[cfg(feature = "managed-branch")]
+            Self::Branch(binding) => Some(binding),
+        }
     }
 }
 
 #[derive(Clone)]
 pub(crate) struct NamespaceStore {
-    pub(crate) volume_id: VolumeId,
-    pub(crate) operator: Operator,
-    pub(crate) backend: RecordBackend,
+    volume_id: VolumeId,
+    data: Operator,
+    backend: RecordBackend,
+    authority: NamespaceAuthority,
+    head_key: String,
 }
 
 impl NamespaceStore {
-    pub(crate) fn object(volume_id: VolumeId, operator: Operator) -> Result<Self, ManagedError> {
-        Ok(Self {
-            volume_id,
-            operator: operator.clone(),
-            backend: RecordBackend::object(operator, "open Managed namespace")?,
-        })
-    }
-
-    pub(crate) fn d1(volume_id: VolumeId, operator: Operator, metadata: D1Metadata) -> Self {
+    pub(crate) fn new(volume_id: VolumeId, operator: Operator, backend: RecordBackend) -> Self {
         Self {
             volume_id,
-            operator,
-            backend: RecordBackend::d1(volume_id, metadata),
+            data: operator,
+            backend,
+            authority: NamespaceAuthority::Base,
+            head_key: BASE_HEAD_KEY.to_owned(),
         }
     }
 
+    #[cfg(feature = "managed-branch")]
+    pub(crate) fn branch(
+        volume_id: VolumeId,
+        data: Operator,
+        backend: RecordBackend,
+        binding: BranchBinding,
+        head_key: String,
+    ) -> Self {
+        Self {
+            volume_id,
+            data,
+            backend,
+            authority: NamespaceAuthority::Branch(binding),
+            head_key,
+        }
+    }
+
+    #[cfg(feature = "managed-branch")]
+    pub(crate) fn volume_id(&self) -> VolumeId {
+        self.volume_id
+    }
+
+    pub(crate) fn binding(&self) -> Option<&BranchBinding> {
+        self.authority.binding()
+    }
+
     pub(crate) async fn observe(&self) -> Result<Option<NamespaceObservation>, ManagedError> {
-        let Some((bytes, revision)) = self.read_head().await? else {
-            return Ok(None);
-        };
-        let head = decode_head(&bytes)?;
-        self.recover_observation(head, revision).await.map(Some)
+        self.observe_from_optional(None).await
     }
 
     pub(crate) async fn observe_from(
         &self,
         base: &NamespaceSnapshot,
     ) -> Result<Option<NamespaceObservation>, ManagedError> {
-        let Some((bytes, revision)) = self.read_head().await? else {
-            return Ok(None);
-        };
-        let head = decode_head(&bytes)?;
-        head.validate(self.volume_id)?;
-        if base.volume_id == self.volume_id {
-            validate_snapshot(base)?;
-            if let Some(snapshot) = replay_tail_from(base, &head)? {
-                return Ok(Some(NamespaceObservation {
-                    snapshot,
-                    witness: NamespaceWitness {
-                        revision,
-                        authority: Box::new(ObservationAuthority {
-                            head,
-                            checkpoint_results: None,
-                        }),
-                    },
-                }));
-            }
-        }
-        self.recover_observation(head, revision).await.map(Some)
+        self.observe_from_optional(Some(base)).await
     }
 
-    async fn recover_observation(
+    async fn observe_from_optional(
         &self,
-        head: StoredHead,
-        revision: Revision,
-    ) -> Result<NamespaceObservation, ManagedError> {
-        let (snapshot, checkpoint) = self.recover(&head).await?;
-        Ok(NamespaceObservation {
+        base: Option<&NamespaceSnapshot>,
+    ) -> Result<Option<NamespaceObservation>, ManagedError> {
+        let Some((head, revision)) = self.read_bound_head("read Managed namespace").await? else {
+            return Ok(None);
+        };
+        let Some(state) = &head.state else {
+            return Ok(None);
+        };
+        if let Some(base) = base
+            && base.volume_id == self.volume_id
+            && let Some(snapshot) = replay_tail_from(base, state)?
+        {
+            return Ok(Some(NamespaceObservation {
+                snapshot,
+                witness: NamespaceWitness {
+                    revision,
+                    head,
+                    checkpoint_results: None,
+                },
+            }));
+        }
+        let checkpoint = self.read_checkpoint(state.checkpoint).await?;
+        let (snapshot, checkpoint_results) = recover_namespace(checkpoint, state, self.volume_id)?;
+        Ok(Some(NamespaceObservation {
             snapshot,
             witness: NamespaceWitness {
                 revision,
-                authority: Box::new(ObservationAuthority {
-                    head,
-                    checkpoint_results: Some(checkpoint.results),
-                }),
+                head,
+                checkpoint_results: Some(checkpoint_results),
             },
-        })
+        }))
     }
 
     pub(crate) async fn publish(
@@ -184,107 +199,135 @@ impl NamespaceStore {
                 "publication belongs to another volume",
             ));
         }
-        if observed.is_some_and(|(witness, _)| witness.gc_sweep().is_some()) {
+        let (head, revision, base, checkpoint_results) = match observed {
+            Some((witness, snapshot)) => (
+                witness.head.clone(),
+                Some(witness.revision.clone()),
+                Some(snapshot),
+                witness.checkpoint_results.clone(),
+            ),
+            None if self.authority.branch_id().is_some() => {
+                let (head, revision) = self
+                    .read_bound_head("publish Managed namespace")
+                    .await?
+                    .expect("a bound branch has a HEAD");
+                if head.state.is_some() {
+                    return self.outcome_after_race(publication.operation).await;
+                }
+                (head, Some(revision), None, None)
+            }
+            None => {
+                if self.read_raw_head().await?.is_some() {
+                    return self.outcome_after_race(publication.operation).await;
+                }
+                (StoredHead::unborn(self.volume_id, None), None, None, None)
+            }
+        };
+        if head.maintenance_active {
             return Ok(CommitOutcome::Conflict {
-                observed: observed.expect("checked above").1.cursor,
+                observed: base.map_or(ChangeCursor::Genesis, |snapshot| snapshot.cursor),
             });
         }
-        let base = observed.map(|(_, snapshot)| snapshot);
-        let stored = NamespaceChange::from_publication(publication, base);
-        let encoded_transaction = encode_table_value(&stored, "publish Managed namespace")?;
-        let request_sha256 = sha256(&encoded_transaction);
-        if !validate_publication(publication, base)? {
+
+        let valid = validate_publication(publication, base)?;
+        let change = StoredChange {
+            origin_branch: self.authority.branch_id(),
+            change: NamespaceChange::from_publication(publication, base),
+        };
+        let request_digest = change.request_digest()?;
+        let change_bytes = change.encoded_len()?;
+        if !valid {
             if matches!(
-                self.resolve_known(publication.operation, Some(request_sha256))
+                self.resolve_known(publication.operation, Some(request_digest))
                     .await?,
                 CommitOutcome::Committed(_)
             ) {
                 return Ok(CommitOutcome::Committed(publication.target.cursor));
             }
             return Ok(CommitOutcome::Conflict {
-                observed: base.map_or(ChangeCursor::Genesis, |state| state.cursor),
+                observed: base.map_or(ChangeCursor::Genesis, |snapshot| snapshot.cursor),
             });
         }
 
-        let appended_tail_bytes = observed
-            .map_or(0, |(witness, _)| witness.authority.head.tail_bytes())
-            + encoded_transaction.len();
-        let checkpoint_due = observed.is_none()
-            || observed.is_some_and(|(witness, _)| {
-                witness.authority.head.tail.len() + 1 >= usize::from(MAX_TAIL_TRANSACTIONS)
-                    || appended_tail_bytes > MAX_TAIL_BYTES
-            });
-        let (checkpoint, checkpoint_cursor, tail) = if checkpoint_due {
-            // The publication target and committed change tail are pinned by
-            // the observation used for CAS. Building a checkpoint never rereads
-            // the remote checkpoint or HEAD.
-            let mut committed = match observed {
-                Some((witness, _)) => match &witness.authority.checkpoint_results {
-                    Some(results) => results.clone(),
-                    None => {
-                        self.read_checkpoint(witness.authority.head.checkpoint)
-                            .await?
-                            .results
-                    }
-                },
-                None => BTreeMap::new(),
-            };
-            if let Some((witness, _)) = observed {
-                for transaction in &witness.authority.head.tail {
-                    committed.insert(
-                        transaction.operation,
-                        StoredCommittedResult::from_transaction(transaction)?,
-                    );
+        let state = match (&head.state, checkpoint_results) {
+            (None, None) => {
+                let result = StoredCommittedResult::from_change(&change)?;
+                let checkpoint = StoredCheckpoint {
+                    snapshot: publication.target.clone(),
+                    results: vec![result],
+                };
+                StoredNamespaceState {
+                    checkpoint: self.write_checkpoint(&checkpoint).await?,
+                    checkpoint_cursor: publication.target.cursor,
+                    tail: Vec::new(),
+                    previous_history: None,
                 }
             }
-            committed.insert(
-                publication.operation,
-                StoredCommittedResult {
-                    operation: publication.operation,
-                    cursor: stored.cursor,
-                    request_sha256,
-                },
-            );
-            let checkpoint_id = self
-                .write_checkpoint(&publication.target, &committed)
-                .await?;
-            (checkpoint_id, publication.target.cursor, Vec::new())
-        } else {
-            let (witness, _) = observed.expect("checkpoint policy has an observation");
-            let mut tail = witness.authority.head.tail.clone();
-            tail.push(stored.clone());
-            (
-                witness.authority.head.checkpoint,
-                witness.authority.head.checkpoint_cursor,
-                tail,
-            )
+            (Some(current), checkpoint_results) => {
+                let tail_bytes = current.tail.iter().try_fold(0_usize, |total, change| {
+                    change
+                        .encoded_len()
+                        .map(|length| total.saturating_add(length))
+                })?;
+                if current.tail.len() + 1 >= super::state::MAX_TAIL_TRANSACTIONS
+                    || tail_bytes.saturating_add(change_bytes) > super::state::MAX_TAIL_BYTES
+                {
+                    let checkpoint_results = match checkpoint_results {
+                        Some(results) => results,
+                        None => {
+                            self.read_checkpoint(current.checkpoint)
+                                .await?
+                                .recover(self.volume_id)?
+                                .1
+                        }
+                    };
+                    let previous_history = if let Some(branch) = self.authority.branch_id() {
+                        let history = StoredHistory::new(self.volume_id, branch, current)?;
+                        Some(self.write_history(&history).await?)
+                    } else {
+                        None
+                    };
+                    let results = results_for_rotation(checkpoint_results, current, &change)?;
+                    let checkpoint = StoredCheckpoint {
+                        snapshot: publication.target.clone(),
+                        results: results.into_values().collect(),
+                    };
+                    StoredNamespaceState {
+                        checkpoint: self.write_checkpoint(&checkpoint).await?,
+                        checkpoint_cursor: publication.target.cursor,
+                        tail: Vec::new(),
+                        previous_history,
+                    }
+                } else {
+                    let mut next = current.clone();
+                    next.tail.push(change);
+                    next
+                }
+            }
+            _ => {
+                return Err(corrupt(
+                    "publish Managed namespace",
+                    "observation and HEAD disagree",
+                ));
+            }
         };
-        let head = StoredHead::new(
-            self.volume_id,
-            stored.cursor,
-            checkpoint,
-            checkpoint_cursor,
-            tail,
-        )?
-        .with_maintenance(
-            observed.map_or(0, |(witness, _)| witness.authority.head.maintenance_epoch),
-            observed.and_then(|(witness, _)| witness.authority.head.maintenance_owner),
-        );
-        let head = encode_head(&head)?;
-        let replaced = match observed {
-            Some((witness, _)) => {
+        let mut next = head;
+        next.state = Some(state);
+        let bytes = encode_head(&next)?;
+        let replaced = match revision {
+            Some(revision) => {
                 self.backend
                     .replace(
-                        HEAD_KEY,
-                        &witness.revision,
-                        head,
+                        &self.head_key,
+                        &revision,
+                        bytes,
                         "publish Managed namespace",
                     )
                     .await
             }
             None => {
                 self.backend
-                    .create(HEAD_KEY, head, "publish Managed namespace")
+                    .create(&self.head_key, bytes, "publish Managed namespace")
                     .await
             }
         };
@@ -298,38 +341,104 @@ impl NamespaceStore {
         }
     }
 
+    pub(crate) async fn resolve(
+        &self,
+        operation: OperationId,
+    ) -> Result<CommitOutcome, ManagedError> {
+        match self.resolve_known(operation, None).await {
+            Err(error) if error.kind() == ManagedErrorKind::Unavailable => {
+                Ok(CommitOutcome::Unknown)
+            }
+            result => result,
+        }
+    }
+
+    async fn resolve_known(
+        &self,
+        operation: OperationId,
+        expected: Option<[u8; 32]>,
+    ) -> Result<CommitOutcome, ManagedError> {
+        let Some((head, _)) = self.read_bound_head("resolve Managed publication").await? else {
+            return Ok(CommitOutcome::Absent);
+        };
+        let Some(state) = head.state else {
+            return Ok(CommitOutcome::Absent);
+        };
+        if let Some(change) = state.tail.iter().find(|change| {
+            change.origin_branch == self.authority.branch_id()
+                && change.change.operation == operation
+        }) {
+            require_request_digest(expected, change.request_digest()?)?;
+            return Ok(CommitOutcome::Committed(change.change.cursor));
+        }
+        let checkpoint = self.read_checkpoint(state.checkpoint).await?;
+        let Some(result) = checkpoint.resolve(self.authority.branch_id(), operation)? else {
+            return Ok(CommitOutcome::Absent);
+        };
+        require_request_digest(expected, result.request_sha256)?;
+        Ok(CommitOutcome::Committed(result.cursor))
+    }
+
+    async fn outcome_after_race(
+        &self,
+        operation: OperationId,
+    ) -> Result<CommitOutcome, ManagedError> {
+        match self.resolve(operation).await? {
+            result @ (CommitOutcome::Committed(_) | CommitOutcome::Unknown) => Ok(result),
+            _ => Ok(CommitOutcome::Conflict {
+                observed: self
+                    .observe()
+                    .await?
+                    .map_or(ChangeCursor::Genesis, |value| value.snapshot.cursor),
+            }),
+        }
+    }
+
     pub(crate) async fn begin_gc(
         &self,
         observed: &NamespaceWitness,
     ) -> Result<NamespaceGcSweep, ManagedError> {
-        if observed.gc_sweep().is_some() {
-            return Err(conflict(
+        if self.authority.branch_id().is_some() {
+            return Err(invalid(
                 "begin Managed namespace GC",
-                "another namespace GC is active",
+                "branch GC belongs to its volume control plane",
             ));
         }
-        let mut head = observed.authority.head.clone();
+        let mut head = observed.head.clone();
         let sweep = head.begin_gc(*OperationId::generate().as_bytes())?;
         if self
-            .replace_head(&observed.revision, encode_head(&head)?)
+            .backend
+            .replace(
+                &self.head_key,
+                &observed.revision,
+                encode_head(&head)?,
+                "begin Managed namespace GC",
+            )
             .await?
         {
-            return Ok(sweep);
+            Ok(sweep)
+        } else {
+            Err(conflict(
+                "begin Managed namespace GC",
+                "namespace authority changed",
+            ))
         }
-        Err(conflict(
-            "begin Managed namespace GC",
-            "namespace authority changed",
-        ))
     }
 
     pub(crate) async fn resume_gc(
         &self,
         observed: &NamespaceWitness,
     ) -> Result<NamespaceGcSweep, ManagedError> {
-        let mut head = observed.authority.head.clone();
+        let mut head = observed.head.clone();
         let sweep = head.resume_gc(*OperationId::generate().as_bytes())?;
         if self
-            .replace_head(&observed.revision, encode_head(&head)?)
+            .backend
+            .replace(
+                &self.head_key,
+                &observed.revision,
+                encode_head(&head)?,
+                "resume Managed namespace GC",
+            )
             .await?
         {
             Ok(sweep)
@@ -342,34 +451,52 @@ impl NamespaceStore {
     }
 
     pub(crate) async fn finish_gc(&self, sweep: NamespaceGcSweep) -> Result<(), ManagedError> {
-        let observed = self.observe().await?.ok_or_else(|| {
-            conflict("finish Managed namespace GC", "namespace authority changed")
-        })?;
-        if observed.witness.authority.head.maintenance_epoch == sweep.epoch()
-            && observed.witness.gc_sweep().is_none()
-        {
+        let (mut head, revision) = self
+            .read_bound_head("finish Managed namespace GC")
+            .await?
+            .ok_or_else(|| {
+                conflict("finish Managed namespace GC", "namespace authority changed")
+            })?;
+        if head.maintenance_epoch == sweep.epoch() && head.gc_sweep()?.is_none() {
             return Ok(());
         }
-        if observed.witness.gc_sweep() != Some(sweep) {
+        if head.gc_sweep()? != Some(sweep) {
             return Err(conflict(
                 "finish Managed namespace GC",
                 "GC sweep token does not match the authority",
             ));
         }
-        let mut head = observed.witness.authority.head.clone();
+        if self.authority.branch_id().is_some() {
+            return Err(invalid(
+                "sweep Managed checkpoints",
+                "branch checkpoint GC belongs to its volume control plane",
+            ));
+        }
+        let retained = head
+            .state
+            .as_ref()
+            .map(|state| checkpoint_key(state.checkpoint));
+        sweep_checkpoint_objects(&self.data, retained.as_deref()).await?;
         head.finish_gc(sweep)?;
         if self
-            .replace_head(&observed.witness.revision, encode_head(&head)?)
+            .backend
+            .replace(
+                &self.head_key,
+                &revision,
+                encode_head(&head)?,
+                "finish Managed namespace GC",
+            )
             .await?
         {
             return Ok(());
         }
-        let current = self.observe().await?.ok_or_else(|| {
-            conflict("finish Managed namespace GC", "namespace authority changed")
-        })?;
-        if current.witness.authority.head.maintenance_epoch == sweep.epoch()
-            && current.witness.gc_sweep().is_none()
-        {
+        let (current, _) = self
+            .read_bound_head("finish Managed namespace GC")
+            .await?
+            .ok_or_else(|| {
+                conflict("finish Managed namespace GC", "namespace authority changed")
+            })?;
+        if current.maintenance_epoch == sweep.epoch() && current.gc_sweep()?.is_none() {
             Ok(())
         } else {
             Err(conflict(
@@ -379,465 +506,248 @@ impl NamespaceStore {
         }
     }
 
-    pub(crate) async fn resolve(
+    pub(crate) async fn read_checkpoint(
         &self,
-        operation: OperationId,
-    ) -> Result<CommitOutcome, ManagedError> {
-        match self.resolve_known(operation, None).await {
-            Err(error) if error.kind() == ManagedErrorKind::Unavailable => {
-                Ok(CommitOutcome::Unknown)
+        id: [u8; 32],
+    ) -> Result<StoredCheckpoint, ManagedError> {
+        let key = checkpoint_key(id);
+        let metadata = match self.data.stat(&key).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return Err(corrupt("read Managed namespace", "checkpoint is missing"));
             }
-            outcome => outcome,
-        }
-    }
-
-    async fn resolve_known(
-        &self,
-        operation: OperationId,
-        expected_sha256: Option<[u8; 32]>,
-    ) -> Result<CommitOutcome, ManagedError> {
-        let Some(head) = self.read_current_head().await? else {
-            return Ok(CommitOutcome::Absent);
+            Err(_) => return Err(unavailable("read Managed namespace")),
         };
-        head.validate(self.volume_id)?;
-        if let Some(transaction) = head
-            .tail
-            .iter()
-            .find(|transaction| transaction.operation == operation)
-        {
-            let observed_sha256 = transaction_sha256(transaction, "resolve Managed publication")?;
-            require_same_operation(expected_sha256, observed_sha256)?;
-            return Ok(CommitOutcome::Committed(transaction.cursor));
-        }
-        let checkpoint = self.read_checkpoint(head.checkpoint).await?;
-        if let Some(result) = checkpoint.results.get(&operation) {
-            require_same_operation(expected_sha256, result.request_sha256)?;
-            return Ok(CommitOutcome::Committed(result.cursor));
-        }
-        Ok(CommitOutcome::Absent)
-    }
-
-    async fn outcome_after_race(
-        &self,
-        operation: OperationId,
-    ) -> Result<CommitOutcome, ManagedError> {
-        let outcome = self.resolve(operation).await?;
-        if matches!(
-            outcome,
-            CommitOutcome::Committed(_) | CommitOutcome::Unknown
-        ) {
-            return Ok(outcome);
-        }
-        let observed = self
-            .observe()
-            .await?
-            .map_or(ChangeCursor::Genesis, |value| value.snapshot.cursor);
-        Ok(CommitOutcome::Conflict { observed })
-    }
-
-    async fn recover(
-        &self,
-        head: &StoredHead,
-    ) -> Result<(NamespaceSnapshot, StoredCheckpoint), ManagedError> {
-        head.validate(self.volume_id)?;
-        self.recover_bounded(head).await
-    }
-
-    async fn recover_bounded(
-        &self,
-        head: &StoredHead,
-    ) -> Result<(NamespaceSnapshot, StoredCheckpoint), ManagedError> {
-        let checkpoint = self.read_checkpoint(head.checkpoint).await?;
-        if checkpoint.snapshot.volume_id != self.volume_id
-            || checkpoint.snapshot.cursor != head.checkpoint_cursor
-        {
-            return Err(corrupt(
-                "read Managed namespace",
-                "checkpoint and HEAD disagree",
-            ));
-        }
-        let mut snapshot = checkpoint.snapshot.clone();
-        validate_snapshot(&snapshot)
-            .map_err(|_| corrupt("read Managed namespace", "checkpoint is invalid"))?;
-
-        for transaction in &head.tail {
-            if transaction.parent != snapshot.cursor {
-                return Err(corrupt(
+        let encoded_length = usize::try_from(metadata.content_length())
+            .ok()
+            .filter(|length| *length <= MAX_CHECKPOINT_ENCODED_BYTES)
+            .ok_or_else(|| {
+                corrupt(
                     "read Managed namespace",
-                    "transaction tail is not consecutive",
-                ));
+                    "checkpoint exceeds its encoded size limit",
+                )
+            })?;
+        let bytes = match self
+            .data
+            .read_with(&key)
+            .range(0..metadata.content_length())
+            .await
+        {
+            Ok(bytes) => bytes.to_bytes(),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return Err(corrupt("read Managed namespace", "checkpoint is missing"));
             }
-            snapshot = transaction.apply(Some(snapshot))?;
-        }
-        if snapshot.cursor != head.cursor {
+            Err(_) => return Err(unavailable("read Managed namespace")),
+        };
+        if bytes.len() != encoded_length || <[u8; 32]>::from(Sha256::digest(&bytes)) != id {
             return Err(corrupt(
                 "read Managed namespace",
-                "checkpoint and transaction tail do not reach HEAD",
+                "checkpoint identity is invalid",
             ));
         }
-        Ok((snapshot, checkpoint))
+        let checkpoint = decode_checkpoint(&bytes)?;
+        if checkpoint.snapshot.volume_id != self.volume_id {
+            return Err(corrupt(
+                "read Managed namespace",
+                "checkpoint volume is invalid",
+            ));
+        }
+        Ok(checkpoint)
     }
 
     async fn write_checkpoint(
         &self,
-        snapshot: &NamespaceSnapshot,
-        results: &BTreeMap<OperationId, StoredCommittedResult>,
+        checkpoint: &StoredCheckpoint,
     ) -> Result<[u8; 32], ManagedError> {
-        let results = results.values().cloned().collect::<Vec<_>>();
-        let pending = PendingCheckpoint::new(snapshot, &results)?;
-        for part in &pending.parts {
-            ensure_immutable(
-                &self.operator,
-                &checkpoint_part_key(&part.reference.id),
-                &part.bytes,
-                "publish Managed namespace",
-                ManagedErrorKind::Conflict,
-                "operation identity was reused with another payload",
-            )
-            .await?;
-        }
-        let root = pending.finish();
-        let bytes = root.encode()?;
-        let id = sha256(&bytes);
+        let bytes = encode_checkpoint(checkpoint)?;
+        let id: [u8; 32] = Sha256::digest(&bytes).into();
         ensure_immutable(
-            &self.operator,
-            &checkpoint_key(&id),
+            &self.data,
+            &checkpoint_key(id),
             &bytes,
-            "publish Managed namespace",
-            ManagedErrorKind::Conflict,
-            "operation identity was reused with another payload",
+            "checkpoint Managed namespace",
+            ManagedErrorKind::Corrupt,
+            "immutable checkpoint changed",
         )
         .await?;
         Ok(id)
     }
 
-    async fn read_checkpoint(&self, id: [u8; 32]) -> Result<StoredCheckpoint, ManagedError> {
+    #[cfg(feature = "managed-branch")]
+    pub(crate) async fn read_history(&self, id: [u8; 32]) -> Result<StoredHistory, ManagedError> {
         let bytes = read_content_addressed(
-            &self.operator,
-            &checkpoint_key(&id),
+            &self.data,
+            &history_key(id),
             &id,
-            "read Managed namespace",
-            "checkpoint is missing",
-            "checkpoint key and content disagree",
+            "read Managed history",
+            "namespace history is missing",
+            "namespace history identity is invalid",
         )
         .await?;
-        let root = CheckpointRoot::decode(&bytes)?;
-        let mut parts = Vec::with_capacity(root.parts.len());
-        for reference in root.parts.iter().copied() {
-            let bytes = object::read(
-                &self.operator,
-                &checkpoint_part_key(&reference.id),
-                "read Managed namespace",
-            )
-            .await?
-            .ok_or_else(|| corrupt("read Managed namespace", "checkpoint part is missing"))?;
-            parts.push(CheckpointPart { reference, bytes });
-        }
-        let (snapshot, results) = root.recover::<StoredCommittedResult>(parts)?;
-        let mut indexed = BTreeMap::new();
-        for result in results {
-            result.validate(result.operation)?;
-            if indexed.insert(result.operation, result).is_some() {
+        let history: StoredHistory = decode_record(HISTORY_MAGIC, &bytes, MAX_HISTORY_BYTES)?;
+        history.validate(self.volume_id)?;
+        Ok(history)
+    }
+
+    async fn write_history(&self, history: &StoredHistory) -> Result<[u8; 32], ManagedError> {
+        let bytes = encode_record(HISTORY_MAGIC, history, MAX_HISTORY_BYTES)?;
+        let id: [u8; 32] = Sha256::digest(&bytes).into();
+        ensure_immutable(
+            &self.data,
+            &history_key(id),
+            &bytes,
+            "archive Managed history",
+            ManagedErrorKind::Corrupt,
+            "immutable namespace history changed",
+        )
+        .await?;
+        Ok(id)
+    }
+
+    #[cfg(feature = "managed-branch")]
+    pub(crate) async fn find_history_state(
+        &self,
+        mut history_id: Option<[u8; 32]>,
+        sequence: u64,
+    ) -> Result<Option<StoredNamespaceState>, ManagedError> {
+        let mut visited = BTreeSet::new();
+        while let Some(id) = history_id {
+            if !visited.insert(id) {
                 return Err(corrupt(
-                    "read Managed operation results",
-                    "duplicate operation result",
+                    "read Managed history",
+                    "namespace history contains a cycle",
                 ));
             }
+            let history = self.read_history(id).await?;
+            if let Some(state) = history.state_at(sequence) {
+                return Ok(Some(state));
+            }
+            history_id = history.state.previous_history;
         }
-        Ok(StoredCheckpoint {
-            snapshot,
-            results: indexed,
-        })
+        Ok(None)
     }
 
-    async fn read_head(&self) -> Result<Option<(Vec<u8>, Revision)>, ManagedError> {
-        self.backend.read(HEAD_KEY, "read Managed namespace").await
-    }
-
-    async fn read_current_head(&self) -> Result<Option<StoredHead>, ManagedError> {
-        self.backend
-            .read_bytes(HEAD_KEY, "read Managed namespace")
-            .await?
-            .map(|bytes| decode_head(&bytes))
-            .transpose()
-    }
-
-    async fn replace_head(
+    #[cfg(feature = "managed-branch")]
+    pub(crate) async fn visit_retained(
         &self,
-        expected_revision: &Revision,
-        bytes: Vec<u8>,
-    ) -> Result<bool, ManagedError> {
-        self.backend
-            .replace(
-                HEAD_KEY,
-                expected_revision,
-                bytes,
-                "publish Managed namespace",
-            )
-            .await
-    }
-}
-
-fn checkpoint_key(id: &[u8; 32]) -> String {
-    format!("{CHECKPOINT_ROOT}/{}.ofs", hex(id))
-}
-
-fn checkpoint_part_key(id: &[u8; 32]) -> String {
-    let encoded = hex(id);
-    format!("{CHECKPOINT_PART_ROOT}/{encoded}.ofs")
-}
-
-fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(DIGITS[(byte >> 4) as usize] as char);
-        output.push(DIGITS[(byte & 0x0f) as usize] as char);
-    }
-    output
-}
-
-fn encode_head(value: &StoredHead) -> Result<Vec<u8>, ManagedError> {
-    let body = encode_table_value(value, "write Managed namespace")?;
-    if body.len() > MAX_HEAD_BYTES {
-        return Err(invalid(
-            "write Managed namespace",
-            "HEAD exceeds its decoded size limit",
-        ));
-    }
-    let decoded_length = u32::try_from(body.len()).map_err(|_| {
-        invalid(
-            "write Managed namespace",
-            "HEAD exceeds its decoded size limit",
-        )
-    })?;
-    let compressed = zstd::bulk::compress(&body, HEAD_COMPRESSION_LEVEL)
-        .map_err(|_| invalid("write Managed namespace", "HEAD cannot be compressed"))?;
-    let mut bytes = Vec::with_capacity(12 + compressed.len() + 32);
-    bytes.extend_from_slice(HEAD_MAGIC);
-    bytes.extend_from_slice(&decoded_length.to_be_bytes());
-    bytes.extend_from_slice(&compressed);
-    let checksum: [u8; 32] = Sha256::digest(&bytes).into();
-    bytes.extend_from_slice(&checksum);
-    Ok(bytes)
-}
-
-fn decode_head(bytes: &[u8]) -> Result<StoredHead, ManagedError> {
-    let encoded = bytes
-        .strip_prefix(HEAD_MAGIC)
-        .and_then(|bytes| bytes.get(..bytes.len().checked_sub(32)?))
-        .ok_or_else(|| corrupt("read Managed namespace", "HEAD format is invalid"))?;
-    let expected = bytes
-        .get(bytes.len().saturating_sub(32)..)
-        .ok_or_else(|| corrupt("read Managed namespace", "HEAD checksum is missing"))?;
-    if Sha256::digest(&bytes[..bytes.len() - 32]).as_slice() != expected {
-        return Err(corrupt(
-            "read Managed namespace",
-            "HEAD checksum does not match",
-        ));
-    }
-    let (length, compressed) = encoded
-        .split_first_chunk::<4>()
-        .ok_or_else(|| corrupt("read Managed namespace", "HEAD length is missing"))?;
-    let decoded_length = u32::from_be_bytes(*length) as usize;
-    if decoded_length > MAX_HEAD_BYTES {
-        return Err(corrupt(
-            "read Managed namespace",
-            "HEAD decoded size exceeds its limit",
-        ));
-    }
-    let body = zstd::bulk::decompress(compressed, decoded_length)
-        .map_err(|_| corrupt("read Managed namespace", "HEAD compression is invalid"))?;
-    if body.len() != decoded_length {
-        return Err(corrupt(
-            "read Managed namespace",
-            "HEAD decoded length does not match",
-        ));
-    }
-    decode_table_value(&body, "read Managed namespace")
-}
-
-fn encode_table_value<T: Serialize>(
-    value: &T,
-    action: &'static str,
-) -> Result<Vec<u8>, ManagedError> {
-    let mut bytes = Vec::new();
-    ciborium::ser::into_writer(value, &mut bytes)
-        .map_err(|_| invalid(action, "namespace change cannot be encoded"))?;
-    Ok(bytes)
-}
-
-fn decode_table_value<T: DeserializeOwned>(
-    bytes: &[u8],
-    action: &'static str,
-) -> Result<T, ManagedError> {
-    let mut input = Cursor::new(bytes);
-    let value = ciborium::de::from_reader(&mut input)
-        .map_err(|_| corrupt(action, "namespace change cannot be decoded"))?;
-    if input.position() != bytes.len() as u64 {
-        return Err(corrupt(action, "namespace change has trailing bytes"));
-    }
-    Ok(value)
-}
-
-fn sha256(bytes: &[u8]) -> [u8; 32] {
-    Sha256::digest(bytes).into()
-}
-
-fn invalid(action: &'static str, message: &'static str) -> ManagedError {
-    ManagedError::new(ManagedErrorKind::Invalid, action, message)
-}
-
-fn corrupt(action: &'static str, message: &'static str) -> ManagedError {
-    ManagedError::new(ManagedErrorKind::Corrupt, action, message)
-}
-
-fn require_same_operation(
-    expected: Option<[u8; 32]>,
-    observed: [u8; 32],
-) -> Result<(), ManagedError> {
-    if expected.is_none_or(|expected| expected == observed) {
+        state: &StoredNamespaceState,
+        mut visit: impl FnMut(&NamespaceSnapshot) -> Result<(), ManagedError>,
+    ) -> Result<(), ManagedError> {
+        let checkpoint = self.read_checkpoint(state.checkpoint).await?;
+        let (mut snapshot, _) = checkpoint.recover(self.volume_id)?;
+        if snapshot.cursor != state.checkpoint_cursor {
+            return Err(corrupt(
+                "read Managed history",
+                "checkpoint and retained state disagree",
+            ));
+        }
+        visit(&snapshot)?;
+        for change in &state.tail {
+            snapshot = change.change.apply(Some(snapshot))?;
+            visit(&snapshot)?;
+        }
+        if !state.tail.is_empty() {
+            super::validate_snapshot(&snapshot)
+                .map_err(|_| corrupt("read Managed history", "recovered namespace is invalid"))?;
+        }
         Ok(())
-    } else {
-        Err(conflict(
-            "publish Managed namespace",
-            "operation identity was reused with another payload",
-        ))
+    }
+
+    pub(crate) async fn read_raw_head(
+        &self,
+    ) -> Result<Option<(StoredHead, Revision)>, ManagedError> {
+        let Some((bytes, revision)) = self
+            .backend
+            .read(&self.head_key, "read Managed namespace")
+            .await?
+        else {
+            return Ok(None);
+        };
+        let head = decode_head(&bytes)?;
+        head.validate(self.volume_id, self.authority.branch_id())?;
+        Ok(Some((head, revision)))
+    }
+
+    async fn read_bound_head(
+        &self,
+        action: &'static str,
+    ) -> Result<Option<(StoredHead, Revision)>, ManagedError> {
+        let value = self.read_raw_head().await?;
+        if self.authority.branch_id().is_some() {
+            let (head, _) = value
+                .as_ref()
+                .ok_or_else(|| conflict(action, "branch incarnation no longer exists"))?;
+            if head.sealed {
+                return Err(conflict(action, "branch incarnation no longer exists"));
+            }
+            if head.maintenance_active {
+                return Err(conflict(action, "branch maintenance is active"));
+            }
+        }
+        Ok(value)
     }
 }
 
-fn conflict(action: &'static str, message: &'static str) -> ManagedError {
-    ManagedError::new(ManagedErrorKind::Conflict, action, message)
-}
-
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct StoredHead {
-    major: u16,
-    volume_id: VolumeId,
-    cursor: ChangeCursor,
-    checkpoint: [u8; 32],
-    checkpoint_cursor: ChangeCursor,
-    tail: Vec<NamespaceChange>,
-    maintenance_epoch: u64,
-    maintenance_state: StoredMaintenanceState,
-    #[serde(default)]
-    maintenance_owner: Option<[u8; 16]>,
-    maintenance_fixed_cursor: Option<ChangeCursor>,
-}
-
-impl std::fmt::Debug for StoredHead {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("StoredHead")
-            .field("cursor", &self.cursor)
-            .field("checkpoint_cursor", &self.checkpoint_cursor)
-            .field("tail_changes", &self.tail.len())
-            .field("maintenance_epoch", &self.maintenance_epoch)
-            .field("maintenance_state", &self.maintenance_state)
-            .finish()
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum StoredMaintenanceState {
-    Idle,
-    Sweeping,
+pub(crate) struct StoredHead {
+    pub(crate) volume_id: VolumeId,
+    pub(crate) branch_id: Option<BranchId>,
+    pub(crate) sealed: bool,
+    pub(crate) state: Option<StoredNamespaceState>,
+    pub(crate) maintenance_epoch: u64,
+    pub(crate) maintenance_active: bool,
+    pub(crate) maintenance_owner: Option<[u8; 16]>,
+    pub(crate) maintenance_fixed_cursor: Option<ChangeCursor>,
 }
 
 impl StoredHead {
-    fn new(
-        volume_id: VolumeId,
-        cursor: ChangeCursor,
-        checkpoint: [u8; 32],
-        checkpoint_cursor: ChangeCursor,
-        tail: Vec<NamespaceChange>,
-    ) -> Result<Self, ManagedError> {
-        let head = Self {
-            major: FORMAT_MAJOR,
+    pub(crate) const fn unborn(volume_id: VolumeId, branch_id: Option<BranchId>) -> Self {
+        Self {
             volume_id,
-            cursor,
-            checkpoint,
-            checkpoint_cursor,
-            tail,
+            branch_id,
+            sealed: false,
+            state: None,
             maintenance_epoch: 0,
-            maintenance_state: StoredMaintenanceState::Idle,
+            maintenance_active: false,
             maintenance_owner: None,
             maintenance_fixed_cursor: None,
-        };
-        head.validate_shape()?;
-        Ok(head)
+        }
     }
 
-    fn with_maintenance(mut self, epoch: u64, owner: Option<[u8; 16]>) -> Self {
-        self.maintenance_epoch = epoch;
-        self.maintenance_owner = owner;
-        self
+    pub(crate) fn cursor(&self) -> ChangeCursor {
+        self.state
+            .as_ref()
+            .map_or(ChangeCursor::Genesis, StoredNamespaceState::cursor)
     }
 
-    fn validate(&self, volume_id: VolumeId) -> Result<(), ManagedError> {
-        self.validate_shape()?;
-        if self.volume_id != volume_id {
+    pub(crate) fn validate(
+        &self,
+        volume_id: VolumeId,
+        branch_id: Option<BranchId>,
+    ) -> Result<(), ManagedError> {
+        if self.volume_id != volume_id || self.branch_id != branch_id {
             return Err(corrupt(
                 "read Managed namespace",
-                "HEAD integrity is invalid",
+                "HEAD identity is invalid",
             ));
         }
+        if let Some(state) = &self.state {
+            state.validate(volume_id)?;
+        }
+        self.gc_sweep()?;
         Ok(())
     }
 
-    fn validate_shape(&self) -> Result<(), ManagedError> {
-        let cursor = self.cursor;
-        let checkpoint = self.checkpoint_cursor;
-        if self.major != FORMAT_MAJOR
-            || self.tail.len() > usize::from(MAX_TAIL_TRANSACTIONS)
-            || self.tail_bytes() > MAX_TAIL_BYTES
-            || checkpoint.sequence().checked_add(self.tail.len() as u64) != Some(cursor.sequence())
-            || self.gc_sweep().is_err()
-        {
-            return Err(corrupt("read Managed namespace", "HEAD shape is invalid"));
-        }
-        let mut parent = checkpoint;
-        for change in &self.tail {
-            change.validate(self.volume_id)?;
-            if change.parent != parent {
-                return Err(corrupt(
-                    "read Managed namespace",
-                    "HEAD change tail is not consecutive",
-                ));
-            }
-            parent = change.cursor;
-        }
-        if parent != cursor {
-            return Err(corrupt(
-                "read Managed namespace",
-                "HEAD change tail does not reach its cursor",
-            ));
-        }
-        Ok(())
-    }
-
-    fn tail_bytes(&self) -> usize {
-        self.tail
-            .iter()
-            .map(|change| {
-                encode_table_value(change, "encode Managed HEAD")
-                    .expect("validated change can be encoded")
-                    .len()
-            })
-            .sum()
-    }
-
-    fn gc_sweep(&self) -> Result<Option<NamespaceGcSweep>, ManagedError> {
+    pub(crate) fn gc_sweep(&self) -> Result<Option<NamespaceGcSweep>, ManagedError> {
         match (
-            self.maintenance_state,
+            self.maintenance_active,
             self.maintenance_owner,
             self.maintenance_fixed_cursor,
         ) {
-            (StoredMaintenanceState::Idle, _, None) => Ok(None),
-            (StoredMaintenanceState::Sweeping, Some(owner), Some(fixed))
-                if self.maintenance_epoch > 0 && fixed == self.cursor =>
+            (false, _, None) => Ok(None),
+            (true, Some(owner), Some(fixed))
+                if self.maintenance_epoch > 0 && fixed == self.cursor() =>
             {
                 Ok(Some(NamespaceGcSweep::new(
                     self.maintenance_epoch,
@@ -865,13 +775,13 @@ impl StoredHead {
                 "maintenance epoch is exhausted",
             )
         })?;
-        self.maintenance_state = StoredMaintenanceState::Sweeping;
+        self.maintenance_active = true;
         self.maintenance_owner = Some(owner);
-        self.maintenance_fixed_cursor = Some(self.cursor);
+        self.maintenance_fixed_cursor = Some(self.cursor());
         Ok(NamespaceGcSweep::new(
             self.maintenance_epoch,
             owner,
-            self.cursor,
+            self.cursor(),
         ))
     }
 
@@ -897,102 +807,282 @@ impl StoredHead {
                 "GC sweep token does not match the authority",
             ));
         }
-        self.maintenance_state = StoredMaintenanceState::Idle;
+        self.maintenance_active = false;
         self.maintenance_fixed_cursor = None;
         Ok(())
     }
 }
 
-#[derive(Clone)]
-struct StoredCheckpoint {
-    snapshot: NamespaceSnapshot,
-    results: BTreeMap<OperationId, StoredCommittedResult>,
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct StoredCommittedResult {
-    operation: OperationId,
-    cursor: ChangeCursor,
-    request_sha256: [u8; 32],
-}
-
-impl StoredCommittedResult {
-    fn from_transaction(transaction: &NamespaceChange) -> Result<Self, ManagedError> {
-        Ok(Self {
-            operation: transaction.operation,
-            cursor: transaction.cursor,
-            request_sha256: transaction_sha256(transaction, "checkpoint Managed namespace")?,
-        })
-    }
-
-    fn validate(&self, operation: OperationId) -> Result<(), ManagedError> {
-        if self.cursor.operation() != Some(operation) {
-            return Err(corrupt(
-                "read Managed operation results",
-                "operation result cursor is invalid",
-            ));
-        }
-        Ok(())
-    }
-}
-
-fn transaction_sha256(
-    transaction: &NamespaceChange,
-    action: &'static str,
-) -> Result<[u8; 32], ManagedError> {
-    encode_table_value(transaction, action).map(|bytes| sha256(&bytes))
-}
-
-fn replay_tail_from(
-    base: &NamespaceSnapshot,
-    head: &StoredHead,
-) -> Result<Option<NamespaceSnapshot>, ManagedError> {
-    let target = head.cursor;
-    if base.cursor == target {
-        return Ok(Some(base.clone()));
-    }
-    let mut start = None;
-    for (index, transaction) in head.tail.iter().enumerate() {
-        if transaction.parent == base.cursor {
-            start = Some(index);
-            break;
-        }
-    }
-    let Some(start) = start else {
-        return Ok(None);
-    };
-    let mut snapshot = base.clone();
-    for transaction in &head.tail[start..] {
-        if transaction.parent != snapshot.cursor {
-            return Err(corrupt(
-                "read Managed namespace",
-                "transaction tail is not consecutive",
-            ));
-        }
-        snapshot = transaction.apply(Some(snapshot))?;
-    }
-    if snapshot.cursor != target {
-        return Err(corrupt(
-            "read Managed namespace",
-            "transaction tail does not reach HEAD",
+fn encode_checkpoint(checkpoint: &StoredCheckpoint) -> Result<Vec<u8>, ManagedError> {
+    let mut body = Vec::new();
+    ciborium::into_writer(checkpoint, &mut body).map_err(|_| {
+        invalid(
+            "checkpoint Managed namespace",
+            "checkpoint cannot be encoded",
+        )
+    })?;
+    if body.len() > MAX_CHECKPOINT_DECODED_BYTES {
+        return Err(invalid(
+            "checkpoint Managed namespace",
+            "checkpoint exceeds its decoded size limit",
         ));
     }
-    Ok(Some(snapshot))
+    let decoded_length = u64::try_from(body.len()).map_err(|_| {
+        invalid(
+            "checkpoint Managed namespace",
+            "checkpoint exceeds its decoded size limit",
+        )
+    })?;
+    let compressed = zstd::bulk::compress(&body, COMPRESSION_LEVEL).map_err(|_| {
+        invalid(
+            "checkpoint Managed namespace",
+            "checkpoint cannot be compressed",
+        )
+    })?;
+    let encoded_length = CHECKPOINT_MAGIC
+        .len()
+        .saturating_add(8)
+        .saturating_add(compressed.len());
+    if encoded_length > MAX_CHECKPOINT_ENCODED_BYTES {
+        return Err(invalid(
+            "checkpoint Managed namespace",
+            "checkpoint exceeds its encoded size limit",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(encoded_length);
+    bytes.extend_from_slice(CHECKPOINT_MAGIC);
+    bytes.extend_from_slice(&decoded_length.to_be_bytes());
+    bytes.extend_from_slice(&compressed);
+    Ok(bytes)
+}
+
+fn decode_checkpoint(bytes: &[u8]) -> Result<StoredCheckpoint, ManagedError> {
+    if bytes.len() > MAX_CHECKPOINT_ENCODED_BYTES {
+        return Err(corrupt(
+            "read Managed namespace",
+            "checkpoint exceeds its encoded size limit",
+        ));
+    }
+    let encoded = bytes
+        .strip_prefix(CHECKPOINT_MAGIC)
+        .ok_or_else(|| corrupt("read Managed namespace", "checkpoint format is invalid"))?;
+    let (length, compressed) = encoded
+        .split_first_chunk::<8>()
+        .ok_or_else(|| corrupt("read Managed namespace", "checkpoint length is missing"))?;
+    let decoded_length = usize::try_from(u64::from_be_bytes(*length))
+        .ok()
+        .filter(|length| *length <= MAX_CHECKPOINT_DECODED_BYTES)
+        .ok_or_else(|| {
+            corrupt(
+                "read Managed namespace",
+                "checkpoint decoded size exceeds its limit",
+            )
+        })?;
+    let body = zstd::bulk::decompress(compressed, decoded_length).map_err(|_| {
+        corrupt(
+            "read Managed namespace",
+            "checkpoint compression is invalid",
+        )
+    })?;
+    if body.len() != decoded_length {
+        return Err(corrupt(
+            "read Managed namespace",
+            "checkpoint decoded length does not match",
+        ));
+    }
+    decode_value(&body)
+}
+
+pub(crate) fn encode_head(value: &StoredHead) -> Result<Vec<u8>, ManagedError> {
+    let mut body = Vec::new();
+    ciborium::into_writer(value, &mut body)
+        .map_err(|_| invalid("write Managed namespace", "HEAD cannot be encoded"))?;
+    if body.len() > MAX_HEAD_BYTES {
+        return Err(invalid(
+            "write Managed namespace",
+            "HEAD exceeds its decoded size limit",
+        ));
+    }
+    let decoded_length = u32::try_from(body.len()).map_err(|_| {
+        invalid(
+            "write Managed namespace",
+            "HEAD exceeds its decoded size limit",
+        )
+    })?;
+    let compressed = zstd::bulk::compress(&body, COMPRESSION_LEVEL)
+        .map_err(|_| invalid("write Managed namespace", "HEAD cannot be compressed"))?;
+    let mut bytes = Vec::with_capacity(12 + compressed.len() + 32);
+    bytes.extend_from_slice(HEAD_MAGIC);
+    bytes.extend_from_slice(&decoded_length.to_be_bytes());
+    bytes.extend_from_slice(&compressed);
+    let checksum: [u8; 32] = Sha256::digest(&bytes).into();
+    bytes.extend_from_slice(&checksum);
+    Ok(bytes)
+}
+
+pub(crate) fn decode_head(bytes: &[u8]) -> Result<StoredHead, ManagedError> {
+    let encoded = bytes
+        .strip_prefix(HEAD_MAGIC)
+        .and_then(|bytes| bytes.get(..bytes.len().checked_sub(32)?))
+        .ok_or_else(|| corrupt("read Managed namespace", "HEAD format is invalid"))?;
+    if Sha256::digest(&bytes[..bytes.len() - 32]).as_slice() != &bytes[bytes.len() - 32..] {
+        return Err(corrupt(
+            "read Managed namespace",
+            "HEAD checksum does not match",
+        ));
+    }
+    let (length, compressed) = encoded
+        .split_first_chunk::<4>()
+        .ok_or_else(|| corrupt("read Managed namespace", "HEAD length is missing"))?;
+    let decoded_length = u32::from_be_bytes(*length) as usize;
+    if decoded_length > MAX_HEAD_BYTES {
+        return Err(corrupt(
+            "read Managed namespace",
+            "HEAD decoded size exceeds its limit",
+        ));
+    }
+    let body = zstd::bulk::decompress(compressed, decoded_length)
+        .map_err(|_| corrupt("read Managed namespace", "HEAD compression is invalid"))?;
+    if body.len() != decoded_length {
+        return Err(corrupt(
+            "read Managed namespace",
+            "HEAD decoded length does not match",
+        ));
+    }
+    decode_value(&body)
+}
+
+fn encode_record<T: Serialize>(
+    magic: &[u8; 8],
+    value: &T,
+    maximum: usize,
+) -> Result<Vec<u8>, ManagedError> {
+    let mut bytes = Vec::from(magic);
+    ciborium::into_writer(value, &mut bytes)
+        .map_err(|_| invalid("write Managed history", "record cannot be encoded"))?;
+    if bytes.len() - magic.len() > maximum {
+        return Err(invalid(
+            "write Managed history",
+            "record exceeds its size limit",
+        ));
+    }
+    let checksum: [u8; 32] = Sha256::digest(&bytes).into();
+    bytes.extend_from_slice(&checksum);
+    Ok(bytes)
+}
+
+#[cfg(feature = "managed-branch")]
+fn decode_record<T: DeserializeOwned>(
+    magic: &[u8; 8],
+    bytes: &[u8],
+    maximum: usize,
+) -> Result<T, ManagedError> {
+    let body = bytes
+        .strip_prefix(magic)
+        .and_then(|bytes| bytes.get(..bytes.len().checked_sub(32)?))
+        .ok_or_else(|| corrupt("read Managed history", "record format is invalid"))?;
+    if body.len() > maximum
+        || Sha256::digest(&bytes[..bytes.len() - 32]).as_slice() != &bytes[bytes.len() - 32..]
+    {
+        return Err(corrupt(
+            "read Managed history",
+            "record checksum is invalid",
+        ));
+    }
+    decode_value(body)
+}
+
+fn decode_value<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, ManagedError> {
+    let mut input = Cursor::new(bytes);
+    let value = ciborium::from_reader(&mut input)
+        .map_err(|_| corrupt("read Managed namespace", "record cannot be decoded"))?;
+    if input.position() != bytes.len() as u64 {
+        return Err(corrupt(
+            "read Managed namespace",
+            "record has trailing bytes",
+        ));
+    }
+    Ok(value)
+}
+
+async fn sweep_checkpoint_objects(
+    data: &Operator,
+    retained: Option<&str>,
+) -> Result<(), ManagedError> {
+    let prefix = format!("{CHECKPOINT_ROOT}/");
+    let unreachable = data
+        .list_with(&prefix)
+        .recursive(true)
+        .await
+        .map_err(|_| unavailable("sweep Managed checkpoints"))?
+        .into_iter()
+        .filter(|entry| entry.metadata().is_file() && retained != Some(entry.path()))
+        .map(|entry| entry.path().to_owned())
+        .collect::<Vec<_>>();
+    if !unreachable.is_empty() {
+        data.delete_iter(unreachable.iter().map(String::as_str))
+            .await
+            .map_err(|_| unavailable("sweep Managed checkpoints"))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn checkpoint_key(id: [u8; 32]) -> String {
+    format!("{CHECKPOINT_ROOT}/{}.ofs", hex(&id))
+}
+
+pub(crate) fn history_key(id: [u8; 32]) -> String {
+    format!("{HISTORY_ROOT}/{}.ofs", hex(&id))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(DIGITS[(byte >> 4) as usize] as char);
+        encoded.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn invalid(action: &'static str, message: &'static str) -> ManagedError {
+    ManagedError::new(ManagedErrorKind::Invalid, action, message)
+}
+
+fn conflict(action: &'static str, message: &'static str) -> ManagedError {
+    ManagedError::new(ManagedErrorKind::Conflict, action, message)
+}
+
+fn corrupt(action: &'static str, message: &'static str) -> ManagedError {
+    ManagedError::new(ManagedErrorKind::Corrupt, action, message)
+}
+
+fn unavailable(action: &'static str) -> ManagedError {
+    ManagedError::new(
+        ManagedErrorKind::Unavailable,
+        action,
+        "storage operation failed",
+    )
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::num::NonZeroU64;
 
-    use super::*;
-    use crate::managed::metadata::namespace::managed_generation;
     use opendal::services::Memory;
 
-    fn root_snapshot(cursor: ChangeCursor) -> NamespaceSnapshot {
-        let root = NodeId::from_bytes([3; 16]);
+    use super::*;
+    use crate::filesystem::{DirectoryRecord, NodeAttributes, NodeId, NodeKind, NodeRecord};
+    use crate::managed::metadata::namespace::managed_generation;
+
+    fn checkpoint_snapshot(
+        volume_id: VolumeId,
+        cursor: ChangeCursor,
+        root: NodeId,
+    ) -> NamespaceSnapshot {
         NamespaceSnapshot {
-            volume_id: VolumeId::from_bytes([1; 16]),
+            volume_id,
             cursor,
             root,
             nodes: BTreeMap::from([(
@@ -1017,187 +1107,57 @@ mod tests {
         }
     }
 
-    #[test]
-    fn head_recovers_the_same_gc_sweep_until_it_is_finished() {
-        let volume = VolumeId::from_bytes([1; 16]);
+    #[tokio::test]
+    async fn checkpoint_identity_and_base_gc_are_durable() {
+        let volume_id = VolumeId::from_bytes([1; 16]);
         let operation = OperationId::from_bytes([2; 16]);
-        let cursor = ChangeCursor::at(NonZeroU64::new(1).unwrap(), operation);
-        let mut head = StoredHead::new(volume, cursor, [4; 32], cursor, Vec::new()).unwrap();
-
-        let sweep = head.begin_gc([5; 16]).unwrap();
-        let mut recovered = decode_head(&encode_head(&head).unwrap()).unwrap();
-        recovered.validate(volume).unwrap();
-        assert_eq!(recovered.gc_sweep().unwrap(), Some(sweep));
-
-        assert_eq!(
-            recovered.begin_gc([6; 16]).unwrap_err().kind(),
-            ManagedErrorKind::Conflict
+        let cursor = ChangeCursor::at(NonZeroU64::MIN, operation);
+        let current = checkpoint_snapshot(volume_id, cursor, NodeId::from_bytes([3; 16]));
+        let old = checkpoint_snapshot(
+            volume_id,
+            ChangeCursor::Genesis,
+            NodeId::from_bytes([4; 16]),
         );
-        let resumed = recovered.resume_gc([7; 16]).unwrap();
-        assert_eq!(resumed.epoch(), sweep.epoch());
-        assert_eq!(resumed.fixed_cursor(), sweep.fixed_cursor());
-        assert_ne!(resumed, sweep);
-        assert_eq!(
-            recovered.finish_gc(sweep).unwrap_err().kind(),
-            ManagedErrorKind::Conflict
-        );
-
-        recovered.finish_gc(resumed).unwrap();
-        let idle = decode_head(&encode_head(&recovered).unwrap()).unwrap();
-        idle.validate(volume).unwrap();
-        assert_eq!(idle.gc_sweep().unwrap(), None);
-        assert_eq!(idle.maintenance_epoch, resumed.epoch());
-    }
-
-    #[test]
-    fn one_interpreter_recovers_checkpoint_and_bounded_tail() {
-        let first = OperationId::from_bytes([4; 16]);
-        let first_cursor = ChangeCursor::at(NonZeroU64::new(1).unwrap(), first);
-        let first_snapshot = root_snapshot(first_cursor);
-        let first_publication = NamespacePublication {
-            operation: first,
-            parent: ChangeCursor::Genesis,
-            expected_nodes: vec![NodePrecondition {
-                node: first_snapshot.root,
-                expected_generation: None,
-            }],
-            expected_directories: vec![DirectoryPrecondition {
-                directory: first_snapshot.root,
-                expected_generation: None,
-            }],
-            target: first_snapshot.clone(),
-        };
-        let checkpoint = NamespaceChange::from_publication(&first_publication, None)
-            .apply(None)
-            .unwrap();
-        let second = OperationId::from_bytes([5; 16]);
-        let mut target = checkpoint.clone();
-        target.cursor = ChangeCursor::at(NonZeroU64::new(2).unwrap(), second);
-        let publication = NamespacePublication {
-            operation: second,
-            parent: first_cursor,
-            expected_nodes: Vec::new(),
-            expected_directories: Vec::new(),
-            target: target.clone(),
-        };
-        let recovered = NamespaceChange::from_publication(&publication, Some(&first_snapshot))
-            .apply(Some(checkpoint))
-            .unwrap();
-        assert_eq!(recovered, target);
-    }
-
-    #[tokio::test]
-    async fn committed_operations_resolve_from_checkpoint_and_inline_tail() {
-        let first = OperationId::from_bytes([41; 16]);
-        let first_cursor = ChangeCursor::at(NonZeroU64::new(1).unwrap(), first);
-        let first_snapshot = root_snapshot(first_cursor);
-        let first_publication = NamespacePublication {
-            operation: first,
-            parent: ChangeCursor::Genesis,
-            expected_nodes: vec![NodePrecondition {
-                node: first_snapshot.root,
-                expected_generation: None,
-            }],
-            expected_directories: vec![DirectoryPrecondition {
-                directory: first_snapshot.root,
-                expected_generation: None,
-            }],
-            target: first_snapshot.clone(),
-        };
-        let operator = Operator::new(Memory::default()).unwrap().finish();
-        let namespace = NamespaceStore {
-            volume_id: first_snapshot.volume_id,
-            operator: operator.clone(),
-            backend: RecordBackend::test_object(operator),
-        };
-        assert_eq!(
-            namespace.publish(None, &first_publication).await.unwrap(),
-            CommitOutcome::Committed(first_cursor)
-        );
-        assert_eq!(
-            namespace.resolve(first).await.unwrap(),
-            CommitOutcome::Committed(first_cursor)
-        );
-
-        let first_head = namespace.read_current_head().await.unwrap().unwrap();
-        let second = OperationId::from_bytes([42; 16]);
-        let second_cursor = ChangeCursor::at(NonZeroU64::new(2).unwrap(), second);
-        let mut second_snapshot = first_snapshot.clone();
-        second_snapshot.cursor = second_cursor;
-        let second_publication = NamespacePublication {
-            operation: second,
-            parent: first_cursor,
-            expected_nodes: Vec::new(),
-            expected_directories: Vec::new(),
-            target: second_snapshot,
-        };
-        let stored = NamespaceChange::from_publication(&second_publication, Some(&first_snapshot));
-        let head = StoredHead::new(
-            namespace.volume_id,
-            stored.cursor,
-            first_head.checkpoint,
-            first_head.checkpoint_cursor,
-            vec![stored],
-        )
+        let current_bytes = encode_checkpoint(&StoredCheckpoint {
+            snapshot: current.clone(),
+            results: Vec::new(),
+        })
         .unwrap();
-        namespace
-            .operator
-            .write(HEAD_KEY, encode_head(&head).unwrap())
-            .await
-            .unwrap();
+        let current_id: [u8; 32] = Sha256::digest(&current_bytes).into();
         assert_eq!(
-            namespace.resolve(second).await.unwrap(),
-            CommitOutcome::Committed(second_cursor)
+            decode_checkpoint(&current_bytes)
+                .unwrap()
+                .recover(volume_id)
+                .unwrap()
+                .0,
+            current
         );
+        let mut corrupt = current_bytes.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
         assert_eq!(
-            namespace.resolve(first).await.unwrap(),
-            CommitOutcome::Committed(first_cursor)
+            decode_checkpoint(&corrupt).unwrap_err().kind(),
+            ManagedErrorKind::Corrupt
         );
-    }
 
-    #[tokio::test]
-    async fn missing_checkpoint_part_is_reported_as_corruption() {
-        let operation = OperationId::from_bytes([10; 16]);
-        let cursor = ChangeCursor::at(NonZeroU64::new(1).unwrap(), operation);
-        let snapshot = root_snapshot(cursor);
-        let publication = NamespacePublication {
-            operation,
-            parent: ChangeCursor::Genesis,
-            expected_nodes: vec![NodePrecondition {
-                node: snapshot.root,
-                expected_generation: None,
-            }],
-            expected_directories: vec![DirectoryPrecondition {
-                directory: snapshot.root,
-                expected_generation: None,
-            }],
-            target: snapshot.clone(),
-        };
+        let old_bytes = encode_checkpoint(&StoredCheckpoint {
+            snapshot: old,
+            results: Vec::new(),
+        })
+        .unwrap();
+        let old_id: [u8; 32] = Sha256::digest(&old_bytes).into();
         let operator = Operator::new(Memory::default()).unwrap().finish();
-        let namespace = NamespaceStore {
-            volume_id: snapshot.volume_id,
-            operator: operator.clone(),
-            backend: RecordBackend::test_object(operator.clone()),
-        };
-        assert_eq!(
-            namespace.publish(None, &publication).await.unwrap(),
-            CommitOutcome::Committed(cursor)
-        );
-        let head = operator.read(HEAD_KEY).await.unwrap().to_bytes();
-        let head = decode_head(&head).unwrap();
-        let checkpoint = namespace.read_checkpoint(head.checkpoint).await.unwrap();
-        let bytes = operator
-            .read(&checkpoint_key(&head.checkpoint))
-            .await
-            .unwrap()
-            .to_bytes();
-        let root = CheckpointRoot::decode(&bytes).unwrap();
         operator
-            .delete(&checkpoint_part_key(&root.parts[0].id))
+            .write(&checkpoint_key(current_id), current_bytes)
             .await
             .unwrap();
-        assert_eq!(checkpoint.snapshot, snapshot);
-        let error = namespace.recover(&head).await.err().unwrap();
-        assert_eq!(error.kind(), ManagedErrorKind::Corrupt);
+        operator
+            .write(&checkpoint_key(old_id), old_bytes)
+            .await
+            .unwrap();
+        sweep_checkpoint_objects(&operator, Some(&checkpoint_key(current_id)))
+            .await
+            .unwrap();
+        assert!(operator.exists(&checkpoint_key(current_id)).await.unwrap());
+        assert!(!operator.exists(&checkpoint_key(old_id)).await.unwrap());
     }
 }

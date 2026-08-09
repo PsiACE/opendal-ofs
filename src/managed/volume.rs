@@ -22,16 +22,14 @@ use std::num::NonZeroUsize;
 
 use opendal::Operator;
 
-#[cfg(feature = "managed-branch")]
-use super::extensions::branch::{BoundNamespace, BranchWitness};
 use super::format::ExtentMap;
 use super::metadata::namespace::{
     FileVersionRecord, NamespaceGcSweep, NamespacePublication, NamespaceSnapshot, NamespaceStore,
     NamespaceWitness,
 };
+use super::metadata::record::RecordBackend;
 use super::{
-    AuthorityKnownContent, D1Metadata, ManagedData, ManagedError, ManagedErrorKind,
-    SegmentGcMaintenance,
+    AuthorityKnownContent, ManagedData, ManagedError, ManagedErrorKind, SegmentGcMaintenance,
 };
 use crate::filesystem::{AuthorityIdentity, CommitOutcome, OperationId, VolumeId};
 use crate::filesystem::{
@@ -42,80 +40,44 @@ use crate::filesystem::{
 #[derive(Clone)]
 pub struct ManagedVolume {
     volume_id: VolumeId,
-    namespace: NamespaceAuthority,
+    namespace: NamespaceStore,
     data: ManagedData,
-}
-
-#[derive(Clone)]
-enum NamespaceAuthority {
-    Base(NamespaceStore),
-    #[cfg(feature = "managed-branch")]
-    Branch(BoundNamespace),
 }
 
 #[derive(Clone, Debug)]
 pub struct ManagedObservation {
-    authority: AuthorityObservation,
+    witness: NamespaceWitness,
     filesystem_snapshot: VolumeSnapshot,
-}
-
-#[derive(Clone, Debug)]
-enum AuthorityObservation {
-    Base(NamespaceWitness),
-    #[cfg(feature = "managed-branch")]
-    Branch(Box<BranchWitness>),
 }
 
 impl ManagedObservation {
     fn gc_sweep(&self) -> Option<NamespaceGcSweep> {
-        match &self.authority {
-            AuthorityObservation::Base(witness) => witness.gc_sweep(),
-            #[cfg(feature = "managed-branch")]
-            AuthorityObservation::Branch(_) => None,
-        }
+        self.witness.gc_sweep()
     }
 }
 
 impl ManagedVolume {
-    pub(crate) fn object(
+    pub(crate) fn new(
         volume_id: VolumeId,
         data_operator: Operator,
+        backend: RecordBackend,
     ) -> Result<Self, ManagedError> {
         Ok(Self {
             volume_id,
-            namespace: NamespaceAuthority::Base(NamespaceStore::object(
-                volume_id,
-                data_operator.clone(),
-            )?),
+            namespace: NamespaceStore::new(volume_id, data_operator.clone(), backend),
             data: ManagedData::new(data_operator)?,
         })
     }
 
     #[cfg(feature = "managed-branch")]
-    pub(crate) fn branch(
+    pub(crate) fn bound(
         volume_id: VolumeId,
         data_operator: Operator,
-        namespace: BoundNamespace,
+        namespace: NamespaceStore,
     ) -> Result<Self, ManagedError> {
         Ok(Self {
             volume_id,
-            namespace: NamespaceAuthority::Branch(namespace),
-            data: ManagedData::new(data_operator)?,
-        })
-    }
-
-    pub(crate) fn d1(
-        volume_id: VolumeId,
-        data_operator: Operator,
-        metadata: D1Metadata,
-    ) -> Result<Self, ManagedError> {
-        Ok(Self {
-            volume_id,
-            namespace: NamespaceAuthority::Base(NamespaceStore::d1(
-                volume_id,
-                data_operator.clone(),
-                metadata,
-            )),
+            namespace,
             data: ManagedData::new(data_operator)?,
         })
     }
@@ -129,27 +91,15 @@ impl ManagedVolume {
         &self,
         base: Option<&NamespaceSnapshot>,
     ) -> Result<Option<ManagedObservation>, ManagedError> {
-        match &self.namespace {
-            NamespaceAuthority::Base(namespace) => match base {
-                Some(base) => namespace.observe_from(base).await?,
-                None => namespace.observe().await?,
-            }
-            .map(|observed| {
-                let (snapshot, witness) = observed.into_parts();
-                managed_observation(snapshot, AuthorityObservation::Base(witness))
-            })
-            .transpose(),
-            #[cfg(feature = "managed-branch")]
-            NamespaceAuthority::Branch(namespace) => match base {
-                Some(base) => namespace.observe_from(base).await?,
-                None => namespace.observe().await?,
-            }
-            .map(|observed| {
-                let (snapshot, witness) = observed.into_parts();
-                managed_observation(snapshot, AuthorityObservation::Branch(Box::new(witness)))
-            })
-            .transpose(),
+        match base {
+            Some(base) => self.namespace.observe_from(base).await?,
+            None => self.namespace.observe().await?,
         }
+        .map(|observed| {
+            let (snapshot, witness) = observed.into_parts();
+            managed_observation(snapshot, witness)
+        })
+        .transpose()
     }
 
     async fn publish(
@@ -160,41 +110,13 @@ impl ManagedVolume {
         let base = observed
             .map(|observed| to_managed_snapshot(&observed.filesystem_snapshot))
             .transpose()?;
-        match (&self.namespace, observed.map(|value| &value.authority)) {
-            (NamespaceAuthority::Base(namespace), Some(AuthorityObservation::Base(witness))) => {
-                namespace
-                    .publish(
-                        Some((witness, base.as_ref().expect("decoded above"))),
-                        publication,
-                    )
-                    .await
-            }
-            (NamespaceAuthority::Base(namespace), None) => {
-                namespace.publish(None, publication).await
-            }
-            #[cfg(feature = "managed-branch")]
+        let observed = observed.map(|observed| {
             (
-                NamespaceAuthority::Branch(namespace),
-                Some(AuthorityObservation::Branch(witness)),
-            ) => {
-                namespace
-                    .publish(
-                        Some((witness, base.as_ref().expect("decoded above"))),
-                        publication,
-                    )
-                    .await
-            }
-            #[cfg(feature = "managed-branch")]
-            (NamespaceAuthority::Branch(namespace), None) => {
-                namespace.publish(None, publication).await
-            }
-            #[cfg(feature = "managed-branch")]
-            _ => Err(ManagedError::new(
-                ManagedErrorKind::Invalid,
-                "publish Managed namespace",
-                "observation belongs to another metadata authority",
-            )),
-        }
+                &observed.witness,
+                base.as_ref().expect("an observation was decoded above"),
+            )
+        });
+        self.namespace.publish(observed, publication).await
     }
 
     /// Fence namespace publication and fix the snapshot used by one GC sweep.
@@ -202,25 +124,7 @@ impl ManagedVolume {
         &self,
         observed: &ManagedObservation,
     ) -> Result<NamespaceGcSweep, ManagedError> {
-        match (&self.namespace, &observed.authority) {
-            (NamespaceAuthority::Base(namespace), AuthorityObservation::Base(observed)) => {
-                namespace.begin_gc(observed).await
-            }
-            #[cfg(feature = "managed-branch")]
-            (NamespaceAuthority::Branch(_), AuthorityObservation::Branch(_)) => {
-                Err(ManagedError::new(
-                    ManagedErrorKind::Invalid,
-                    "begin Managed namespace GC",
-                    "branch GC must be started through its volume control plane",
-                ))
-            }
-            #[cfg(feature = "managed-branch")]
-            _ => Err(ManagedError::new(
-                ManagedErrorKind::Invalid,
-                "begin Managed namespace GC",
-                "observation belongs to another metadata authority",
-            )),
-        }
+        self.namespace.begin_gc(&observed.witness).await
     }
 
     /// Take ownership of an interrupted namespace GC sweep.
@@ -228,38 +132,12 @@ impl ManagedVolume {
         &self,
         observed: &ManagedObservation,
     ) -> Result<NamespaceGcSweep, ManagedError> {
-        match (&self.namespace, &observed.authority) {
-            (NamespaceAuthority::Base(namespace), AuthorityObservation::Base(observed)) => {
-                namespace.resume_gc(observed).await
-            }
-            #[cfg(feature = "managed-branch")]
-            (NamespaceAuthority::Branch(_), AuthorityObservation::Branch(_)) => {
-                Err(ManagedError::new(
-                    ManagedErrorKind::Invalid,
-                    "resume Managed namespace GC",
-                    "branch GC must be resumed through its volume control plane",
-                ))
-            }
-            #[cfg(feature = "managed-branch")]
-            _ => Err(ManagedError::new(
-                ManagedErrorKind::Invalid,
-                "resume Managed namespace GC",
-                "observation belongs to another metadata authority",
-            )),
-        }
+        self.namespace.resume_gc(&observed.witness).await
     }
 
     /// Release the publication fence for the matching GC sweep.
     pub async fn finish_gc(&self, sweep: NamespaceGcSweep) -> Result<(), ManagedError> {
-        match &self.namespace {
-            NamespaceAuthority::Base(namespace) => namespace.finish_gc(sweep).await,
-            #[cfg(feature = "managed-branch")]
-            NamespaceAuthority::Branch(_) => Err(ManagedError::new(
-                ManagedErrorKind::Invalid,
-                "finish Managed namespace GC",
-                "branch GC must be finished through its volume control plane",
-            )),
-        }
+        self.namespace.finish_gc(sweep).await
     }
 
     /// Delete data segments unreachable from the snapshot fixed by this sweep.
@@ -302,13 +180,10 @@ impl Volume for ManagedVolume {
     }
 
     fn authority(&self) -> AuthorityIdentity {
-        match &self.namespace {
-            #[cfg(feature = "managed-branch")]
-            NamespaceAuthority::Branch(namespace) => {
-                AuthorityIdentity::branch(self.volume_id, namespace.binding().clone())
-            }
-            _ => AuthorityIdentity::base(self.volume_id),
-        }
+        self.namespace.binding().map_or_else(
+            || AuthorityIdentity::base(self.volume_id),
+            |binding| AuthorityIdentity::branch(self.volume_id, binding.clone()),
+        )
     }
 
     fn initial_generation(&self) -> crate::filesystem::Generation {
@@ -369,12 +244,7 @@ impl Volume for ManagedVolume {
     }
 
     async fn resolve(&self, operation: OperationId) -> Result<CommitOutcome, VolumeError> {
-        match &self.namespace {
-            NamespaceAuthority::Base(namespace) => namespace.resolve(operation).await,
-            #[cfg(feature = "managed-branch")]
-            NamespaceAuthority::Branch(namespace) => namespace.resolve(operation).await,
-        }
-        .map_err(Into::into)
+        self.namespace.resolve(operation).await.map_err(Into::into)
     }
 
     async fn materialize(
@@ -418,11 +288,11 @@ fn authority_known_content(
 
 fn managed_observation(
     snapshot: NamespaceSnapshot,
-    authority: AuthorityObservation,
+    witness: NamespaceWitness,
 ) -> Result<ManagedObservation, ManagedError> {
     let filesystem_snapshot = to_volume_snapshot(snapshot)?;
     Ok(ManagedObservation {
-        authority,
+        witness,
         filesystem_snapshot,
     })
 }

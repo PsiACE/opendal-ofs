@@ -164,9 +164,9 @@ pub(crate) struct VolumeCreateArgs {
     #[arg(long, value_parser = parse_volume_model, value_name = "MODEL")]
     pub model: VolumeModel,
 
-    /// Managed volume feature to require. May be repeated.
+    /// Managed volume feature to require.
     #[arg(long, value_enum, value_name = "FEATURE")]
-    pub enable: Vec<EnableFeature>,
+    pub enable: Option<EnableFeature>,
 
     /// OpenDAL data URL. Credentials are not stored in the catalog.
     #[arg(long, env = "OFS_STORAGE_URL", value_name = "URL")]

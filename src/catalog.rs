@@ -33,18 +33,8 @@ const SCHEMA_MAJOR: u16 = 1;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VolumeDefinition {
     pub volume_id: VolumeId,
+    pub model: VolumeModel,
     pub storage: Url,
-    pub settings: VolumeSettings,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum VolumeSettings {
-    Direct,
-    Managed(ManagedVolumeSettings),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ManagedVolumeSettings {
     pub metadata: Option<Url>,
 }
 
@@ -53,8 +43,9 @@ impl VolumeDefinition {
         require_credential_free("storage", &storage)?;
         Ok(Self {
             volume_id,
+            model: VolumeModel::Direct,
             storage,
-            settings: VolumeSettings::Direct,
+            metadata: None,
         })
     }
     pub fn managed(volume_id: VolumeId, storage: Url, metadata: Option<Url>) -> Result<Self> {
@@ -64,23 +55,10 @@ impl VolumeDefinition {
         }
         Ok(Self {
             volume_id,
+            model: VolumeModel::Managed,
             storage,
-            settings: VolumeSettings::Managed(ManagedVolumeSettings { metadata }),
+            metadata,
         })
-    }
-
-    pub fn managed_settings(&self) -> Option<&ManagedVolumeSettings> {
-        match &self.settings {
-            VolumeSettings::Direct => None,
-            VolumeSettings::Managed(settings) => Some(settings),
-        }
-    }
-
-    pub const fn model(&self) -> VolumeModel {
-        match &self.settings {
-            VolumeSettings::Direct => VolumeModel::Direct,
-            VolumeSettings::Managed(_) => VolumeModel::Managed,
-        }
     }
 }
 
@@ -232,21 +210,15 @@ impl From<&Catalog> for StoredCatalog {
 
 impl From<&VolumeDefinition> for StoredVolume {
     fn from(volume: &VolumeDefinition) -> Self {
-        let metadata = match &volume.settings {
-            VolumeSettings::Direct => None,
-            VolumeSettings::Managed(settings) => {
-                settings.metadata.as_ref().map(ToString::to_string)
-            }
-        };
         Self {
             volume_id: *volume.volume_id.as_bytes(),
-            model: match volume.model() {
+            model: match volume.model {
                 VolumeModel::Direct => "direct",
                 VolumeModel::Managed => "managed",
             }
             .into(),
             storage: volume.storage.to_string(),
-            metadata,
+            metadata: volume.metadata.as_ref().map(ToString::to_string),
         }
     }
 }

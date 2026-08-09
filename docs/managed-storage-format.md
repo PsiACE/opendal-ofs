@@ -27,8 +27,8 @@ garbage-collection schedules are policy and are not stored in the superblock.
 | --- | --- | --- |
 | Superblock | Metadata | Immutable for the volume lifetime |
 | Namespace HEAD | Object Metadata | Mutable commit point |
-| Checkpoint root and part | Metadata backend | Immutable while referenced |
-| Transactional namespace rows | Transactional Metadata | Managed by native transactions and checkpoints |
+| Checkpoint | OpenDAL data storage | Immutable while referenced |
+| Authority record | Metadata | Mutable through native revision CAS |
 | File version and extent map | Metadata | Immutable logical file version |
 | Segment | Data | Immutable until unreachable |
 | Replica state | Sync frontend | Local and persistent, outside the volume |
@@ -58,25 +58,23 @@ Object Metadata stores the superblock at:
 .ofs/managed/metadata/v1/superblock.json
 ```
 
-Transactional Metadata stores the same fields in its native format table. The
-JSON representation is a strict UTF-8 object:
+Transactional Metadata stores the same bytes under the same logical key in its
+native authority-record table. The JSON representation is a strict UTF-8
+object:
 
 ```json
 {
-  "specification": "managed/1",
+  "version": 1,
   "volume_id": "00112233445566778899aabbccddeeff",
-  "naming_policy": "portable-utf8/1",
-  "metadata_format": "object/1",
-  "file_version_format": "extent-map/1",
-  "data_format": "segment/1",
-  "required_extensions": []
+  "metadata": "object",
+  "extensions": []
 }
 ```
 
 `volume_id` is 16 bytes encoded as 32 lowercase hexadecimal characters.
-`metadata_format` is `object/1` or `transactional/1`. Required extensions MUST
-be strictly ordered without duplicates. Readers reject unknown fields,
-identifiers, formats, and required extensions.
+`metadata` is `object` or `transactional`. `extensions` MUST be strictly
+ordered without duplicates. Readers reject another version, unknown fields,
+metadata identifiers, and required extensions.
 
 The optional required extension `branch/v1` replaces the single namespace
 authority with durable named authorities. Its format and lifecycle rules are
@@ -141,46 +139,14 @@ Segments are stored at:
 ```
 
 The directory partition is derived from the segment digest. It is not a second
-identity. A segment has this layout:
+identity. A segment is the raw content bytes concatenated in `ContentRef`
+order. The extent map owns every offset and length; there is no second index or
+footer in the segment. SHA-256 and the length of the complete object form its
+`SegmentRef` and determine its key.
 
-```text
-+-------------------------------+
-| "OFSSEG01"                    | 8 bytes
-| format major                  | u16, value 1
-+-------------------------------+
-| raw content extents           |
-+-------------------------------+
-| named-field CBOR footer       |
-+-------------------------------+
-| "OFSSEGTR"                    | 8 bytes
-| footer offset                 | u64
-| footer length                 | u64
-| segment SHA-256               | 32 bytes
-+-------------------------------+
-```
-
-The footer is equivalent to:
-
-```text
-{
-  major: 1,
-  entries: [
-    {
-      content: { digest: bytes(32), length: uint },
-      offset: uint
-    }
-  ]
-}
-```
-
-Footer entries are strictly ordered by `ContentRef`. They describe the entire
-raw content region without gaps or overlaps. `ContentRef.length` is the stored
-range length. The segment digest covers every byte before the digest field and
-determines the object key.
-
-A complete read verifies the envelope, segment digest, footer, entry ordering,
-ranges, and each content digest. A sparse read fetches the extent range from
-the file version and verifies its `ContentRef`.
+A complete read verifies the segment length and digest before slicing the
+requested extents, then verifies each `ContentRef`. A sparse read fetches the
+extent ranges from the file version and verifies each returned `ContentRef`.
 
 ## Object Metadata layout
 
@@ -190,7 +156,6 @@ Object Metadata uses these keys:
 .ofs/managed/metadata/v1/superblock.json
 .ofs/managed/metadata/v1/head.ofs
 .ofs/managed/metadata/v1/checkpoints/sha256/<digest>.ofs
-.ofs/managed/metadata/v1/checkpoint-parts/sha256/<digest>.ofs
 ```
 
 `head.ofs` is the only mutable namespace object. A conditional replacement is
@@ -217,60 +182,43 @@ cursors, resulting root, generation preconditions, and ordered node,
 directory, directory-entry, and file-version effects. The chain MUST be
 consecutive from the checkpoint cursor to the current cursor.
 
-### Checkpoint root
+### Checkpoint
 
-A checkpoint root has this envelope:
-
-```text
-"OFS1CKP1"
-named-field CBOR checkpoint root
-SHA-256 of preceding bytes
-```
-
-The checkpoint root contains format major `1`, volume identity, checkpoint
-cursor, root node, and ordered part references. Each reference carries the
-part digest and encoded length. SHA-256 of the complete encoded root determines
-its object key.
-
-The parts form one complete snapshot. Records are the natural Managed domain
-records: one node, directory, file version, or committed-operation receipt per
-record. A directory record includes its complete entry map and a file-version
-record includes its complete extent list. The checkpoint format does not add a
-second header/entry/extent model.
-
-Records are split at a target encoded size. The target is write policy, not a
-persisted limit. A natural record is never split merely to meet the target.
-Each part has this envelope:
+A checkpoint has this envelope:
 
 ```text
-"OFS1CPP1"
-named-field CBOR { major, volume_id, records }
-SHA-256 of preceding bytes
+"OFS1CKZ1"                    8 bytes
+decoded CBOR length           u64
+zstd frame                    variable
 ```
 
-Recovery reads every referenced part, verifies its digest, encoded length,
-format major, and volume scope, rejects missing or duplicate natural records,
-validates the resulting snapshot, and applies no overlay or tombstones. A new
-checkpoint never depends on an older checkpoint. The checkpoint codec submits
-parts through the metadata backend without defining another concurrency
-policy; configured backend and OpenDAL layers remain authoritative.
+The decoded strict CBOR record contains one complete `NamespaceSnapshot` and
+the ordered committed-operation receipts required for publication recovery.
+The format does not add another node, directory, file-version, or extent model.
+SHA-256 of the complete envelope determines its object key.
+
+Encoded and decoded checkpoint sizes are each limited to 256 MiB. Recovery
+uses one bounded OpenDAL range read, verifies the complete content identity,
+requires the exact v1 magic and decoded length, rejects trailing or unknown
+CBOR fields, validates the volume and snapshot, and rejects duplicate receipts.
+A checkpoint never depends on another checkpoint.
 
 ## Transactional Metadata layout
 
 Transactional Metadata stores the superblock and all mutable authority records
-in these D1 tables:
+in one D1 table:
 
 ```text
-ofs_managed_v1_formats
-ofs_managed_v1_records
+ofs_managed_v1_authority_records
 ```
 
-`STORE_KEY` and `VolumeId` scope one Managed volume inside the shared tables.
-Each record row has the same logical key used by Object Metadata, its encoded
-value, and a monotonically increasing CAS revision. The base namespace uses
-the `head.ofs` logical key; extensions use their own key prefixes in the same
-table. Immutable checkpoint roots and parts are stored through the same record
-interface for extensions, while base immutable checkpoints remain in the
+The primary key is `(store_key, record_key)`. Each row contains those two text
+fields, an integer CAS `revision`, and the encoded bytes in lowercase
+`value_hex`. `store_key` is the configured physical authority scope;
+`record_key` is exactly the logical key used by Object Metadata, including the
+superblock, base HEAD, and extension registry and heads. `VolumeId` is verified
+from the stored value instead of being duplicated in the table schema.
+Immutable checkpoints for both base and branch authorities remain in the
 configured OpenDAL storage. The filesystem and Data segment layouts are
 identical for Object and Transactional Metadata.
 
@@ -281,7 +229,7 @@ Publication is ordered as follows:
 1. Observe one Metadata snapshot and revision token.
 2. Write and verify immutable Data segments.
 3. Validate the target namespace and generation preconditions.
-4. Write any immutable checkpoint objects or rows.
+4. Write any immutable checkpoint objects.
 5. Commit with one conditional HEAD replacement or one native transaction.
 
 Segments written before a failed Metadata commit are unreachable. Garbage
@@ -299,7 +247,7 @@ A reader MUST reject:
 - unordered or duplicate records and invalid key ranges;
 - overflow, out-of-bounds extents, gaps, or overlaps;
 - an invalid cursor chain, generation transition, or filesystem invariant;
-- a missing referenced segment, checkpoint root, or checkpoint part.
+- a missing referenced segment or checkpoint.
 
 An immutable write may accept an existing object only after verifying that it
 has the expected identity and contents. Missing referenced objects are

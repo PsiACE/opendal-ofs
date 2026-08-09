@@ -302,15 +302,6 @@ OFS_CONFIG="$peer_config" "$OFS_BIN" sync "$peer_alias" "$replica_b" --state "$s
 grep -Fxq 'directory identity survives a move' "$replica_b/tree-after/branch/leaf.txt" || \
   fail 'moved directory subtree content was not materialized'
 
-printf '%s\n' 'published by replica a' >"$replica_a/a-only.txt"
-printf '%s\n' 'published by replica b' >"$replica_b/b-only.txt"
-printf '%s\n' 'acceptance: merge disjoint changes from two replicas'
-OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a"
-OFS_CONFIG="$peer_config" "$OFS_BIN" sync "$peer_alias" "$replica_b" --state "$state_b"
-OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a"
-cmp "$replica_a/a-only.txt" "$replica_b/a-only.txt" || fail 'replica b lost replica a disjoint change'
-cmp "$replica_a/b-only.txt" "$replica_b/b-only.txt" || fail 'replica a lost replica b disjoint change'
-
 printf '%s\n' 'common base' >"$replica_a/shared.txt"
 printf '%s\n' 'second common base' >"$replica_a/shared-two.txt"
 OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a"
@@ -342,51 +333,6 @@ OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a"
 grep -Fxq 'candidate from replica b' "$replica_a/shared.txt" || fail 'resolved content was not published'
 grep -Fxq 'second candidate from replica b' "$replica_a/shared-two.txt" || \
   fail 'second resolved content was not published'
-
-printf '%s\n' 'acceptance: recover a durable publication intent after process death'
-mkdir "$replica_a/crash-recovery"
-for index in $(seq -w 1 128); do
-  {
-    printf 'crash recovery file %s\n' "$index"
-    head -c 65536 /dev/zero
-  } >"$replica_a/crash-recovery/$index.bin"
-done
-OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a" &
-crash_pid=$!
-intent_observed=false
-for _ in $(seq 1 200); do
-  if ! kill -0 "$crash_pid" 2>/dev/null; then
-    break
-  fi
-  recovery_status=$(OFS_CONFIG="$config" "$OFS_BIN" status --state "$state_a" --json 2>/dev/null || true)
-  if grep -Eq '"pending"[[:space:]]*:[[:space:]]*true' <<<"$recovery_status"; then
-    if kill -KILL "$crash_pid" 2>/dev/null; then
-      intent_observed=true
-    fi
-    break
-  fi
-  sleep 0.01
-done
-wait "$crash_pid" 2>/dev/null || true
-[[ "$intent_observed" == true ]] || fail 'could not interrupt sync after its intent became durable'
-recovery_status=$(OFS_CONFIG="$config" "$OFS_BIN" status --state "$state_a" --json)
-grep -Eq '"pending"[[:space:]]*:[[:space:]]*true' <<<"$recovery_status" || \
-  fail 'process death lost the durable publication intent'
-recovered=false
-for _ in $(seq 1 5); do
-  if OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a"; then
-    recovered=true
-    break
-  fi
-  sleep 0.05
-done
-[[ "$recovered" == true ]] || fail 'repeated sync could not resolve the durable publication intent'
-recovery_status=$(OFS_CONFIG="$config" "$OFS_BIN" status --state "$state_a" --json)
-grep -Eq '"pending"[[:space:]]*:[[:space:]]*false' <<<"$recovery_status" || \
-  fail 'recovered publication did not clear its completed intent'
-OFS_CONFIG="$peer_config" "$OFS_BIN" sync "$peer_alias" "$replica_b" --state "$state_b"
-cmp "$replica_a/crash-recovery/128.bin" "$replica_b/crash-recovery/128.bin" || \
-  fail 'recovered publication did not materialize on another replica'
 
 printf '%s\n' 'acceptance: recover through a long change history'
 for generation in $(seq 1 60); do

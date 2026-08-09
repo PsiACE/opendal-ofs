@@ -16,10 +16,8 @@ use ofs::catalog::{Catalog, VolumeDefinition};
 use ofs::filesystem::BranchName;
 use ofs::filesystem::{Volume, VolumeId, VolumeModel};
 #[cfg(feature = "managed-branch")]
-use ofs::managed::extensions::branch::{BranchInfo, BranchStore, ForkPoint};
-use ofs::managed::{
-    D1Config, ManagedErrorKind, ManagedFormat, ManagedMetadata, ManagedVolume, SegmentGcMaintenance,
-};
+use ofs::managed::extensions::branch::{BranchInfo, ForkPoint};
+use ofs::managed::{D1Config, ManagedFormat, ManagedMetadata, ManagedVolume, SegmentGcMaintenance};
 use ofs::sync::{ReplicaState, SyncEngine};
 use opendal::Operator;
 use opendal::layers::{ConcurrentLimitLayer, RetryLayer};
@@ -62,7 +60,12 @@ async fn branch_command(config: &Path, command: BranchCommand) -> Result<()> {
         BranchCommand::Create(args) => (&args.alias, args.runtime.transfer_concurrency),
         BranchCommand::Delete(args) => (&args.alias, args.runtime.transfer_concurrency),
     };
-    let branches = open_branch_authority(config, alias, concurrency).await?;
+    let ManagedContext {
+        format,
+        data,
+        metadata,
+    } = open_managed_context(config, alias, concurrency).await?;
+    let branches = metadata.branches(&format, data)?;
     match command {
         BranchCommand::List(args) => {
             let listed = branches.list().await?;
@@ -156,26 +159,23 @@ fn branch_json(branch: &BranchInfo) -> serde_json::Value {
 }
 
 async fn gc_volume(config: &Path, args: VolumeGcArgs) -> Result<()> {
+    let ManagedContext {
+        format,
+        data,
+        metadata,
+    } = open_managed_context(config, &args.alias, args.runtime.transfer_concurrency).await?;
     #[cfg(feature = "managed-branch")]
-    {
-        let ManagedContext {
-            format,
-            data,
-            metadata,
-        } = open_managed_context(config, &args.alias, args.runtime.transfer_concurrency).await?;
-        if format.requires_extension(ofs::managed::ManagedExtension::BranchV1) {
-            let branches = metadata.branches(&format, data.clone())?;
-            let collected = if args.resume {
-                branches.resume_garbage_collect(data).await?
-            } else {
-                branches.garbage_collect(data).await?
-            };
-            print_gc_result(&args.alias, collected);
-            return Ok(());
-        }
+    if format.requires_extension(ofs::managed::ManagedExtension::BranchV1) {
+        let branches = metadata.branches(&format, data)?;
+        let collected = if args.resume {
+            branches.resume_garbage_collect().await?
+        } else {
+            branches.garbage_collect().await?
+        };
+        print_gc_result(&args.alias, collected);
+        return Ok(());
     }
-    let volume =
-        open_managed_volume(config, &args.alias, None, args.runtime.transfer_concurrency).await?;
+    let volume = metadata.open_volume(format, data)?;
     let Some(observed) = volume.observe().await? else {
         print_gc_result(&args.alias, SegmentGcMaintenance::default());
         return Ok(());
@@ -226,34 +226,20 @@ async fn open_managed_volume(
     metadata.open_volume(format, data).map_err(Into::into)
 }
 
-#[cfg(feature = "managed-branch")]
-async fn open_branch_authority(
-    config: &Path,
-    alias: &str,
-    transfer_concurrency: NonZeroUsize,
-) -> Result<BranchStore> {
-    let ManagedContext {
-        format,
-        data,
-        metadata,
-    } = open_managed_context(config, alias, transfer_concurrency).await?;
-    Ok(metadata.branches(&format, data)?)
-}
-
 async fn open_managed_context(
     config: &Path,
     alias: &str,
     transfer_concurrency: NonZeroUsize,
 ) -> Result<ManagedContext> {
-    let catalog = load_catalog(config)?;
+    let catalog = Catalog::load(config).context("cannot open the volume catalog")?;
     let definition = catalog
         .get(alias)
         .with_context(|| format!("volume alias {alias:?} is not in the catalog"))?;
-    let settings = definition
-        .managed_settings()
-        .context("this operation requires a Managed volume")?;
+    if definition.model != VolumeModel::Managed {
+        bail!("this operation requires a Managed volume");
+    }
     let data = open_operator(&definition.storage, transfer_concurrency)?;
-    let metadata = open_metadata(data.clone(), settings.metadata.as_ref())?;
+    let metadata = open_metadata(data.clone(), definition.metadata.as_ref())?;
     let format = metadata.read_format().await?;
     if format.volume_id() != definition.volume_id {
         bail!("volume catalog and Managed format v1 binding disagree");
@@ -266,10 +252,7 @@ async fn open_managed_context(
 }
 
 async fn create_volume(config: &Path, mut args: VolumeCreateArgs) -> Result<()> {
-    if args.enable.len() > 1 {
-        bail!("--enable branch may be specified only once");
-    }
-    let branch_enabled = !args.enable.is_empty();
+    let branch_enabled = args.enable.is_some();
     if args.model == VolumeModel::Direct && branch_enabled {
         bail!("--enable branch requires --model managed");
     }
@@ -324,13 +307,7 @@ async fn create_volume(config: &Path, mut args: VolumeCreateArgs) -> Result<()> 
     let format = if configured.is_some() {
         metadata.read_format().await?
     } else {
-        match metadata.create_format(&desired).await {
-            Ok(created) => created,
-            Err(error) if error.kind() == ManagedErrorKind::Conflict => {
-                metadata.read_format().await?
-            }
-            Err(error) => return Err(error.into()),
-        }
+        metadata.create_format(&desired).await?
     };
     if configured
         .as_ref()
@@ -399,7 +376,7 @@ fn create_direct_volume(
 
 fn open_metadata(data: Operator, metadata: Option<&Url>) -> Result<ManagedMetadata> {
     match metadata {
-        None => Ok(ManagedMetadata::object(data)),
+        None => ManagedMetadata::object(data).map_err(Into::into),
         Some(url) if url.scheme() == "d1" => {
             ManagedMetadata::d1(d1_config(url)?).map_err(Into::into)
         }
@@ -448,13 +425,13 @@ async fn sync_volume(config: &Path, args: SyncArgs) -> Result<()> {
 fn status(config: &Path, args: StatusArgs) -> Result<()> {
     let state = ReplicaState::load(&args.state)?
         .with_context(|| format!("replica state does not exist: {}", args.state.display()))?;
-    let catalog = load_catalog(config)?;
+    let catalog = Catalog::load(config).context("cannot open the volume catalog")?;
     let (alias, definition) = catalog
         .find_by_id(state.volume)
         .context("replica volume is not in the local catalog")?;
-    definition
-        .managed_settings()
-        .context("replica state is not bound to a Managed volume")?;
+    if definition.model != VolumeModel::Managed {
+        bail!("replica state is not bound to a Managed volume");
+    }
     let value = serde_json::json!({
         "volume_alias": alias,
         "volume_id": state.volume.to_string(),
@@ -488,10 +465,6 @@ fn status(config: &Path, args: StatusArgs) -> Result<()> {
 
 fn hex_bytes(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn load_catalog(config: &Path) -> Result<Catalog> {
-    Catalog::load(config).context("cannot open the volume catalog")
 }
 
 fn open_operator(url: &Url, transfer_concurrency: NonZeroUsize) -> Result<Operator> {
@@ -538,11 +511,11 @@ fn d1_config(url: &Url) -> Result<D1Config> {
 }
 
 async fn mount_volume(config: &Path, args: MountArgs) -> Result<()> {
-    let catalog = load_catalog(config)?;
+    let catalog = Catalog::load(config).context("cannot open the volume catalog")?;
     let definition = catalog
         .get(&args.alias)
         .with_context(|| format!("volume alias {:?} is not in the catalog", args.alias))?;
-    if definition.model() != VolumeModel::Direct {
+    if definition.model != VolumeModel::Direct {
         bail!(
             "mount currently supports Direct volumes; {:?} is Managed",
             args.alias

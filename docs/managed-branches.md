@@ -364,16 +364,13 @@ Object Metadata uses an extension-owned prefix:
 ```text
 .ofs/managed/metadata/v1/extensions/branch/v1/registry.ofs
 .ofs/managed/metadata/v1/extensions/branch/v1/heads/<branch-id>.ofs
-.ofs/managed/metadata/v1/extensions/branch/v1/checkpoints/sha256/<digest>.ofs
-.ofs/managed/metadata/v1/extensions/branch/v1/checkpoint-parts/sha256/<digest>.ofs
+.ofs/managed/metadata/v1/checkpoints/sha256/<digest>.ofs
 .ofs/managed/metadata/v1/extensions/branch/v1/history/sha256/<digest>.ofs
 ```
 
 The registry and heads are mutable conditional-write objects. A checkpoint is
-a small content-addressed root over immutable content-addressed parts. Parts
-contain natural namespace records: nodes, complete directories, complete file
-versions, and operation receipts. The root is published only after every part
-has been created and verified. History is also immutable and
+one bounded, compressed, content-addressed OpenDAL object containing the shared
+namespace snapshot and operation receipts. History is also immutable and
 content-addressed. The base Managed `head.ofs` is not read or mirrored for a
 branching volume.
 
@@ -381,8 +378,6 @@ Base and branch namespaces share the checkpoint builder and recovery
 validation. One record backend contains the complete Object/D1 dispatch and
 provides native read, create, revision-CAS replace, list, and delete
 operations. Namespace and branch layers do not branch on providers.
-Checkpoint capacity is the sum of its immutable parts rather than one encoded
-snapshot value.
 
 Opening Object metadata requires OpenDAL capabilities for read, create-only
 write, and conditional replace; list and delete are required by GC when it is
@@ -396,14 +391,15 @@ roots. Listing is used only during garbage collection of unreachable objects.
 D1 uses the Managed record table shared by base and extension authorities:
 
 ```text
-ofs_managed_v1_records
+ofs_managed_v1_authority_records
 ```
 
-Rows are scoped by the existing D1 store key, `VolumeId`, and the same logical
-record key used by Object Metadata. Lifecycle and publication use revision
-predicates. Immutable parts are written and verified idempotently before a
-checkpoint root is published. Missing, duplicated, reordered, or modified
-parts are corruption.
+Rows are scoped by the existing D1 store key and the same logical record key
+used by Object Metadata. The stored superblock and authority values carry and
+validate `VolumeId`; the table does not duplicate it. Lifecycle and publication
+use revision predicates. Immutable checkpoints and history remain in the
+configured OpenDAL storage and are verified by their complete content
+identities.
 
 The registry remains one small mutable authority record. D1's value limit and
 the selected Object provider's conditional-write limit are its real
@@ -450,8 +446,8 @@ Unpublished immutable segments may be removed, but a fenced Sync publication
 cannot reference them and retry stages them again.
 
 Extension metadata uses the same roots. Registered heads, referenced
-checkpoint roots, checkpoint parts, and reachable history remain live. Sealed
-or unregistered heads and unreferenced immutable records can be reclaimed
+checkpoints, and reachable history remain live. Sealed or unregistered heads
+and unreferenced immutable records can be reclaimed
 under the same fence. Listing and deletion are paged or streamed, so provider
 request size is not a namespace-format limit.
 
@@ -497,8 +493,7 @@ branch metadata extension.
 One CLI acceptance workflow runs unchanged against Object and D1 metadata:
 
 ```text
-cargo x managed-sync test branch object
-cargo x managed-sync test branch d1
+cargo x managed-sync test all
 ```
 
 It covers Direct rejection before mutation, remote extension negotiation,
@@ -526,12 +521,11 @@ Retaining every historical position retains its metadata and referenced data.
 Historical lookup is linear in the number of archived history segments. A
 disposable index may improve lookup without becoming authority.
 
-Checkpoint storage is split and provider requests remain governed by the
-configured backend layers, but recovery still constructs one in-memory
-`NamespaceSnapshot`. This is suitable for Sync,
-but it is below lakeFS's range-indexed metadata lookup for very large
-namespaces. The checkpoint root can later point to indexed ranges without
-changing registry, head, history, or branch binding semantics.
+Checkpoint storage is one bounded compressed object and recovery constructs one
+in-memory `NamespaceSnapshot`. This is suitable for Sync, but it is below
+lakeFS's range-indexed metadata lookup for very large namespaces. An indexed
+checkpoint would be a later format change without changing registry, head,
+history, or branch binding semantics.
 
 The registry is a single mutable record. Branch lifecycle is therefore atomic
 and simple, but the practical branch count remains bounded by the selected

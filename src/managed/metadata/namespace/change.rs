@@ -19,7 +19,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use super::validation::validate_transition;
+use super::validation::{
+    match_preconditions, validate_directory_generation, validate_node_generation,
+};
 use super::{
     DirectoryPrecondition, DirectoryRecord, FileVersionRecord, NamespacePublication,
     NamespaceSnapshot, NodePrecondition, NodeRecord,
@@ -168,16 +170,13 @@ impl NamespaceChange {
         }
     }
 
-    /// Apply a change after its containing HEAD/state or source publication
-    /// has established operation and cursor ancestry.
     pub(crate) fn apply(
         &self,
         base: Option<NamespaceSnapshot>,
     ) -> Result<NamespaceSnapshot, ManagedError> {
-        let mut target = match &base {
-            Some(base) if base.volume_id == self.volume_id && base.cursor == self.parent => {
-                base.clone()
-            }
+        self.validate(self.volume_id)?;
+        let mut target = match base {
+            Some(base) if base.volume_id == self.volume_id && base.cursor == self.parent => base,
             Some(_) => return Err(corrupt("transaction base is invalid")),
             None if self.parent == ChangeCursor::Genesis => NamespaceSnapshot {
                 volume_id: self.volume_id,
@@ -190,11 +189,24 @@ impl NamespaceChange {
             None => return Err(corrupt("initial transaction does not begin at genesis")),
         };
 
+        let expected_nodes = match_preconditions(
+            &target.nodes,
+            self.expected_nodes
+                .iter()
+                .map(|condition| (condition.node, condition.expected_generation.as_ref())),
+            |record| &record.generation,
+            "duplicate node precondition",
+        )
+        .map_err(|_| corrupt("transaction is invalid"))?
+        .ok_or_else(|| corrupt("transaction preconditions are stale"))?;
         apply_records(
             &mut target.nodes,
             self.remove_nodes.iter().copied(),
             self.put_nodes.iter().cloned(),
             |record| record.id,
+            |id, current, next| {
+                validate_node_generation(current, next, expected_nodes.contains(&id))
+            },
             "node delta is invalid",
         )?;
         let put_directories = self
@@ -205,11 +217,24 @@ impl NamespaceChange {
                 delta.apply(base)
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let expected_directories = match_preconditions(
+            &target.directories,
+            self.expected_directories
+                .iter()
+                .map(|condition| (condition.directory, condition.expected_generation.as_ref())),
+            |record| &record.generation,
+            "duplicate directory precondition",
+        )
+        .map_err(|_| corrupt("transaction is invalid"))?
+        .ok_or_else(|| corrupt("transaction preconditions are stale"))?;
         apply_records(
             &mut target.directories,
             self.remove_directories.iter().copied(),
             put_directories,
             |record| record.node,
+            |id, current, next| {
+                validate_directory_generation(current, next, expected_directories.contains(&id))
+            },
             "directory delta is invalid",
         )?;
         apply_records(
@@ -217,21 +242,19 @@ impl NamespaceChange {
             self.remove_file_versions.iter().copied(),
             self.put_file_versions.iter().cloned(),
             |record| record.id,
+            |_, current, next| {
+                if next.is_some_and(|next| {
+                    !next.is_valid() || current.is_some_and(|current| current != next)
+                }) {
+                    Err(corrupt("file version delta is invalid"))
+                } else {
+                    Ok(())
+                }
+            },
             "file version delta is invalid",
         )?;
         target.root = self.root;
         target.cursor = self.cursor;
-
-        if !validate_transition(
-            &self.expected_nodes,
-            &self.expected_directories,
-            &target,
-            base.as_ref(),
-        )
-        .map_err(|_| corrupt("transaction is invalid"))?
-        {
-            return Err(corrupt("transaction preconditions are stale"));
-        }
         Ok(target)
     }
 
@@ -251,6 +274,7 @@ fn apply_records<K, V>(
     removed: impl IntoIterator<Item = K>,
     put: impl IntoIterator<Item = V>,
     key: impl Fn(&V) -> K,
+    validate: impl Fn(K, Option<&V>, Option<&V>) -> Result<(), ManagedError>,
     invalid_delta: &'static str,
 ) -> Result<(), ManagedError>
 where
@@ -258,15 +282,20 @@ where
 {
     let mut changed = BTreeSet::new();
     for id in removed {
-        if !changed.insert(id) || current.remove(&id).is_none() {
+        if !changed.insert(id) || !current.contains_key(&id) {
             return Err(corrupt(invalid_delta));
         }
+        validate(id, current.get(&id), None).map_err(|_| corrupt("transaction is invalid"))?;
+        current.remove(&id);
     }
     for record in put {
-        if !changed.insert(key(&record)) {
+        let id = key(&record);
+        if !changed.insert(id) {
             return Err(corrupt(invalid_delta));
         }
-        current.insert(key(&record), record);
+        validate(id, current.get(&id), Some(&record))
+            .map_err(|_| corrupt("transaction is invalid"))?;
+        current.insert(id, record);
     }
     Ok(())
 }

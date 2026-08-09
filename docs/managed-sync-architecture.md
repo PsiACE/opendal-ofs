@@ -125,8 +125,8 @@ select a metadata backend.
 Sync reads each changed live file once. The same bounded stream writes the
 reconstructable local cache and feeds the volume-owned file-version builder.
 The builder returns an opaque descriptor containing the logical digest and
-extent plan; Sync persists that descriptor in the staging manifest. A retry or
-process restart therefore does not read and hash the cached file again.
+extent plan; Sync persists that descriptor in the pending replica state. A
+retry or process restart therefore does not read and hash the cached file again.
 Namespace publication never depends on a live path that may change or
 disappear. Files below the chunking threshold produce one content extent.
 Larger files use FastCDC. These are placement policies, not different storage
@@ -142,7 +142,7 @@ Staging performs the following work:
    uploads it with create-only semantics.
 4. File completion records supply the logical length and whole-file digest.
 5. The builder returns file versions with complete logical-to-physical extent
-   maps, which the staging manifest stores without interpreting.
+   maps, which the pending replica state stores without interpreting.
 
 Backpressure bounds buffered file data to the active segment, the channel, and
 at most one chunk held by each reader; only the resulting extent metadata grows
@@ -165,9 +165,9 @@ OFS verifies segment structure, every returned content digest, logical length,
 and the assembled whole-file digest before closing the writer. A failed read
 or digest check aborts the staged output.
 
-The read path does not list objects or read a segment footer to locate file
-bytes. The file version already contains the segment identity, byte offset,
-and length.
+The read path does not list objects or consult a second segment index to locate
+file bytes. The file version already contains the segment identity, byte
+offset, and length.
 
 Opening and observing a volume has one provider-independent shape:
 
@@ -177,9 +177,9 @@ Opening and observing a volume has one provider-independent shape:
 | Branch | Superblock and registry name/id | Read branch HEAD, then replay its retained tail from the verified common snapshot |
 
 The registry resolves a branch incarnation; it does not pre-read mutable HEAD
-state that observation will immediately read again. A checkpoint root and its
-parts are loaded only for a cold replica or after its common cursor has fallen
-behind the retained tail. Checkpoint receipts are loaded lazily when tail
+state that observation will immediately read again. A checkpoint is loaded
+only for a cold replica or after its common cursor has fallen behind the
+retained tail. Checkpoint receipts are loaded lazily when tail
 rotation actually needs them. Normal publication does not issue an operation
 receipt lookup before CAS. Receipt resolution belongs only to pending-intent
 recovery, invalid retries, CAS races, and unknown commit results.
@@ -202,35 +202,32 @@ Sync engine do not dispatch on provider types.
 
 ### Object Metadata
 
-Object Metadata has one mutable `head.ofs` and immutable checkpoint roots and
-parts. HEAD contains the current cursor, a checkpoint reference, an ordered
+Object Metadata has one mutable `head.ofs` and immutable checkpoints. HEAD
+contains the current cursor, a checkpoint reference, an ordered
 tail of committed namespace changes, and garbage-collection maintenance state.
 
 Publication writes immutable data first. It writes new checkpoint objects only
 when checkpoint policy requires them, then replaces HEAD with an ETag
 precondition. The conditional replacement is the namespace commit point.
 
-Each checkpoint is one complete snapshot expressed directly as shared node,
-directory, file-version, and operation-receipt records. The writer packs those
-natural records into bounded immutable checkpoint parts and publishes one small
-content-addressed root after all parts are durable. There is no checkpoint-only
-filesystem model, delta table, or tombstone layer. A failed conditional HEAD
-replacement may leave unreferenced immutable checkpoint objects, but it cannot
-expose a partial checkpoint.
+Each checkpoint is one complete snapshot and its operation receipts encoded as
+strict CBOR, compressed, bounded, and stored as one content-addressed OpenDAL
+object. There is no checkpoint-only filesystem model, delta table, part index,
+or tombstone layer. A failed conditional HEAD replacement may leave an
+unreferenced immutable checkpoint, but it cannot expose a partial checkpoint.
 
 An established replica reuses its verified common snapshot when its cursor is
-still covered by the HEAD tail. A cold reader loads the checkpoint root and all
-parts needed to reconstruct the snapshot. Part I/O uses the metadata backend
-without adding a checkpoint-specific concurrency default.
+still covered by the HEAD tail. A cold reader loads the checkpoint with one
+bounded OpenDAL read and verifies its complete content identity before
+decompression.
 
 ### Transactional Metadata
 
 D1 supplies the mutable namespace commit point as one revision-CAS record in
-`ofs_managed_v1_records`. Base and branch authorities use the same key/value
-adapter, checkpoint codec, and namespace records as Object Metadata. Base
-immutable checkpoint objects stay in the volume's OpenDAL operator; branch
-checkpoint records use the native authority backend. Choosing D1 does not
-create another filesystem model or checkpoint format.
+`ofs_managed_v1_authority_records`. Base and branch authorities use the same
+key/value adapter, checkpoint codec, and namespace records as Object Metadata.
+All immutable checkpoints stay in the volume's OpenDAL operator. Choosing D1
+does not create another filesystem model or checkpoint format.
 
 D1 requests have an explicit operation timeout. Schema creation is idempotent
 and is submitted with the operation that first needs the record table, so a new
@@ -296,11 +293,11 @@ common base. If it produces a publication, the pending intent is durable before
 the CAS write and remains present until the committed target is safely installed.
 
 The pending cache is stored beside replica state by relative name. It is not
-authority. Its manifest contains the already verified opaque file versions;
-an absent or malformed current-format manifest invalidates the pending attempt
-instead of selecting a compatibility path. If the operation committed, Sync
-reconstructs from the authoritative snapshot when doing so cannot overwrite a
-local change.
+authority. The replica state's pending intent contains the already verified
+opaque file versions; an absent or malformed cache invalidates the pending
+attempt instead of selecting a compatibility path. If the operation committed,
+Sync returns to the normal observe and reconciliation path so a local change is
+never overwritten.
 
 Directory presence is merged per path. Additions and deletions in disjoint
 subtrees converge. Deleting a directory while the other side changes its
@@ -341,9 +338,9 @@ successful empty collection.
 Foreground publication and materialization do not list the data prefix.
 
 The collector itself performs the one current fence observation used for the
-sweep; callers cannot supply an older snapshot. Branch collection decodes each
-retained checkpoint root once and uses that same root both to mark checkpoint
-parts and to recover retained snapshots.
+sweep; callers cannot supply an older snapshot. Branch collection retains each
+checkpoint referenced by a live head or history state and recovers the
+snapshots used to mark shared data segments.
 
 ## Extensions
 
@@ -353,8 +350,8 @@ model. A branch binding wraps a backend-native authority behind one
 Base and branch expose the same observation, CAS publication, receipt
 resolution, bounded-tail, and unknown-commit behavior. Object and D1 implement
 the same small revision-CAS record operations. Base and branch checkpoints use
-one content-addressed part codec, and branch snapshots and publications use the
-shared node, directory, precondition, and Managed file-version records.
+one content-addressed object codec, and branch snapshots and publications use
+the shared node, directory, precondition, and Managed file-version records.
 
 The branch feature controls commands and extension code only. It does not
 change `managed/1` base-volume readability or create an alternate data plane.

@@ -27,7 +27,7 @@ fn run() -> Result<(), String> {
         Some("managed-sync") => managed_sync::run(arguments),
         Some("-h" | "--help") => {
             println!(
-                "Usage: cargo x managed-sync <doctor|up|down|test workflow object|d1|test branch object|d1|test staging|perf [OUTPUT]|bub [OUTPUT]>"
+                "Usage: cargo x managed-sync <up|down|test all|workflow object|d1|branch object|d1|staging|perf [OPTIONS]>"
             );
             Ok(())
         }

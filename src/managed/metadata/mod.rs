@@ -18,47 +18,43 @@
 pub(crate) mod d1;
 pub(crate) mod namespace;
 pub(crate) mod object;
-#[doc(hidden)]
-pub mod record;
+pub(crate) mod record;
 mod superblock;
 
 pub use d1::D1Config;
-pub(crate) use d1::D1Metadata;
 pub use namespace::NamespaceGcSweep;
 pub use superblock::{ManagedExtension, ManagedFormat, MetadataFormat};
 
-use object::ObjectMetadata;
 use opendal::Operator;
+use record::RecordBackend;
+use superblock::SUPERBLOCK_KEY;
 
 #[cfg(feature = "managed-branch")]
 use super::extensions::branch::{BoundNamespace, BranchStore};
 use super::{ManagedError, ManagedVolume};
-/// The metadata authority selected for one Managed volume.
-///
-/// Backend selection ends here. Callers open formats, volumes, and optional
-/// extensions without repeating Object/D1 dispatch throughout the access
-/// model.
-pub struct ManagedMetadata(MetadataBackend);
-
-enum MetadataBackend {
-    Object(ObjectMetadata),
-    D1(D1Metadata),
+/// The selected format and sole mutable-record authority for one Managed volume.
+pub struct ManagedMetadata {
+    format: MetadataFormat,
+    backend: RecordBackend,
 }
 
 impl ManagedMetadata {
-    pub const fn object(operator: Operator) -> Self {
-        Self(MetadataBackend::Object(ObjectMetadata::new(operator)))
+    pub fn object(operator: Operator) -> Result<Self, ManagedError> {
+        Ok(Self {
+            format: MetadataFormat::ObjectV1,
+            backend: RecordBackend::object(operator, "open Managed metadata")?,
+        })
     }
 
     pub fn d1(config: D1Config) -> Result<Self, ManagedError> {
-        D1Metadata::new(config).map(MetadataBackend::D1).map(Self)
+        Ok(Self {
+            format: MetadataFormat::TransactionalV1,
+            backend: RecordBackend::d1(config)?,
+        })
     }
 
     pub const fn metadata_format(&self) -> MetadataFormat {
-        match &self.0 {
-            MetadataBackend::Object(_) => MetadataFormat::ObjectV1,
-            MetadataBackend::D1(_) => MetadataFormat::TransactionalV1,
-        }
+        self.format
     }
 
     pub async fn create_format(
@@ -66,31 +62,29 @@ impl ManagedMetadata {
         desired: &ManagedFormat,
     ) -> Result<ManagedFormat, ManagedError> {
         self.require_backend_format(desired)?;
-        match &self.0 {
-            MetadataBackend::Object(metadata) => metadata.create_format(desired).await,
-            MetadataBackend::D1(metadata) => metadata.create_format(desired).await,
-        }
+        let observed = self
+            .backend
+            .create_or_read(SUPERBLOCK_KEY, desired.encode()?, "create Managed format")
+            .await
+            .and_then(|bytes| ManagedFormat::decode(&bytes))?;
+        self.require_backend_format(&observed)?;
+        Ok(observed)
     }
 
     pub async fn read_format(&self) -> Result<ManagedFormat, ManagedError> {
-        let format = self.read_format_optional().await?.ok_or_else(|| {
-            ManagedError::new(
-                super::ManagedErrorKind::Unavailable,
-                "read Managed format",
-                "Managed format does not exist",
-            )
-        })?;
-        Ok(format)
-    }
-
-    async fn read_format_optional(&self) -> Result<Option<ManagedFormat>, ManagedError> {
-        let format = match &self.0 {
-            MetadataBackend::Object(metadata) => metadata.read_format_optional().await,
-            MetadataBackend::D1(metadata) => metadata.read_format_optional().await,
-        }?;
-        if let Some(format) = &format {
-            self.require_backend_format(format)?;
-        }
+        let (bytes, _) = self
+            .backend
+            .read(SUPERBLOCK_KEY, "read Managed format")
+            .await?
+            .ok_or_else(|| {
+                ManagedError::new(
+                    super::ManagedErrorKind::Unavailable,
+                    "read Managed format",
+                    "Managed format does not exist",
+                )
+            })?;
+        let format = ManagedFormat::decode(&bytes)?;
+        self.require_backend_format(&format)?;
         Ok(format)
     }
 
@@ -108,10 +102,7 @@ impl ManagedMetadata {
             ));
         }
         let volume_id = format.volume_id();
-        match &self.0 {
-            MetadataBackend::Object(_) => ManagedVolume::object(volume_id, data),
-            MetadataBackend::D1(metadata) => ManagedVolume::d1(volume_id, data, metadata.clone()),
-        }
+        ManagedVolume::new(volume_id, data, self.backend.clone())
     }
 
     #[cfg(feature = "managed-branch")]
@@ -131,7 +122,7 @@ impl ManagedMetadata {
                 "branch namespace does not match the Managed format",
             ));
         }
-        ManagedVolume::branch(format.volume_id(), data, namespace)
+        ManagedVolume::bound(format.volume_id(), data, namespace.0)
     }
 
     #[cfg(feature = "managed-branch")]
@@ -149,10 +140,7 @@ impl ManagedMetadata {
             ));
         }
         let volume_id = format.volume_id();
-        match &self.0 {
-            MetadataBackend::Object(_) => BranchStore::object(volume_id, data),
-            MetadataBackend::D1(metadata) => Ok(BranchStore::d1(volume_id, metadata.clone())),
-        }
+        Ok(BranchStore::new(volume_id, data, self.backend.clone()))
     }
 
     fn require_backend_format(&self, format: &ManagedFormat) -> Result<(), ManagedError> {
@@ -165,20 +153,5 @@ impl ManagedMetadata {
                 "superblock metadata format does not match its authority",
             ))
         }
-    }
-}
-
-fn require_same_format(
-    desired: &ManagedFormat,
-    observed: ManagedFormat,
-) -> Result<ManagedFormat, ManagedError> {
-    if &observed == desired {
-        Ok(observed)
-    } else {
-        Err(ManagedError::new(
-            super::ManagedErrorKind::Conflict,
-            "create Managed format",
-            "metadata is bound to another Managed volume",
-        ))
     }
 }

@@ -9,7 +9,7 @@
 use std::env;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -23,15 +23,13 @@ pub(crate) fn run(mut arguments: impl Iterator<Item = String>) -> Result<(), Str
         .next()
         .ok_or_else(|| "missing Managed Sync command; expected doctor, up, or down".to_string())?;
     match command.as_str() {
-        "doctor" => no_arguments(arguments, doctor),
         "up" => no_arguments(arguments, up),
         "down" => no_arguments(arguments, down),
         "test" => test(arguments),
-        "perf" => optional_output(arguments, run_performance),
-        "bub" => optional_output(arguments, run_bub),
+        "perf" => run_performance(arguments),
         "-h" | "--help" => {
             println!(
-                "Usage: cargo x managed-sync <doctor|up|down|test workflow object|d1|test branch object|d1|test staging|perf [OUTPUT]|bub [OUTPUT]>"
+                "Usage: cargo x managed-sync <up|down|test all|workflow object|d1|branch object|d1|staging|perf [OPTIONS]>"
             );
             Ok(())
         }
@@ -39,81 +37,13 @@ pub(crate) fn run(mut arguments: impl Iterator<Item = String>) -> Result<(), Str
     }
 }
 
-fn optional_output(
-    mut arguments: impl Iterator<Item = String>,
-    action: fn(Option<&str>) -> Result<(), String>,
-) -> Result<(), String> {
-    let output = arguments.next();
-    if let Some(argument) = arguments.next() {
-        return Err(format!("unexpected argument {argument:?}"));
-    }
-    action(output.as_deref())
-}
-
-fn run_performance(output: Option<&str>) -> Result<(), String> {
-    let mut command = Command::new("bash");
+fn run_performance(arguments: impl Iterator<Item = String>) -> Result<(), String> {
+    let mut command = Command::new("python3");
     command
         .current_dir(workspace_root())
-        .arg("tests/performance/managed-sync/run.sh");
-    if let Some(output) = output {
-        command.arg(output);
-    }
+        .arg("scripts/managed_sync_perf.py")
+        .args(arguments);
     run_command(&mut command, "run Managed Sync release A/B")
-}
-
-fn run_bub(output: Option<&str>) -> Result<(), String> {
-    let bub_available = Command::new("bub")
-        .arg("--help")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success());
-    if !bub_available {
-        return Err("Bub is required for the agent workflow".into());
-    }
-    up()?;
-    let result = run_bub_with_fixtures(output);
-    let cleanup = down();
-    result?;
-    cleanup
-}
-
-fn run_bub_with_fixtures(output: Option<&str>) -> Result<(), String> {
-    run_command(
-        Command::new("cargo")
-            .current_dir(workspace_root())
-            .args(["build", "--locked"]),
-        "build ofs for the Bub workflow",
-    )?;
-    let run_root = output.map(PathBuf::from).unwrap_or_else(|| {
-        workspace_root().join(format!(
-            ".local/evidence/managed-sync-bub-{}",
-            std::process::id()
-        ))
-    });
-    if run_root.exists() {
-        return Err(format!("Bub output already exists: {}", run_root.display()));
-    }
-    std::fs::create_dir_all(&run_root)
-        .map_err(|error| format!("could not create Bub output: {error}"))?;
-    let run_root = std::fs::canonicalize(&run_root)
-        .map_err(|error| format!("could not resolve Bub output: {error}"))?;
-    let endpoint = format!("http%3A%2F%2F127.0.0.1%3A{}", minio_port());
-    let storage = format!("s3://managed-sync/bub?endpoint={endpoint}&region=us-east-1");
-    let mut command = Command::new("bash");
-    command
-        .current_dir(workspace_root())
-        .arg("tests/agent/managed-sync/run.sh")
-        .env("OFS_BIN", workspace_root().join("target/debug/ofs"))
-        .env("OFS_RUN_ROOT", &run_root)
-        .env("OFS_STORAGE_URL", storage)
-        .env("AWS_ACCESS_KEY_ID", "minioadmin")
-        .env("AWS_SECRET_ACCESS_KEY", "minioadmin")
-        .env("AWS_REGION", "us-east-1");
-    let result = run_command(&mut command, "run Bub Managed Sync workflow");
-    println!("Bub evidence: {}", run_root.display());
-    result
 }
 
 fn no_arguments(
@@ -127,45 +57,61 @@ fn no_arguments(
 }
 
 fn test(mut arguments: impl Iterator<Item = String>) -> Result<(), String> {
-    let kind = arguments
-        .next()
-        .ok_or_else(|| "expected `test workflow|branch object|d1` or `test staging`".to_string())?;
-    let test = match kind.as_str() {
+    let kind = arguments.next().ok_or_else(|| {
+        "expected `test all`, `test workflow|branch object|d1`, or `test staging`".to_string()
+    })?;
+    let tests = match kind.as_str() {
         "workflow" | "branch" => {
             let metadata = arguments
                 .next()
                 .ok_or_else(|| format!("{kind} requires object or d1 metadata"))?;
-            if !matches!(metadata.as_str(), "object" | "d1") {
-                return Err(format!("{kind} metadata must be object or d1"));
-            }
-            Some((kind, metadata))
+            let metadata = match metadata.as_str() {
+                "object" => "object",
+                "d1" => "d1",
+                _ => return Err(format!("{kind} metadata must be object or d1")),
+            };
+            vec![(Some(kind), metadata)]
         }
-        "staging" => None,
+        "staging" => vec![(None, "object")],
+        "all" => vec![
+            (Some("workflow".into()), "object"),
+            (Some("workflow".into()), "d1"),
+            (Some("branch".into()), "object"),
+            (Some("branch".into()), "d1"),
+            (None, "object"),
+        ],
         _ => {
-            return Err("expected `test workflow|branch object|d1` or `test staging`".into());
+            return Err(
+                "expected `test all`, `test workflow|branch object|d1`, or `test staging`".into(),
+            );
         }
     };
     if let Some(argument) = arguments.next() {
         return Err(format!("unexpected argument {argument:?}"));
     }
-
+    build_ofs()?;
     up()?;
-    let result = match test {
-        Some((kind, metadata)) => run_acceptance(&kind, &metadata),
-        None => run_staging_regression(),
-    };
+    let result = tests
+        .into_iter()
+        .try_for_each(|(kind, metadata)| match kind {
+            Some(kind) => run_acceptance(&kind, metadata),
+            None => run_staging_regression(),
+        });
     let cleanup = down();
     result?;
     cleanup
 }
 
-fn run_staging_regression() -> Result<(), String> {
+fn build_ofs() -> Result<(), String> {
     run_command(
         Command::new("cargo")
             .current_dir(workspace_root())
             .args(["build", "--locked"]),
-        "build ofs for the Managed Sync staging regression",
-    )?;
+        "build ofs for Managed acceptance",
+    )
+}
+
+fn run_staging_regression() -> Result<(), String> {
     let run_root = env::temp_dir().join(format!(
         "ofs-managed-sync-staging-{}-{}",
         std::process::id(),
@@ -209,13 +155,6 @@ fn run_acceptance(suite: &str, metadata: &str) -> Result<(), String> {
         "branch" => "tests/behavior/managed-branch/workflow.sh",
         _ => return Err(format!("unknown acceptance suite {suite:?}")),
     };
-    run_command(
-        Command::new("cargo")
-            .current_dir(workspace_root())
-            .args(["build", "--locked"]),
-        "build ofs for acceptance",
-    )?;
-
     let run_root = env::temp_dir().join(format!(
         "ofs-managed-{suite}-{}-{}",
         std::process::id(),
@@ -265,22 +204,7 @@ fn run_acceptance(suite: &str, metadata: &str) -> Result<(), String> {
     result
 }
 
-fn doctor() -> Result<(), String> {
-    ensure_fixture()?;
-    run_command(
-        compose()?.args(["config", "--quiet"]),
-        "validate Compose fixture",
-    )?;
-    let check = up();
-    let cleanup = down();
-    check?;
-    cleanup?;
-    println!("Managed Sync MinIO and local D1 checks passed.");
-    Ok(())
-}
-
 fn up() -> Result<(), String> {
-    ensure_fixture()?;
     run_command(
         compose()?.args(["up", "--detach", "minio", "d1"]),
         "start MinIO and local D1",
@@ -300,7 +224,6 @@ fn up() -> Result<(), String> {
         ]),
         "create the Managed Sync MinIO bucket",
     )?;
-    query_d1()?;
     println!(
         "Managed Sync fixtures are ready: MinIO http://127.0.0.1:{}, D1 http://127.0.0.1:{}/client/v4.",
         minio_port(),
@@ -310,41 +233,10 @@ fn up() -> Result<(), String> {
 }
 
 fn down() -> Result<(), String> {
-    ensure_fixture()?;
     run_command(
         compose()?.args(["down", "--volumes", "--remove-orphans"]),
         "stop Managed Sync fixtures",
     )
-}
-
-fn query_d1() -> Result<(), String> {
-    let endpoint = format!(
-        "http://127.0.0.1:{}/client/v4/accounts/local/d1/database/managed-sync/query",
-        d1_port()
-    );
-    let output = Command::new("curl")
-        .args([
-            "--fail",
-            "--silent",
-            "--show-error",
-            "--request",
-            "POST",
-            "--header",
-            "Authorization: Bearer local-d1-token",
-            "--header",
-            "Content-Type: application/json",
-            "--data-binary",
-            r#"{"batch":[{"sql":"CREATE TABLE IF NOT EXISTS fixture_doctor (value BLOB NOT NULL)","params":[]},{"sql":"DELETE FROM fixture_doctor","params":[]},{"sql":"INSERT INTO fixture_doctor (value) VALUES (?)","params":[[1,2,3]]},{"sql":"SELECT value FROM fixture_doctor","params":[]}]}"#,
-            &endpoint,
-        ])
-        .output()
-        .map_err(|error| format!("could not query local D1: {error}"))?;
-    require_success(&output, "query local D1")?;
-    let response = String::from_utf8_lossy(&output.stdout);
-    if !response.contains("\"value\": [1, 2, 3]") {
-        return Err("local D1 returned an unexpected query result".into());
-    }
-    Ok(())
 }
 
 fn wait_for_http(url: &str) -> Result<(), String> {
@@ -434,30 +326,6 @@ fn run_command(command: &mut Command, purpose: &str) -> Result<(), String> {
     } else {
         Err(format!("could not {purpose}: process exited with {status}"))
     }
-}
-
-fn require_success(output: &Output, purpose: &str) -> Result<(), String> {
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "could not {purpose}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
-    }
-}
-
-fn ensure_fixture() -> Result<(), String> {
-    for relative in [COMPOSE_FILE, "fixtures/managed-sync/d1-query-api.py"] {
-        let path = workspace_root().join(relative);
-        if !path.is_file() {
-            return Err(format!(
-                "Managed Sync fixture is missing: {}",
-                path.display()
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn workspace_root() -> PathBuf {

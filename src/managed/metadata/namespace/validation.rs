@@ -18,11 +18,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::records::{
-    DirectoryPrecondition, DirectoryRecord, NamespacePublication, NamespaceSnapshot,
-    NodePrecondition, NodeRecord, managed_generation, managed_generation_number,
-    next_managed_generation,
+    DirectoryRecord, NamespacePublication, NamespaceSnapshot, NodeRecord, managed_generation,
+    managed_generation_number, next_managed_generation,
 };
-use crate::filesystem::{ChangeCursor, FileVersionId, NodeAttributes, NodeId, NodeKind};
+use crate::filesystem::{
+    ChangeCursor, FileVersionId, Generation, NodeAttributes, NodeId, NodeKind,
+};
 use crate::managed::{ManagedError, ManagedErrorKind};
 
 pub(crate) fn validate_publication(
@@ -42,34 +43,40 @@ pub(crate) fn validate_publication(
             "publication ancestry is invalid",
         ));
     }
-    validate_transition(
-        &publication.expected_nodes,
-        &publication.expected_directories,
-        &publication.target,
-        base,
-    )
-}
-
-pub(crate) fn validate_transition(
-    expected_nodes: &[NodePrecondition],
-    expected_directories: &[DirectoryPrecondition],
-    target: &NamespaceSnapshot,
-    base: Option<&NamespaceSnapshot>,
-) -> Result<bool, ManagedError> {
+    let target = &publication.target;
     validate_snapshot(target)?;
     let empty_nodes = BTreeMap::new();
     let empty_directories = BTreeMap::new();
     let nodes = base.map_or(&empty_nodes, |state| &state.nodes);
     let directories = base.map_or(&empty_directories, |state| &state.directories);
-    if !preconditions_match_nodes(nodes, expected_nodes)?
-        || !preconditions_match_directories(directories, expected_directories)?
-    {
+    let Some(node_conditions) = match_preconditions(
+        nodes,
+        publication
+            .expected_nodes
+            .iter()
+            .map(|condition| (condition.node, condition.expected_generation.as_ref())),
+        |record| &record.generation,
+        "duplicate node precondition",
+    )?
+    else {
         return Ok(false);
-    }
+    };
+    let Some(directory_conditions) = match_preconditions(
+        directories,
+        publication
+            .expected_directories
+            .iter()
+            .map(|condition| (condition.directory, condition.expected_generation.as_ref())),
+        |record| &record.generation,
+        "duplicate directory precondition",
+    )?
+    else {
+        return Ok(false);
+    };
     validate_generations(
         target,
-        expected_nodes,
-        expected_directories,
+        &node_conditions,
+        &directory_conditions,
         nodes,
         directories,
     )?;
@@ -113,125 +120,99 @@ pub(crate) fn validate_snapshot(snapshot: &NamespaceSnapshot) -> Result<(), Mana
     Ok(())
 }
 
-fn preconditions_match_nodes(
-    current: &BTreeMap<NodeId, NodeRecord>,
-    expected: &[NodePrecondition],
-) -> Result<bool, ManagedError> {
+pub(super) fn match_preconditions<'a, K, V>(
+    current: &BTreeMap<K, V>,
+    expected: impl IntoIterator<Item = (K, Option<&'a Generation>)>,
+    generation: impl Fn(&V) -> &Generation,
+    duplicate: &'static str,
+) -> Result<Option<BTreeSet<K>>, ManagedError>
+where
+    K: Copy + Ord,
+{
     let mut unique = BTreeSet::new();
-    for condition in expected {
-        if !unique.insert(condition.node) {
-            return Err(invalid(
-                "publish Managed namespace",
-                "duplicate node precondition",
-            ));
+    for (key, expected_generation) in expected {
+        if !unique.insert(key) {
+            return Err(invalid("publish Managed namespace", duplicate));
         }
-        if current.get(&condition.node).map(|node| &node.generation)
-            != condition.expected_generation.as_ref()
-        {
-            return Ok(false);
+        if current.get(&key).map(&generation) != expected_generation {
+            return Ok(None);
         }
     }
-    Ok(true)
-}
-
-fn preconditions_match_directories(
-    current: &BTreeMap<NodeId, DirectoryRecord>,
-    expected: &[DirectoryPrecondition],
-) -> Result<bool, ManagedError> {
-    let mut unique = BTreeSet::new();
-    for condition in expected {
-        if !unique.insert(condition.directory) {
-            return Err(invalid(
-                "publish Managed namespace",
-                "duplicate directory precondition",
-            ));
-        }
-        if current
-            .get(&condition.directory)
-            .map(|directory| &directory.generation)
-            != condition.expected_generation.as_ref()
-        {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+    Ok(Some(unique))
 }
 
 fn validate_generations(
     target: &NamespaceSnapshot,
-    expected_nodes: &[NodePrecondition],
-    expected_directories: &[DirectoryPrecondition],
+    node_conditions: &BTreeSet<NodeId>,
+    directory_conditions: &BTreeSet<NodeId>,
     nodes: &BTreeMap<NodeId, NodeRecord>,
     directories: &BTreeMap<NodeId, DirectoryRecord>,
 ) -> Result<(), ManagedError> {
-    let node_conditions = expected_nodes
-        .iter()
-        .map(|condition| condition.node)
-        .collect::<BTreeSet<_>>();
     for id in nodes.keys().chain(target.nodes.keys()) {
         let current = nodes.get(id);
         let next = target.nodes.get(id);
-        let changed = current.map(node_body) != next.map(node_body);
-        let expected = match (current, next, changed) {
-            (None, Some(_), _) => managed_generation(1),
-            (Some(node), Some(_), false) => node.generation.clone(),
-            (Some(node), Some(_), true) => next_managed_generation(&node.generation)
-                .ok_or_else(|| invalid("publish Managed namespace", "node generation overflow"))?,
-            (Some(_), None, _) => {
-                if !node_conditions.contains(id) {
-                    return Err(invalid(
-                        "publish Managed namespace",
-                        "changed node lacks a precondition",
-                    ));
-                }
-                continue;
-            }
-            (None, None, _) => continue,
-        };
-        if next.is_some_and(|node| node.generation != expected)
-            || changed && !node_conditions.contains(id)
-        {
-            return Err(invalid(
-                "publish Managed namespace",
-                "node generation transition is invalid",
-            ));
-        }
+        validate_node_generation(current, next, node_conditions.contains(id))?;
     }
 
-    let directory_conditions = expected_directories
-        .iter()
-        .map(|condition| condition.directory)
-        .collect::<BTreeSet<_>>();
     for id in directories.keys().chain(target.directories.keys()) {
         let current = directories.get(id);
         let next = target.directories.get(id);
-        let changed = current.map(|item| &item.entries) != next.map(|item| &item.entries);
-        let expected = match (current, next, changed) {
-            (None, Some(_), _) => managed_generation(1),
-            (Some(directory), Some(_), false) => directory.generation.clone(),
-            (Some(directory), Some(_), true) => next_managed_generation(&directory.generation)
-                .ok_or_else(|| {
-                    invalid("publish Managed namespace", "directory generation overflow")
-                })?,
-            (Some(_), None, _) => {
-                if !directory_conditions.contains(id) {
-                    return Err(invalid(
-                        "publish Managed namespace",
-                        "changed directory lacks a precondition",
-                    ));
-                }
-                continue;
-            }
-            (None, None, _) => continue,
-        };
-        if next.is_some_and(|directory| directory.generation != expected)
-            || changed && !directory_conditions.contains(id)
-        {
+        validate_directory_generation(current, next, directory_conditions.contains(id))?;
+    }
+    Ok(())
+}
+
+pub(super) fn validate_node_generation(
+    current: Option<&NodeRecord>,
+    next: Option<&NodeRecord>,
+    has_precondition: bool,
+) -> Result<(), ManagedError> {
+    validate_generation(
+        current.map(|record| &record.generation),
+        next.map(|record| &record.generation),
+        current.map(node_body) != next.map(node_body),
+        has_precondition,
+    )
+}
+
+pub(super) fn validate_directory_generation(
+    current: Option<&DirectoryRecord>,
+    next: Option<&DirectoryRecord>,
+    has_precondition: bool,
+) -> Result<(), ManagedError> {
+    validate_generation(
+        current.map(|record| &record.generation),
+        next.map(|record| &record.generation),
+        current.map(|record| &record.entries) != next.map(|record| &record.entries),
+        has_precondition,
+    )
+}
+
+fn validate_generation(
+    current: Option<&Generation>,
+    next: Option<&Generation>,
+    changed: bool,
+    has_precondition: bool,
+) -> Result<(), ManagedError> {
+    let expected = match (current, next, changed) {
+        (None, Some(_), _) => managed_generation(1),
+        (Some(generation), Some(_), false) => generation.clone(),
+        (Some(generation), Some(_), true) => next_managed_generation(generation)
+            .ok_or_else(|| invalid("publish Managed namespace", "record generation overflow"))?,
+        (Some(_), None, _) if has_precondition => return Ok(()),
+        (Some(_), None, _) => {
             return Err(invalid(
                 "publish Managed namespace",
-                "directory generation transition is invalid",
+                "changed record lacks a precondition",
             ));
         }
+        (None, None, _) => return Ok(()),
+    };
+    if next.is_some_and(|generation| *generation != expected) || changed && !has_precondition {
+        return Err(invalid(
+            "publish Managed namespace",
+            "record generation transition is invalid",
+        ));
     }
     Ok(())
 }
@@ -249,7 +230,9 @@ mod tests {
     use std::num::NonZeroU64;
 
     use super::*;
-    use crate::filesystem::{DirectoryEntry, OperationId, VolumeId};
+    use crate::filesystem::{
+        DirectoryEntry, DirectoryPrecondition, NodePrecondition, OperationId, VolumeId,
+    };
     use crate::managed::format::{ContentRef, Extent, ExtentMap, SegmentRef};
     use crate::managed::metadata::namespace::FileVersionRecord;
 
