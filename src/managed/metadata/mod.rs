@@ -40,10 +40,8 @@ use crate::filesystem::VolumeId;
 /// Backend selection ends here. Callers open formats, volumes, and optional
 /// extensions without repeating Object/D1 dispatch throughout the access
 /// model.
-#[derive(Clone)]
 pub struct ManagedMetadata(MetadataBackend);
 
-#[derive(Clone)]
 enum MetadataBackend {
     Object(ObjectMetadata),
     D1(D1Metadata),

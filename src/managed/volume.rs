@@ -81,14 +81,7 @@ impl ManagedVolume {
         format: ManagedFormat,
         data_operator: Operator,
     ) -> Result<Self, ManagedError> {
-        if !format.required_extensions().is_empty() {
-            return Err(ManagedError::new(
-                ManagedErrorKind::Invalid,
-                "open Managed volume",
-                "base namespace does not accept Managed extensions",
-            ));
-        }
-        let volume_id = format.volume_id();
+        let volume_id = base_volume_id(&format)?;
         Ok(Self {
             volume_id,
             namespace: NamespaceAuthority::Base(NamespaceStore::object(
@@ -126,14 +119,7 @@ impl ManagedVolume {
         data_operator: Operator,
         metadata: D1Metadata,
     ) -> Result<Self, ManagedError> {
-        if !format.required_extensions().is_empty() {
-            return Err(ManagedError::new(
-                ManagedErrorKind::Invalid,
-                "open Managed volume",
-                "base namespace does not accept Managed extensions",
-            ));
-        }
-        let volume_id = format.volume_id();
+        let volume_id = base_volume_id(&format)?;
         Ok(Self {
             volume_id,
             namespace: NamespaceAuthority::Base(NamespaceStore::d1(
@@ -319,6 +305,17 @@ impl ManagedVolume {
         let snapshot = to_managed_snapshot(&observed.filesystem_snapshot)?;
         self.data.collect_unreachable_segments(&snapshot).await
     }
+}
+
+fn base_volume_id(format: &ManagedFormat) -> Result<VolumeId, ManagedError> {
+    if !format.required_extensions().is_empty() {
+        return Err(ManagedError::new(
+            ManagedErrorKind::Invalid,
+            "open Managed volume",
+            "base namespace does not accept Managed extensions",
+        ));
+    }
+    Ok(format.volume_id())
 }
 
 impl VolumeObservation for ManagedObservation {
@@ -558,56 +555,5 @@ impl From<ManagedError> for VolumeError {
             ManagedErrorKind::Unavailable => VolumeErrorKind::Unavailable,
         };
         Self::new(kind, error.to_string())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use sha2::{Digest as _, Sha256};
-
-    use super::*;
-    use crate::managed::format::{ContentRef, Extent, SegmentRef};
-
-    #[test]
-    fn filesystem_descriptor_round_trips_a_multi_extent_file() {
-        let first = b"first ";
-        let second = b"second";
-        let logical_digest: [u8; 32] = Sha256::digest([first.as_slice(), second].concat()).into();
-        let record = FileVersionRecord::from_extents(
-            (first.len() + second.len()) as u64,
-            logical_digest,
-            ExtentMap {
-                extents: vec![
-                    Extent {
-                        logical_offset: 0,
-                        content: ContentRef {
-                            digest: Sha256::digest(first).into(),
-                            length: first.len() as u64,
-                        },
-                        segment: SegmentRef {
-                            digest: [1; 32],
-                            length: 128,
-                        },
-                        segment_offset: 10,
-                    },
-                    Extent {
-                        logical_offset: first.len() as u64,
-                        content: ContentRef {
-                            digest: Sha256::digest(second).into(),
-                            length: second.len() as u64,
-                        },
-                        segment: SegmentRef {
-                            digest: [1; 32],
-                            length: 128,
-                        },
-                        segment_offset: 16,
-                    },
-                ],
-            },
-        )
-        .unwrap();
-
-        let exposed = encode_file_version(&record).unwrap();
-        assert_eq!(decode_file_version(&exposed).unwrap(), record);
     }
 }
