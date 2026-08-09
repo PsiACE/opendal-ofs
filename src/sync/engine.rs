@@ -160,6 +160,7 @@ impl<V: Volume> SyncEngine<V> {
         let source_files = staged.files().clone();
         let mut publish = remote.is_none() && !local.entries().is_empty();
         let mut install_remote = false;
+        let mut install_full_tree = false;
         let mut conflicts = Vec::new();
         let mut local_renames = BTreeMap::new();
         let requested = resolve_paths.iter().cloned().collect::<BTreeSet<_>>();
@@ -230,6 +231,7 @@ impl<V: Volume> SyncEngine<V> {
                 }
             }
             let full_tree = state.installed.is_empty() && local.entries().is_empty();
+            install_full_tree = full_tree;
             let installed = materialize_files(
                 &self.volume,
                 &target,
@@ -266,7 +268,11 @@ impl<V: Volume> SyncEngine<V> {
                     bail!("local replica changed while remote state was being installed");
                 }
                 if install_remote {
-                    install_staged_changes(replica_path, &staged, &local, &source_files)?;
+                    if install_full_tree {
+                        install_staged_tree(replica_path, &staging_path)?;
+                    } else {
+                        install_staged_changes(replica_path, &staged, &local, &source_files)?;
+                    }
                 }
                 state = state_from_snapshot(remote_tree, replica_path, &state).await?;
             } else {
@@ -486,6 +492,25 @@ fn install_staged_changes(
         } else {
             set_executable(&destination, entry.executable)?;
         }
+    }
+    Ok(())
+}
+
+fn install_staged_tree(replica: &Path, staging: &Path) -> Result<()> {
+    let backup = fresh_sibling(replica, "backup");
+    let existed = replica.exists();
+    if existed {
+        fs::rename(replica, &backup).context("move prior replica aside")?;
+    }
+    if let Err(error) = fs::rename(staging, replica) {
+        if existed {
+            let _ = fs::rename(&backup, replica);
+        }
+        return Err(error).context("install staged replica tree");
+    }
+    sync_parent(replica)?;
+    if existed {
+        fs::remove_dir_all(backup).context("remove replaced replica tree")?;
     }
     Ok(())
 }
