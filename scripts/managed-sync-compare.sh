@@ -30,6 +30,8 @@ Options:
                           release build of the current working tree.
   --output DIRECTORY      New evidence directory.
   --rounds N              Lifecycle generations (default: 12).
+  --profile NAME          Workload profile: standard or agent-home
+                          (default: standard).
   -h, --help              Show this help.
 EOF
 }
@@ -39,9 +41,10 @@ baseline=
 candidate=
 output=
 rounds=12
+profile=standard
 while (($#)); do
   case $1 in
-    --baseline|--candidate|--output|--rounds)
+    --baseline|--candidate|--output|--rounds|--profile)
       (($# >= 2)) || { printf 'missing value for %s\n' "$1" >&2; exit 2; }
       name=${1#--}
       printf -v "$name" '%s' "$2"
@@ -61,8 +64,12 @@ done
 
 [[ -n $baseline ]] || { printf '%s\n' '--baseline is required' >&2; exit 2; }
 [[ $rounds =~ ^[1-9][0-9]*$ ]] || { printf '%s\n' '--rounds must be greater than zero' >&2; exit 2; }
+case $profile in
+  standard|agent-home) ;;
+  *) printf 'unknown workload profile: %s\n' "$profile" >&2; exit 2 ;;
+esac
 
-declare -a settings=("OFS_PERF_ROUNDS=$rounds")
+declare -a settings=("OFS_PERF_ROUNDS=$rounds" "OFS_PERF_PROFILE=$profile")
 select_source() {
   local role=$1 source=$2 path
   if [[ -f $source ]]; then

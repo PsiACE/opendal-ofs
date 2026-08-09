@@ -9,7 +9,7 @@
 
 set -euo pipefail
 
-baseline_sha=${OFS_PERF_BASELINE:-b262c3ae9f0c8147a3295072fc05e36adb1f9702}
+baseline_sha=${OFS_PERF_BASELINE:-af448ae}
 baseline_binary=${OFS_PERF_BASELINE_BIN:-}
 workspace=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
 suite="$workspace/tests/performance/managed-sync"
@@ -17,12 +17,19 @@ candidate_sha=${OFS_PERF_CANDIDATE:-$(git -C "$workspace" rev-parse HEAD)}
 candidate_binary=${OFS_PERF_CANDIDATE_BIN:-}
 output=${1:-$workspace/.local/performance/managed-sync-ab-$(date -u +%Y%m%dT%H%M%SZ)}
 rounds=${OFS_PERF_ROUNDS:-12}
+profile=${OFS_PERF_PROFILE:-standard}
 bucket=ofs-managed-performance
 access_key=ofs-performance
 secret_key=ofs-performance-password
 minio_image=${MINIO_IMAGE:-quay.io/minio/minio:RELEASE.2024-09-22T00-33-43Z}
 mc_image=${MC_IMAGE:-quay.io/minio/mc:RELEASE.2024-09-16T17-43-14Z}
 schedule=(baseline candidate candidate baseline baseline candidate)
+
+case $profile in
+  standard) workload="$suite/workload.sh" ;;
+  agent-home) workload="$suite/agent-home-workload.sh" ;;
+  *) printf 'unknown workload profile: %s\n' "$profile" >&2; exit 2 ;;
+esac
 
 if [[ -n ${OFS_CONTAINER_RUNTIME:-} ]]; then
   runtime=$OFS_CONTAINER_RUNTIME
@@ -131,8 +138,12 @@ proxy_port=$(<"$proxy_ready")
   printf 'rustc\t%s\n' "$(rustc --version)"
   printf 'kernel\t%s\n' "$(uname -srmo)"
   printf 'container_runtime\t%s\n' "$runtime"
+  if [[ $profile == agent-home ]]; then
+    printf 'agent_image\t%s\n' "${OFS_AGENT_IMAGE:-quay.io/fedora/fedora:44}"
+  fi
   printf 'minio_image\t%s\n' "$minio_image"
   printf 'rounds\t%s\n' "$rounds"
+  printf 'profile\t%s\n' "$profile"
 } >"$output/context.tsv"
 
 for index in "${!schedule[@]}"; do
@@ -146,7 +157,7 @@ for index in "${!schedule[@]}"; do
     OFS_BIN="$scratch/ofs-$release" OFS_RUN_ROOT="$run_root" OFS_STORAGE_URL="$storage_url" \
     OFS_METRICS="$output/samples.tsv" OFS_INPUTS="$output/inputs.tsv" \
     OFS_COMMANDS="$output/commands.tsv" OFS_RELEASE="$release" OFS_RUN_ID="$run" \
-    OFS_PERF_ROUNDS="$rounds" "$suite/workload.sh"
+    OFS_PERF_ROUNDS="$rounds" OFS_CONTAINER_RUNTIME="$runtime" "$workload"
 
   mc_run du --json "performance/$bucket/$object_root" >"$run_root/object-inventory.json"
   mc_run ls --recursive --json "performance/$bucket/$object_root" \

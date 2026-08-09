@@ -123,9 +123,21 @@ Publication writes immutable data first. It writes new checkpoint objects only
 when checkpoint policy requires them, then replaces HEAD with an ETag
 precondition. The conditional replacement is the namespace commit point.
 
+Each checkpoint is a complete snapshot partitioned into stable path ranges.
+The writer groups the records for a path, chooses deterministic boundaries,
+reuses an unchanged range's content-addressed SSTable, and uploads only changed
+ranges. Opaque node and file-version identities remain record keys, but they do
+not control physical placement. This distinction keeps edits near the affected
+paths even when another replica created the nodes. One manifest is sufficient,
+partition ranges never overlap, and there are no delta tables or tombstone
+layers. A failed conditional HEAD replacement may leave unreferenced immutable
+checkpoint objects, but it cannot expose a partial checkpoint.
+
 An established replica can reuse its verified common snapshot when its cursor
-is still covered by the HEAD tail. A cold reader loads the manifest and only
-the SSTable blocks selected by their key ranges.
+is still covered by the HEAD tail. A cold reader loads the manifest and the
+typed-key blocks needed to reconstruct the snapshot. Reads from separate
+SSTable objects run with bounded concurrency. Blocks from one object are
+submitted together through OpenDAL's range fetch interface.
 
 ### Transactional Metadata
 

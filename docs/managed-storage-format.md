@@ -224,8 +224,30 @@ SHA-256 of preceding bytes
 ```
 
 The manifest contains format major, volume identity, checkpoint cursor, root
-node, and ordered SSTable references. SHA-256 of the complete encoded manifest
-determines its object key.
+node, and ordered SSTable references. Each reference carries the encoded table
+length, the first and last physical partition keys, and the table's complete
+block index. The partition ranges MUST be strictly ordered and non-overlapping.
+Together, the referenced tables form one complete snapshot in which every
+namespace record appears exactly once. A reader does not merge overlays or
+apply tombstones. SHA-256 of the complete encoded manifest determines its
+object key.
+
+Snapshot partition keys are derived from portable filesystem paths, not from
+local volume aliases or opaque node identities. The root partition starts with
+byte `1`. Each child appends its UTF-8 name followed by a zero byte. A directory
+entry is assigned to the child's path. Node and directory records use the
+node's path, and a file version uses the lowest path of any file that references
+it. Committed operation results use byte `2` followed by the operation identity.
+The naming policy excludes the zero byte, so this encoding is unambiguous.
+
+A checkpoint writer splits these ordered groups at deterministic,
+content-defined path boundaries with bounded target sizes. It never divides the
+records for one path. When a range has the same records and encoding as the
+preceding checkpoint, the writer reuses its existing SSTable reference. Changed
+ranges become new immutable SSTables. Adding, removing, renaming, or editing a
+path therefore changes its containing range and, at most, the ranges up to the
+next stable boundary. The new manifest still describes the complete namespace,
+so recovery never depends on an older manifest.
 
 ### SSTable
 
@@ -249,9 +271,17 @@ The format major in each block, index, and table envelope is followed by a
 reserved `u16` that MUST be zero. The table checksum determines the SSTable
 object key.
 
-The namespace uses typed key prefixes for nodes, directories, directory
-entries, file versions, and committed operation results. Readers select blocks
-by key range and fetch those byte ranges through OpenDAL.
+Within each SSTable, records remain strictly ordered by typed record key. The
+namespace uses separate prefixes for nodes, directories, directory entries,
+file versions, and committed operation results. Typed record ranges may overlap
+between SSTables because physical partition order is path based. Readers use
+the block index to select typed-key ranges and fetch those byte ranges through
+OpenDAL.
+
+Table splitting thresholds and the boundary function are write policy. They
+are not persisted in the superblock and do not affect decoding. Every table
+reference carries all persisted partition and block metadata needed to validate
+and read that table.
 
 ## Transactional Metadata layout
 

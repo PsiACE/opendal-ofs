@@ -37,11 +37,20 @@ const MIN_BLOCK_BYTES: u32 = 64 * 1024;
 const TARGET_BLOCK_BYTES: u32 = 256 * 1024;
 const MAX_BLOCK_BYTES: u32 = 1024 * 1024;
 const FETCH_COALESCING_GAP_BYTES: usize = 64 * 1024;
+const MIN_TABLE_RECORD_BYTES: usize = 1024 * 1024;
+const MAX_TABLE_RECORD_BYTES: usize = 4 * 1024 * 1024;
+const TABLE_BOUNDARY_MASK: u64 = 0x3f;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Record {
     pub(crate) key: Vec<u8>,
     pub(crate) value: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RecordGroup {
+    pub(crate) partition_key: Vec<u8>,
+    pub(crate) records: Vec<Record>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -60,6 +69,8 @@ pub(crate) struct BlockHandle {
 pub(crate) struct TableRef {
     pub(crate) id: [u8; 32],
     pub(crate) encoded_bytes: u64,
+    pub(crate) first_partition_key: Vec<u8>,
+    pub(crate) last_partition_key: Vec<u8>,
     pub(crate) blocks: Vec<BlockHandle>,
 }
 
@@ -82,12 +93,91 @@ const PRODUCTION_POLICY: BlockPolicy = BlockPolicy {
     maximum: MAX_BLOCK_BYTES,
 };
 
-pub(crate) fn build(
+pub(crate) fn build_set(
     scope: [u8; 16],
-    records: Vec<Record>,
+    groups: Vec<RecordGroup>,
     action: &'static str,
-) -> Result<Option<EncodedTable>, ManagedError> {
-    build_with_policy(scope, records, PRODUCTION_POLICY, action)
+) -> Result<Vec<EncodedTable>, ManagedError> {
+    if groups.iter().any(|group| group.records.is_empty())
+        || groups
+            .windows(2)
+            .any(|pair| pair[0].partition_key >= pair[1].partition_key)
+    {
+        return Err(invalid(
+            action,
+            "SSTable partition groups are not strictly ordered",
+        ));
+    }
+
+    let mut tables = Vec::new();
+    let mut current = Vec::<RecordGroup>::new();
+    let mut current_bytes = 0_usize;
+    for group in groups {
+        for record in &group.records {
+            current_bytes = current_bytes
+                .checked_add(record_frame_length(record, action)?)
+                .ok_or_else(|| invalid(action, "SSTable table size is invalid"))?;
+        }
+        let boundary = current_bytes >= MAX_TABLE_RECORD_BYTES
+            || current_bytes >= MIN_TABLE_RECORD_BYTES && stable_boundary(&group.partition_key);
+        current.push(group);
+        if boundary {
+            tables.push(build_groups(scope, std::mem::take(&mut current), action)?);
+            current_bytes = 0;
+        }
+    }
+    if !current.is_empty() {
+        tables.push(build_groups(scope, current, action)?);
+    }
+    Ok(tables)
+}
+
+fn build_groups(
+    scope: [u8; 16],
+    groups: Vec<RecordGroup>,
+    action: &'static str,
+) -> Result<EncodedTable, ManagedError> {
+    let first_partition_key = groups
+        .first()
+        .expect("groups are not empty")
+        .partition_key
+        .clone();
+    let last_partition_key = groups
+        .last()
+        .expect("groups are not empty")
+        .partition_key
+        .clone();
+    let mut records = groups
+        .into_iter()
+        .flat_map(|group| group.records)
+        .collect::<Vec<_>>();
+    records.sort_by(|left, right| left.key.cmp(&right.key));
+    let mut table = build_with_policy(scope, records, PRODUCTION_POLICY, action)?
+        .expect("partition groups contain records");
+    table.reference.first_partition_key = first_partition_key;
+    table.reference.last_partition_key = last_partition_key;
+    Ok(table)
+}
+
+fn record_frame_length(record: &Record, action: &'static str) -> Result<usize, ManagedError> {
+    let _ =
+        u32::try_from(record.key.len()).map_err(|_| invalid(action, "SSTable key is too long"))?;
+    let _ = u32::try_from(record.value.len())
+        .map_err(|_| invalid(action, "SSTable value is too long"))?;
+    8_usize
+        .checked_add(record.key.len())
+        .and_then(|length| length.checked_add(record.value.len()))
+        .ok_or_else(|| invalid(action, "SSTable record is too large"))
+}
+
+fn stable_boundary(key: &[u8]) -> bool {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    key.iter().fold(FNV_OFFSET, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
+    }) & TABLE_BOUNDARY_MASK
+        == 0
 }
 
 fn build_with_policy(
@@ -102,6 +192,8 @@ fn build_with_policy(
     if records.windows(2).any(|pair| pair[0].key >= pair[1].key) {
         return Err(invalid(action, "SSTable records are not strictly ordered"));
     }
+    let first_key = records.first().expect("table is non-empty").key.clone();
+    let last_key = records.last().expect("table is non-empty").key.clone();
     let envelope =
         u32::try_from(BLOCK_HEADER_LENGTH + BLOCK_TRAILER_LENGTH).expect("block envelope fits u32");
     if policy.minimum <= envelope
@@ -177,6 +269,8 @@ fn build_with_policy(
         reference: TableRef {
             id,
             encoded_bytes: bytes.len() as u64,
+            first_partition_key: first_key,
+            last_partition_key: last_key,
             blocks,
         },
         bytes,

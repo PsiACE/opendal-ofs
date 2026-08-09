@@ -71,15 +71,7 @@ def object_class(path: str) -> str:
     decoded = "/" + unquote(path).lstrip("/")
     if "/.ofs/managed/data/v1/segments/sha256/" in decoded:
         return "segment_data"
-    if "/.ofs/managed/indexes/data-pack/v1/packs/sha256/" in decoded:
-        return "pack_data"
-    if "/.ofs/managed/indexes/data-pack/v1/" in decoded:
-        return "secondary_index"
-    if "/.ofs/managed/data/v1/loose/sha256/" in decoded or "/data/sha256/" in decoded:
-        return "loose_data"
-    if decoded.endswith("/.ofs/managed/metadata/v1/superblock.json") or decoded.endswith(
-        "/metadata/format"
-    ):
+    if decoded.endswith("/.ofs/managed/metadata/v1/superblock.json"):
         return "format"
     if "/.ofs/managed/metadata/v1/" in decoded or "/metadata/" in decoded:
         return "metadata"
@@ -106,11 +98,7 @@ def load_requests(path: Path, intervals):
         distribution[key]["bytes_in"] += request["bytes_in"]
         distribution[key]["bytes_out"] += request["bytes_out"]
         uploaded[run]["request_bytes"] += request["bytes_in"]
-        if request["method"] == "PUT" and classification in {
-            "segment_data",
-            "loose_data",
-            "pack_data",
-        }:
+        if request["method"] == "PUT" and classification == "segment_data":
             uploaded[run]["data_put_bytes"] += request["bytes_in"]
             if phase == "noop":
                 noop_data_puts.append(request)
@@ -193,8 +181,8 @@ def comparison_summary(samples, requests, inventories, inputs, equal):
             "total_bytes": 0,
         }
     )
-    metadata_classes = {"format", "metadata", "secondary_index"}
-    data_classes = {"segment_data", "loose_data", "pack_data"}
+    metadata_classes = {"format", "metadata"}
+    data_classes = {"segment_data"}
     for row in inventories:
         total = object_totals[row["run"]]
         total["total_objects"] += row["objects"]

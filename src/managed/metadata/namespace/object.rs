@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::num::NonZeroU64;
 
+use futures::{StreamExt as _, TryStreamExt as _, stream};
 use opendal::{ErrorKind, Operator};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -38,7 +39,9 @@ use crate::filesystem::{
     ChangeCursor, CommitOutcome, FileVersionId, NodeId, OperationId, VolumeId,
 };
 use crate::managed::format::ExtentMap;
-use crate::managed::format::sstable::{self, Record as TableRecord, TableRef};
+use crate::managed::format::sstable::{
+    self, Record as TableRecord, RecordGroup as TableRecordGroup, TableRef,
+};
 use crate::managed::{ManagedError, ManagedErrorKind};
 
 #[cfg(test)]
@@ -56,11 +59,15 @@ const MAX_TAIL_TRANSACTIONS: u16 = 32;
 const MAX_TAIL_BYTES: usize = 128 * 1024;
 const MAX_HEAD_BYTES: usize = 256 * 1024;
 const HEAD_COMPRESSION_LEVEL: i32 = 3;
+const MAX_CHECKPOINT_UPLOADS: usize = 8;
+const MAX_CHECKPOINT_READS: usize = 8;
 const NODE_PREFIX: u8 = 1;
 const DIRECTORY_PREFIX: u8 = 2;
 const DIRECTORY_ENTRY_PREFIX: u8 = 3;
 const FILE_VERSION_PREFIX: u8 = 4;
 const OPERATION_RESULT_PREFIX: u8 = 5;
+const SNAPSHOT_PARTITION_PREFIX: u8 = 1;
+const OPERATION_PARTITION_PREFIX: u8 = 2;
 
 #[derive(Clone, Debug)]
 pub(crate) struct NamespaceObservation {
@@ -217,13 +224,16 @@ impl ObjectNamespace {
             // The publication target and committed change tail are pinned by
             // the observation used for CAS. Building a manifest never rereads
             // the remote checkpoint or HEAD.
+            let mut previous_manifest = None;
             let mut committed = match observed {
                 Some(value) => {
                     let manifest = match &value.authority.manifest {
                         Some(manifest) => manifest.clone(),
                         None => self.read_manifest(&value.authority.head.checkpoint).await?,
                     };
-                    self.read_operation_results(&manifest).await?
+                    let committed = self.read_operation_results(&manifest).await?;
+                    previous_manifest = Some(manifest);
+                    committed
                 }
                 None => BTreeMap::new(),
             };
@@ -243,7 +253,7 @@ impl ObjectNamespace {
                 },
             );
             let checkpoint = self
-                .checkpoint_full(&publication.target, &committed)
+                .checkpoint_full(&publication.target, &committed, previous_manifest.as_ref())
                 .await?;
             let bytes = encode_cbor(MANIFEST_MAGIC, &checkpoint, "checkpoint Managed namespace")?;
             let checkpoint_id = sha256(&bytes);
@@ -486,28 +496,49 @@ impl ObjectNamespace {
         &self,
         snapshot: &NamespaceSnapshot,
         committed: &BTreeMap<OperationId, StoredCommittedResult>,
+        previous: Option<&StoredManifest>,
     ) -> Result<StoredManifest, ManagedError> {
         let scope = *self.volume_id.as_bytes();
-        let mut records = Vec::new();
+        let paths = snapshot_partition_keys(snapshot)?;
+        let mut groups = BTreeMap::<Vec<u8>, Vec<TableRecord>>::new();
         for node in snapshot.nodes.values() {
-            records.push(TableRecord {
-                key: typed_key(NODE_PREFIX, node.id.as_bytes()),
-                value: encode_table_value(
-                    &SnapshotNodeRecord::from(node),
+            let partition = paths.get(&node.id).ok_or_else(|| {
+                invalid(
                     "checkpoint Managed namespace",
-                )?,
-            });
+                    "snapshot node is not reachable from its root",
+                )
+            })?;
+            groups
+                .entry(partition.clone())
+                .or_default()
+                .push(TableRecord {
+                    key: typed_key(NODE_PREFIX, node.id.as_bytes()),
+                    value: encode_table_value(
+                        &SnapshotNodeRecord::from(node),
+                        "checkpoint Managed namespace",
+                    )?,
+                });
         }
         for directory in snapshot.directories.values() {
-            records.push(TableRecord {
-                key: typed_key(DIRECTORY_PREFIX, directory.node.as_bytes()),
-                value: encode_table_value(
-                    &SnapshotDirectoryRecord::from(directory),
+            let partition = paths.get(&directory.node).ok_or_else(|| {
+                invalid(
                     "checkpoint Managed namespace",
-                )?,
-            });
+                    "snapshot directory is not reachable from its root",
+                )
+            })?;
+            groups
+                .entry(partition.clone())
+                .or_default()
+                .push(TableRecord {
+                    key: typed_key(DIRECTORY_PREFIX, directory.node.as_bytes()),
+                    value: encode_table_value(
+                        &SnapshotDirectoryRecord::from(directory),
+                        "checkpoint Managed namespace",
+                    )?,
+                });
             for (name, entry) in &directory.entries {
-                records.push(TableRecord {
+                let partition = child_partition_key(partition, name)?;
+                groups.entry(partition).or_default().push(TableRecord {
                     key: directory_entry_key(directory.node, name),
                     value: encode_table_value(
                         &StoredDirectoryEntry::from(*entry),
@@ -516,32 +547,89 @@ impl ObjectNamespace {
                 });
             }
         }
+        let mut version_partitions = BTreeMap::<FileVersionId, Vec<u8>>::new();
+        for node in snapshot.nodes.values() {
+            if let Some(version) = node.file_version {
+                let partition = paths.get(&node.id).ok_or_else(|| {
+                    invalid(
+                        "checkpoint Managed namespace",
+                        "snapshot file is not reachable from its root",
+                    )
+                })?;
+                version_partitions
+                    .entry(version)
+                    .and_modify(|current| {
+                        if partition < current {
+                            current.clone_from(partition);
+                        }
+                    })
+                    .or_insert_with(|| partition.clone());
+            }
+        }
         for version in snapshot.file_versions.values() {
-            records.push(TableRecord {
-                key: typed_key(FILE_VERSION_PREFIX, version.id.as_bytes()),
-                value: encode_table_value(
-                    &SnapshotFileVersionRecord::from(version),
+            let partition = version_partitions.get(&version.id).ok_or_else(|| {
+                invalid(
                     "checkpoint Managed namespace",
-                )?,
-            });
+                    "snapshot file version is not referenced by a file",
+                )
+            })?;
+            groups
+                .entry(partition.clone())
+                .or_default()
+                .push(TableRecord {
+                    key: typed_key(FILE_VERSION_PREFIX, version.id.as_bytes()),
+                    value: encode_table_value(
+                        &SnapshotFileVersionRecord::from(version),
+                        "checkpoint Managed namespace",
+                    )?,
+                });
         }
         for (operation, result) in committed {
-            records.push(TableRecord {
+            let mut partition = Vec::with_capacity(1 + operation.as_bytes().len());
+            partition.push(OPERATION_PARTITION_PREFIX);
+            partition.extend_from_slice(operation.as_bytes());
+            groups.entry(partition).or_default().push(TableRecord {
                 key: typed_key(OPERATION_RESULT_PREFIX, operation.as_bytes()),
                 value: encode_table_value(result, "checkpoint Managed namespace")?,
             });
         }
-        records.sort_by(|left, right| left.key.cmp(&right.key));
-        let encoded = sstable::build(scope, records, "checkpoint Managed namespace")?
-            .expect("a valid namespace contains at least its root node");
-        self.ensure_immutable(&sstable_key(&encoded.reference.id), &encoded.bytes)
+        let groups = groups
+            .into_iter()
+            .map(|(partition_key, mut records)| {
+                records.sort_by(|left, right| left.key.cmp(&right.key));
+                TableRecordGroup {
+                    partition_key,
+                    records,
+                }
+            })
+            .collect();
+        let encoded = sstable::build_set(scope, groups, "checkpoint Managed namespace")?;
+        let tables: Vec<TableRef> = stream::iter(encoded)
+            .map(|encoded| async move {
+                if let Some(existing) = previous
+                    .into_iter()
+                    .flat_map(|manifest| &manifest.tables)
+                    .find(|existing| *existing == &encoded.reference)
+                {
+                    return Ok(existing.clone());
+                }
+                self.ensure_immutable(&sstable_key(&encoded.reference.id), &encoded.bytes)
+                    .await?;
+                Ok(encoded.reference)
+            })
+            .buffered(MAX_CHECKPOINT_UPLOADS)
+            .try_collect()
             .await?;
+        debug_assert!(
+            !tables.is_empty(),
+            "a valid namespace contains its root node"
+        );
         Ok(StoredManifest {
             major: FORMAT_MAJOR,
             volume_id: scope,
             cursor: snapshot.cursor.into(),
             root: *snapshot.root.as_bytes(),
-            tables: vec![encoded.reference],
+            tables,
         })
     }
 
@@ -554,82 +642,74 @@ impl ObjectNamespace {
         let mut directories = BTreeMap::new();
         let mut entries = Vec::new();
         let mut file_versions = BTreeMap::new();
-        for table in checkpoint.tables.iter().cloned() {
-            let lower = [NODE_PREFIX];
-            let upper = [OPERATION_RESULT_PREFIX];
-            let blocks = table
-                .blocks
-                .into_iter()
-                .filter(|block| {
-                    block.last_key.as_slice() >= lower.as_slice()
-                        && block.first_key.as_slice() < upper.as_slice()
-                })
-                .collect();
-            let records = sstable::fetch(
-                &self.operator,
-                &sstable_key(&table.id),
-                *self.volume_id.as_bytes(),
-                blocks,
-                "read Managed namespace",
-            )
+        let tables: Vec<Vec<TableRecord>> = stream::iter(checkpoint.tables.iter().cloned())
+            .map(|table| {
+                self.read_table_range(
+                    table,
+                    NODE_PREFIX,
+                    OPERATION_RESULT_PREFIX,
+                    "read Managed namespace",
+                )
+            })
+            .buffered(MAX_CHECKPOINT_READS)
+            .try_collect()
             .await?;
-            for (_, records) in records {
-                for record in records {
-                    let (&prefix, key) = record
-                        .key
-                        .split_first()
-                        .ok_or_else(|| corrupt("read Managed namespace", "SSTable key is empty"))?;
-                    match prefix {
-                        NODE_PREFIX => {
-                            let stored: SnapshotNodeRecord =
-                                decode_table_value(&record.value, "read Managed namespace")?;
-                            let id = table_node_id(key, "node table key is invalid")?;
-                            if nodes.contains_key(&id) {
-                                return Err(corrupt(
-                                    "read Managed namespace",
-                                    "node table key is invalid",
-                                ));
-                            }
-                            let node = stored.into_record(id);
-                            nodes.insert(node.id, node);
-                        }
-                        DIRECTORY_PREFIX => {
-                            let stored: SnapshotDirectoryRecord =
-                                decode_table_value(&record.value, "read Managed namespace")?;
-                            let node = table_node_id(key, "directory table key is invalid")?;
-                            let directory = stored.into_record(node);
-                            if directories.insert(directory.node, directory).is_some() {
-                                return Err(corrupt(
-                                    "read Managed namespace",
-                                    "duplicate directory record",
-                                ));
-                            }
-                        }
-                        DIRECTORY_ENTRY_PREFIX => {
-                            let stored: StoredDirectoryEntry =
-                                decode_table_value(&record.value, "read Managed namespace")?;
-                            let (directory, name) = table_directory_entry_key(key)?;
-                            entries.push((directory, name, stored));
-                        }
-                        FILE_VERSION_PREFIX => {
-                            let stored: SnapshotFileVersionRecord =
-                                decode_table_value(&record.value, "read Managed namespace")?;
-                            let id = table_file_version_id(key)?;
-                            let version = stored.into_record(id);
-                            if file_versions.insert(version.id, version).is_some() {
-                                return Err(corrupt(
-                                    "read Managed namespace",
-                                    "duplicate file version record",
-                                ));
-                            }
-                        }
-                        OPERATION_RESULT_PREFIX => continue,
-                        _ => {
+        for records in tables {
+            for record in records {
+                let (&prefix, key) = record
+                    .key
+                    .split_first()
+                    .ok_or_else(|| corrupt("read Managed namespace", "SSTable key is empty"))?;
+                match prefix {
+                    NODE_PREFIX => {
+                        let stored: SnapshotNodeRecord =
+                            decode_table_value(&record.value, "read Managed namespace")?;
+                        let id = table_node_id(key, "node table key is invalid")?;
+                        if nodes.contains_key(&id) {
                             return Err(corrupt(
                                 "read Managed namespace",
-                                "SSTable key type is invalid",
+                                "node table key is invalid",
                             ));
                         }
+                        let node = stored.into_record(id);
+                        nodes.insert(node.id, node);
+                    }
+                    DIRECTORY_PREFIX => {
+                        let stored: SnapshotDirectoryRecord =
+                            decode_table_value(&record.value, "read Managed namespace")?;
+                        let node = table_node_id(key, "directory table key is invalid")?;
+                        let directory = stored.into_record(node);
+                        if directories.insert(directory.node, directory).is_some() {
+                            return Err(corrupt(
+                                "read Managed namespace",
+                                "duplicate directory record",
+                            ));
+                        }
+                    }
+                    DIRECTORY_ENTRY_PREFIX => {
+                        let stored: StoredDirectoryEntry =
+                            decode_table_value(&record.value, "read Managed namespace")?;
+                        let (directory, name) = table_directory_entry_key(key)?;
+                        entries.push((directory, name, stored));
+                    }
+                    FILE_VERSION_PREFIX => {
+                        let stored: SnapshotFileVersionRecord =
+                            decode_table_value(&record.value, "read Managed namespace")?;
+                        let id = table_file_version_id(key)?;
+                        let version = stored.into_record(id);
+                        if file_versions.insert(version.id, version).is_some() {
+                            return Err(corrupt(
+                                "read Managed namespace",
+                                "duplicate file version record",
+                            ));
+                        }
+                    }
+                    OPERATION_RESULT_PREFIX => continue,
+                    _ => {
+                        return Err(corrupt(
+                            "read Managed namespace",
+                            "SSTable key type is invalid",
+                        ));
                     }
                 }
             }
@@ -685,46 +765,67 @@ impl ObjectNamespace {
         manifest: &StoredManifest,
     ) -> Result<BTreeMap<OperationId, StoredCommittedResult>, ManagedError> {
         validate_tables(&manifest.tables)?;
-        let lower = [OPERATION_RESULT_PREFIX];
-        let upper = [OPERATION_RESULT_PREFIX + 1];
         let mut results = BTreeMap::new();
-        for table in &manifest.tables {
-            let blocks = table
-                .blocks
-                .iter()
-                .filter(|block| {
-                    block.last_key.as_slice() >= lower.as_slice()
-                        && block.first_key.as_slice() < upper.as_slice()
-                })
-                .cloned()
-                .collect();
-            for (_, records) in sstable::fetch(
-                &self.operator,
-                &sstable_key(&table.id),
-                *self.volume_id.as_bytes(),
-                blocks,
-                "read Managed operation results",
-            )
-            .await?
-            {
-                for record in records {
-                    if record.key.first() != Some(&OPERATION_RESULT_PREFIX) {
-                        continue;
-                    }
-                    let operation = operation_id_from_key(&record.key[1..])?;
-                    let result: StoredCommittedResult =
-                        decode_table_value(&record.value, "read Managed operation results")?;
-                    result.validate(operation)?;
-                    if results.insert(operation, result).is_some() {
-                        return Err(corrupt(
-                            "read Managed operation results",
-                            "duplicate operation result",
-                        ));
-                    }
+        let tables: Vec<Vec<TableRecord>> = stream::iter(manifest.tables.iter().cloned())
+            .map(|table| {
+                self.read_table_range(
+                    table,
+                    OPERATION_RESULT_PREFIX,
+                    OPERATION_RESULT_PREFIX + 1,
+                    "read Managed operation results",
+                )
+            })
+            .buffered(MAX_CHECKPOINT_READS)
+            .try_collect()
+            .await?;
+        for records in tables {
+            for record in records {
+                if record.key.first() != Some(&OPERATION_RESULT_PREFIX) {
+                    continue;
+                }
+                let operation = operation_id_from_key(&record.key[1..])?;
+                let result: StoredCommittedResult =
+                    decode_table_value(&record.value, "read Managed operation results")?;
+                result.validate(operation)?;
+                if results.insert(operation, result).is_some() {
+                    return Err(corrupt(
+                        "read Managed operation results",
+                        "duplicate operation result",
+                    ));
                 }
             }
         }
         Ok(results)
+    }
+
+    async fn read_table_range(
+        &self,
+        table: TableRef,
+        lower: u8,
+        upper: u8,
+        action: &'static str,
+    ) -> Result<Vec<TableRecord>, ManagedError> {
+        let lower = [lower];
+        let upper = [upper];
+        let blocks = table
+            .blocks
+            .into_iter()
+            .filter(|block| {
+                block.last_key.as_slice() >= lower.as_slice()
+                    && block.first_key.as_slice() < upper.as_slice()
+            })
+            .collect();
+        Ok(sstable::fetch(
+            &self.operator,
+            &sstable_key(&table.id),
+            *self.volume_id.as_bytes(),
+            blocks,
+            action,
+        )
+        .await?
+        .into_iter()
+        .flat_map(|(_, records)| records)
+        .collect())
     }
 
     async fn read_operation_result(
@@ -844,6 +945,49 @@ fn directory_entry_key(directory: NodeId, name: &str) -> Vec<u8> {
     key.extend_from_slice(directory.as_bytes());
     key.extend_from_slice(name.as_bytes());
     key
+}
+
+fn snapshot_partition_keys(
+    snapshot: &NamespaceSnapshot,
+) -> Result<BTreeMap<NodeId, Vec<u8>>, ManagedError> {
+    let root = vec![SNAPSHOT_PARTITION_PREFIX];
+    let mut paths = BTreeMap::from([(snapshot.root, root)]);
+    let mut pending = vec![snapshot.root];
+    while let Some(directory_id) = pending.pop() {
+        let directory = snapshot.directories.get(&directory_id).ok_or_else(|| {
+            invalid(
+                "checkpoint Managed namespace",
+                "snapshot directory is missing",
+            )
+        })?;
+        let parent = paths
+            .get(&directory_id)
+            .expect("pending directories have a path")
+            .clone();
+        for (name, entry) in &directory.entries {
+            let path = child_partition_key(&parent, name)?;
+            if paths.insert(entry.node, path).is_none()
+                && snapshot.directories.contains_key(&entry.node)
+            {
+                pending.push(entry.node);
+            }
+        }
+    }
+    Ok(paths)
+}
+
+fn child_partition_key(parent: &[u8], name: &str) -> Result<Vec<u8>, ManagedError> {
+    if name.as_bytes().contains(&0) {
+        return Err(invalid(
+            "checkpoint Managed namespace",
+            "snapshot name contains an invalid byte",
+        ));
+    }
+    let mut key = Vec::with_capacity(parent.len() + name.len() + 1);
+    key.extend_from_slice(parent);
+    key.extend_from_slice(name.as_bytes());
+    key.push(0);
+    Ok(key)
 }
 
 fn typed_key(prefix: u8, body: &[u8]) -> Vec<u8> {
@@ -1294,9 +1438,13 @@ fn transaction_sha256(
 }
 
 fn validate_tables(tables: &[TableRef]) -> Result<(), ManagedError> {
-    let mut previous_last: Option<&[u8]> = None;
+    let mut previous_partition_last: Option<&[u8]> = None;
     for table in tables {
         if table.encoded_bytes == 0
+            || table.first_partition_key.is_empty()
+            || table.first_partition_key > table.last_partition_key
+            || previous_partition_last
+                .is_some_and(|last| last >= table.first_partition_key.as_slice())
             || table.blocks.is_empty()
             || table.blocks.iter().any(|block| {
                 block.records == 0 || block.encoded_bytes == 0 || block.first_key > block.last_key
@@ -1307,7 +1455,9 @@ fn validate_tables(tables: &[TableRef]) -> Result<(), ManagedError> {
                 "manifest SSTable references are invalid",
             ));
         }
+        previous_partition_last = Some(&table.last_partition_key);
         let mut end = 0_u64;
+        let mut previous_last: Option<&[u8]> = None;
         for block in &table.blocks {
             if block.offset < end
                 || block.offset.checked_add(block.encoded_bytes).is_none()
@@ -1851,7 +2001,7 @@ mod tests {
             operator: operator.clone(),
         };
         let checkpoint = namespace
-            .checkpoint_full(&snapshot, &BTreeMap::new())
+            .checkpoint_full(&snapshot, &BTreeMap::new(), None)
             .await
             .unwrap();
         assert_eq!(checkpoint.tables.len(), 1);
@@ -1859,7 +2009,7 @@ mod tests {
         let missing = sstable_key(&checkpoint.tables[0].id);
         operator.delete(&missing).await.unwrap();
         let checkpoint = namespace
-            .checkpoint_full(&snapshot, &BTreeMap::new())
+            .checkpoint_full(&snapshot, &BTreeMap::new(), None)
             .await
             .unwrap();
         assert!(operator.stat(&missing).await.is_ok());
