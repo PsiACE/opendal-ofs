@@ -281,8 +281,8 @@ impl NamespaceStore {
                                 .1
                         }
                     };
-                    let previous_history = if let Some(branch) = self.authority.branch_id() {
-                        let history = StoredHistory::new(self.volume_id, branch, current)?;
+                    let previous_history = if self.authority.branch_id().is_some() {
+                        let history = StoredHistory::new(self.volume_id, current)?;
                         Some(self.write_history(&history).await?)
                     } else {
                         None

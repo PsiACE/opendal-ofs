@@ -30,35 +30,47 @@ use crate::filesystem::{VolumeId, VolumeModel};
 
 const SCHEMA_MAJOR: u16 = 1;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct VolumeDefinition {
     pub volume_id: VolumeId,
     pub model: VolumeModel,
     pub storage: Url,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Url>,
 }
 
 impl VolumeDefinition {
     pub fn direct(volume_id: VolumeId, storage: Url) -> Result<Self> {
-        require_credential_free("storage", &storage)?;
-        Ok(Self {
+        let definition = Self {
             volume_id,
             model: VolumeModel::Direct,
             storage,
             metadata: None,
-        })
+        };
+        definition.validate()?;
+        Ok(definition)
     }
     pub fn managed(volume_id: VolumeId, storage: Url, metadata: Option<Url>) -> Result<Self> {
-        require_credential_free("storage", &storage)?;
-        if let Some(metadata) = &metadata {
-            require_credential_free("metadata", metadata)?;
-        }
-        Ok(Self {
+        let definition = Self {
             volume_id,
             model: VolumeModel::Managed,
             storage,
             metadata,
-        })
+        };
+        definition.validate()?;
+        Ok(definition)
+    }
+
+    fn validate(&self) -> Result<()> {
+        require_credential_free("storage", &self.storage)?;
+        if let Some(metadata) = &self.metadata {
+            require_credential_free("metadata", metadata)?;
+        }
+        if self.model == VolumeModel::Direct && self.metadata.is_some() {
+            bail!("Direct volume contains Managed-only catalog settings");
+        }
+        Ok(())
     }
 }
 
@@ -90,11 +102,11 @@ impl Catalog {
             );
         }
         let mut volumes: BTreeMap<String, VolumeDefinition> = BTreeMap::new();
-        for (alias, stored) in stored.volumes {
+        for (alias, definition) in stored.volumes {
             if alias.is_empty() {
                 bail!("volume alias is empty");
             }
-            let definition: VolumeDefinition = stored.try_into()?;
+            definition.validate()?;
             if let Some((existing, _)) = volumes
                 .iter()
                 .find(|(_, current)| current.volume_id == definition.volume_id)
@@ -124,6 +136,7 @@ impl Catalog {
         if alias.is_empty() {
             bail!("volume alias is empty");
         }
+        definition.validate()?;
         match self.volumes.get(alias) {
             Some(existing) if existing == &definition => Ok(false),
             Some(_) => bail!("volume alias {alias:?} conflicts with its existing configuration"),
@@ -138,7 +151,10 @@ impl Catalog {
     }
 
     pub fn save(&self) -> Result<()> {
-        let stored = StoredCatalog::from(self);
+        let stored = StoredCatalog {
+            schema_major: SCHEMA_MAJOR,
+            volumes: self.volumes.clone(),
+        };
         let mut bytes = serde_json::to_vec_pretty(&stored)?;
         bytes.push(b'\n');
 
@@ -181,73 +197,7 @@ impl Catalog {
 #[serde(deny_unknown_fields)]
 struct StoredCatalog {
     schema_major: u16,
-    volumes: BTreeMap<String, StoredVolume>,
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct StoredVolume {
-    volume_id: [u8; 16],
-    model: String,
-    storage: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    metadata: Option<String>,
-}
-
-impl From<&Catalog> for StoredCatalog {
-    fn from(catalog: &Catalog) -> Self {
-        let volumes = catalog
-            .volumes
-            .iter()
-            .map(|(alias, volume)| (alias.clone(), StoredVolume::from(volume)))
-            .collect();
-        Self {
-            schema_major: SCHEMA_MAJOR,
-            volumes,
-        }
-    }
-}
-
-impl From<&VolumeDefinition> for StoredVolume {
-    fn from(volume: &VolumeDefinition) -> Self {
-        Self {
-            volume_id: *volume.volume_id.as_bytes(),
-            model: match volume.model {
-                VolumeModel::Direct => "direct",
-                VolumeModel::Managed => "managed",
-            }
-            .into(),
-            storage: volume.storage.to_string(),
-            metadata: volume.metadata.as_ref().map(ToString::to_string),
-        }
-    }
-}
-
-impl TryFrom<StoredVolume> for VolumeDefinition {
-    type Error = anyhow::Error;
-
-    fn try_from(volume: StoredVolume) -> Result<Self> {
-        let volume_id = VolumeId::from_bytes(volume.volume_id);
-        let model = match volume.model.as_str() {
-            "direct" => VolumeModel::Direct,
-            "managed" => VolumeModel::Managed,
-            value => bail!("unknown volume model {value:?}"),
-        };
-        let storage = Url::parse(&volume.storage).context("invalid storage URL in catalog")?;
-        let metadata = volume
-            .metadata
-            .map(|value| Url::parse(&value).context("invalid metadata URL in catalog"))
-            .transpose()?;
-        match model {
-            VolumeModel::Direct => {
-                if metadata.is_some() {
-                    bail!("Direct volume contains Managed-only catalog settings");
-                }
-                Self::direct(volume_id, storage)
-            }
-            VolumeModel::Managed => Self::managed(volume_id, storage, metadata),
-        }
-    }
+    volumes: BTreeMap<String, VolumeDefinition>,
 }
 
 fn require_credential_free(kind: &str, url: &Url) -> Result<()> {

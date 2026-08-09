@@ -168,19 +168,16 @@ impl StoredCommittedResult {
 #[serde(deny_unknown_fields)]
 pub(crate) struct StoredHistory {
     pub(crate) volume_id: VolumeId,
-    pub(crate) creator_branch: BranchId,
     pub(crate) state: StoredNamespaceState,
 }
 
 impl StoredHistory {
     pub(crate) fn new(
         volume_id: VolumeId,
-        creator_branch: BranchId,
         state: &StoredNamespaceState,
     ) -> Result<Self, ManagedError> {
         let history = Self {
             volume_id,
-            creator_branch,
             state: state.clone(),
         };
         history.validate(volume_id)?;

@@ -43,6 +43,7 @@ const RANGE_FETCH_GAP: usize = 512 * 1024;
 const TARGET_SEGMENT_SIZE: u64 = 16 * 1024 * 1024;
 const MATERIALIZE_WINDOW_BYTES: u64 = TARGET_SEGMENT_SIZE;
 const MATERIALIZE_CACHE_BYTES: usize = 64 * 1024 * 1024;
+const MATERIALIZE_BATCH_BYTES: u64 = MATERIALIZE_CACHE_BYTES as u64;
 const FASTCDC_MINIMUM_FILE_SIZE: u64 = 1024 * 1024;
 const FASTCDC_MINIMUM_SIZE: u32 = 64 * 1024;
 const FASTCDC_TARGET_SIZE: u32 = 256 * 1024;
@@ -58,18 +59,23 @@ pub struct SegmentGcMaintenance {
 
 /// Unique immutable data segments retained across one or more namespace positions.
 #[derive(Default)]
-pub(crate) struct RetainedDataRoots(BTreeSet<SegmentRef>);
+pub(crate) struct RetainedDataRoots(BTreeMap<[u8; 32], u64>);
 
 impl RetainedDataRoots {
     pub(crate) fn retain(&mut self, snapshot: &NamespaceSnapshot) -> Result<(), ManagedError> {
         visit_reachable_file_versions(snapshot, "mark retained data segments", |version| {
-            self.0.extend(
-                version
-                    .extent_map
-                    .extents
-                    .iter()
-                    .map(|extent| extent.segment),
-            );
+            for extent in &version.extent_map.extents {
+                match self.0.insert(extent.segment.digest, extent.segment.length) {
+                    Some(length) if length != extent.segment.length => {
+                        return Err(corrupt(
+                            "mark retained data segments",
+                            "one segment digest has conflicting physical lengths",
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            Ok(())
         })
     }
 }
@@ -366,36 +372,55 @@ impl ManagedData {
         full_tree: bool,
         concurrency: NonZeroUsize,
     ) -> Result<(), ManagedError> {
-        let plans = MaterializationPlan::new(
-            &requests,
-            full_tree,
-            self.operator.info().full_capability().stat,
-        );
-        let cached = if plans
-            .segments
-            .values()
-            .any(|plan| matches!(plan, SegmentReadPlan::Complete { .. }))
-        {
-            self.cached_operator().await?
-        } else {
-            self.operator.clone()
-        };
-        let context = Arc::new(MaterializationContext {
-            target: target.clone(),
-            cached,
-            plans,
-        });
-        stream::iter(requests)
-            .map(|(path, version)| {
-                let context = context.clone();
-                async move {
-                    self.materialize_file(&context, path, version, concurrency)
-                        .await
-                }
-            })
-            .buffer_unordered(concurrency.get())
-            .try_collect()
-            .await
+        let mut batches = Vec::new();
+        let mut batch = Vec::new();
+        let mut batch_bytes = 0_u64;
+        for request in requests {
+            let size = request.1.logical_size;
+            if !batch.is_empty() && batch_bytes.saturating_add(size) > MATERIALIZE_BATCH_BYTES {
+                batches.push(std::mem::take(&mut batch));
+                batch_bytes = 0;
+            }
+            batch_bytes = batch_bytes.saturating_add(size);
+            batch.push(request);
+        }
+        if !batch.is_empty() {
+            batches.push(batch);
+        }
+
+        for requests in batches {
+            let plans = MaterializationPlan::new(
+                &requests,
+                full_tree,
+                self.operator.info().full_capability().stat,
+            );
+            let cached = if plans
+                .segments
+                .values()
+                .any(|plan| matches!(plan, SegmentReadPlan::Complete { .. }))
+            {
+                self.cached_operator().await?
+            } else {
+                self.operator.clone()
+            };
+            let context = Arc::new(MaterializationContext {
+                target: target.clone(),
+                cached,
+                plans,
+            });
+            stream::iter(requests)
+                .map(|(path, version)| {
+                    let context = context.clone();
+                    async move {
+                        self.materialize_file(&context, path, version, concurrency)
+                            .await
+                    }
+                })
+                .buffer_unordered(concurrency.get())
+                .try_collect::<Vec<_>>()
+                .await?;
+        }
+        Ok(())
     }
 
     async fn cached_operator(&self) -> Result<Operator, ManagedError> {
@@ -436,16 +461,7 @@ impl ManagedData {
         let extents = &version.extent_map.extents;
         let mut start = 0;
         while start < extents.len() {
-            let mut end = start;
-            let mut window_bytes = 0_u64;
-            while end < extents.len()
-                && (end == start
-                    || window_bytes.saturating_add(extents[end].content.length)
-                        <= MATERIALIZE_WINDOW_BYTES)
-            {
-                window_bytes = window_bytes.saturating_add(extents[end].content.length);
-                end += 1;
-            }
+            let end = extent_window_end(extents, start);
             let fetched = match self
                 .read_extent_window(context, &extents[start..end], concurrency)
                 .await
@@ -567,18 +583,14 @@ impl ManagedData {
                 continue;
             };
             result.scanned += 1;
-            if roots.0.contains(&reference) {
+            if let Some(length) = roots.0.get(&reference.digest) {
+                if *length != reference.length {
+                    return Err(corrupt(
+                        "collect unreachable data segments",
+                        "live segment has an unexpected physical length",
+                    ));
+                }
                 continue;
-            }
-            if roots
-                .0
-                .iter()
-                .any(|candidate| candidate.digest == reference.digest)
-            {
-                return Err(corrupt(
-                    "collect unreachable data segments",
-                    "live segment has an unexpected physical length",
-                ));
             }
             let deleted_bytes = result
                 .deleted_bytes
@@ -611,6 +623,12 @@ impl MaterializationPlan {
         cache_complete_segments: bool,
     ) -> Self {
         let mut segments = BTreeMap::<SegmentRef, SegmentDemand>::new();
+        let oversized = requests
+            .iter()
+            .map(|(_, version)| version.logical_size)
+            .fold(0_u64, u64::saturating_add)
+            > MATERIALIZE_BATCH_BYTES;
+        let mut windows = BTreeMap::<SegmentRef, usize>::new();
         for (_, version) in requests {
             for extent in &version.extent_map.extents {
                 *segments
@@ -618,6 +636,20 @@ impl MaterializationPlan {
                     .or_default()
                     .entry(demand_key(extent))
                     .or_default() += 1;
+            }
+            if oversized {
+                let mut start = 0;
+                while start < version.extent_map.extents.len() {
+                    let end = extent_window_end(&version.extent_map.extents, start);
+                    for segment in version.extent_map.extents[start..end]
+                        .iter()
+                        .map(|extent| extent.segment)
+                        .collect::<BTreeSet<_>>()
+                    {
+                        *windows.entry(segment).or_default() += 1;
+                    }
+                    start = end;
+                }
             }
         }
         Self {
@@ -627,7 +659,8 @@ impl MaterializationPlan {
                     let plan = if cache_complete_segments
                         && usize::try_from(segment.length)
                             .is_ok_and(|length| length <= MATERIALIZE_CACHE_BYTES)
-                        && prefer_complete_segment(segment, &demands, full_tree)
+                        && (prefer_complete_segment(segment, &demands, full_tree)
+                            || windows.get(&segment).is_some_and(|count| *count > 1))
                     {
                         SegmentReadPlan::Complete {
                             demands: demands.keys().copied().collect(),
@@ -718,6 +751,19 @@ impl SegmentReadPlan {
             }
         }
     }
+}
+
+fn extent_window_end(extents: &[Extent], start: usize) -> usize {
+    let mut end = start;
+    let mut bytes = 0_u64;
+    while end < extents.len()
+        && (end == start
+            || bytes.saturating_add(extents[end].content.length) <= MATERIALIZE_WINDOW_BYTES)
+    {
+        bytes = bytes.saturating_add(extents[end].content.length);
+        end += 1;
+    }
+    end
 }
 
 fn demand_key(extent: &Extent) -> DemandKey {
@@ -999,7 +1045,7 @@ fn seal_segment(contents: BTreeMap<ContentRef, Vec<u8>>) -> Result<SealedSegment
     let mut encoded = Vec::new();
     let mut offsets = BTreeMap::new();
     for (content, bytes) in contents {
-        if content.length == 0 || content_ref(&bytes) != content {
+        if content.length == 0 || content.length != bytes.len() as u64 {
             return Err(invalid(
                 "seal data segment",
                 "segment entry does not match its content reference",
@@ -1054,7 +1100,7 @@ fn verify_complete_segment(reference: SegmentRef, bytes: &Buffer) -> Result<(), 
 fn visit_reachable_file_versions(
     snapshot: &NamespaceSnapshot,
     action: &'static str,
-    mut visit: impl FnMut(&FileVersionRecord),
+    mut visit: impl FnMut(&FileVersionRecord) -> Result<(), ManagedError>,
 ) -> Result<(), ManagedError> {
     let mut visited = BTreeSet::new();
     let mut pending = vec![snapshot.root];
@@ -1087,7 +1133,7 @@ fn visit_reachable_file_versions(
                         "live node references an invalid file version",
                     ));
                 }
-                visit(version);
+                visit(version)?;
             }
         }
     }

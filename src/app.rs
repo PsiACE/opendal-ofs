@@ -176,17 +176,11 @@ async fn gc_volume(config: &Path, args: VolumeGcArgs) -> Result<()> {
         return Ok(());
     }
     let volume = metadata.open_volume(format, data)?;
-    let Some(observed) = volume.observe().await? else {
-        print_gc_result(&args.alias, SegmentGcMaintenance::default());
-        return Ok(());
-    };
-    let sweep = if args.resume {
-        volume.resume_gc(&observed).await?
+    let collected = if args.resume {
+        volume.resume_garbage_collect().await?
     } else {
-        volume.begin_gc(&observed).await?
+        volume.garbage_collect().await?
     };
-    let collected = volume.collect_unreachable_segments(sweep).await?;
-    volume.finish_gc(sweep).await?;
     print_gc_result(&args.alias, collected);
     Ok(())
 }

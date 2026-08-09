@@ -119,32 +119,25 @@ impl ManagedVolume {
         self.namespace.publish(observed, publication).await
     }
 
-    /// Fence namespace publication and fix the snapshot used by one GC sweep.
-    pub async fn begin_gc(
-        &self,
-        observed: &ManagedObservation,
-    ) -> Result<NamespaceGcSweep, ManagedError> {
-        self.namespace.begin_gc(&observed.witness).await
+    /// Mark the current namespace, sweep unreachable data, then release publication.
+    pub async fn garbage_collect(&self) -> Result<SegmentGcMaintenance, ManagedError> {
+        self.collect(false).await
     }
 
-    /// Take ownership of an interrupted namespace GC sweep.
-    pub async fn resume_gc(
-        &self,
-        observed: &ManagedObservation,
-    ) -> Result<NamespaceGcSweep, ManagedError> {
-        self.namespace.resume_gc(&observed.witness).await
+    /// Take ownership of an interrupted sweep and complete it.
+    pub async fn resume_garbage_collect(&self) -> Result<SegmentGcMaintenance, ManagedError> {
+        self.collect(true).await
     }
 
-    /// Release the publication fence for the matching GC sweep.
-    pub async fn finish_gc(&self, sweep: NamespaceGcSweep) -> Result<(), ManagedError> {
-        self.namespace.finish_gc(sweep).await
-    }
-
-    /// Delete data segments unreachable from the snapshot fixed by this sweep.
-    pub async fn collect_unreachable_segments(
-        &self,
-        sweep: NamespaceGcSweep,
-    ) -> Result<SegmentGcMaintenance, ManagedError> {
+    async fn collect(&self, resume: bool) -> Result<SegmentGcMaintenance, ManagedError> {
+        let Some(observed) = self.observe().await? else {
+            return Ok(SegmentGcMaintenance::default());
+        };
+        let sweep = if resume {
+            self.namespace.resume_gc(&observed.witness).await?
+        } else {
+            self.namespace.begin_gc(&observed.witness).await?
+        };
         let observed = self.observe().await?.ok_or_else(|| {
             ManagedError::new(
                 ManagedErrorKind::Conflict,
@@ -162,7 +155,9 @@ impl ManagedVolume {
             ));
         }
         let snapshot = to_managed_snapshot(&observed.filesystem_snapshot)?;
-        self.data.collect_unreachable_segments(&snapshot).await
+        let collected = self.data.collect_unreachable_segments(&snapshot).await?;
+        self.namespace.finish_gc(sweep).await?;
+        Ok(collected)
     }
 }
 

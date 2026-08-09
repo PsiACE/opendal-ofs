@@ -16,7 +16,8 @@
 // under the License.
 
 /// Selects where the authoritative filesystem namespace lives.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, serde::Deserialize, Eq, Hash, PartialEq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum VolumeModel {
     /// Existing storage paths and objects are authoritative.
     Direct,

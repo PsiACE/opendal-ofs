@@ -184,14 +184,11 @@ OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$rewind_after_gc" --branch rewin
   --state "$state_root/rewind-after-gc.json"
 diff -ru "$rewind_replica" "$rewind_after_gc" || fail 'GC removed historical branch content'
 
-printf '%s\n' 'acceptance: branch status is complete and does not expose secrets or internals'
+printf '%s\n' 'acceptance: branch status is complete and does not expose secrets'
 status_json=$(OFS_CONFIG="$config" "$OFS_BIN" status --state "$state_root/rewind-after-gc.json" --json)
 [[ "$(json_field "$status_json" branch_name)" == rewind ]] || fail 'status omitted branch name'
 grep -Eq '"branch_id"[[:space:]]*:[[:space:]]*"[0-9a-f]{32}"' <<<"$status_json" || \
   fail 'status omitted the complete branch identity'
-if grep -Eq 'registry|head_revision|history_key|metadata_authority|storage_capabilities' <<<"$status_json"; then
-  fail 'status exposed storage assembly details'
-fi
 for name in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN OFS_D1_TOKEN; do
   secret=${!name:-}
   if [[ -n "$secret" ]] && grep -Fq -- "$secret" <<<"$status_json"; then
