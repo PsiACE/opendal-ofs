@@ -17,19 +17,13 @@
 
 //! Durable named branches for Managed metadata.
 
-mod d1;
 mod namespace;
 pub(crate) mod records;
 mod store;
 
-pub use d1::D1BranchStore;
 pub use namespace::{BoundNamespace, BranchObservation};
-pub use store::ObjectBranchStore;
-pub type ObjectBoundNamespace = BoundNamespace<ObjectBranchStore>;
-pub type ObjectBranchObservation = BranchObservation<String>;
-pub type D1BoundNamespace = BoundNamespace<D1BranchStore>;
-pub type D1BranchObservation = BranchObservation<u64>;
 pub use records::{BranchInfo, BranchLifecycle, ForkPoint};
+pub use store::BranchStore;
 
 /// Required Managed superblock extension implemented by this module.
 pub const IDENTIFIER: &str = "branch/v1";

@@ -24,7 +24,6 @@ use super::local::{
 use crate::filesystem::{FileVersion, Volume, VolumeSnapshot};
 
 const COPY_CHUNK: usize = 1024 * 1024;
-const COPY_CONCURRENCY: usize = 8;
 const MANIFEST_FORMAT: &str = "ofs-staged-tree";
 const MANIFEST_MAJOR: u16 = 1;
 
@@ -46,7 +45,7 @@ pub(crate) struct StagedTree {
 }
 
 impl StagedTree {
-    pub(crate) async fn inspect(tree: &LocalTree) -> Result<Self> {
+    pub(crate) async fn inspect(tree: &LocalTree, concurrency: NonZeroUsize) -> Result<Self> {
         let source = tree.operator()?;
         let files = stream::iter(
             tree.entries()
@@ -89,7 +88,7 @@ impl StagedTree {
                     }
                 }),
         )
-        .buffer_unordered(COPY_CONCURRENCY)
+        .buffer_unordered(concurrency.get())
         .try_collect::<BTreeMap<_, _>>()
         .await?;
         for (path, entry) in tree.entries() {

@@ -29,61 +29,33 @@ const RECORDS: &str = "ofs_managed_v1_records";
 #[cfg(feature = "managed-branch")]
 const DELETE_BATCH: usize = 100;
 
-#[allow(async_fn_in_trait)]
-pub trait RecordBackend: Clone + Send + Sync {
-    type Revision: Clone + std::fmt::Debug + Eq + Send + Sync;
-
-    async fn read(
-        &self,
-        key: &str,
-        action: &'static str,
-    ) -> Result<Option<(Vec<u8>, Self::Revision)>, ManagedError>;
-    async fn read_bytes(
-        &self,
-        key: &str,
-        action: &'static str,
-    ) -> Result<Option<Vec<u8>>, ManagedError>;
-    async fn create(
-        &self,
-        key: &str,
-        bytes: Vec<u8>,
-        action: &'static str,
-    ) -> Result<bool, ManagedError>;
-    async fn replace(
-        &self,
-        key: &str,
-        revision: &Self::Revision,
-        bytes: Vec<u8>,
-        action: &'static str,
-    ) -> Result<bool, ManagedError>;
-}
-
-#[cfg(feature = "managed-branch")]
-#[allow(async_fn_in_trait)]
-pub trait BranchRecordBackend: RecordBackend {
-    async fn list(&self, prefix: &str, action: &'static str) -> Result<Vec<String>, ManagedError>;
-    async fn delete(&self, keys: Vec<String>, action: &'static str) -> Result<(), ManagedError>;
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum Revision {
+    Object(String),
+    D1(u64),
 }
 
 #[derive(Clone)]
-pub struct ObjectRecordBackend {
+pub(crate) enum RecordBackend {
+    Object(ObjectBackend),
+    D1(D1Backend),
+}
+
+#[derive(Clone)]
+pub(crate) struct ObjectBackend {
     operator: Operator,
 }
 
-impl ObjectRecordBackend {
-    pub(crate) const fn new(operator: Operator) -> Self {
+impl ObjectBackend {
+    const fn new(operator: Operator) -> Self {
         Self { operator }
     }
-}
-
-impl RecordBackend for ObjectRecordBackend {
-    type Revision = String;
 
     async fn read(
         &self,
         key: &str,
         action: &'static str,
-    ) -> Result<Option<(Vec<u8>, Self::Revision)>, ManagedError> {
+    ) -> Result<Option<(Vec<u8>, String)>, ManagedError> {
         object::read_with_revision(&self.operator, key, action).await
     }
 
@@ -107,16 +79,13 @@ impl RecordBackend for ObjectRecordBackend {
     async fn replace(
         &self,
         key: &str,
-        revision: &Self::Revision,
+        revision: &str,
         bytes: Vec<u8>,
         action: &'static str,
     ) -> Result<bool, ManagedError> {
         object::replace(&self.operator, key, revision, bytes, action).await
     }
-}
-
-#[cfg(feature = "managed-branch")]
-impl BranchRecordBackend for ObjectRecordBackend {
+    #[cfg(feature = "managed-branch")]
     async fn list(&self, prefix: &str, action: &'static str) -> Result<Vec<String>, ManagedError> {
         self.operator
             .list_with(prefix)
@@ -132,6 +101,7 @@ impl BranchRecordBackend for ObjectRecordBackend {
             .map_err(|_| unavailable(action))
     }
 
+    #[cfg(feature = "managed-branch")]
     async fn delete(&self, keys: Vec<String>, action: &'static str) -> Result<(), ManagedError> {
         self.operator
             .delete_iter(keys.iter().map(String::as_str))
@@ -141,28 +111,23 @@ impl BranchRecordBackend for ObjectRecordBackend {
 }
 
 #[derive(Clone)]
-pub struct D1RecordBackend {
+pub(crate) struct D1Backend {
     session: D1Session,
     volume: String,
 }
 
-impl D1RecordBackend {
-    pub(crate) fn new(volume_id: VolumeId, metadata: D1Metadata) -> Self {
+impl D1Backend {
+    fn new(volume_id: VolumeId, metadata: D1Metadata) -> Self {
         Self {
             session: metadata.session(),
             volume: hex(volume_id.as_bytes()),
         }
     }
-}
-
-impl RecordBackend for D1RecordBackend {
-    type Revision = u64;
-
     async fn read(
         &self,
         key: &str,
         action: &'static str,
-    ) -> Result<Option<(Vec<u8>, Self::Revision)>, ManagedError> {
+    ) -> Result<Option<(Vec<u8>, u64)>, ManagedError> {
         let results = self
             .session
             .query(
@@ -227,7 +192,7 @@ impl RecordBackend for D1RecordBackend {
     async fn replace(
         &self,
         key: &str,
-        revision: &Self::Revision,
+        revision: &u64,
         bytes: Vec<u8>,
         action: &'static str,
     ) -> Result<bool, ManagedError> {
@@ -253,10 +218,7 @@ impl RecordBackend for D1RecordBackend {
             .await?;
         changed(&results, action)
     }
-}
-
-#[cfg(feature = "managed-branch")]
-impl BranchRecordBackend for D1RecordBackend {
+    #[cfg(feature = "managed-branch")]
     async fn list(&self, prefix: &str, action: &'static str) -> Result<Vec<String>, ManagedError> {
         let results = self
             .session
@@ -283,6 +245,7 @@ impl BranchRecordBackend for D1RecordBackend {
             .collect()
     }
 
+    #[cfg(feature = "managed-branch")]
     async fn delete(&self, keys: Vec<String>, action: &'static str) -> Result<(), ManagedError> {
         for keys in keys.chunks(DELETE_BATCH) {
             let placeholders = std::iter::repeat_n("?", keys.len())
@@ -310,15 +273,124 @@ impl BranchRecordBackend for D1RecordBackend {
         }
         Ok(())
     }
-}
-
-impl D1RecordBackend {
     fn params(&self, key: &str) -> Vec<Value> {
         vec![
             self.session.store_key().to_owned().into(),
             self.volume.clone().into(),
             key.to_owned().into(),
         ]
+    }
+}
+
+impl RecordBackend {
+    pub(crate) fn object(operator: Operator, action: &'static str) -> Result<Self, ManagedError> {
+        let capability = operator.info().full_capability();
+        if !capability.read
+            || !capability.write
+            || !capability.write_with_if_not_exists
+            || !capability.write_with_if_match
+        {
+            return Err(ManagedError::new(
+                ManagedErrorKind::Invalid,
+                action,
+                "object metadata requires read, create-only write, and conditional replace",
+            ));
+        }
+        Ok(Self::Object(ObjectBackend::new(operator)))
+    }
+
+    pub(crate) fn d1(volume_id: VolumeId, metadata: D1Metadata) -> Self {
+        Self::D1(D1Backend::new(volume_id, metadata))
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn test_object(operator: Operator) -> Self {
+        Self::Object(ObjectBackend::new(operator))
+    }
+
+    pub(crate) async fn read(
+        &self,
+        key: &str,
+        action: &'static str,
+    ) -> Result<Option<(Vec<u8>, Revision)>, ManagedError> {
+        match self {
+            Self::Object(backend) => backend
+                .read(key, action)
+                .await
+                .map(|value| value.map(|(bytes, revision)| (bytes, Revision::Object(revision)))),
+            Self::D1(backend) => backend
+                .read(key, action)
+                .await
+                .map(|value| value.map(|(bytes, revision)| (bytes, Revision::D1(revision)))),
+        }
+    }
+
+    pub(crate) async fn read_bytes(
+        &self,
+        key: &str,
+        action: &'static str,
+    ) -> Result<Option<Vec<u8>>, ManagedError> {
+        match self {
+            Self::Object(backend) => backend.read_bytes(key, action).await,
+            Self::D1(backend) => backend.read_bytes(key, action).await,
+        }
+    }
+
+    pub(crate) async fn create(
+        &self,
+        key: &str,
+        bytes: Vec<u8>,
+        action: &'static str,
+    ) -> Result<bool, ManagedError> {
+        match self {
+            Self::Object(backend) => backend.create(key, bytes, action).await,
+            Self::D1(backend) => backend.create(key, bytes, action).await,
+        }
+    }
+
+    pub(crate) async fn replace(
+        &self,
+        key: &str,
+        revision: &Revision,
+        bytes: Vec<u8>,
+        action: &'static str,
+    ) -> Result<bool, ManagedError> {
+        match (self, revision) {
+            (Self::Object(backend), Revision::Object(revision)) => {
+                backend.replace(key, revision, bytes, action).await
+            }
+            (Self::D1(backend), Revision::D1(revision)) => {
+                backend.replace(key, revision, bytes, action).await
+            }
+            _ => Err(corrupt(
+                action,
+                "record revision belongs to another backend",
+            )),
+        }
+    }
+
+    #[cfg(feature = "managed-branch")]
+    pub(crate) async fn list(
+        &self,
+        prefix: &str,
+        action: &'static str,
+    ) -> Result<Vec<String>, ManagedError> {
+        match self {
+            Self::Object(backend) => backend.list(prefix, action).await,
+            Self::D1(backend) => backend.list(prefix, action).await,
+        }
+    }
+
+    #[cfg(feature = "managed-branch")]
+    pub(crate) async fn delete(
+        &self,
+        keys: Vec<String>,
+        action: &'static str,
+    ) -> Result<(), ManagedError> {
+        match self {
+            Self::Object(backend) => backend.delete(keys, action).await,
+            Self::D1(backend) => backend.delete(keys, action).await,
+        }
     }
 }
 

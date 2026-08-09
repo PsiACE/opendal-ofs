@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Backend-neutral branch authority plus the Object Metadata constructor.
+//! Branch authority over native revision-CAS records.
 
 use std::collections::BTreeSet;
 use std::io::Cursor;
@@ -26,7 +26,6 @@ use serde::de::DeserializeOwned;
 use sha2::{Digest as _, Sha256};
 
 use super::namespace::BoundNamespace;
-use super::namespace::BranchNamespaceStore;
 use super::records::{
     BranchInfo, BranchLifecycle, ForkPoint, StoredBranchHead, StoredBranchRegistry,
     StoredCheckpoint, StoredHistory, StoredNamespaceState, info, recover_retained,
@@ -35,8 +34,10 @@ use crate::filesystem::{BranchBinding, BranchId, BranchName, OperationId, Volume
 use crate::managed::metadata::namespace::{
     CheckpointPart, CheckpointRoot, NamespaceSnapshot, PendingCheckpoint,
 };
-use crate::managed::metadata::record::{BranchRecordBackend, ObjectRecordBackend};
-use crate::managed::{ManagedData, ManagedError, ManagedErrorKind, SegmentGcMaintenance};
+use crate::managed::metadata::record::{RecordBackend, Revision};
+use crate::managed::{
+    D1Metadata, ManagedData, ManagedError, ManagedErrorKind, SegmentGcMaintenance,
+};
 
 const ROOT: &str = ".ofs/managed/metadata/v1/extensions/branch/v1";
 const REGISTRY_KEY: &str = ".ofs/managed/metadata/v1/extensions/branch/v1/registry.ofs";
@@ -50,20 +51,18 @@ const MAX_HEAD_BYTES: usize = 256 * 1024;
 const MAX_HISTORY_BYTES: usize = 512 * 1024;
 
 #[derive(Clone)]
-pub struct BranchStore<B> {
+pub struct BranchStore {
     pub(crate) volume_id: VolumeId,
-    pub(crate) backend: B,
+    pub(crate) backend: RecordBackend,
 }
 
-pub type ObjectBranchStore = BranchStore<ObjectRecordBackend>;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ObjectBranchGcFence {
+pub(crate) struct BranchGcFence {
     epoch: u64,
     owner: [u8; 16],
 }
 
-impl ObjectBranchGcFence {
+impl BranchGcFence {
     fn owns_registry(self, registry: &StoredBranchRegistry) -> bool {
         registry.maintenance_epoch == self.epoch && registry.maintenance_owner == Some(self.owner)
     }
@@ -73,7 +72,7 @@ impl ObjectBranchGcFence {
     }
 }
 
-struct ObjectGcRoots {
+struct GcRoots {
     snapshots: Vec<NamespaceSnapshot>,
     heads: BTreeSet<String>,
     checkpoints: BTreeSet<String>,
@@ -81,18 +80,16 @@ struct ObjectGcRoots {
     histories: BTreeSet<String>,
 }
 
-impl<B: BranchRecordBackend> BranchNamespaceStore for BranchStore<B> {
-    type Revision = B::Revision;
-
-    fn volume_id(&self) -> VolumeId {
+impl BranchStore {
+    pub(crate) fn volume_id(&self) -> VolumeId {
         self.volume_id
     }
 
-    async fn current_head(
+    pub(crate) async fn current_head(
         &self,
         binding: &BranchBinding,
         action: &'static str,
-    ) -> Result<(StoredBranchHead, Self::Revision), ManagedError> {
+    ) -> Result<(StoredBranchHead, Revision), ManagedError> {
         let (head, revision) = self
             .read_head(binding.id)
             .await?
@@ -106,10 +103,10 @@ impl<B: BranchRecordBackend> BranchNamespaceStore for BranchStore<B> {
         Ok((head, revision))
     }
 
-    async fn replace_head(
+    pub(crate) async fn replace_head(
         &self,
         branch: BranchId,
-        revision: &Self::Revision,
+        revision: &Revision,
         head: &StoredBranchHead,
     ) -> Result<bool, ManagedError> {
         let bytes = encode(HEAD_MAGIC, head, MAX_HEAD_BYTES, "publish Managed branch")?;
@@ -117,44 +114,20 @@ impl<B: BranchRecordBackend> BranchNamespaceStore for BranchStore<B> {
             .await
     }
 
-    async fn read_checkpoint(&self, id: [u8; 32]) -> Result<StoredCheckpoint, ManagedError> {
-        BranchStore::read_checkpoint(self, id).await
-    }
-
-    async fn write_checkpoint(
-        &self,
-        checkpoint: &StoredCheckpoint,
-    ) -> Result<[u8; 32], ManagedError> {
-        BranchStore::write_checkpoint(self, checkpoint).await
-    }
-
-    async fn write_history(&self, history: &StoredHistory) -> Result<[u8; 32], ManagedError> {
-        BranchStore::write_history(self, history).await
-    }
-}
-
-impl BranchStore<ObjectRecordBackend> {
-    pub fn new(volume_id: VolumeId, operator: Operator) -> Result<Self, ManagedError> {
-        let capability = operator.info().full_capability();
-        if !capability.read
-            || !capability.write
-            || !capability.write_with_if_not_exists
-            || !capability.write_with_if_match
-        {
-            return Err(invalid(
-                "open Managed branches",
-                "object branch metadata requires read, create-only write, and conditional replace",
-            ));
-        }
+    pub fn object(volume_id: VolumeId, operator: Operator) -> Result<Self, ManagedError> {
         Ok(Self {
             volume_id,
-            backend: ObjectRecordBackend::new(operator),
+            backend: RecordBackend::object(operator, "open Managed branches")?,
         })
     }
-}
 
-#[allow(private_bounds)]
-impl<B: BranchRecordBackend> BranchStore<B> {
+    pub fn d1(volume_id: VolumeId, metadata: D1Metadata) -> Self {
+        Self {
+            volume_id,
+            backend: RecordBackend::d1(volume_id, metadata),
+        }
+    }
+
     /// Idempotently create the first unborn branch. The head is prepared
     /// before the registry, making the registry the branch-existence authority.
     pub async fn initialize(&self, default_name: BranchName) -> Result<BranchInfo, ManagedError> {
@@ -252,7 +225,7 @@ impl<B: BranchRecordBackend> BranchStore<B> {
         info(name.clone(), id, &head, registry.default_branch)
     }
 
-    pub async fn bind(&self, name: &BranchName) -> Result<BoundNamespace<Self>, ManagedError> {
+    pub async fn bind(&self, name: &BranchName) -> Result<BoundNamespace, ManagedError> {
         let branch = self.get(name).await?;
         if branch.lifecycle != BranchLifecycle::Active {
             return Err(conflict(
@@ -365,7 +338,7 @@ impl<B: BranchRecordBackend> BranchStore<B> {
         }
     }
 
-    async fn begin_gc(&self) -> Result<ObjectBranchGcFence, ManagedError> {
+    async fn begin_gc(&self) -> Result<BranchGcFence, ManagedError> {
         let (registry, fence) = loop {
             let (mut registry, revision) = self.registry().await?;
             if registry.maintenance_active {
@@ -379,7 +352,7 @@ impl<B: BranchRecordBackend> BranchStore<B> {
                     invalid("begin Managed branch GC", "maintenance epoch is exhausted")
                 })?;
             registry.maintenance_active = true;
-            let fence = ObjectBranchGcFence {
+            let fence = BranchGcFence {
                 epoch: registry.maintenance_epoch,
                 owner: *OperationId::generate().as_bytes(),
             };
@@ -408,7 +381,7 @@ impl<B: BranchRecordBackend> BranchStore<B> {
     async fn fix_gc_heads(
         &self,
         registry: &StoredBranchRegistry,
-        fence: ObjectBranchGcFence,
+        fence: BranchGcFence,
         action: &'static str,
     ) -> Result<(), ManagedError> {
         let mut fixed = registry.clone();
@@ -462,7 +435,7 @@ impl<B: BranchRecordBackend> BranchStore<B> {
         &self,
         name: BranchName,
         branch_id: BranchId,
-        fence: ObjectBranchGcFence,
+        fence: BranchGcFence,
         action: &'static str,
     ) -> Result<StoredBranchRegistry, ManagedError> {
         loop {
@@ -482,7 +455,7 @@ impl<B: BranchRecordBackend> BranchStore<B> {
         }
     }
 
-    async fn gc_roots(&self, fence: ObjectBranchGcFence) -> Result<ObjectGcRoots, ManagedError> {
+    async fn gc_roots(&self, fence: BranchGcFence) -> Result<GcRoots, ManagedError> {
         let (registry, registry_revision) = self.registry().await?;
         if !registry.maintenance_active || !fence.owns_registry(&registry) {
             return Err(conflict(
@@ -490,7 +463,7 @@ impl<B: BranchRecordBackend> BranchStore<B> {
                 "GC fence does not match the registry",
             ));
         }
-        let mut roots = ObjectGcRoots {
+        let mut roots = GcRoots {
             snapshots: Vec::new(),
             heads: BTreeSet::new(),
             checkpoints: BTreeSet::new(),
@@ -570,7 +543,7 @@ impl<B: BranchRecordBackend> BranchStore<B> {
         Ok(roots)
     }
 
-    async fn finish_gc(&self, fence: ObjectBranchGcFence) -> Result<(), ManagedError> {
+    async fn finish_gc(&self, fence: BranchGcFence) -> Result<(), ManagedError> {
         let branches = loop {
             let (mut registry, revision) = self.registry().await?;
             if !registry.maintenance_active {
@@ -663,7 +636,7 @@ impl<B: BranchRecordBackend> BranchStore<B> {
                 "branch maintenance is not active",
             ));
         }
-        let fence = ObjectBranchGcFence {
+        let fence = BranchGcFence {
             epoch: registry.maintenance_epoch,
             owner: *OperationId::generate().as_bytes(),
         };
@@ -692,7 +665,7 @@ impl<B: BranchRecordBackend> BranchStore<B> {
     async fn collect_with_fence(
         &self,
         data_operator: Operator,
-        fence: ObjectBranchGcFence,
+        fence: BranchGcFence,
     ) -> Result<SegmentGcMaintenance, ManagedError> {
         let roots = self.gc_roots(fence).await?;
         let data = ManagedData::new(data_operator)?;
@@ -706,29 +679,29 @@ impl<B: BranchRecordBackend> BranchStore<B> {
 
     async fn sweep_metadata(
         &self,
-        fence: ObjectBranchGcFence,
-        roots: &ObjectGcRoots,
+        fence: BranchGcFence,
+        roots: &GcRoots,
     ) -> Result<(), ManagedError> {
         self.ensure_gc_fence(fence, "sweep Managed branch GC metadata")
             .await?;
-        let heads = self
-            .metadata_candidates(&format!("{ROOT}/heads/"), 16)
-            .await?;
-        let checkpoints = self
-            .metadata_candidates(&format!("{ROOT}/checkpoints/sha256/"), 32)
-            .await?;
-        let checkpoint_parts = self
-            .metadata_candidates(&format!("{ROOT}/checkpoint-parts/sha256/"), 32)
-            .await?;
-        let histories = self
-            .metadata_candidates(&format!("{ROOT}/history/sha256/"), 32)
-            .await?;
-        let unreachable = heads
-            .difference(&roots.heads)
-            .chain(checkpoints.difference(&roots.checkpoints))
-            .chain(checkpoint_parts.difference(&roots.checkpoint_parts))
-            .chain(histories.difference(&roots.histories))
-            .cloned()
+        let head_prefix = format!("{ROOT}/heads/");
+        let checkpoint_prefix = format!("{ROOT}/checkpoints/sha256/");
+        let part_prefix = format!("{ROOT}/checkpoint-parts/sha256/");
+        let history_prefix = format!("{ROOT}/history/sha256/");
+        let unreachable = self
+            .backend
+            .list(&format!("{ROOT}/"), "scan Managed branch GC metadata")
+            .await?
+            .into_iter()
+            .filter(|key| {
+                (canonical_metadata_key(key, &head_prefix, 16) && !roots.heads.contains(key))
+                    || (canonical_metadata_key(key, &checkpoint_prefix, 32)
+                        && !roots.checkpoints.contains(key))
+                    || (canonical_metadata_key(key, &part_prefix, 32)
+                        && !roots.checkpoint_parts.contains(key))
+                    || (canonical_metadata_key(key, &history_prefix, 32)
+                        && !roots.histories.contains(key))
+            })
             .collect::<Vec<_>>();
         self.ensure_gc_fence(fence, "sweep Managed branch GC metadata")
             .await?;
@@ -739,24 +712,9 @@ impl<B: BranchRecordBackend> BranchStore<B> {
             .await
     }
 
-    async fn metadata_candidates(
-        &self,
-        prefix: &str,
-        identity_bytes: usize,
-    ) -> Result<BTreeSet<String>, ManagedError> {
-        let entries = self
-            .backend
-            .list(prefix, "scan Managed branch GC metadata")
-            .await?;
-        Ok(entries
-            .into_iter()
-            .filter(|key| canonical_metadata_key(key, prefix, identity_bytes))
-            .collect())
-    }
-
     async fn ensure_gc_fence(
         &self,
-        fence: ObjectBranchGcFence,
+        fence: BranchGcFence,
         action: &'static str,
     ) -> Result<(), ManagedError> {
         let (registry, _) = self.registry().await?;
@@ -921,7 +879,10 @@ impl<B: BranchRecordBackend> BranchStore<B> {
         Ok(root)
     }
 
-    async fn read_checkpoint(&self, id: [u8; 32]) -> Result<StoredCheckpoint, ManagedError> {
+    pub(crate) async fn read_checkpoint(
+        &self,
+        id: [u8; 32],
+    ) -> Result<StoredCheckpoint, ManagedError> {
         let root = self.read_checkpoint_root(id).await?;
         let mut parts = Vec::with_capacity(root.parts.len());
         for reference in root.parts.iter().copied() {
@@ -938,7 +899,7 @@ impl<B: BranchRecordBackend> BranchStore<B> {
         Ok(StoredCheckpoint { snapshot, results })
     }
 
-    async fn write_checkpoint(
+    pub(crate) async fn write_checkpoint(
         &self,
         checkpoint: &StoredCheckpoint,
     ) -> Result<[u8; 32], ManagedError> {
@@ -979,7 +940,10 @@ impl<B: BranchRecordBackend> BranchStore<B> {
         Ok(history)
     }
 
-    async fn write_history(&self, history: &StoredHistory) -> Result<[u8; 32], ManagedError> {
+    pub(crate) async fn write_history(
+        &self,
+        history: &StoredHistory,
+    ) -> Result<[u8; 32], ManagedError> {
         let bytes = encode(
             HISTORY_MAGIC,
             history,
@@ -1027,7 +991,7 @@ impl<B: BranchRecordBackend> BranchStore<B> {
         Ok(bytes)
     }
 
-    async fn registry(&self) -> Result<(StoredBranchRegistry, B::Revision), ManagedError> {
+    async fn registry(&self) -> Result<(StoredBranchRegistry, Revision), ManagedError> {
         self.read_registry()
             .await?
             .ok_or_else(|| corrupt("read Managed branches", "branch registry is missing"))
@@ -1035,7 +999,7 @@ impl<B: BranchRecordBackend> BranchStore<B> {
 
     async fn read_registry(
         &self,
-    ) -> Result<Option<(StoredBranchRegistry, B::Revision)>, ManagedError> {
+    ) -> Result<Option<(StoredBranchRegistry, Revision)>, ManagedError> {
         let Some((bytes, revision)) = self
             .backend
             .read(REGISTRY_KEY, "read Managed branches")
@@ -1056,7 +1020,7 @@ impl<B: BranchRecordBackend> BranchStore<B> {
     async fn read_head(
         &self,
         branch_id: BranchId,
-    ) -> Result<Option<(StoredBranchHead, B::Revision)>, ManagedError> {
+    ) -> Result<Option<(StoredBranchHead, Revision)>, ManagedError> {
         let Some((bytes, revision)) = self
             .backend
             .read(&head_key(branch_id), "read Managed branch")
@@ -1082,7 +1046,7 @@ impl<B: BranchRecordBackend> BranchStore<B> {
     async fn replace(
         &self,
         key: &str,
-        expected_revision: &B::Revision,
+        expected_revision: &Revision,
         bytes: Vec<u8>,
         action: &'static str,
     ) -> Result<bool, ManagedError> {
@@ -1308,9 +1272,9 @@ mod tests {
     async fn checkpoint_parts_round_trip_and_a_missing_part_is_corrupt() {
         let snapshot = checkpoint_snapshot(5_000);
         let operator = Operator::new(Memory::default()).unwrap().finish();
-        let store = ObjectBranchStore {
+        let store = BranchStore {
             volume_id: snapshot.volume_id,
-            backend: ObjectRecordBackend::new(operator.clone()),
+            backend: RecordBackend::test_object(operator.clone()),
         };
         let checkpoint = StoredCheckpoint::new(&snapshot, BTreeMap::new()).unwrap();
         let id = store.write_checkpoint(&checkpoint).await.unwrap();
@@ -1340,11 +1304,11 @@ mod tests {
         let volume = VolumeId::from_bytes([1; 16]);
         let branch = BranchId::from_bytes([2; 16]);
         let main = BranchName::parse("main").unwrap();
-        let old = ObjectBranchGcFence {
+        let old = BranchGcFence {
             epoch: 1,
             owner: [3; 16],
         };
-        let current = ObjectBranchGcFence {
+        let current = BranchGcFence {
             epoch: 1,
             owner: [4; 16],
         };

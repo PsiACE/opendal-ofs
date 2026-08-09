@@ -221,8 +221,8 @@ pub(crate) fn recover_namespace(
     checkpoint: StoredCheckpoint,
     state: &StoredNamespaceState,
     volume_id: VolumeId,
-) -> Result<NamespaceSnapshot, ManagedError> {
-    let (mut snapshot, _) = checkpoint.recover(volume_id)?;
+) -> Result<(NamespaceSnapshot, StoredResults), ManagedError> {
+    let (mut snapshot, results) = checkpoint.recover(volume_id)?;
     if snapshot.cursor != state.checkpoint_cursor {
         return Err(corrupt("branch checkpoint and HEAD disagree"));
     }
@@ -232,7 +232,7 @@ pub(crate) fn recover_namespace(
     if snapshot.cursor != state.cursor()? {
         return Err(corrupt("branch transaction tail does not reach HEAD"));
     }
-    Ok(snapshot)
+    Ok((snapshot, results))
 }
 
 pub(crate) fn recover_retained(
@@ -253,12 +253,10 @@ pub(crate) fn recover_retained(
 }
 
 pub(crate) fn results_for_rotation(
-    checkpoint: StoredCheckpoint,
+    mut results: StoredResults,
     state: &StoredNamespaceState,
     committed: &StoredChange,
-    volume_id: VolumeId,
 ) -> Result<StoredResults, ManagedError> {
-    let (_, mut results) = checkpoint.recover(volume_id)?;
     for change in state.tail.iter().chain(std::iter::once(committed)) {
         let result = StoredCommittedResult::from_change(change)?;
         results.insert((result.origin(), result.operation()), result);
@@ -617,7 +615,7 @@ mod tests {
 
         for sequence in 1..=snapshot.cursor.sequence() {
             let retained = history.state_at(sequence).unwrap();
-            let recovered = recover_namespace(checkpoint.clone(), &retained, volume).unwrap();
+            let (recovered, _) = recover_namespace(checkpoint.clone(), &retained, volume).unwrap();
             assert_eq!(recovered.cursor.sequence(), sequence);
         }
     }

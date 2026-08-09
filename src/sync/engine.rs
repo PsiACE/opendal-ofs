@@ -95,8 +95,13 @@ impl<V: Volume> SyncEngine<V> {
                         false
                     };
                     let safe_to_install = target_is_live
-                        || committed_tree_is_safe(&state, replica_path, observed.snapshot())
-                            .await?;
+                        || committed_tree_is_safe(
+                            &state,
+                            replica_path,
+                            observed.snapshot(),
+                            self.transfer_concurrency,
+                        )
+                        .await?;
                     if !target_is_live && !safe_to_install {
                         state.pending = None;
                         state.install(state_path)?;
@@ -154,16 +159,16 @@ impl<V: Volume> SyncEngine<V> {
             }
             None => {
                 let local = LocalTree::scan(replica_path).await?;
-                if resolve_paths.is_empty()
-                    && state.conflicts.is_empty()
-                    && remote.is_some_and(|snapshot| {
-                        snapshot.cursor == state.common && local_matches_state(&local, &state)
-                    })
-                {
-                    return Ok(result(&state, false));
+                if resolve_paths.is_empty() && state.conflicts.is_empty() {
+                    if let Some(snapshot) = remote
+                        && snapshot.cursor == state.common
+                        && local_matches_state(&local, &state)?
+                    {
+                        return Ok(result(&state, false));
+                    }
                 }
                 let staging_path = fresh_sibling(state_path, "publish");
-                let known_digests = known_local_digests(&local, &state);
+                let known_digests = known_local_digests(&local, &state)?;
                 let staged = StagedTree::prepare_for_publish(
                     &local,
                     &staging_path,
@@ -480,9 +485,10 @@ async fn committed_tree_is_safe(
     state: &ReplicaState,
     replica: &Path,
     committed: &VolumeSnapshot,
+    concurrency: NonZeroUsize,
 ) -> Result<bool> {
     let local = LocalTree::scan(replica).await?;
-    let staged = StagedTree::inspect(&local).await?;
+    let staged = StagedTree::inspect(&local, concurrency).await?;
     let safe = match reconcile(state, &staged, committed) {
         Ok(plan) => {
             let files_are_safe = plan.actions.iter().all(|action| {
@@ -513,34 +519,17 @@ fn directory_changes(
     remote: &VolumeSnapshot,
 ) -> Result<(bool, bool)> {
     let base_kinds = state
-        .base
-        .iter()
-        .map(|(path, entry)| {
-            (
-                path.clone(),
-                if entry.digest.is_some() {
-                    LocalKind::File
-                } else {
-                    LocalKind::Directory
-                },
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
+        .authority
+        .as_ref()
+        .map(snapshot_kinds)
+        .transpose()?
+        .unwrap_or_default();
     let local_kinds = local
         .entries()
         .iter()
         .map(|(path, entry)| (path.clone(), entry.kind))
         .collect::<BTreeMap<_, _>>();
-    let remote_kinds = snapshot_paths(remote)?
-        .into_iter()
-        .map(|(path, node)| {
-            let kind = match remote.nodes[&node].kind {
-                NodeKind::Directory => LocalKind::Directory,
-                NodeKind::RegularFile => LocalKind::File,
-            };
-            (path, kind)
-        })
-        .collect::<BTreeMap<_, _>>();
+    let remote_kinds = snapshot_kinds(remote)?;
     let paths = base_kinds
         .keys()
         .chain(local_kinds.keys())
@@ -563,13 +552,13 @@ fn directory_changes(
         }
     }
 
-    for (path, entry) in &state.base {
-        if entry.digest.is_some() {
+    for (path, kind) in &base_kinds {
+        if *kind != LocalKind::Directory {
             continue;
         }
         let local_kept = local_kinds.get(path) == Some(&LocalKind::Directory);
         let remote_kept = remote_kinds.get(path) == Some(&LocalKind::Directory);
-        if !remote_kept && local_kept && local_subtree_changed(state, local, path) {
+        if !remote_kept && local_kept && local_subtree_changed(state, local, path)? {
             bail!("cannot reconcile {path:?}: remote directory deletion overlaps local changes");
         }
         if !local_kept && remote_kept && remote_subtree_changed(state, remote, path)? {
@@ -587,8 +576,14 @@ fn directory_changes(
     }
 }
 
-fn local_subtree_changed(state: &ReplicaState, local: &LocalTree, directory: &str) -> bool {
-    state
+fn local_subtree_changed(state: &ReplicaState, local: &LocalTree, directory: &str) -> Result<bool> {
+    let base_kinds = state
+        .authority
+        .as_ref()
+        .map(snapshot_kinds)
+        .transpose()?
+        .unwrap_or_default();
+    Ok(state
         .base
         .keys()
         .chain(local.entries().keys())
@@ -596,11 +591,7 @@ fn local_subtree_changed(state: &ReplicaState, local: &LocalTree, directory: &st
         .any(
             |path| match (state.base.get(path), local.entries().get(path)) {
                 (Some(base), Some(current)) => {
-                    let base_kind = if base.digest.is_some() {
-                        LocalKind::File
-                    } else {
-                        LocalKind::Directory
-                    };
+                    let base_kind = base_kinds[path];
                     current.kind != base_kind
                         || current.kind == LocalKind::File
                             && (base.local_identity != current.native_identity
@@ -612,7 +603,7 @@ fn local_subtree_changed(state: &ReplicaState, local: &LocalTree, directory: &st
                 (None, None) => false,
                 _ => true,
             },
-        )
+        ))
 }
 
 fn remote_subtree_changed(
@@ -621,37 +612,20 @@ fn remote_subtree_changed(
     directory: &str,
 ) -> Result<bool> {
     let remote_paths = snapshot_paths(remote)?;
-    let paths = state
-        .base
+    let base = state.authority.as_ref();
+    let base_paths = base.map(snapshot_paths).transpose()?.unwrap_or_default();
+    let paths = base_paths
         .keys()
         .chain(remote_paths.keys())
         .filter(|path| path_is_within(path, directory))
         .collect::<BTreeSet<_>>();
     for path in paths {
-        let changed = match (state.base.get(path), remote_paths.get(path)) {
-            (Some(base), Some(node)) => {
-                let record = remote
-                    .nodes
-                    .get(node)
-                    .context("remote path references a missing node")?;
-                let remote_digest = match record.file_version {
-                    Some(version) => Some(
-                        remote
-                            .file_versions
-                            .get(&version)
-                            .context("remote node references a missing file version")?
-                            .logical_digest,
-                    ),
-                    None => None,
-                };
-                let remote_directory_generation = remote
-                    .directories
-                    .get(node)
-                    .map(|directory| &directory.generation);
-                base.node != *node
-                    || base.generation != record.generation
-                    || base.digest != remote_digest
-                    || base.directory_generation.as_ref() != remote_directory_generation
+        let changed = match (base_paths.get(path), remote_paths.get(path)) {
+            (Some(base_node), Some(remote_node)) => {
+                let base = base.expect("base paths require an authority snapshot");
+                base_node != remote_node
+                    || base.nodes.get(base_node) != remote.nodes.get(remote_node)
+                    || base.directories.get(base_node) != remote.directories.get(remote_node)
             }
             (None, None) => false,
             _ => true,
@@ -704,10 +678,15 @@ async fn delete_absent_directories(
         .filter(|(_, node)| remote.nodes[node].kind == NodeKind::Directory)
         .map(|(path, _)| path)
         .collect::<BTreeSet<_>>();
-    let mut removed = state
-        .base
+    let base_kinds = state
+        .authority
+        .as_ref()
+        .map(snapshot_kinds)
+        .transpose()?
+        .unwrap_or_default();
+    let mut removed = base_kinds
         .iter()
-        .filter(|(path, entry)| entry.digest.is_none() && !remote.contains(*path))
+        .filter(|(path, kind)| **kind == LocalKind::Directory && !remote.contains(*path))
         .map(|(path, _)| path.clone())
         .collect::<Vec<_>>();
     removed.sort_by_key(|path| std::cmp::Reverse(path.matches('/').count()));
@@ -730,9 +709,6 @@ async fn state_from_snapshot(
     state.authority = Some(snapshot.clone());
     for (path, node) in snapshot_paths(snapshot)? {
         let record = &snapshot.nodes[&node];
-        let digest = record
-            .file_version
-            .map(|version| snapshot.file_versions[&version].logical_digest);
         let local_kind = match record.kind {
             NodeKind::Directory => LocalKind::Directory,
             NodeKind::RegularFile => LocalKind::File,
@@ -741,17 +717,9 @@ async fn state_from_snapshot(
         if local_entry.is_some_and(|entry| entry.kind != local_kind) {
             bail!("installed local path {path:?} has the wrong kind");
         }
-        let directory_generation = snapshot
-            .directories
-            .get(&node)
-            .map(|directory| directory.generation.clone());
         state.base.insert(
             path,
             BaseEntry {
-                node,
-                generation: record.generation.clone(),
-                directory_generation,
-                digest,
                 local_identity: local_entry.and_then(|entry| entry.native_identity),
                 local_size: local_entry.map(|entry| entry.size),
                 local_modified: local_entry.map(|entry| entry.modified.clone()),
@@ -762,21 +730,34 @@ async fn state_from_snapshot(
     Ok(state)
 }
 
-fn local_matches_state(local: &LocalTree, state: &ReplicaState) -> bool {
-    local.entries().len() == state.base.len()
+fn local_matches_state(local: &LocalTree, state: &ReplicaState) -> Result<bool> {
+    let base_kinds = state
+        .authority
+        .as_ref()
+        .map(snapshot_kinds)
+        .transpose()?
+        .unwrap_or_default();
+    Ok(local.entries().len() == state.base.len()
         && local.entries().iter().all(|(path, entry)| {
             state.base.get(path).is_some_and(|base| {
                 base.local_identity == entry.native_identity
                     && base.local_size == Some(entry.size)
                     && base.local_modified.as_deref() == Some(entry.modified.as_str())
                     && base.local_executable == Some(entry.executable)
-                    && base.digest.is_some() == (entry.kind == LocalKind::File)
+                    && base_kinds.get(path) == Some(&entry.kind)
             })
-        })
+        }))
 }
 
-fn known_local_digests(local: &LocalTree, state: &ReplicaState) -> BTreeMap<String, [u8; 32]> {
-    local
+fn known_local_digests(
+    local: &LocalTree,
+    state: &ReplicaState,
+) -> Result<BTreeMap<String, [u8; 32]>> {
+    let Some(authority) = &state.authority else {
+        return Ok(BTreeMap::new());
+    };
+    let paths = snapshot_paths(authority)?;
+    Ok(local
         .entries()
         .iter()
         .filter_map(|(path, entry)| {
@@ -787,12 +768,30 @@ fn known_local_digests(local: &LocalTree, state: &ReplicaState) -> BTreeMap<Stri
                 && base.local_modified.as_deref() == Some(entry.modified.as_str())
                 && base.local_executable == Some(entry.executable)
             {
-                base.digest.map(|digest| (path.clone(), digest))
+                let node = paths.get(path)?;
+                let version = authority.nodes[node].file_version?;
+                Some((
+                    path.clone(),
+                    authority.file_versions[&version].logical_digest,
+                ))
             } else {
                 None
             }
         })
-        .collect()
+        .collect())
+}
+
+fn snapshot_kinds(snapshot: &VolumeSnapshot) -> Result<BTreeMap<String, LocalKind>> {
+    Ok(snapshot_paths(snapshot)?
+        .into_iter()
+        .map(|(path, node)| {
+            let kind = match snapshot.nodes[&node].kind {
+                NodeKind::Directory => LocalKind::Directory,
+                NodeKind::RegularFile => LocalKind::File,
+            };
+            (path, kind)
+        })
+        .collect())
 }
 
 fn install_staged_changes(replica: &Path, staged: &StagedTree, before: &FrozenTree) -> Result<()> {

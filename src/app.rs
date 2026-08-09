@@ -16,9 +16,7 @@ use ofs::catalog::{Catalog, VolumeDefinition};
 use ofs::filesystem::BranchName;
 use ofs::filesystem::{Volume, VolumeId, VolumeModel};
 #[cfg(feature = "managed-branch")]
-use ofs::managed::extensions::branch::{
-    BranchInfo, D1BoundNamespace, D1BranchStore, ForkPoint, ObjectBoundNamespace, ObjectBranchStore,
-};
+use ofs::managed::extensions::branch::{BranchInfo, BranchStore, ForkPoint};
 use ofs::managed::{
     D1Config, D1Metadata, ManagedErrorKind, ManagedFormat, ManagedVolume, MetadataFormat,
     ObjectMetadata, SegmentGcMaintenance,
@@ -43,84 +41,6 @@ struct ManagedContext {
     format: ManagedFormat,
     data: Operator,
     metadata: MetadataAuthority,
-}
-
-#[cfg(feature = "managed-branch")]
-enum BranchAuthority {
-    Object(ObjectBranchStore),
-    D1(D1BranchStore),
-}
-
-#[cfg(feature = "managed-branch")]
-enum BoundBranchNamespace {
-    Object(ObjectBoundNamespace),
-    D1(D1BoundNamespace),
-}
-
-#[cfg(feature = "managed-branch")]
-impl BranchAuthority {
-    async fn initialize(&self, name: BranchName) -> Result<BranchInfo> {
-        match self {
-            Self::Object(store) => Ok(store.initialize(name).await?),
-            Self::D1(store) => Ok(store.initialize(name).await?),
-        }
-    }
-
-    async fn list(&self) -> Result<Vec<BranchInfo>> {
-        match self {
-            Self::Object(store) => Ok(store.list().await?),
-            Self::D1(store) => Ok(store.list().await?),
-        }
-    }
-
-    async fn get(&self, name: &BranchName) -> Result<BranchInfo> {
-        match self {
-            Self::Object(store) => Ok(store.get(name).await?),
-            Self::D1(store) => Ok(store.get(name).await?),
-        }
-    }
-
-    async fn bind(&self, name: &BranchName) -> Result<BoundBranchNamespace> {
-        match self {
-            Self::Object(store) => Ok(BoundBranchNamespace::Object(store.bind(name).await?)),
-            Self::D1(store) => Ok(BoundBranchNamespace::D1(store.bind(name).await?)),
-        }
-    }
-
-    async fn fork(
-        &self,
-        source: &BranchName,
-        point: ForkPoint,
-        target: BranchName,
-    ) -> Result<BranchInfo> {
-        match self {
-            Self::Object(store) => Ok(store.fork(source, point, target).await?),
-            Self::D1(store) => Ok(store.fork(source, point, target).await?),
-        }
-    }
-
-    async fn delete(&self, name: &BranchName) -> Result<()> {
-        match self {
-            Self::Object(store) => Ok(store.delete(name).await?),
-            Self::D1(store) => Ok(store.delete(name).await?),
-        }
-    }
-
-    async fn default_name(&self) -> Result<BranchName> {
-        match self {
-            Self::Object(store) => Ok(store.default_name().await?),
-            Self::D1(store) => Ok(store.default_name().await?),
-        }
-    }
-
-    async fn garbage_collect(&self, data: Operator, resume: bool) -> Result<SegmentGcMaintenance> {
-        match (self, resume) {
-            (Self::Object(store), false) => Ok(store.garbage_collect(data).await?),
-            (Self::Object(store), true) => Ok(store.resume_garbage_collect(data).await?),
-            (Self::D1(store), false) => Ok(store.garbage_collect(data).await?),
-            (Self::D1(store), true) => Ok(store.resume_garbage_collect(data).await?),
-        }
-    }
 }
 
 impl MetadataAuthority {
@@ -169,15 +89,10 @@ impl MetadataAuthority {
     }
 
     #[cfg(feature = "managed-branch")]
-    fn branches(&self, volume_id: VolumeId, data: Operator) -> Result<BranchAuthority> {
+    fn branches(&self, volume_id: VolumeId, data: Operator) -> Result<BranchStore> {
         match self {
-            Self::Object(_) => Ok(BranchAuthority::Object(ObjectBranchStore::new(
-                volume_id, data,
-            )?)),
-            Self::D1(metadata) => Ok(BranchAuthority::D1(D1BranchStore::new(
-                volume_id,
-                metadata.clone(),
-            ))),
+            Self::Object(_) => BranchStore::object(volume_id, data).map_err(Into::into),
+            Self::D1(metadata) => Ok(BranchStore::d1(volume_id, metadata.clone())),
         }
     }
 }
@@ -309,10 +224,12 @@ async fn gc_volume(config: &Path, args: VolumeGcArgs) -> Result<()> {
             metadata,
         } = open_managed_context(config, &args.alias, args.runtime.transfer_concurrency).await?;
         if format.requires_extension(ofs::managed::ManagedExtension::BranchV1) {
-            let collected = metadata
-                .branches(format.volume_id(), data.clone())?
-                .garbage_collect(data, args.resume)
-                .await?;
+            let branches = metadata.branches(format.volume_id(), data.clone())?;
+            let collected = if args.resume {
+                branches.resume_garbage_collect(data).await?
+            } else {
+                branches.garbage_collect(data).await?
+            };
             print_gc_result(&args.alias, collected);
             return Ok(());
         }
@@ -363,14 +280,8 @@ async fn open_managed_volume(
             Some(name) => parse_branch_name(name)?,
             None => branches.default_name().await?,
         };
-        return match branches.bind(&name).await? {
-            BoundBranchNamespace::Object(namespace) => {
-                ManagedVolume::object_branch(format, data, namespace).map_err(Into::into)
-            }
-            BoundBranchNamespace::D1(namespace) => {
-                ManagedVolume::d1_branch(format, data, namespace).map_err(Into::into)
-            }
-        };
+        return ManagedVolume::branch(format, data, branches.bind(&name).await?)
+            .map_err(Into::into);
     }
     if branch.is_some() {
         bail!("Managed volume does not enable branch/v1");
@@ -387,7 +298,7 @@ async fn open_branch_authority(
     config: &Path,
     alias: &str,
     transfer_concurrency: NonZeroUsize,
-) -> Result<BranchAuthority> {
+) -> Result<BranchStore> {
     let ManagedContext {
         format,
         data,

@@ -9,64 +9,32 @@
 //! Branch binding over a backend-native authority.
 
 use std::collections::BTreeMap;
-use std::fmt::Debug;
 
 use super::records::{
     BranchLifecycle, MAX_TAIL_BYTES, MAX_TAIL_TRANSACTIONS, StoredBranchHead, StoredChange,
-    StoredCheckpoint, StoredCommittedResult, StoredHistory, StoredNamespaceState,
+    StoredCheckpoint, StoredCommittedResult, StoredHistory, StoredNamespaceState, StoredResults,
     recover_namespace, require_request_digest, results_for_rotation,
 };
-use crate::filesystem::{
-    BranchBinding, BranchId, ChangeCursor, CommitOutcome, OperationId, VolumeId,
-};
+use super::store::BranchStore;
+use crate::filesystem::{BranchBinding, ChangeCursor, CommitOutcome, OperationId, VolumeId};
 use crate::managed::metadata::namespace::{NamespacePublication, NamespaceSnapshot};
 use crate::managed::{ManagedError, ManagedErrorKind};
 
-#[allow(async_fn_in_trait)]
-pub(crate) trait BranchNamespaceStore: Clone + Send + Sync {
-    type Revision: Clone + Debug + Send + Sync;
-
-    fn volume_id(&self) -> VolumeId;
-
-    async fn current_head(
-        &self,
-        binding: &BranchBinding,
-        action: &'static str,
-    ) -> Result<(StoredBranchHead, Self::Revision), ManagedError>;
-
-    async fn replace_head(
-        &self,
-        branch: BranchId,
-        revision: &Self::Revision,
-        head: &StoredBranchHead,
-    ) -> Result<bool, ManagedError>;
-
-    async fn read_checkpoint(&self, id: [u8; 32]) -> Result<StoredCheckpoint, ManagedError>;
-
-    async fn write_checkpoint(
-        &self,
-        checkpoint: &StoredCheckpoint,
-    ) -> Result<[u8; 32], ManagedError>;
-
-    async fn write_history(&self, history: &StoredHistory) -> Result<[u8; 32], ManagedError>;
-}
-
 #[derive(Clone)]
-pub struct BoundNamespace<S> {
-    pub(crate) store: S,
+pub struct BoundNamespace {
+    pub(crate) store: BranchStore,
     pub(crate) binding: BranchBinding,
 }
 
 #[derive(Clone, Debug)]
-pub struct BranchObservation<R> {
+pub struct BranchObservation {
     pub(crate) snapshot: NamespaceSnapshot,
-    revision: R,
+    revision: crate::managed::metadata::record::Revision,
     head: StoredBranchHead,
-    checkpoint: StoredCheckpoint,
+    checkpoint_results: StoredResults,
 }
 
-#[allow(private_bounds)]
-impl<S: BranchNamespaceStore> BoundNamespace<S> {
+impl BoundNamespace {
     pub fn binding(&self) -> &BranchBinding {
         &self.binding
     }
@@ -75,9 +43,7 @@ impl<S: BranchNamespaceStore> BoundNamespace<S> {
         self.store.volume_id()
     }
 
-    pub(crate) async fn observe(
-        &self,
-    ) -> Result<Option<BranchObservation<S::Revision>>, ManagedError> {
+    pub(crate) async fn observe(&self) -> Result<Option<BranchObservation>, ManagedError> {
         let (head, revision) = self
             .store
             .current_head(&self.binding, "read Managed branch")
@@ -86,32 +52,33 @@ impl<S: BranchNamespaceStore> BoundNamespace<S> {
             return Ok(None);
         };
         let checkpoint = self.store.read_checkpoint(state.checkpoint).await?;
-        let snapshot = recover_namespace(checkpoint.clone(), state, self.store.volume_id())?;
+        let (snapshot, checkpoint_results) =
+            recover_namespace(checkpoint, state, self.store.volume_id())?;
         Ok(Some(BranchObservation {
             snapshot,
             revision,
             head,
-            checkpoint,
+            checkpoint_results,
         }))
     }
 
     pub(crate) async fn observe_from(
         &self,
         _base: &NamespaceSnapshot,
-    ) -> Result<Option<BranchObservation<S::Revision>>, ManagedError> {
+    ) -> Result<Option<BranchObservation>, ManagedError> {
         self.observe().await
     }
 
     pub(crate) async fn publish(
         &self,
-        observed: Option<&BranchObservation<S::Revision>>,
+        observed: Option<&BranchObservation>,
         publication: &NamespacePublication,
     ) -> Result<CommitOutcome, ManagedError> {
         let branch = self.binding.id;
         if publication.target.volume_id != self.store.volume_id() {
             return Err(invalid("publication belongs to another volume"));
         }
-        let (head, revision, base, checkpoint) = match observed {
+        let (head, revision, base, checkpoint_results) = match observed {
             Some(observed) => {
                 observed.head.validate(self.store.volume_id(), branch)?;
                 if observed.head.lifecycle != BranchLifecycle::Active
@@ -123,7 +90,7 @@ impl<S: BranchNamespaceStore> BoundNamespace<S> {
                     observed.head.clone(),
                     observed.revision.clone(),
                     Some(&observed.snapshot),
-                    Some(observed.checkpoint.clone()),
+                    Some(observed.checkpoint_results.clone()),
                 )
             }
             None => {
@@ -158,7 +125,7 @@ impl<S: BranchNamespaceStore> BoundNamespace<S> {
             return Ok(CommitOutcome::Committed(cursor));
         }
 
-        let state = match (&head.state, checkpoint) {
+        let state = match (&head.state, checkpoint_results) {
             (None, None) => {
                 let result = StoredCommittedResult::from_change(&change)?;
                 let results = BTreeMap::from([((branch, publication.operation), result)]);
@@ -170,7 +137,7 @@ impl<S: BranchNamespaceStore> BoundNamespace<S> {
                     previous_history: None,
                 }
             }
-            (Some(current), Some(checkpoint)) => {
+            (Some(current), Some(checkpoint_results)) => {
                 let appended_bytes = current
                     .tail
                     .iter()
@@ -185,8 +152,7 @@ impl<S: BranchNamespaceStore> BoundNamespace<S> {
                 {
                     let history = StoredHistory::new(self.store.volume_id(), branch, current)?;
                     let history = self.store.write_history(&history).await?;
-                    let results =
-                        results_for_rotation(checkpoint, current, &change, self.store.volume_id())?;
+                    let results = results_for_rotation(checkpoint_results, current, &change)?;
                     let checkpoint = StoredCheckpoint::new(&publication.target, results)?;
                     StoredNamespaceState {
                         checkpoint: self.store.write_checkpoint(&checkpoint).await?,

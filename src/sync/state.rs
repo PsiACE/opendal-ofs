@@ -16,8 +16,8 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::filesystem::{
-    AuthorityIdentity, BranchBinding, ChangeCursor, DirectoryRecord, FileVersion, Generation,
-    NodeId, NodeRecord, OperationId, VolumeId, VolumeSnapshot,
+    AuthorityIdentity, BranchBinding, ChangeCursor, DirectoryRecord, FileVersion, NodeId,
+    NodeRecord, OperationId, VolumeId, VolumeSnapshot,
 };
 use crate::sync::local::NativeIdentity;
 
@@ -28,10 +28,6 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct BaseEntry {
-    pub node: NodeId,
-    pub generation: Generation,
-    pub directory_generation: Option<Generation>,
-    pub digest: Option<[u8; 32]>,
     pub local_identity: Option<NativeIdentity>,
     pub local_size: Option<u64>,
     pub local_modified: Option<String>,
@@ -320,15 +316,7 @@ fn validate_base(snapshot: &VolumeSnapshot, base: &BTreeMap<String, BaseEntry>) 
             .with_context(|| format!("replica base is missing {path:?}"))?;
         let record = &snapshot.nodes[&node];
         let version = record.file_version.map(|id| &snapshot.file_versions[&id]);
-        if saved.node != node
-            || saved.generation != record.generation
-            || saved.directory_generation
-                != snapshot
-                    .directories
-                    .get(&node)
-                    .map(|directory| directory.generation.clone())
-            || saved.digest != version.map(|version| version.logical_digest)
-            || saved.local_executable != Some(record.attributes.executable)
+        if saved.local_executable != Some(record.attributes.executable)
             || version.is_some_and(|version| saved.local_size != Some(version.logical_size))
         {
             bail!("replica base disagrees with authority snapshot at {path:?}");

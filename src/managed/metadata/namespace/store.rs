@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Backend-neutral namespace authority plus the Object Metadata constructor.
+//! Namespace authority over native revision-CAS records.
 
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -33,8 +33,8 @@ use super::{
 };
 use crate::filesystem::{ChangeCursor, CommitOutcome, OperationId, VolumeId};
 use crate::managed::metadata::object::{self, ensure_immutable, read_content_addressed};
-use crate::managed::metadata::record::{ObjectRecordBackend, RecordBackend};
-use crate::managed::{ManagedError, ManagedErrorKind};
+use crate::managed::metadata::record::{RecordBackend, Revision};
+use crate::managed::{D1Metadata, ManagedError, ManagedErrorKind};
 
 #[cfg(test)]
 use crate::filesystem::{
@@ -53,13 +53,13 @@ const MAX_HEAD_BYTES: usize = 256 * 1024;
 const HEAD_COMPRESSION_LEVEL: i32 = 3;
 
 #[derive(Clone, Debug)]
-pub(crate) struct NamespaceObservation<R = String> {
+pub(crate) struct NamespaceObservation {
     pub snapshot: NamespaceSnapshot,
-    revision: R,
+    revision: Revision,
     authority: Box<ObservationAuthority>,
 }
 
-impl<R> NamespaceObservation<R> {
+impl NamespaceObservation {
     pub(crate) fn gc_sweep(&self) -> Option<NamespaceGcSweep> {
         self.authority
             .head
@@ -71,7 +71,7 @@ impl<R> NamespaceObservation<R> {
 #[derive(Clone)]
 struct ObservationAuthority {
     head: StoredHead,
-    checkpoint: Option<StoredCheckpoint>,
+    checkpoint_results: Option<BTreeMap<OperationId, StoredCommittedResult>>,
 }
 
 impl std::fmt::Debug for ObservationAuthority {
@@ -79,47 +79,37 @@ impl std::fmt::Debug for ObservationAuthority {
         formatter
             .debug_struct("ObservationAuthority")
             .field("head", &self.head)
-            .field("checkpoint_loaded", &self.checkpoint.is_some())
+            .field("checkpoint_loaded", &self.checkpoint_results.is_some())
             .field("tail_changes", &self.head.tail.len())
             .finish()
     }
 }
 
 #[derive(Clone)]
-pub(crate) struct NamespaceStore<B> {
+pub(crate) struct NamespaceStore {
     pub(crate) volume_id: VolumeId,
     pub(crate) operator: Operator,
-    pub(crate) backend: B,
+    pub(crate) backend: RecordBackend,
 }
 
-pub(crate) type ObjectNamespace = NamespaceStore<ObjectRecordBackend>;
-
-impl NamespaceStore<ObjectRecordBackend> {
-    pub(crate) fn new(volume_id: VolumeId, operator: Operator) -> Result<Self, ManagedError> {
-        let capability = operator.info().full_capability();
-        if !capability.read
-            || !capability.write
-            || !capability.write_with_if_not_exists
-            || !capability.write_with_if_match
-        {
-            return Err(invalid(
-                "open Managed namespace",
-                "object metadata requires read, create-only write, and conditional replace",
-            ));
-        }
+impl NamespaceStore {
+    pub(crate) fn object(volume_id: VolumeId, operator: Operator) -> Result<Self, ManagedError> {
         Ok(Self {
             volume_id,
             operator: operator.clone(),
-            backend: ObjectRecordBackend::new(operator),
+            backend: RecordBackend::object(operator, "open Managed namespace")?,
         })
     }
-}
 
-#[allow(private_bounds)]
-impl<B: RecordBackend> NamespaceStore<B> {
-    pub(crate) async fn observe(
-        &self,
-    ) -> Result<Option<NamespaceObservation<B::Revision>>, ManagedError> {
+    pub(crate) fn d1(volume_id: VolumeId, operator: Operator, metadata: D1Metadata) -> Self {
+        Self {
+            volume_id,
+            operator,
+            backend: RecordBackend::d1(volume_id, metadata),
+        }
+    }
+
+    pub(crate) async fn observe(&self) -> Result<Option<NamespaceObservation>, ManagedError> {
         let Some((bytes, revision)) = self.read_head().await? else {
             return Ok(None);
         };
@@ -130,7 +120,7 @@ impl<B: RecordBackend> NamespaceStore<B> {
     pub(crate) async fn observe_from(
         &self,
         base: &NamespaceSnapshot,
-    ) -> Result<Option<NamespaceObservation<B::Revision>>, ManagedError> {
+    ) -> Result<Option<NamespaceObservation>, ManagedError> {
         let Some((bytes, revision)) = self.read_head().await? else {
             return Ok(None);
         };
@@ -144,7 +134,7 @@ impl<B: RecordBackend> NamespaceStore<B> {
                     revision,
                     authority: Box::new(ObservationAuthority {
                         head,
-                        checkpoint: None,
+                        checkpoint_results: None,
                     }),
                 }));
             }
@@ -155,22 +145,22 @@ impl<B: RecordBackend> NamespaceStore<B> {
     async fn recover_observation(
         &self,
         head: StoredHead,
-        revision: B::Revision,
-    ) -> Result<NamespaceObservation<B::Revision>, ManagedError> {
+        revision: Revision,
+    ) -> Result<NamespaceObservation, ManagedError> {
         let (snapshot, checkpoint) = self.recover(&head).await?;
         Ok(NamespaceObservation {
             snapshot,
             revision,
             authority: Box::new(ObservationAuthority {
                 head,
-                checkpoint: Some(checkpoint),
+                checkpoint_results: Some(checkpoint.results),
             }),
         })
     }
 
     pub(crate) async fn publish(
         &self,
-        observed: Option<&NamespaceObservation<B::Revision>>,
+        observed: Option<&NamespaceObservation>,
         publication: &NamespacePublication,
     ) -> Result<CommitOutcome, ManagedError> {
         if publication.target.volume_id != self.volume_id {
@@ -213,16 +203,14 @@ impl<B: RecordBackend> NamespaceStore<B> {
             // the observation used for CAS. Building a checkpoint never rereads
             // the remote checkpoint or HEAD.
             let mut committed = match observed {
-                Some(value) => {
-                    let checkpoint = match &value.authority.checkpoint {
-                        Some(checkpoint) => checkpoint.clone(),
-                        None => {
-                            self.read_checkpoint(value.authority.head.checkpoint)
-                                .await?
-                        }
-                    };
-                    checkpoint.results
-                }
+                Some(value) => match &value.authority.checkpoint_results {
+                    Some(results) => results.clone(),
+                    None => {
+                        self.read_checkpoint(value.authority.head.checkpoint)
+                            .await?
+                            .results
+                    }
+                },
                 None => BTreeMap::new(),
             };
             if let Some(observed) = observed {
@@ -296,7 +284,7 @@ impl<B: RecordBackend> NamespaceStore<B> {
 
     pub(crate) async fn begin_gc(
         &self,
-        observed: &NamespaceObservation<B::Revision>,
+        observed: &NamespaceObservation,
     ) -> Result<NamespaceGcSweep, ManagedError> {
         if observed.snapshot.volume_id != self.volume_id {
             return Err(invalid(
@@ -326,7 +314,7 @@ impl<B: RecordBackend> NamespaceStore<B> {
 
     pub(crate) async fn resume_gc(
         &self,
-        observed: &NamespaceObservation<B::Revision>,
+        observed: &NamespaceObservation,
     ) -> Result<NamespaceGcSweep, ManagedError> {
         if observed.snapshot.volume_id != self.volume_id {
             return Err(invalid(
@@ -557,7 +545,7 @@ impl<B: RecordBackend> NamespaceStore<B> {
         })
     }
 
-    async fn read_head(&self) -> Result<Option<(Vec<u8>, B::Revision)>, ManagedError> {
+    async fn read_head(&self) -> Result<Option<(Vec<u8>, Revision)>, ManagedError> {
         self.backend.read(HEAD_KEY, "read Managed namespace").await
     }
 
@@ -571,7 +559,7 @@ impl<B: RecordBackend> NamespaceStore<B> {
 
     async fn replace_head(
         &self,
-        expected_revision: &B::Revision,
+        expected_revision: &Revision,
         bytes: Vec<u8>,
     ) -> Result<bool, ManagedError> {
         self.backend
@@ -1123,10 +1111,10 @@ mod tests {
             target: first_snapshot.clone(),
         };
         let operator = Operator::new(Memory::default()).unwrap().finish();
-        let namespace = ObjectNamespace {
+        let namespace = NamespaceStore {
             volume_id: first_snapshot.volume_id,
             operator: operator.clone(),
-            backend: ObjectRecordBackend::new(operator),
+            backend: RecordBackend::test_object(operator),
         };
         assert_eq!(
             namespace.publish(None, &first_publication).await.unwrap(),
@@ -1192,10 +1180,10 @@ mod tests {
             target: snapshot.clone(),
         };
         let operator = Operator::new(Memory::default()).unwrap().finish();
-        let namespace = ObjectNamespace {
+        let namespace = NamespaceStore {
             volume_id: snapshot.volume_id,
             operator: operator.clone(),
-            backend: ObjectRecordBackend::new(operator.clone()),
+            backend: RecordBackend::test_object(operator.clone()),
         };
         assert_eq!(
             namespace.publish(None, &publication).await.unwrap(),

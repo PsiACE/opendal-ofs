@@ -19,7 +19,6 @@
 
 mod change;
 mod checkpoint;
-mod d1;
 mod records;
 mod store;
 mod validation;
@@ -27,12 +26,11 @@ mod validation;
 #[cfg(feature = "managed-branch")]
 pub(crate) use change::NamespaceChange;
 pub(crate) use checkpoint::{CheckpointPart, CheckpointRoot, PendingCheckpoint};
-pub(crate) use d1::{D1Namespace, D1NamespaceObservation};
 pub use records::NamespaceGcSweep;
 pub(crate) use records::{
     DirectoryPrecondition, DirectoryRecord, FileVersionRecord, NamespacePublication,
     NamespaceSnapshot, NodePrecondition, NodeRecord, managed_generation, next_managed_generation,
 };
-pub(crate) use store::{NamespaceObservation, ObjectNamespace};
+pub(crate) use store::{NamespaceObservation, NamespaceStore};
 #[cfg(feature = "managed-branch")]
 pub(crate) use validation::{validate_publication, validate_snapshot};

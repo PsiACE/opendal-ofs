@@ -54,7 +54,6 @@ const FASTCDC_MINIMUM_FILE_SIZE: u64 = 1024 * 1024;
 const FASTCDC_MINIMUM_SIZE: u32 = 64 * 1024;
 const FASTCDC_TARGET_SIZE: u32 = 256 * 1024;
 const FASTCDC_MAXIMUM_SIZE: u32 = 1024 * 1024;
-const DELETE_BATCH_SIZE: usize = 1000;
 
 /// Data segments removed by one namespace-fenced garbage-collection sweep.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -651,7 +650,11 @@ impl ManagedData {
             )?);
         }
         let mut result = SegmentGcMaintenance::default();
-        let mut unreachable = Vec::new();
+        let mut deleter = self
+            .operator
+            .deleter()
+            .await
+            .map_err(|_| unavailable("delete unreachable data segments"))?;
         let mut entries = self
             .operator
             .lister_with(&format!("{SEGMENT_ROOT}/"))
@@ -693,23 +696,17 @@ impl ManagedData {
                         "deleted byte count exceeds format v1",
                     )
                 })?;
-            unreachable.push(entry.path().to_owned());
-            result.deleted += 1;
-            result.deleted_bytes = deleted_bytes;
-            if unreachable.len() == DELETE_BATCH_SIZE {
-                self.operator
-                    .delete_iter(unreachable.iter().map(String::as_str))
-                    .await
-                    .map_err(|_| unavailable("delete unreachable data segments"))?;
-                unreachable.clear();
-            }
-        }
-        if !unreachable.is_empty() {
-            self.operator
-                .delete_iter(unreachable.iter().map(String::as_str))
+            deleter
+                .delete(entry.path())
                 .await
                 .map_err(|_| unavailable("delete unreachable data segments"))?;
+            result.deleted += 1;
+            result.deleted_bytes = deleted_bytes;
         }
+        deleter
+            .close()
+            .await
+            .map_err(|_| unavailable("delete unreachable data segments"))?;
         Ok(result)
     }
 }

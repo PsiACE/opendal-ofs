@@ -38,7 +38,6 @@ pub(crate) fn build_publication<V: Volume>(
         Some(state) => snapshot_paths(state)?,
         None => BTreeMap::new(),
     };
-    validate_replica_paths(&old_paths, replica)?;
     let kinds = local_kinds(local)?;
     validate_prepared(local, prepared)?;
     reject_unresolved_renames(&kinds, &old_paths, authoritative, replica, prepared)?;
@@ -220,20 +219,6 @@ fn validate_prepared(local: &LocalTree, prepared: &BTreeMap<String, FileVersion>
     Ok(())
 }
 
-fn validate_replica_paths(
-    authoritative: &BTreeMap<String, NodeId>,
-    replica: &ReplicaState,
-) -> Result<()> {
-    for (path, base) in &replica.base {
-        if let Some(node) = authoritative.get(path)
-            && *node != base.node
-        {
-            bail!("replica identity for {path:?} disagrees with the authoritative namespace");
-        }
-    }
-    Ok(())
-}
-
 fn reject_unresolved_renames(
     local: &BTreeMap<String, NodeKind>,
     old_paths: &BTreeMap<String, NodeId>,
@@ -244,6 +229,8 @@ fn reject_unresolved_renames(
     let Some(authoritative) = authoritative else {
         return Ok(());
     };
+    let base = replica.authority.as_ref();
+    let base_paths = base.map(snapshot_paths).transpose()?.unwrap_or_default();
     for (path, kind) in local {
         if old_paths.contains_key(path) || *kind != NodeKind::RegularFile {
             continue;
@@ -256,10 +243,17 @@ fn reject_unresolved_renames(
             continue;
         }
         let digest = prepared[path].logical_digest;
-        let possible = replica.base.iter().any(|(old_path, base)| {
+        let possible = base_paths.iter().any(|(old_path, node)| {
             !local.contains_key(old_path)
-                && base.digest == Some(digest)
-                && authoritative.nodes.contains_key(&base.node)
+                && authoritative.nodes.contains_key(node)
+                && base
+                    .and_then(|snapshot| snapshot.nodes[node].file_version)
+                    .is_some_and(|version| {
+                        base.expect("base paths require an authority snapshot")
+                            .file_versions[&version]
+                            .logical_digest
+                            == digest
+                    })
         });
         if possible {
             bail!(
