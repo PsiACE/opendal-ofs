@@ -258,9 +258,7 @@ async fn open_managed_context(
     let data = open_operator(&definition.storage, transfer_concurrency)?;
     let metadata = open_metadata(data.clone(), settings.metadata.as_ref())?;
     let format = metadata.read_format().await?;
-    if format.volume_id() != definition.volume_id
-        || format.metadata_format() != metadata.metadata_format()
-    {
+    if format.volume_id() != definition.volume_id {
         bail!("volume catalog and Managed format v1 binding disagree");
     }
     Ok(ManagedContext {
@@ -338,10 +336,9 @@ async fn create_volume(config: &Path, mut args: VolumeCreateArgs) -> Result<()> 
             Err(error) => return Err(error.into()),
         },
     };
-    if format.metadata_format() != metadata.metadata_format()
-        || configured
-            .as_ref()
-            .is_some_and(|definition| definition.volume_id != format.volume_id())
+    if configured
+        .as_ref()
+        .is_some_and(|definition| definition.volume_id != format.volume_id())
     {
         bail!("volume catalog and Managed format v1 binding disagree");
     }

@@ -69,6 +69,7 @@ impl ManagedMetadata {
         &self,
         desired: &ManagedFormat,
     ) -> Result<ManagedFormat, ManagedError> {
+        self.require_backend_format(desired)?;
         match &self.0 {
             MetadataBackend::Object(metadata) => metadata.create_format(desired).await,
             MetadataBackend::D1(metadata) => metadata.create_format(desired).await,
@@ -76,17 +77,23 @@ impl ManagedMetadata {
     }
 
     pub async fn read_format(&self) -> Result<ManagedFormat, ManagedError> {
-        match &self.0 {
+        let format = match &self.0 {
             MetadataBackend::Object(metadata) => metadata.read_format().await,
             MetadataBackend::D1(metadata) => metadata.read_format().await,
-        }
+        }?;
+        self.require_backend_format(&format)?;
+        Ok(format)
     }
 
     pub async fn read_format_optional(&self) -> Result<Option<ManagedFormat>, ManagedError> {
-        match &self.0 {
+        let format = match &self.0 {
             MetadataBackend::Object(metadata) => metadata.read_format_optional().await,
             MetadataBackend::D1(metadata) => metadata.read_format_optional().await,
+        }?;
+        if let Some(format) = &format {
+            self.require_backend_format(format)?;
         }
+        Ok(format)
     }
 
     pub fn open_volume(
@@ -94,6 +101,7 @@ impl ManagedMetadata {
         format: ManagedFormat,
         data: Operator,
     ) -> Result<ManagedVolume, ManagedError> {
+        self.require_backend_format(&format)?;
         match &self.0 {
             MetadataBackend::Object(_) => ManagedVolume::object(format, data),
             MetadataBackend::D1(metadata) => ManagedVolume::d1(format, data, metadata.clone()),
@@ -107,6 +115,7 @@ impl ManagedMetadata {
         data: Operator,
         namespace: BoundNamespace,
     ) -> Result<ManagedVolume, ManagedError> {
+        self.require_backend_format(&format)?;
         ManagedVolume::branch(format, data, namespace)
     }
 
@@ -119,6 +128,18 @@ impl ManagedMetadata {
         match &self.0 {
             MetadataBackend::Object(_) => BranchStore::object(volume_id, data),
             MetadataBackend::D1(metadata) => Ok(BranchStore::d1(volume_id, metadata.clone())),
+        }
+    }
+
+    fn require_backend_format(&self, format: &ManagedFormat) -> Result<(), ManagedError> {
+        if format.metadata_format() == self.metadata_format() {
+            Ok(())
+        } else {
+            Err(ManagedError::new(
+                super::ManagedErrorKind::Invalid,
+                "open Managed metadata",
+                "superblock metadata format does not match its authority",
+            ))
         }
     }
 }

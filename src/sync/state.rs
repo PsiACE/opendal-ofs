@@ -61,11 +61,11 @@ pub struct ReplicaState {
 }
 
 impl ReplicaState {
-    pub fn empty(volume: VolumeId) -> Self {
+    pub(crate) fn empty(volume: VolumeId) -> Self {
         Self::empty_for(AuthorityIdentity::base(volume))
     }
 
-    pub fn empty_for(authority: AuthorityIdentity) -> Self {
+    pub(crate) fn empty_for(authority: AuthorityIdentity) -> Self {
         Self {
             volume: authority.volume,
             branch: authority.branch,

@@ -25,6 +25,3 @@ pub use namespace::BoundNamespace;
 pub(crate) use namespace::BranchWitness;
 pub use records::{BranchInfo, BranchLifecycle, ForkPoint};
 pub use store::BranchStore;
-
-/// Required Managed superblock extension implemented by this module.
-pub const IDENTIFIER: &str = "branch/v1";

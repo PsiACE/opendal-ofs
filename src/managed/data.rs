@@ -624,7 +624,7 @@ impl ManagedData {
             .map_err(|error| referenced_segment_error("read data segment", error))?;
         verified
             .get_or_try_init(|| async {
-                verify_complete_demands(extent.segment, &bytes.clone().to_bytes(), demands)
+                verify_complete_demands(extent.segment, &bytes.to_bytes(), demands)
             })
             .await?;
         slice_extent(&bytes, 0, extent)

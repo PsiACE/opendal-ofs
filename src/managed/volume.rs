@@ -31,7 +31,7 @@ use super::metadata::namespace::{
 };
 use super::{
     AuthorityKnownContent, D1Metadata, ManagedData, ManagedError, ManagedErrorKind, ManagedFormat,
-    MetadataFormat, SegmentGcMaintenance,
+    SegmentGcMaintenance,
 };
 use crate::filesystem::{AuthorityIdentity, CommitOutcome, OperationId, VolumeId};
 use crate::filesystem::{
@@ -81,13 +81,11 @@ impl ManagedVolume {
         format: ManagedFormat,
         data_operator: Operator,
     ) -> Result<Self, ManagedError> {
-        if format.metadata_format() != MetadataFormat::ObjectV1
-            || !format.required_extensions().is_empty()
-        {
+        if !format.required_extensions().is_empty() {
             return Err(ManagedError::new(
                 ManagedErrorKind::Invalid,
                 "open Managed volume",
-                "superblock metadata format is not object/1",
+                "base namespace does not accept Managed extensions",
             ));
         }
         let volume_id = format.volume_id();
@@ -128,13 +126,11 @@ impl ManagedVolume {
         data_operator: Operator,
         metadata: D1Metadata,
     ) -> Result<Self, ManagedError> {
-        if format.metadata_format() != MetadataFormat::TransactionalV1
-            || !format.required_extensions().is_empty()
-        {
+        if !format.required_extensions().is_empty() {
             return Err(ManagedError::new(
                 ManagedErrorKind::Invalid,
                 "open Managed volume",
-                "superblock metadata format is not transactional/1",
+                "base namespace does not accept Managed extensions",
             ));
         }
         let volume_id = format.volume_id();
