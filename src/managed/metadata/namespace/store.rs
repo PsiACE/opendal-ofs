@@ -55,11 +55,22 @@ const HEAD_COMPRESSION_LEVEL: i32 = 3;
 #[derive(Clone, Debug)]
 pub(crate) struct NamespaceObservation {
     pub snapshot: NamespaceSnapshot,
+    witness: NamespaceWitness,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NamespaceWitness {
     revision: Revision,
     authority: Box<ObservationAuthority>,
 }
 
 impl NamespaceObservation {
+    pub(crate) fn into_parts(self) -> (NamespaceSnapshot, NamespaceWitness) {
+        (self.snapshot, self.witness)
+    }
+}
+
+impl NamespaceWitness {
     pub(crate) fn gc_sweep(&self) -> Option<NamespaceGcSweep> {
         self.authority
             .head
@@ -131,11 +142,13 @@ impl NamespaceStore {
             if let Some(snapshot) = replay_tail_from(base, &head)? {
                 return Ok(Some(NamespaceObservation {
                     snapshot,
-                    revision,
-                    authority: Box::new(ObservationAuthority {
-                        head,
-                        checkpoint_results: None,
-                    }),
+                    witness: NamespaceWitness {
+                        revision,
+                        authority: Box::new(ObservationAuthority {
+                            head,
+                            checkpoint_results: None,
+                        }),
+                    },
                 }));
             }
         }
@@ -150,17 +163,19 @@ impl NamespaceStore {
         let (snapshot, checkpoint) = self.recover(&head).await?;
         Ok(NamespaceObservation {
             snapshot,
-            revision,
-            authority: Box::new(ObservationAuthority {
-                head,
-                checkpoint_results: Some(checkpoint.results),
-            }),
+            witness: NamespaceWitness {
+                revision,
+                authority: Box::new(ObservationAuthority {
+                    head,
+                    checkpoint_results: Some(checkpoint.results),
+                }),
+            },
         })
     }
 
     pub(crate) async fn publish(
         &self,
-        observed: Option<&NamespaceObservation>,
+        observed: Option<(&NamespaceWitness, &NamespaceSnapshot)>,
         publication: &NamespacePublication,
     ) -> Result<CommitOutcome, ManagedError> {
         if publication.target.volume_id != self.volume_id {
@@ -169,12 +184,12 @@ impl NamespaceStore {
                 "publication belongs to another volume",
             ));
         }
-        if observed.is_some_and(|value| value.gc_sweep().is_some()) {
+        if observed.is_some_and(|(witness, _)| witness.gc_sweep().is_some()) {
             return Ok(CommitOutcome::Conflict {
-                observed: observed.expect("checked above").snapshot.cursor,
+                observed: observed.expect("checked above").1.cursor,
             });
         }
-        let base = observed.map(|value| &value.snapshot);
+        let base = observed.map(|(_, snapshot)| snapshot);
         let stored = NamespaceChange::from_publication(publication, base);
         let encoded_transaction = encode_table_value(&stored, "publish Managed namespace")?;
         let request_sha256 = sha256(&encoded_transaction);
@@ -191,11 +206,12 @@ impl NamespaceStore {
             });
         }
 
-        let appended_tail_bytes = observed.map_or(0, |value| value.authority.head.tail_bytes())
+        let appended_tail_bytes = observed
+            .map_or(0, |(witness, _)| witness.authority.head.tail_bytes())
             + encoded_transaction.len();
         let checkpoint_due = observed.is_none()
-            || observed.is_some_and(|value| {
-                value.authority.head.tail.len() + 1 >= usize::from(MAX_TAIL_TRANSACTIONS)
+            || observed.is_some_and(|(witness, _)| {
+                witness.authority.head.tail.len() + 1 >= usize::from(MAX_TAIL_TRANSACTIONS)
                     || appended_tail_bytes > MAX_TAIL_BYTES
             });
         let (checkpoint, checkpoint_cursor, tail) = if checkpoint_due {
@@ -203,18 +219,18 @@ impl NamespaceStore {
             // the observation used for CAS. Building a checkpoint never rereads
             // the remote checkpoint or HEAD.
             let mut committed = match observed {
-                Some(value) => match &value.authority.checkpoint_results {
+                Some((witness, _)) => match &witness.authority.checkpoint_results {
                     Some(results) => results.clone(),
                     None => {
-                        self.read_checkpoint(value.authority.head.checkpoint)
+                        self.read_checkpoint(witness.authority.head.checkpoint)
                             .await?
                             .results
                     }
                 },
                 None => BTreeMap::new(),
             };
-            if let Some(observed) = observed {
-                for transaction in &observed.authority.head.tail {
+            if let Some((witness, _)) = observed {
+                for transaction in &witness.authority.head.tail {
                     committed.insert(
                         transaction.operation,
                         StoredCommittedResult::from_transaction(transaction)?,
@@ -234,12 +250,12 @@ impl NamespaceStore {
                 .await?;
             (checkpoint_id, publication.target.cursor, Vec::new())
         } else {
-            let observed = observed.expect("checkpoint policy has an observation");
-            let mut tail = observed.authority.head.tail.clone();
+            let (witness, _) = observed.expect("checkpoint policy has an observation");
+            let mut tail = witness.authority.head.tail.clone();
             tail.push(stored.clone());
             (
-                observed.authority.head.checkpoint,
-                observed.authority.head.checkpoint_cursor,
+                witness.authority.head.checkpoint,
+                witness.authority.head.checkpoint_cursor,
                 tail,
             )
         };
@@ -251,16 +267,16 @@ impl NamespaceStore {
             tail,
         )?
         .with_maintenance(
-            observed.map_or(0, |value| value.authority.head.maintenance_epoch),
-            observed.and_then(|value| value.authority.head.maintenance_owner),
+            observed.map_or(0, |(witness, _)| witness.authority.head.maintenance_epoch),
+            observed.and_then(|(witness, _)| witness.authority.head.maintenance_owner),
         );
         let head = encode_head(&head)?;
         let replaced = match observed {
-            Some(observed) => {
+            Some((witness, _)) => {
                 self.backend
                     .replace(
                         HEAD_KEY,
-                        &observed.revision,
+                        &witness.revision,
                         head,
                         "publish Managed namespace",
                     )
@@ -284,14 +300,8 @@ impl NamespaceStore {
 
     pub(crate) async fn begin_gc(
         &self,
-        observed: &NamespaceObservation,
+        observed: &NamespaceWitness,
     ) -> Result<NamespaceGcSweep, ManagedError> {
-        if observed.snapshot.volume_id != self.volume_id {
-            return Err(invalid(
-                "begin Managed namespace GC",
-                "observation belongs to another volume",
-            ));
-        }
         if observed.gc_sweep().is_some() {
             return Err(conflict(
                 "begin Managed namespace GC",
@@ -314,14 +324,8 @@ impl NamespaceStore {
 
     pub(crate) async fn resume_gc(
         &self,
-        observed: &NamespaceObservation,
+        observed: &NamespaceWitness,
     ) -> Result<NamespaceGcSweep, ManagedError> {
-        if observed.snapshot.volume_id != self.volume_id {
-            return Err(invalid(
-                "resume Managed namespace GC",
-                "observation belongs to another volume",
-            ));
-        }
         let mut head = observed.authority.head.clone();
         let sweep = head.resume_gc(*OperationId::generate().as_bytes())?;
         if self
@@ -341,21 +345,21 @@ impl NamespaceStore {
         let observed = self.observe().await?.ok_or_else(|| {
             conflict("finish Managed namespace GC", "namespace authority changed")
         })?;
-        if observed.authority.head.maintenance_epoch == sweep.epoch()
-            && observed.gc_sweep().is_none()
+        if observed.witness.authority.head.maintenance_epoch == sweep.epoch()
+            && observed.witness.gc_sweep().is_none()
         {
             return Ok(());
         }
-        if observed.gc_sweep() != Some(sweep) {
+        if observed.witness.gc_sweep() != Some(sweep) {
             return Err(conflict(
                 "finish Managed namespace GC",
                 "GC sweep token does not match the authority",
             ));
         }
-        let mut head = observed.authority.head.clone();
+        let mut head = observed.witness.authority.head.clone();
         head.finish_gc(sweep)?;
         if self
-            .replace_head(&observed.revision, encode_head(&head)?)
+            .replace_head(&observed.witness.revision, encode_head(&head)?)
             .await?
         {
             return Ok(());
@@ -363,7 +367,8 @@ impl NamespaceStore {
         let current = self.observe().await?.ok_or_else(|| {
             conflict("finish Managed namespace GC", "namespace authority changed")
         })?;
-        if current.authority.head.maintenance_epoch == sweep.epoch() && current.gc_sweep().is_none()
+        if current.witness.authority.head.maintenance_epoch == sweep.epoch()
+            && current.witness.gc_sweep().is_none()
         {
             Ok(())
         } else {

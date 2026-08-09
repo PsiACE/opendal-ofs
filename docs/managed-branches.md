@@ -200,10 +200,11 @@ The implementation lives under:
 managed::extensions::branch
 ```
 
-The Cargo feature `managed-branch` owns the Object and D1 implementations,
-branch lifecycle API, history codec, and branch-bound `ManagedVolume`
-adapters. Default builds enable the feature. Builds can exclude it and still
-compile the base Object and D1 Managed paths.
+The Cargo feature `managed-branch` owns the branch lifecycle API, history
+codec, and branch-bound `ManagedVolume` adapter. Default builds enable the
+feature. Builds can exclude it and still compile the base Object and D1
+Managed paths. Object and D1 differ only at the shared revision-CAS record
+backend.
 
 A small amount of negotiation plumbing remains unconditional:
 
@@ -377,16 +378,15 @@ content-addressed. The base Managed `head.ofs` is not read or mirrored for a
 branching volume.
 
 Base and branch namespaces share the checkpoint builder and recovery
-validation. Object and D1 share the mutable record interface; their adapters
-provide only native read, create,
-revision-CAS replace, list, and delete operations. Checkpoint capacity is the
-sum of its immutable parts rather than one encoded snapshot value.
+validation. One record backend contains the complete Object/D1 dispatch and
+provides native read, create, revision-CAS replace, list, and delete
+operations. Namespace and branch layers do not branch on providers.
+Checkpoint capacity is the sum of its immutable parts rather than one encoded
+snapshot value.
 
-Reads obtain an ETag with `stat` and then issue an `If-Match` read. The decoded
-bytes and the revision used by the next conditional write therefore belong to
-the same object generation. Opening the store requires OpenDAL capabilities
-for read, conditional read, stat, create-only write, conditional replace,
-list, and delete as needed by the selected operation.
+Opening Object metadata requires OpenDAL capabilities for read, create-only
+write, and conditional replace; list and delete are required by GC when it is
+run.
 
 Correctness never depends on listing heads. The registry supplies live branch
 roots. Listing is used only during garbage collection of unreachable objects.

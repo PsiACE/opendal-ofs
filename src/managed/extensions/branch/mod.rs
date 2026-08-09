@@ -21,7 +21,8 @@ mod namespace;
 pub(crate) mod records;
 mod store;
 
-pub use namespace::{BoundNamespace, BranchObservation};
+pub use namespace::BoundNamespace;
+pub(crate) use namespace::BranchWitness;
 pub use records::{BranchInfo, BranchLifecycle, ForkPoint};
 pub use store::BranchStore;
 

@@ -23,11 +23,11 @@ use std::num::NonZeroUsize;
 use opendal::Operator;
 
 #[cfg(feature = "managed-branch")]
-use super::extensions::branch::{BoundNamespace, BranchObservation};
+use super::extensions::branch::{BoundNamespace, BranchWitness};
 use super::format::ExtentMap;
 use super::metadata::namespace::{
-    FileVersionRecord, NamespaceGcSweep, NamespaceObservation, NamespacePublication,
-    NamespaceSnapshot, NamespaceStore,
+    FileVersionRecord, NamespaceGcSweep, NamespacePublication, NamespaceSnapshot, NamespaceStore,
+    NamespaceWitness,
 };
 use super::{
     AuthorityKnownContent, D1Metadata, ManagedData, ManagedError, ManagedErrorKind, ManagedFormat,
@@ -61,23 +61,15 @@ pub struct ManagedObservation {
 
 #[derive(Clone, Debug)]
 enum AuthorityObservation {
-    Base(NamespaceObservation),
+    Base(NamespaceWitness),
     #[cfg(feature = "managed-branch")]
-    Branch(Box<BranchObservation>),
+    Branch(Box<BranchWitness>),
 }
 
 impl ManagedObservation {
-    fn snapshot(&self) -> &NamespaceSnapshot {
-        match &self.authority {
-            AuthorityObservation::Base(observed) => &observed.snapshot,
-            #[cfg(feature = "managed-branch")]
-            AuthorityObservation::Branch(observed) => &observed.snapshot,
-        }
-    }
-
     fn gc_sweep(&self) -> Option<NamespaceGcSweep> {
         match &self.authority {
-            AuthorityObservation::Base(observed) => observed.gc_sweep(),
+            AuthorityObservation::Base(witness) => witness.gc_sweep(),
             #[cfg(feature = "managed-branch")]
             AuthorityObservation::Branch(_) => None,
         }
@@ -159,14 +151,18 @@ impl ManagedVolume {
             NamespaceAuthority::Base(namespace) => namespace
                 .observe()
                 .await?
-                .map(|observed| managed_observation(AuthorityObservation::Base(observed)))
+                .map(|observed| {
+                    let (snapshot, witness) = observed.into_parts();
+                    managed_observation(snapshot, AuthorityObservation::Base(witness))
+                })
                 .transpose(),
             #[cfg(feature = "managed-branch")]
             NamespaceAuthority::Branch(namespace) => namespace
                 .observe()
                 .await?
                 .map(|observed| {
-                    managed_observation(AuthorityObservation::Branch(Box::new(observed)))
+                    let (snapshot, witness) = observed.into_parts();
+                    managed_observation(snapshot, AuthorityObservation::Branch(Box::new(witness)))
                 })
                 .transpose(),
         }
@@ -181,14 +177,18 @@ impl ManagedVolume {
             (NamespaceAuthority::Base(namespace), Some(base)) => namespace
                 .observe_from(base)
                 .await?
-                .map(|observed| managed_observation(AuthorityObservation::Base(observed)))
+                .map(|observed| {
+                    let (snapshot, witness) = observed.into_parts();
+                    managed_observation(snapshot, AuthorityObservation::Base(witness))
+                })
                 .transpose(),
             #[cfg(feature = "managed-branch")]
             (NamespaceAuthority::Branch(namespace), Some(base)) => namespace
                 .observe_from(base)
                 .await?
                 .map(|observed| {
-                    managed_observation(AuthorityObservation::Branch(Box::new(observed)))
+                    let (snapshot, witness) = observed.into_parts();
+                    managed_observation(snapshot, AuthorityObservation::Branch(Box::new(witness)))
                 })
                 .transpose(),
             _ => self.observe().await,
@@ -200,16 +200,32 @@ impl ManagedVolume {
         observed: Option<&ManagedObservation>,
         publication: &NamespacePublication,
     ) -> Result<CommitOutcome, ManagedError> {
+        let base = observed
+            .map(|observed| to_managed_snapshot(&observed.filesystem_snapshot))
+            .transpose()?;
         match (&self.namespace, observed.map(|value| &value.authority)) {
-            (NamespaceAuthority::Base(namespace), Some(AuthorityObservation::Base(base))) => {
-                namespace.publish(Some(base), publication).await
+            (NamespaceAuthority::Base(namespace), Some(AuthorityObservation::Base(witness))) => {
+                namespace
+                    .publish(
+                        Some((witness, base.as_ref().expect("decoded above"))),
+                        publication,
+                    )
+                    .await
             }
             (NamespaceAuthority::Base(namespace), None) => {
                 namespace.publish(None, publication).await
             }
             #[cfg(feature = "managed-branch")]
-            (NamespaceAuthority::Branch(namespace), Some(AuthorityObservation::Branch(base))) => {
-                namespace.publish(Some(base), publication).await
+            (
+                NamespaceAuthority::Branch(namespace),
+                Some(AuthorityObservation::Branch(witness)),
+            ) => {
+                namespace
+                    .publish(
+                        Some((witness, base.as_ref().expect("decoded above"))),
+                        publication,
+                    )
+                    .await
             }
             #[cfg(feature = "managed-branch")]
             (NamespaceAuthority::Branch(namespace), None) => {
@@ -303,7 +319,8 @@ impl ManagedVolume {
         observed: &ManagedObservation,
         sweep: NamespaceGcSweep,
     ) -> Result<SegmentGcMaintenance, ManagedError> {
-        if observed.gc_sweep() != Some(sweep) || observed.snapshot().cursor != sweep.fixed_cursor()
+        if observed.gc_sweep() != Some(sweep)
+            || observed.filesystem_snapshot.cursor != sweep.fixed_cursor()
         {
             return Err(ManagedError::new(
                 ManagedErrorKind::Invalid,
@@ -318,16 +335,17 @@ impl ManagedVolume {
                 "namespace authority changed",
             )
         })?;
-        if current.gc_sweep() != Some(sweep) || current.snapshot().cursor != sweep.fixed_cursor() {
+        if current.gc_sweep() != Some(sweep)
+            || current.filesystem_snapshot.cursor != sweep.fixed_cursor()
+        {
             return Err(ManagedError::new(
                 ManagedErrorKind::Conflict,
                 "collect unreachable data segments",
                 "GC sweep ownership changed",
             ));
         }
-        self.data
-            .collect_unreachable_segments(current.snapshot())
-            .await
+        let snapshot = to_managed_snapshot(&current.filesystem_snapshot)?;
+        self.data.collect_unreachable_segments(&snapshot).await
     }
 }
 
@@ -450,13 +468,9 @@ impl Volume for ManagedVolume {
 }
 
 fn managed_observation(
+    snapshot: NamespaceSnapshot,
     authority: AuthorityObservation,
 ) -> Result<ManagedObservation, ManagedError> {
-    let snapshot = match &authority {
-        AuthorityObservation::Base(observed) => &observed.snapshot,
-        #[cfg(feature = "managed-branch")]
-        AuthorityObservation::Branch(observed) => &observed.snapshot,
-    };
     let filesystem_snapshot = to_volume_snapshot(snapshot)?;
     Ok(ManagedObservation {
         authority,
@@ -481,44 +495,43 @@ fn encode_file_version(version: &FileVersionRecord) -> Result<FileVersion, Manag
     ))
 }
 
-fn decode_file_version(version: &FileVersion) -> Result<FileVersionRecord, VolumeError> {
+fn decode_file_version(version: &FileVersion) -> Result<FileVersionRecord, ManagedError> {
     let extent_map: ExtentMap = ciborium::from_reader(version.descriptor()).map_err(|error| {
-        VolumeError::new(
-            VolumeErrorKind::Corrupt,
-            format!("decode Managed file version: {error}"),
+        ManagedError::new(
+            ManagedErrorKind::Corrupt,
+            "decode Managed file version",
+            error.to_string(),
         )
     })?;
-    let decoded = FileVersionRecord::from_extents(
-        version.logical_size,
-        version.logical_digest,
-        extent_map,
-    )
-    .filter(|decoded| decoded.id == version.id)
-    .ok_or_else(|| {
-        VolumeError::new(
-            VolumeErrorKind::Corrupt,
-            "decode Managed file version: descriptor does not match its filesystem identity",
-        )
-    })?;
+    let decoded =
+        FileVersionRecord::from_extents(version.logical_size, version.logical_digest, extent_map)
+            .filter(|decoded| decoded.id == version.id)
+            .ok_or_else(|| {
+                ManagedError::new(
+                    ManagedErrorKind::Corrupt,
+                    "decode Managed file version",
+                    "descriptor does not match its filesystem identity",
+                )
+            })?;
     Ok(decoded)
 }
 
-fn to_volume_snapshot(snapshot: &NamespaceSnapshot) -> Result<VolumeSnapshot, ManagedError> {
+fn to_volume_snapshot(snapshot: NamespaceSnapshot) -> Result<VolumeSnapshot, ManagedError> {
     Ok(VolumeSnapshot {
         volume_id: snapshot.volume_id,
         cursor: snapshot.cursor,
         root: snapshot.root,
-        nodes: snapshot.nodes.clone(),
-        directories: snapshot.directories.clone(),
+        nodes: snapshot.nodes,
+        directories: snapshot.directories,
         file_versions: snapshot
             .file_versions
-            .iter()
-            .map(|(id, version)| Ok((*id, encode_file_version(version)?)))
+            .into_iter()
+            .map(|(id, version)| Ok((id, encode_file_version(&version)?)))
             .collect::<Result<_, ManagedError>>()?,
     })
 }
 
-fn to_managed_snapshot(snapshot: &VolumeSnapshot) -> Result<NamespaceSnapshot, VolumeError> {
+fn to_managed_snapshot(snapshot: &VolumeSnapshot) -> Result<NamespaceSnapshot, ManagedError> {
     Ok(NamespaceSnapshot {
         volume_id: snapshot.volume_id,
         cursor: snapshot.cursor,
@@ -529,13 +542,13 @@ fn to_managed_snapshot(snapshot: &VolumeSnapshot) -> Result<NamespaceSnapshot, V
             .file_versions
             .iter()
             .map(|(id, version)| Ok((*id, decode_file_version(version)?)))
-            .collect::<Result<_, VolumeError>>()?,
+            .collect::<Result<_, ManagedError>>()?,
     })
 }
 
 fn to_managed_publication(
     publication: &VolumePublication,
-) -> Result<NamespacePublication, VolumeError> {
+) -> Result<NamespacePublication, ManagedError> {
     Ok(NamespacePublication {
         operation: publication.operation,
         parent: publication.parent,

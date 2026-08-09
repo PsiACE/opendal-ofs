@@ -112,6 +112,12 @@ An `OperationId` is the idempotency identity for one publication. Repeating a
 committed operation returns its committed cursor. Reusing the same identity
 for another payload is a conflict.
 
+At the `Volume` boundary, an observation retains one RFC 016 `VolumeSnapshot`
+and a small metadata CAS witness. The decoded Managed snapshot is consumed
+while constructing that value rather than retained as a second namespace
+graph. Publication and GC decode opaque file-version descriptors only when
+they need extent maps.
+
 ## Data path
 
 Sync reads each changed live file once. The same bounded stream writes the
@@ -261,6 +267,9 @@ local change.
 Directory presence is merged per path. Additions and deletions in disjoint
 subtrees converge. Deleting a directory while the other side changes its
 subtree is rejected before either the replica or its durable state is changed.
+File content and executable state are reconciled together. A remote-only
+executable change updates local attributes without reading or retransferring
+unchanged file content.
 
 ## Garbage collection
 

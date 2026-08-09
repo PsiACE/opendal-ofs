@@ -27,11 +27,22 @@ pub struct BoundNamespace {
 }
 
 #[derive(Clone, Debug)]
-pub struct BranchObservation {
+pub(crate) struct BranchObservation {
     pub(crate) snapshot: NamespaceSnapshot,
+    witness: BranchWitness,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct BranchWitness {
     revision: crate::managed::metadata::record::Revision,
     head: StoredBranchHead,
     checkpoint_results: StoredResults,
+}
+
+impl BranchObservation {
+    pub(crate) fn into_parts(self) -> (NamespaceSnapshot, BranchWitness) {
+        (self.snapshot, self.witness)
+    }
 }
 
 impl BoundNamespace {
@@ -56,9 +67,11 @@ impl BoundNamespace {
             recover_namespace(checkpoint, state, self.store.volume_id())?;
         Ok(Some(BranchObservation {
             snapshot,
-            revision,
-            head,
-            checkpoint_results,
+            witness: BranchWitness {
+                revision,
+                head,
+                checkpoint_results,
+            },
         }))
     }
 
@@ -71,7 +84,7 @@ impl BoundNamespace {
 
     pub(crate) async fn publish(
         &self,
-        observed: Option<&BranchObservation>,
+        observed: Option<(&BranchWitness, &NamespaceSnapshot)>,
         publication: &NamespacePublication,
     ) -> Result<CommitOutcome, ManagedError> {
         let branch = self.binding.id;
@@ -79,18 +92,18 @@ impl BoundNamespace {
             return Err(invalid("publication belongs to another volume"));
         }
         let (head, revision, base, checkpoint_results) = match observed {
-            Some(observed) => {
-                observed.head.validate(self.store.volume_id(), branch)?;
-                if observed.head.lifecycle != BranchLifecycle::Active
-                    || observed.head.maintenance_active
+            Some((witness, snapshot)) => {
+                witness.head.validate(self.store.volume_id(), branch)?;
+                if witness.head.lifecycle != BranchLifecycle::Active
+                    || witness.head.maintenance_active
                 {
                     return Err(conflict("branch is sealed or under maintenance"));
                 }
                 (
-                    observed.head.clone(),
-                    observed.revision.clone(),
-                    Some(&observed.snapshot),
-                    Some(observed.checkpoint_results.clone()),
+                    witness.head.clone(),
+                    witness.revision.clone(),
+                    Some(snapshot),
+                    Some(witness.checkpoint_results.clone()),
                 )
             }
             None => {

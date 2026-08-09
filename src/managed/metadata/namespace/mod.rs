@@ -31,6 +31,6 @@ pub(crate) use records::{
     DirectoryPrecondition, DirectoryRecord, FileVersionRecord, NamespacePublication,
     NamespaceSnapshot, NodePrecondition, NodeRecord, managed_generation, next_managed_generation,
 };
-pub(crate) use store::{NamespaceObservation, NamespaceStore};
+pub(crate) use store::{NamespaceStore, NamespaceWitness};
 #[cfg(feature = "managed-branch")]
 pub(crate) use validation::{validate_publication, validate_snapshot};
