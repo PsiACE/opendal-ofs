@@ -23,6 +23,17 @@ fail() {
   exit 1
 }
 
+tree_digest() {
+  local root=$1
+  (cd "$root" && find . -type f -exec sha256sum {} + | LC_ALL=C sort | sha256sum)
+}
+
+json_field() {
+  local document=$1
+  local field=$2
+  python3 -c 'import json, sys; print(json.load(sys.stdin)[sys.argv[1]])' "$field" <<<"$document"
+}
+
 OFS_BIN=${OFS_BIN:-}
 OFS_CASE_ROOT=${OFS_CASE_ROOT:-}
 OFS_STORAGE_URL=${OFS_STORAGE_URL:-}
@@ -51,6 +62,7 @@ config="$OFS_CASE_ROOT/client/config.json"
 peer_config="$OFS_CASE_ROOT/peer-client/config.json"
 cold_config="$OFS_CASE_ROOT/cold-client/config.json"
 direct_config="$OFS_CASE_ROOT/direct-client/config.json"
+extension_mismatch_config="$OFS_CASE_ROOT/extension-mismatch-client/config.json"
 peer_alias=restored-workspace
 cold_alias=recovered-workspace
 replica_a="$OFS_CASE_ROOT/replica-a"
@@ -62,6 +74,7 @@ cold_state="$OFS_CASE_ROOT/state/cold-replica.json"
 
 mkdir -p "$(dirname "$config")" "$(dirname "$peer_config")" \
   "$(dirname "$cold_config")" "$(dirname "$direct_config")" \
+  "$(dirname "$extension_mismatch_config")" \
   "$replica_a" "$replica_b" "$cold_replica" "$(dirname "$state_a")"
 
 printf '%s\n' 'acceptance: expose only named volume access commands'
@@ -101,6 +114,17 @@ fi
 printf '%s\n' 'acceptance: register one managed volume under client-local aliases'
 OFS_CONFIG="$config" "$OFS_BIN" volume create workspace "${volume_options[@]}"
 OFS_CONFIG="$config" "$OFS_BIN" volume create workspace "${volume_options[@]}"
+empty_gc=$(OFS_CONFIG="$config" "$OFS_BIN" volume gc workspace)
+grep -Eq 'scanned=0 deleted=0 bytes=0' <<<"$empty_gc" || \
+  fail 'garbage collection of an unpublished volume was not an empty success'
+if extension_error=$(OFS_CONFIG="$extension_mismatch_config" "$OFS_BIN" volume create branching-workspace \
+  "${volume_options[@]}" --enable branch 2>&1); then
+  fail 'an explicit extension request changed an existing incompatible Managed volume'
+fi
+grep -Fq 'does not enable requested extension branch/v1' <<<"$extension_error" || \
+  fail 'extension mismatch did not report the observed remote requirement'
+[[ ! -e "$extension_mismatch_config" ]] || \
+  fail 'extension mismatch wrote a local catalog binding'
 OFS_CONFIG="$peer_config" "$OFS_BIN" volume create "$peer_alias" "${volume_options[@]}"
 if duplicate_alias_error=$(OFS_CONFIG="$config" "$OFS_BIN" volume create duplicate-workspace \
   "${volume_options[@]}" 2>&1); then
@@ -161,6 +185,45 @@ cmp "$replica_a/large.bin" "$replica_b/large.bin" || fail 'large file did not ro
 if [[ "$(uname -s)" != MINGW* && "$(uname -s)" != MSYS* ]]; then
   [[ -x "$replica_b/tools/run.sh" ]] || fail 'executable bit did not round trip'
 fi
+
+printf '%s\n' 'acceptance: merge disjoint directory changes from two replicas'
+mkdir -p "$replica_a/from-a/empty" "$replica_b/from-b/empty"
+printf '%s\n' 'nested change from a' >"$replica_a/from-a/value.txt"
+printf '%s\n' 'nested change from b' >"$replica_b/from-b/value.txt"
+OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a"
+OFS_CONFIG="$peer_config" "$OFS_BIN" sync "$peer_alias" "$replica_b" --state "$state_b"
+OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a"
+[[ -d "$replica_a/from-a/empty" && -d "$replica_a/from-b/empty" ]] || \
+  fail 'replica a did not merge disjoint empty directories'
+[[ -d "$replica_b/from-a/empty" && -d "$replica_b/from-b/empty" ]] || \
+  fail 'replica b did not merge disjoint empty directories'
+cmp "$replica_a/from-a/value.txt" "$replica_b/from-a/value.txt" || \
+  fail 'replica b lost replica a nested directory change'
+cmp "$replica_a/from-b/value.txt" "$replica_b/from-b/value.txt" || \
+  fail 'replica a lost replica b nested directory change'
+
+printf '%s\n' 'regression: reject a directory deletion that overlaps a local subtree change'
+mkdir -p "$replica_a/overlap"
+printf '%s\n' 'base' >"$replica_a/overlap/value.txt"
+OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a"
+OFS_CONFIG="$peer_config" "$OFS_BIN" sync "$peer_alias" "$replica_b" --state "$state_b"
+printf '%s\n' 'changed locally' >"$replica_a/overlap/value.txt"
+rm -rf -- "$replica_b/overlap"
+OFS_CONFIG="$peer_config" "$OFS_BIN" sync "$peer_alias" "$replica_b" --state "$state_b"
+overlap_tree=$(tree_digest "$replica_a")
+overlap_state=$(sha256sum "$state_a")
+if OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a" \
+  2>"$OFS_CASE_ROOT/directory-overlap.err"; then
+  fail 'overlapping remote directory deletion replaced a local subtree change'
+fi
+grep -Fq 'directory deletion overlaps local changes' \
+  "$OFS_CASE_ROOT/directory-overlap.err" || fail 'directory overlap error was not actionable'
+[[ "$(tree_digest "$replica_a")" == "$overlap_tree" ]] || \
+  fail 'directory overlap rejection changed user files'
+[[ "$(sha256sum "$state_a")" == "$overlap_state" ]] || \
+  fail 'directory overlap rejection changed replica state'
+rm -rf -- "$replica_a/overlap"
+OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a"
 
 printf '%s\n' 'acceptance: modify, rename, and delete remote entries'
 printf '%s\n' 'modified before rename' >"$replica_a/nested/level/entry.txt"
@@ -278,7 +341,7 @@ OFS_CONFIG="$peer_config" "$OFS_BIN" sync "$peer_alias" "$replica_b" --state "$s
 cmp "$replica_a/crash-recovery/128.bin" "$replica_b/crash-recovery/128.bin" || \
   fail 'recovered publication did not materialize on another replica'
 
-printf '%s\n' 'acceptance: recover through a long bounded change history'
+printf '%s\n' 'acceptance: recover through a long change history'
 for generation in $(seq 1 60); do
   printf 'history change %s\n' "$generation" >"$replica_a/checkpoint.txt"
   OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a" >/dev/null
@@ -286,6 +349,7 @@ done
 OFS_CONFIG="$peer_config" "$OFS_BIN" sync "$peer_alias" "$replica_b" --state "$state_b"
 grep -Fxq 'history change 60' "$replica_b/checkpoint.txt" || \
   fail 'replica did not recover the fixed target after a long change history'
+printf '%s\n' 'regression: collect obsolete segments without changing the live tree'
 garbage_collection=$(OFS_CONFIG="$config" "$OFS_BIN" volume gc workspace)
 grep -Eq 'deleted=[1-9][0-9]*' <<<"$garbage_collection" || \
   fail 'namespace-fenced collection removed no unreachable data segments'
@@ -319,8 +383,12 @@ grep -Eq '"volume_alias"[[:space:]]*:[[:space:]]*"recovered-workspace"' <<<"$sta
   fail 'status did not report the current client local alias'
 grep -Eq '"volume_id"[[:space:]]*:[[:space:]]*"[0-9a-f]{32}"' <<<"$status_json" || \
   fail 'status did not report the durable remote volume identity'
-grep -Eq '"common_sequence"[[:space:]]*:[[:space:]]*74' <<<"$status_json" || \
-  fail 'status did not report the durable common sequence'
+common_sequence=$(json_field "$status_json" common_sequence)
+[[ "$common_sequence" =~ ^[1-9][0-9]*$ ]] || \
+  fail 'status did not report a durable non-genesis common sequence'
+original_status=$(OFS_CONFIG="$config" "$OFS_BIN" status --state "$state_a" --json)
+[[ "$(json_field "$original_status" common_sequence)" == "$common_sequence" ]] || \
+  fail 'converged replicas reported different common sequences'
 grep -Eq '"conflicts"[[:space:]]*:[[:space:]]*0' <<<"$status_json" || \
   fail 'status still reports conflicts after explicit resolution'
 if grep -Eq '"capabilities"|"limitations"|"guarantee"|"metadata_authority"|"layout_settings"|"local_tree_operator"|"durable_state_owners"|"foreground_layout"|"storage_capabilities"' <<<"$status_json"; then

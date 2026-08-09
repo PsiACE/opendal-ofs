@@ -59,7 +59,10 @@ import pathlib
 import sys
 
 state = pathlib.Path(sys.argv[1]).resolve()
-value = pathlib.Path(json.loads(state.read_text())["pending"]["staging"]).resolve()
+value = pathlib.Path(json.loads(state.read_text())["pending"]["staging"])
+if not value.is_absolute():
+    value = state.parent / value
+value = value.resolve()
 if value.parent != state.parent:
     raise SystemExit("pending staging is outside the state directory")
 print(value)
@@ -74,6 +77,7 @@ staged_bytes=$(find "$staging" -type f -printf '%s\n' | awk '{ total += $1 } END
 
 kill -KILL "$sync_pid" 2>/dev/null || true
 wait "$sync_pid" 2>/dev/null || true
+rm -rf -- "$staging"
 recovered=false
 for _ in $(seq 1 5); do
   if OFS_CONFIG="$catalog" "$OFS_BIN" sync staging "$replica" --state "$state" >/dev/null; then
@@ -83,6 +87,38 @@ for _ in $(seq 1 5); do
   sleep 0.05
 done
 [[ $recovered == true ]] || fail 'killed changed-only publication did not recover'
+
+mkdir "$replica/committed-cache-loss"
+for index in $(seq -w 1 128); do
+  {
+    head -c 65536 /dev/zero
+    printf 'committed publication %s\n' "$index"
+  } >"$replica/committed-cache-loss/$index.bin"
+done
+OFS_CONFIG="$catalog" "$OFS_BIN" sync staging "$replica" --state "$state" >/dev/null &
+sync_pid=$!
+stopped=false
+for _ in $(seq 1 300); do
+  if ! kill -0 "$sync_pid" 2>/dev/null; then
+    break
+  fi
+  status=$(OFS_CONFIG="$catalog" "$OFS_BIN" status --state "$state" --json 2>/dev/null || true)
+  if grep -Eq '"pending"[[:space:]]*:[[:space:]]*true' <<<"$status"; then
+    if kill -STOP "$sync_pid" 2>/dev/null; then
+      stopped=true
+    fi
+    break
+  fi
+  sleep 0.01
+done
+[[ $stopped == true ]] || fail 'could not preserve a pending state before commit'
+pending_state="$OFS_CASE_ROOT/pending-before-commit.json"
+cp "$state" "$pending_state"
+kill -CONT "$sync_pid"
+wait "$sync_pid" || fail 'publication did not commit after preserving its pending state'
+cp "$pending_state" "$state"
+OFS_CONFIG="$catalog" "$OFS_BIN" sync staging "$replica" --state "$state" >/dev/null || \
+  fail 'committed publication could not recover without its pending cache'
 OFS_CONFIG="$catalog" "$OFS_BIN" sync staging "$cold" --state "$cold_state" >/dev/null
 diff -qr "$replica" "$cold" >/dev/null || fail 'cold replica differs after staging recovery'
 

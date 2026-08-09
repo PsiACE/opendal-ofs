@@ -318,16 +318,17 @@ async fn gc_volume(config: &Path, args: VolumeGcArgs) -> Result<()> {
             return Ok(());
         }
     }
-    if args.resume {
-        bail!("--resume is only valid for a branch/v1 volume");
-    }
     let volume =
         open_managed_volume(config, &args.alias, None, args.runtime.transfer_concurrency).await?;
-    let observed = volume
-        .observe()
-        .await?
-        .context("Managed volume has no published namespace to collect")?;
-    let sweep = volume.begin_gc(&observed).await?;
+    let Some(observed) = volume.observe().await? else {
+        print_gc_result(&args.alias, SegmentGcMaintenance::default());
+        return Ok(());
+    };
+    let sweep = if args.resume {
+        volume.resume_gc(&observed).await?
+    } else {
+        volume.begin_gc(&observed).await?
+    };
     let fixed = volume
         .observe()
         .await?
@@ -482,27 +483,31 @@ async fn create_volume(config: &Path, mut args: VolumeCreateArgs) -> Result<()> 
     } else {
         desired
     };
-    let format = match configured {
-        Some(_) => {
-            let observed = metadata.read_format().await?;
-            if observed != desired {
-                bail!("volume catalog and Managed format v1 binding disagree");
+    let observed = metadata.read_format_optional().await?;
+    let format = match observed {
+        Some(observed) => observed,
+        None if configured.is_some() => metadata.read_format().await?,
+        None => match metadata.create_format(&desired).await {
+            Ok(created) => created,
+            Err(error) if error.kind() == ManagedErrorKind::Conflict => {
+                metadata.read_format().await?
             }
-            observed
-        }
-        None => match metadata.read_format_optional().await? {
-            Some(observed) => observed,
-            None => match metadata.create_format(&desired).await {
-                Ok(created) => created,
-                Err(error) if error.kind() == ManagedErrorKind::Conflict => {
-                    metadata.read_format().await?
-                }
-                Err(error) => return Err(error.into()),
-            },
+            Err(error) => return Err(error.into()),
         },
     };
+    if format.metadata_format() != metadata.metadata_format()
+        || configured
+            .as_ref()
+            .is_some_and(|definition| definition.volume_id != format.volume_id())
+    {
+        bail!("volume catalog and Managed format v1 binding disagree");
+    }
     #[cfg(feature = "managed-branch")]
-    if branch_enabled {
+    if branch_enabled && !format.requires_extension(ofs::managed::ManagedExtension::BranchV1) {
+        bail!("existing Managed volume does not enable requested extension branch/v1");
+    }
+    #[cfg(feature = "managed-branch")]
+    if format.requires_extension(ofs::managed::ManagedExtension::BranchV1) {
         metadata
             .branches(format.volume_id(), data.clone())?
             .initialize(BranchName::parse("main").expect("main is a valid branch name"))

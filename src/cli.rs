@@ -148,7 +148,7 @@ pub(crate) struct VolumeGcArgs {
     /// Named Managed volume from the local catalog.
     pub alias: String,
 
-    /// Resume a fenced branch collection after confirming its prior process stopped.
+    /// Resume a fenced collection after confirming its prior process stopped.
     #[arg(long)]
     pub resume: bool,
 

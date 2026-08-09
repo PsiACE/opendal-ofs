@@ -330,6 +330,35 @@ impl ManagedVolume {
         }
     }
 
+    /// Take ownership of an interrupted namespace GC sweep.
+    pub async fn resume_gc(
+        &self,
+        observed: &ManagedObservation,
+    ) -> Result<NamespaceGcSweep, ManagedError> {
+        match (&self.namespace, &observed.authority) {
+            (NamespaceAuthority::Object(namespace), AuthorityObservation::Object(observed)) => {
+                namespace.resume_gc(observed).await
+            }
+            (NamespaceAuthority::D1(namespace), AuthorityObservation::D1(observed)) => {
+                namespace.resume_gc(observed).await
+            }
+            #[cfg(feature = "managed-branch")]
+            (NamespaceAuthority::ObjectBranch(_), AuthorityObservation::ObjectBranch(_))
+            | (NamespaceAuthority::D1Branch(_), AuthorityObservation::D1Branch(_)) => {
+                Err(ManagedError::new(
+                    ManagedErrorKind::Invalid,
+                    "resume Managed namespace GC",
+                    "branch GC must be resumed through its volume control plane",
+                ))
+            }
+            _ => Err(ManagedError::new(
+                ManagedErrorKind::Invalid,
+                "resume Managed namespace GC",
+                "observation belongs to another metadata authority",
+            )),
+        }
+    }
+
     /// Release the publication fence for the matching GC sweep.
     pub async fn finish_gc(&self, sweep: NamespaceGcSweep) -> Result<(), ManagedError> {
         match &self.namespace {
@@ -364,8 +393,22 @@ impl ManagedVolume {
                 "observation does not hold this active GC sweep",
             ));
         }
+        let current = self.observe().await?.ok_or_else(|| {
+            ManagedError::new(
+                ManagedErrorKind::Conflict,
+                "collect unreachable data segments",
+                "namespace authority changed",
+            )
+        })?;
+        if current.gc_sweep() != Some(sweep) || current.snapshot().cursor != sweep.fixed_cursor() {
+            return Err(ManagedError::new(
+                ManagedErrorKind::Conflict,
+                "collect unreachable data segments",
+                "GC sweep ownership changed",
+            ));
+        }
         self.data
-            .collect_unreachable_segments(observed.snapshot())
+            .collect_unreachable_segments(current.snapshot())
             .await
     }
 }

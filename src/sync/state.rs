@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write as _};
 use std::num::NonZeroU64;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
@@ -24,7 +24,7 @@ use crate::filesystem::{
 use crate::sync::local::NativeIdentity;
 
 const STATE_FORMAT: &str = "ofs-sync-replica";
-const STATE_MAJOR: u16 = 4;
+const STATE_MAJOR: u16 = 5;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -97,13 +97,36 @@ impl ReplicaState {
     }
 
     pub fn load(path: impl AsRef<Path>) -> Result<Option<Self>> {
-        let bytes = match fs::read(path.as_ref()) {
+        let path = path.as_ref();
+        let bytes = match fs::read(path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error).context("read replica state"),
         };
         let wire: StateWire = serde_json::from_slice(&bytes).context("parse replica state JSON")?;
-        wire.try_into().map(Some)
+        let major = wire.major;
+        let mut state: Self = wire.try_into()?;
+        if let Some(intent) = &mut state.pending {
+            if major >= STATE_MAJOR {
+                let mut components = intent.staging.components();
+                if !matches!(components.next(), Some(Component::Normal(_)))
+                    || components.next().is_some()
+                {
+                    bail!("replica state contains an invalid pending cache name");
+                }
+            }
+            let cache_name = intent
+                .staging
+                .file_name()
+                .context("replica state contains an invalid pending cache path")?
+                .to_owned();
+            let parent = path
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            intent.staging = parent.join(cache_name);
+        }
+        Ok(Some(state))
     }
 
     pub fn install(&self, path: impl AsRef<Path>) -> Result<()> {
@@ -297,7 +320,11 @@ impl From<&ReplicaState> for StateWire {
                 .collect(),
             pending: state.pending.as_ref().map(|intent| IntentWire {
                 operation: *intent.operation.as_bytes(),
-                staging: intent.staging.clone(),
+                staging: intent
+                    .staging
+                    .file_name()
+                    .map(PathBuf::from)
+                    .expect("pending cache is a named sibling of replica state"),
                 renames: intent.renames.clone(),
             }),
             conflicts: state
@@ -317,7 +344,7 @@ impl TryFrom<StateWire> for ReplicaState {
     type Error = anyhow::Error;
 
     fn try_from(wire: StateWire) -> Result<Self> {
-        if wire.format != STATE_FORMAT || !matches!(wire.major, 3 | STATE_MAJOR) {
+        if wire.format != STATE_FORMAT || !matches!(wire.major, 3 | 4 | STATE_MAJOR) {
             bail!("replica state format is unsupported");
         }
         if wire.major == 3 && wire.branch.is_some() {

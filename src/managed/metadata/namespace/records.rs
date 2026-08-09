@@ -175,6 +175,7 @@ pub(crate) struct NamespacePublication {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NamespaceGcSweep {
     epoch: u64,
+    owner: [u8; 16],
     fixed: ChangeCursor,
 }
 
@@ -187,8 +188,16 @@ impl NamespaceGcSweep {
         self.fixed
     }
 
-    pub(crate) const fn new(epoch: u64, fixed: ChangeCursor) -> Self {
-        Self { epoch, fixed }
+    pub(crate) const fn new(epoch: u64, owner: [u8; 16], fixed: ChangeCursor) -> Self {
+        Self {
+            epoch,
+            owner,
+            fixed,
+        }
+    }
+
+    pub(crate) const fn owner(self) -> [u8; 16] {
+        self.owner
     }
 }
 
