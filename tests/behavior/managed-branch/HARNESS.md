@@ -35,7 +35,7 @@ cargo x managed-sync test branch d1
 ```
 
 The workflow covers the default branch, current and historical fork,
-fork at change zero, independent publication, checkpoint rotation, a large
+fork at change zero, independent publication, a long retained history, a large
 namespace publication, deletion and name reuse, stale replica fencing, and
 multi-root garbage collection. These are behaviors a user relies on regardless
 of the physical metadata representation.

@@ -76,6 +76,12 @@ Creation records `branch/v1` in the Managed superblock and creates the default
 branch `main`. Direct volumes reject `--enable branch` before changing the
 catalog or storage.
 
+The remote Managed format is authoritative when another client registers the
+same volume. A client may omit `--enable branch` and still open an existing
+`branch/v1` volume. An explicit extension request against an existing base
+volume fails before the local catalog or branch metadata is changed. Repeating
+creation also completes an interrupted default-branch initialization.
+
 The default branch needs no additional Sync option:
 
 ```text
@@ -179,9 +185,10 @@ by the systems that informed it:
 
 The remaining gap to Overeasy is mainly the access contract. `branch/v1` plus
 Sync provides durable published states, current and historical fork, and
-shared storage. A Managed Mount can reuse the same branch authority, but
-Overeasy-like eager recovery also needs a Mount writeback journal and session
-rules.
+shared storage. Its checkpoint repository also avoids one-value snapshot
+limits, but it is not a lakeFS-style range index. A Managed Mount can reuse the
+same branch authority. Matching Overeasy's eager filesystem recovery still
+requires Mount writeback, session, and journal rules.
 
 # Design and storage semantics
 
@@ -225,6 +232,7 @@ BranchRegistry {
     branches: BranchName -> BranchId
     maintenance_epoch
     maintenance_state
+    maintenance_owner
 }
 ```
 
@@ -242,6 +250,7 @@ BranchHead {
     state: unborn | NamespaceState
     maintenance_epoch
     maintenance_state
+    maintenance_owner
 }
 
 NamespaceState {
@@ -355,17 +364,21 @@ Object Metadata uses an extension-owned prefix:
 .ofs/managed/metadata/v1/extensions/branch/v1/registry.ofs
 .ofs/managed/metadata/v1/extensions/branch/v1/heads/<branch-id>.ofs
 .ofs/managed/metadata/v1/extensions/branch/v1/checkpoints/sha256/<digest>.ofs
+.ofs/managed/metadata/v1/extensions/branch/v1/checkpoint-parts/sha256/<digest>.ofs
 .ofs/managed/metadata/v1/extensions/branch/v1/history/sha256/<digest>.ofs
 ```
 
-The registry and heads are mutable conditional-write objects. Checkpoints and
-history are immutable and content-addressed. The base Managed `head.ofs` is not
-read or mirrored for a branching volume.
+The registry and heads are mutable conditional-write objects. A checkpoint is
+a small content-addressed root over immutable content-addressed parts. Parts
+contain natural namespace records such as nodes, directory entries, file
+extents, and operation receipts. The root is published only after every part
+has been created and verified. History is also immutable and
+content-addressed. The base Managed `head.ofs` is not read or mirrored for a
+branching volume.
 
-An Object branch checkpoint is one content-addressed encoded snapshot rather
-than a base Object manifest plus SSTables. This keeps Object and D1 branch
-recovery on one logical codec, but requires whole-checkpoint encoding and has a
-64 MiB encoded-record limit.
+Object and D1 share the record-set builder and recovery validation. They do not
+share storage calls or mutable authority. Checkpoint capacity is the sum of
+its immutable parts rather than one encoded snapshot value.
 
 Reads obtain an ETag with `stat` and then issue an `If-Match` read. The decoded
 bytes and the revision used by the next conditional write therefore belong to
@@ -378,12 +391,13 @@ roots. Listing is used only during garbage collection of unreachable objects.
 
 ## D1 representation
 
-D1 uses four extension-owned table families:
+D1 uses five extension-owned table families:
 
 ```text
 ofs_managed_branch_v1_registry
 ofs_managed_branch_v1_heads
 ofs_managed_branch_v1_checkpoints
+ofs_managed_branch_v1_checkpoint_parts
 ofs_managed_branch_v1_history
 ```
 
@@ -391,14 +405,17 @@ Rows are scoped by the existing D1 store key and `VolumeId`. Lifecycle and
 publication use revision predicates and D1 batch transactions. The base D1
 namespace tables are neither copied nor used as fallback authority.
 
-Checkpoints can exceed D1's per-value limits, so their encoded bytes are split
-into bounded text chunks. Reads verify the part count, complete length, and
-content digest before decoding. This is a physical difference only; Object and
-D1 expose the same branch behavior. The complete encoded checkpoint remains
-limited to 64 MiB.
+Each immutable part is written and verified in its own idempotent request.
+The checkpoint root is published in a later request, and reads fetch part
+references in pages. Missing, duplicated, reordered, or modified parts are
+corruption. D1 values use the provider's 2,000,000-byte boundary; checkpoint
+record sets split well below it. See the
+[Cloudflare D1 limits](https://developers.cloudflare.com/d1/platform/limits/).
 
-The registry record limit is 1 MiB for both backends. This keeps the maximum
-portable registry representation independent of the selected metadata store.
+The registry remains one small mutable authority record. D1's value limit and
+the selected Object provider's conditional-write limit are its real
+boundaries. Very large branch registries need a different authority
+representation, not an arbitrary format cutoff.
 
 ## Fork and deletion linearization
 
@@ -419,9 +436,10 @@ retry for an old incarnation never removes a replacement with the same name.
 
 ## Garbage collection
 
-GC is fenced at the branch registry. Object Metadata also marks every current
-head with the same epoch because registry and heads are separate objects. D1
-can enforce the fence through transactional registry predicates.
+GC is fenced at the branch registry with an epoch and an owner token. Object
+Metadata also marks every current head with the same token because registry
+and heads are separate objects. D1 enforces the token through transactional
+registry predicates.
 
 The collector recovers every snapshot represented by each current head and
 each retained history interval. It unions reachable `SegmentRef` values and
@@ -430,23 +448,36 @@ sweep; uncertain reachability retains data.
 
 Lifecycle and publication stay blocked until deletion succeeds and the fence
 is released. A failed mark or sweep leaves the epoch active for explicit
-recovery. A normal GC rejects an active epoch; `--resume` is the only operation
-that may reuse it after the previous collector has stopped. This prevents two
-collectors from sharing a fence and one releasing it while the other still
-holds stale deletion candidates.
+recovery. A normal GC rejects an active epoch. After the operator has confirmed
+that the previous process stopped, `--resume` conditionally replaces the owner
+token and continues the same fixed epoch. The old owner can no longer mark,
+sweep metadata, or release the fence. `--resume` is not a concurrent takeover
+protocol; running it while the old collector can still delete data violates
+its command precondition.
+
 Unpublished immutable segments may be removed, but a fenced Sync publication
 cannot reference them and retry stages them again.
 
 Extension metadata uses the same roots. Registered heads, referenced
-checkpoints, and reachable history remain live; sealed or unregistered heads
-and unreferenced immutable records can be reclaimed under the same fence.
+checkpoint roots, checkpoint parts, and reachable history remain live. Sealed
+or unregistered heads and unreferenced immutable records can be reclaimed
+under the same fence. Listing and deletion are paged or streamed, so provider
+request size is not a namespace-format limit.
 
 ## Sync and future Mount
 
 Sync owns replica state, local conflict retention, and the local durability
 boundary. The branch binding is validated before replica directory creation,
-scan, materialization, or state update. State format 4 records an optional
-branch binding; format 3 is accepted only as an unbranched base state.
+scan, materialization, or state update. State format 5 records an optional
+branch binding and a relative pending-cache name. Formats 3 and 4 remain
+readable and their old absolute cache path is rebased beside the current state
+file.
+
+The pending staging tree is a cache, not authority. If it is missing or
+damaged before publication, Sync rebuilds it from the current replica. If the
+operation already committed, Sync rebuilds from the authoritative snapshot
+when that cannot overwrite a local change. This permits moving a state file
+with its replica and recovering after local cache cleanup.
 
 Mount will consume the same bound `Volume` and can reuse branch selection,
 publication, history, data staging, and GC roots. Mount still needs its own
@@ -468,6 +499,7 @@ branch metadata extension.
 | Deleted name is reused | Old replica fails branch identity validation |
 | GC races with publication or fork | Registry epoch forces the mutation to retry |
 | Two ordinary GC commands overlap | The second command fails without joining the epoch |
+| `--resume` while the prior collector still runs | Operator error; stop the prior process before recovery |
 | Retained record is missing or corrupt | Fail closed; do not synthesize state or sweep data |
 
 # Acceptance and regression coverage
@@ -479,11 +511,11 @@ cargo x managed-sync test branch object
 cargo x managed-sync test branch d1
 ```
 
-It covers Direct rejection before mutation, default branch creation, current
-fork, independent divergence, checkpoint rotation, historical fork, deletion
-and name reuse, stale replica rejection without local mutation, multi-root GC,
-cold materialization after GC, a large namespace publication with a retained
-parent, and stable JSON status.
+It covers Direct rejection before mutation, remote extension negotiation,
+default branch creation, current fork, independent divergence, historical
+fork after a long history, deletion and name reuse, stale replica rejection
+without local mutation, multi-root GC, cold materialization after GC, a large
+namespace publication with a retained parent, and stable JSON status.
 
 Regression tests cover mistakes that would silently violate durable behavior:
 
@@ -504,20 +536,21 @@ Retaining every historical position retains its metadata and referenced data.
 Historical lookup is linear in the number of archived history segments. A
 disposable index may improve lookup without becoming authority.
 
-Checkpoint rotation encodes and later recovers a complete extension snapshot.
-The 64 MiB encoded-checkpoint limit and whole-snapshot work are below lakeFS's
-large-namespace metadata scaling. A concrete snapshot repository can later
-reuse Object manifests/SSTables and give D1 another chunked implementation
-without changing registry, head, history, or branch binding semantics.
+Checkpoint storage is split and provider requests are bounded, but recovery
+still constructs one in-memory `NamespaceSnapshot`. This is suitable for Sync,
+but it is below lakeFS's range-indexed metadata lookup for very large
+namespaces. The record-set root can later point to indexed ranges without
+changing registry, head, history, or branch binding semantics.
 
-The registry is a bounded single record. Branch lifecycle is therefore atomic
-and simple, but very large branch counts will need a content-addressed registry
-table behind one mutable root in a later format.
+The registry is a single mutable record. Branch lifecycle is therefore atomic
+and simple, but the practical branch count remains bounded by the selected
+backend. A content-addressed branch index behind the mutable root is a later
+format change if that limit becomes material.
 
 GC briefly blocks publication and branch lifecycle. This favors a small,
 auditable safety protocol over concurrent reclamation. A future implementation
-may introduce epochs or pins that permit more concurrency without weakening
-reachability.
+may add retention pins or generational deletion that permits more concurrency
+without weakening reachability.
 
 There is no merge, tag, branch reset, mounted frontend, writer lease, or
 filesystem-operation journal. These are separate capabilities and should not
