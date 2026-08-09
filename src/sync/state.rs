@@ -27,7 +27,7 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct BaseEntry {
+pub(crate) struct InstalledEntry {
     pub local_identity: Option<NativeIdentity>,
     pub local_size: Option<u64>,
     pub local_modified: Option<String>,
@@ -56,7 +56,7 @@ pub struct ReplicaState {
     pub branch: Option<BranchBinding>,
     pub common: ChangeCursor,
     pub(crate) authority: Option<VolumeSnapshot>,
-    pub(crate) base: BTreeMap<String, BaseEntry>,
+    pub(crate) installed: BTreeMap<String, InstalledEntry>,
     pub pending: Option<PendingIntent>,
     pub conflicts: Vec<ConflictRecord>,
 }
@@ -68,7 +68,7 @@ impl ReplicaState {
             branch: None,
             common: ChangeCursor::Genesis,
             authority: None,
-            base: BTreeMap::new(),
+            installed: BTreeMap::new(),
             pending: None,
             conflicts: Vec::new(),
         }
@@ -80,7 +80,7 @@ impl ReplicaState {
             branch: authority.branch,
             common: ChangeCursor::Genesis,
             authority: None,
-            base: BTreeMap::new(),
+            installed: BTreeMap::new(),
             pending: None,
             conflicts: Vec::new(),
         }
@@ -167,7 +167,7 @@ struct StoredState {
     branch: Option<BranchBinding>,
     common: ChangeCursor,
     authority: Option<StoredSnapshot>,
-    base: BTreeMap<String, BaseEntry>,
+    installed: BTreeMap<String, InstalledEntry>,
     pending: Option<PendingIntent>,
     conflicts: Vec<ConflictRecord>,
 }
@@ -191,7 +191,7 @@ impl From<&ReplicaState> for StoredState {
             branch: state.branch.clone(),
             common: state.common,
             authority: state.authority.as_ref().map(StoredSnapshot::from),
-            base: state.base.clone(),
+            installed: state.installed.clone(),
             pending: state.pending.as_ref().map(|intent| PendingIntent {
                 operation: intent.operation,
                 staging: intent
@@ -224,14 +224,14 @@ impl TryFrom<StoredState> for ReplicaState {
             bail!("replica authority snapshot does not match its common cursor");
         }
         if let Some(snapshot) = &authority {
-            validate_base(snapshot, &stored.base)?;
+            validate_installed(snapshot, &stored.installed)?;
         }
         Ok(Self {
             volume: stored.volume,
             branch: stored.branch,
             common: stored.common,
             authority,
-            base: stored.base,
+            installed: stored.installed,
             pending: stored.pending,
             conflicts: stored.conflicts,
         })
@@ -289,7 +289,10 @@ impl StoredSnapshot {
     }
 }
 
-fn validate_base(snapshot: &VolumeSnapshot, base: &BTreeMap<String, BaseEntry>) -> Result<()> {
+fn validate_installed(
+    snapshot: &VolumeSnapshot,
+    installed: &BTreeMap<String, InstalledEntry>,
+) -> Result<()> {
     let mut expected = BTreeMap::new();
     let mut pending = vec![(String::new(), snapshot.root)];
     while let Some((path, node)) = pending.pop() {
@@ -307,11 +310,11 @@ fn validate_base(snapshot: &VolumeSnapshot, base: &BTreeMap<String, BaseEntry>) 
             }
         }
     }
-    if expected.len() != base.len() {
+    if expected.len() != installed.len() {
         bail!("replica base and authority snapshot contain different paths");
     }
     for (path, node) in expected {
-        let saved = base
+        let saved = installed
             .get(&path)
             .with_context(|| format!("replica base is missing {path:?}"))?;
         let record = &snapshot.nodes[&node];

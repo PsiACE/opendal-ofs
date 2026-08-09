@@ -287,7 +287,7 @@ fn reconcile_local_renames(
         .map(|intent| intent.renames.clone())
         .unwrap_or_default();
     let mut base_by_identity = BTreeMap::new();
-    for (path, entry) in &replica.base {
+    for (path, entry) in &replica.installed {
         if let Some(identity) = entry.local_identity {
             base_by_identity
                 .entry(identity)
@@ -308,7 +308,7 @@ fn reconcile_local_renames(
         let (Some(from), Some(Some(path))) = (from, local_by_identity.get(&identity)) else {
             continue;
         };
-        if !local_paths.contains_key(&from) && !replica.base.contains_key(path) {
+        if !local_paths.contains_key(&from) && !replica.installed.contains_key(path) {
             renames.insert(from, path.clone());
         }
     }
@@ -329,7 +329,7 @@ fn reconcile_local_renames(
         if !local_paths.contains_key(path) {
             bail!("remembered rename target {path:?} is not staged");
         }
-        if local_paths.contains_key(from) || replica.base.contains_key(path) {
+        if local_paths.contains_key(from) || replica.installed.contains_key(path) {
             bail!("remembered rename {from:?} to {path:?} no longer describes the local tree");
         }
         let remote_source = remote.get(from);
@@ -437,14 +437,14 @@ fn reject_unidentified_moves(
 ) {
     let local_paths = local.logical().entries();
     let deleted = replica
-        .base
+        .installed
         .iter()
         .filter(|(path, _)| !local_paths.contains_key(*path))
         .map(|(path, _)| path.clone())
         .collect::<Vec<_>>();
     let added = local_paths
         .keys()
-        .filter(|path| !replica.base.contains_key(*path))
+        .filter(|path| !replica.installed.contains_key(*path))
         .cloned()
         .collect::<Vec<_>>();
     let deleted = deleted
@@ -460,7 +460,7 @@ fn reject_unidentified_moves(
     }
     let identities_are_reliable = deleted.iter().all(|path| {
         replica
-            .base
+            .installed
             .get(path)
             .is_some_and(|entry| entry.local_identity.is_some())
     }) && added.iter().all(|path| {
@@ -472,7 +472,7 @@ fn reject_unidentified_moves(
         matches!(base[from], RemotePath::Directory(_))
             && added.iter().any(|path| {
                 !local.files().contains_key(path)
-                    && replica.base[from]
+                    && replica.installed[from]
                         .local_identity
                         .zip(local_paths[path].native_identity)
                         .is_some_and(|(from, to)| from.device != to.device)

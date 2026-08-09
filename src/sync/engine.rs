@@ -18,8 +18,8 @@ use opendal::{Operator, services};
 
 use super::local::{NativeIdentity, fs_operator, set_executable};
 use super::{
-    BaseEntry, ConflictRecord, LocalKind, LocalTree, PendingIntent, ReconcileAction, ReplicaState,
-    StagedTree, build_publication, reconcile, snapshot_paths,
+    ConflictRecord, InstalledEntry, LocalKind, LocalTree, PendingIntent, ReconcileAction,
+    ReplicaState, StagedTree, build_publication, reconcile, snapshot_paths,
 };
 use crate::filesystem::{
     ChangeCursor, CommitOutcome, FileVersion, MaterializeRequest, NodeKind, OperationId, Volume,
@@ -253,7 +253,7 @@ impl<V: Volume> SyncEngine<V> {
                     }
                 }
             }
-            let full_tree = state.base.is_empty() && local.entries().is_empty();
+            let full_tree = state.installed.is_empty() && local.entries().is_empty();
             staged_full_tree = full_tree;
             let installed = materialize_files(
                 &self.volume,
@@ -586,12 +586,12 @@ fn local_subtree_changed(state: &ReplicaState, local: &LocalTree, directory: &st
         .transpose()?
         .unwrap_or_default();
     Ok(state
-        .base
+        .installed
         .keys()
         .chain(local.entries().keys())
         .filter(|path| path_is_within(path, directory))
         .any(
-            |path| match (state.base.get(path), local.entries().get(path)) {
+            |path| match (state.installed.get(path), local.entries().get(path)) {
                 (Some(base), Some(current)) => {
                     let base_kind = base_kinds[path];
                     current.kind != base_kind
@@ -661,7 +661,7 @@ async fn create_remote_directories(
     remote: &VolumeSnapshot,
 ) -> Result<()> {
     for (path, node) in snapshot_paths(remote)? {
-        if remote.nodes[&node].kind == NodeKind::Directory && !state.base.contains_key(&path) {
+        if remote.nodes[&node].kind == NodeKind::Directory && !state.installed.contains_key(&path) {
             target.create_dir(&format!("{path}/")).await?;
             staged.record_materialized_directory(path).await?;
         }
@@ -719,9 +719,9 @@ async fn state_from_snapshot(
         if local_entry.is_some_and(|entry| entry.kind != local_kind) {
             bail!("installed local path {path:?} has the wrong kind");
         }
-        state.base.insert(
+        state.installed.insert(
             path,
-            BaseEntry {
+            InstalledEntry {
                 local_identity: local_entry.and_then(|entry| entry.native_identity),
                 local_size: local_entry.map(|entry| entry.size),
                 local_modified: local_entry.map(|entry| entry.modified.clone()),
@@ -739,9 +739,9 @@ fn local_matches_state(local: &LocalTree, state: &ReplicaState) -> Result<bool> 
         .map(snapshot_kinds)
         .transpose()?
         .unwrap_or_default();
-    Ok(local.entries().len() == state.base.len()
+    Ok(local.entries().len() == state.installed.len()
         && local.entries().iter().all(|(path, entry)| {
-            state.base.get(path).is_some_and(|base| {
+            state.installed.get(path).is_some_and(|base| {
                 base.local_identity == entry.native_identity
                     && base.local_size == Some(entry.size)
                     && base.local_modified.as_deref() == Some(entry.modified.as_str())
@@ -763,7 +763,7 @@ fn known_local_digests(
         .entries()
         .iter()
         .filter_map(|(path, entry)| {
-            let base = state.base.get(path)?;
+            let base = state.installed.get(path)?;
             if entry.kind == LocalKind::File
                 && base.local_identity == entry.native_identity
                 && base.local_size == Some(entry.size)

@@ -24,4 +24,4 @@ pub(crate) use publication::build_publication;
 pub(crate) use reconcile::{ReconcileAction, reconcile};
 pub(crate) use snapshot::snapshot_paths;
 pub(crate) use staging::StagedTree;
-pub(crate) use state::BaseEntry;
+pub(crate) use state::InstalledEntry;
