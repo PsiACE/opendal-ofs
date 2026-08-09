@@ -663,7 +663,9 @@ impl BranchStore {
         roots: &mut GcRoots,
         state: &StoredNamespaceState,
     ) -> Result<(), ManagedError> {
-        roots.checkpoints.insert(checkpoint_key(state.checkpoint));
+        roots
+            .checkpoints
+            .insert(checkpoint_key(state.checkpoint.digest));
         namespace
             .visit_retained(state, |snapshot| roots.data.retain(snapshot))
             .await

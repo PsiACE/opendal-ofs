@@ -22,6 +22,13 @@ pub(crate) const MAX_TAIL_BYTES: usize = 128 * 1024;
 
 pub(crate) type StoredResults = BTreeMap<(Option<BranchId>, OperationId), StoredCommittedResult>;
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CheckpointRef {
+    pub(crate) digest: [u8; 32],
+    pub(crate) length: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct StoredChange {
@@ -48,7 +55,7 @@ impl StoredChange {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct StoredNamespaceState {
-    pub(crate) checkpoint: [u8; 32],
+    pub(crate) checkpoint: CheckpointRef,
     pub(crate) checkpoint_cursor: ChangeCursor,
     pub(crate) tail: Vec<StoredChange>,
     pub(crate) previous_history: Option<[u8; 32]>,

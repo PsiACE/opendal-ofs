@@ -195,7 +195,10 @@ zstd frame                    variable
 The decoded strict CBOR record contains one complete `NamespaceSnapshot` and
 the ordered committed-operation receipts required for publication recovery.
 The format does not add another node, directory, file-version, or extent model.
-SHA-256 of the complete envelope determines its object key.
+SHA-256 of the complete envelope determines its object key. Mutable namespace
+state references that digest together with the encoded object length, allowing
+one exact bounded range GET without a preceding metadata request; both values
+are verified before decoding.
 
 Encoded and decoded checkpoint sizes are each limited to 256 MiB. Recovery
 uses one bounded OpenDAL range read, verifies the complete content identity,

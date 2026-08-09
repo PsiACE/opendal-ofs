@@ -18,10 +18,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::{
-    NamespaceChange, NamespaceGcSweep, NamespacePublication, NamespaceSnapshot, StoredChange,
-    StoredCheckpoint, StoredCommittedResult, StoredHistory, StoredNamespaceState, StoredResults,
-    recover_namespace, replay_tail_from, require_request_digest, results_for_rotation,
-    validate_publication,
+    CheckpointRef, NamespaceChange, NamespaceGcSweep, NamespacePublication, NamespaceSnapshot,
+    StoredChange, StoredCheckpoint, StoredCommittedResult, StoredHistory, StoredNamespaceState,
+    StoredResults, recover_namespace, replay_tail_from, require_request_digest,
+    results_for_rotation, validate_publication,
 };
 use crate::filesystem::{
     BranchBinding, BranchId, ChangeCursor, CommitOutcome, OperationId, VolumeId,
@@ -475,7 +475,7 @@ impl NamespaceStore {
         let retained = head
             .state
             .as_ref()
-            .map(|state| checkpoint_key(state.checkpoint));
+            .map(|state| checkpoint_key(state.checkpoint.digest));
         sweep_checkpoint_objects(&self.data, retained.as_deref()).await?;
         head.finish_gc(sweep)?;
         if self
@@ -508,17 +508,9 @@ impl NamespaceStore {
 
     pub(crate) async fn read_checkpoint(
         &self,
-        id: [u8; 32],
+        reference: CheckpointRef,
     ) -> Result<StoredCheckpoint, ManagedError> {
-        let key = checkpoint_key(id);
-        let metadata = match self.data.stat(&key).await {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                return Err(corrupt("read Managed namespace", "checkpoint is missing"));
-            }
-            Err(_) => return Err(unavailable("read Managed namespace")),
-        };
-        let encoded_length = usize::try_from(metadata.content_length())
+        let encoded_length = usize::try_from(reference.length)
             .ok()
             .filter(|length| *length <= MAX_CHECKPOINT_ENCODED_BYTES)
             .ok_or_else(|| {
@@ -527,10 +519,12 @@ impl NamespaceStore {
                     "checkpoint exceeds its encoded size limit",
                 )
             })?;
+        let key = checkpoint_key(reference.digest);
         let bytes = match self
             .data
             .read_with(&key)
-            .range(0..metadata.content_length())
+            .range(0..reference.length)
+            .content_length_hint(reference.length)
             .await
         {
             Ok(bytes) => bytes.to_bytes(),
@@ -539,7 +533,9 @@ impl NamespaceStore {
             }
             Err(_) => return Err(unavailable("read Managed namespace")),
         };
-        if bytes.len() != encoded_length || <[u8; 32]>::from(Sha256::digest(&bytes)) != id {
+        if bytes.len() != encoded_length
+            || <[u8; 32]>::from(Sha256::digest(&bytes)) != reference.digest
+        {
             return Err(corrupt(
                 "read Managed namespace",
                 "checkpoint identity is invalid",
@@ -558,19 +554,22 @@ impl NamespaceStore {
     async fn write_checkpoint(
         &self,
         checkpoint: &StoredCheckpoint,
-    ) -> Result<[u8; 32], ManagedError> {
+    ) -> Result<CheckpointRef, ManagedError> {
         let bytes = encode_checkpoint(checkpoint)?;
-        let id: [u8; 32] = Sha256::digest(&bytes).into();
+        let reference = CheckpointRef {
+            digest: Sha256::digest(&bytes).into(),
+            length: bytes.len() as u64,
+        };
         ensure_immutable(
             &self.data,
-            &checkpoint_key(id),
+            &checkpoint_key(reference.digest),
             &bytes,
             "checkpoint Managed namespace",
             ManagedErrorKind::Corrupt,
             "immutable checkpoint changed",
         )
         .await?;
-        Ok(id)
+        Ok(reference)
     }
 
     #[cfg(feature = "managed-branch")]

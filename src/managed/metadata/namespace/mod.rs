@@ -30,9 +30,9 @@ pub(crate) use records::{
     NamespaceSnapshot, NodePrecondition, NodeRecord, managed_generation, next_managed_generation,
 };
 pub(crate) use state::{
-    StoredChange, StoredCheckpoint, StoredCommittedResult, StoredHistory, StoredNamespaceState,
-    StoredResults, recover_namespace, replay_tail_from, require_request_digest,
-    results_for_rotation,
+    CheckpointRef, StoredChange, StoredCheckpoint, StoredCommittedResult, StoredHistory,
+    StoredNamespaceState, StoredResults, recover_namespace, replay_tail_from,
+    require_request_digest, results_for_rotation,
 };
 pub(crate) use store::{NamespaceStore, NamespaceWitness};
 #[cfg(feature = "managed-branch")]
