@@ -24,7 +24,9 @@ use super::{
     DirectoryPrecondition, DirectoryRecord, FileVersionRecord, NamespacePublication,
     NamespaceSnapshot, NodePrecondition, NodeRecord,
 };
-use crate::filesystem::{ChangeCursor, FileVersionId, NodeId, OperationId, VolumeId};
+use crate::filesystem::{
+    ChangeCursor, DirectoryEntry, FileVersionId, Generation, NodeId, OperationId, VolumeId,
+};
 use crate::managed::{ManagedError, ManagedErrorKind};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -39,10 +41,70 @@ pub(crate) struct NamespaceChange {
     pub(crate) expected_directories: Vec<DirectoryPrecondition>,
     pub(crate) put_nodes: Vec<NodeRecord>,
     pub(crate) remove_nodes: Vec<NodeId>,
-    pub(crate) put_directories: Vec<DirectoryRecord>,
+    put_directories: Vec<DirectoryDelta>,
     pub(crate) remove_directories: Vec<NodeId>,
     pub(crate) put_file_versions: Vec<FileVersionRecord>,
     pub(crate) remove_file_versions: Vec<FileVersionId>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DirectoryDelta {
+    node: NodeId,
+    generation: Generation,
+    put_entries: BTreeMap<String, DirectoryEntry>,
+    remove_entries: Vec<String>,
+}
+
+impl DirectoryDelta {
+    fn between(target: &DirectoryRecord, base: Option<&DirectoryRecord>) -> Self {
+        Self {
+            node: target.node,
+            generation: target.generation.clone(),
+            put_entries: target
+                .entries
+                .iter()
+                .filter(|(name, entry)| {
+                    base.and_then(|base| base.entries.get(*name)) != Some(*entry)
+                })
+                .map(|(name, entry)| (name.clone(), *entry))
+                .collect(),
+            remove_entries: base
+                .into_iter()
+                .flat_map(|base| {
+                    base.entries
+                        .keys()
+                        .filter(|name| !target.entries.contains_key(*name))
+                        .cloned()
+                })
+                .collect(),
+        }
+    }
+
+    fn apply(self, base: Option<&DirectoryRecord>) -> Result<DirectoryRecord, ManagedError> {
+        let mut directory = base.cloned().unwrap_or(DirectoryRecord {
+            node: self.node,
+            generation: self.generation.clone(),
+            entries: BTreeMap::new(),
+        });
+        if directory.node != self.node {
+            return Err(corrupt("directory delta identity is invalid"));
+        }
+        directory.generation = self.generation;
+        let mut changed = BTreeSet::new();
+        for name in self.remove_entries {
+            if !changed.insert(name.clone()) || directory.entries.remove(&name).is_none() {
+                return Err(corrupt("directory entry removal is invalid"));
+            }
+        }
+        for (name, entry) in self.put_entries {
+            if !changed.insert(name.clone()) {
+                return Err(corrupt("directory entry update is invalid"));
+            }
+            directory.entries.insert(name, entry);
+        }
+        Ok(directory)
+    }
 }
 
 impl NamespaceChange {
@@ -85,7 +147,7 @@ impl NamespaceChange {
                 .directories
                 .iter()
                 .filter(|(id, record)| base_directories.get(id) != Some(record))
-                .map(|(_, record)| record.clone())
+                .map(|(id, record)| DirectoryDelta::between(record, base_directories.get(id)))
                 .collect(),
             remove_directories: base_directories
                 .keys()
@@ -110,6 +172,7 @@ impl NamespaceChange {
         self,
         base: Option<NamespaceSnapshot>,
     ) -> Result<NamespaceSnapshot, ManagedError> {
+        self.validate(self.volume_id)?;
         let validation_base = base.clone();
         let mut target = match base {
             Some(base) if base.volume_id == self.volume_id && base.cursor == self.parent => base,
@@ -132,10 +195,18 @@ impl NamespaceChange {
             |record| record.id,
             "node delta is invalid",
         )?;
+        let put_directories = self
+            .put_directories
+            .into_iter()
+            .map(|delta| {
+                let base = target.directories.get(&delta.node);
+                delta.apply(base)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         apply_records(
             &mut target.directories,
             self.remove_directories,
-            self.put_directories,
+            put_directories,
             |record| record.node,
             "directory delta is invalid",
         )?;
@@ -162,6 +233,16 @@ impl NamespaceChange {
             return Err(corrupt("transaction preconditions are stale"));
         }
         Ok(target)
+    }
+
+    pub(crate) fn validate(&self, volume_id: VolumeId) -> Result<(), ManagedError> {
+        if self.volume_id != volume_id
+            || self.cursor.operation() != Some(self.operation)
+            || self.parent.sequence().checked_add(1) != Some(self.cursor.sequence())
+        {
+            return Err(corrupt("transaction ancestry is invalid"));
+        }
+        Ok(())
     }
 }
 

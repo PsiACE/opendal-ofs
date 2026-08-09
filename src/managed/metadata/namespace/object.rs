@@ -27,12 +27,11 @@ use sha2::{Digest as _, Sha256};
 use super::change::NamespaceChange;
 use super::validation::{validate_publication, validate_snapshot};
 use super::{
-    DirectoryPrecondition, DirectoryRecord, FileVersionRecord, NamespaceGcSweep,
-    NamespacePublication, NamespaceSnapshot, NodePrecondition, NodeRecord,
+    DirectoryRecord, FileVersionRecord, NamespaceGcSweep, NamespacePublication, NamespaceSnapshot,
+    NodeRecord,
 };
 use crate::filesystem::{
-    ChangeCursor, CommitOutcome, DirectoryEntry, FileVersionId, Generation, NodeId, OperationId,
-    VolumeId,
+    ChangeCursor, CommitOutcome, FileVersionId, NodeId, OperationId, VolumeId,
 };
 use crate::managed::format::sstable::{
     self, Record as TableRecord, RecordGroup as TableRecordGroup, TableRef,
@@ -41,7 +40,9 @@ use crate::managed::metadata::object::{self, ensure_immutable, read_content_addr
 use crate::managed::{ManagedError, ManagedErrorKind};
 
 #[cfg(test)]
-use crate::filesystem::{NodeAttributes, NodeKind};
+use crate::filesystem::{
+    DirectoryEntry, DirectoryPrecondition, NodeAttributes, NodeKind, NodePrecondition,
+};
 
 const HEAD_KEY: &str = ".ofs/managed/metadata/v1/head.ofs";
 const MANIFEST_ROOT: &str = ".ofs/managed/metadata/v1/manifests/sha256";
@@ -250,7 +251,7 @@ impl<B: NamespaceHeadBackend> NamespaceStore<B> {
             });
         }
         let base = observed.map(|value| &value.snapshot);
-        let stored = StoredTransaction::from_publication(publication, base);
+        let stored = NamespaceChange::from_publication(publication, base);
         let encoded_transaction = encode_table_value(&stored, "publish Managed namespace")?;
         let request_sha256 = sha256(&encoded_transaction);
         if !validate_publication(publication, base)? {
@@ -1216,7 +1217,7 @@ struct StoredHead {
     cursor: ChangeCursor,
     checkpoint: [u8; 32],
     checkpoint_cursor: ChangeCursor,
-    tail: Vec<StoredTransaction>,
+    tail: Vec<NamespaceChange>,
     maintenance_epoch: u64,
     maintenance_state: StoredMaintenanceState,
     #[serde(default)]
@@ -1250,7 +1251,7 @@ impl StoredHead {
         cursor: ChangeCursor,
         checkpoint: [u8; 32],
         checkpoint_cursor: ChangeCursor,
-        tail: Vec<StoredTransaction>,
+        tail: Vec<NamespaceChange>,
     ) -> Result<Self, ManagedError> {
         let head = Self {
             major: FORMAT_MAJOR,
@@ -1403,27 +1404,6 @@ impl StoredHead {
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct StoredTransaction {
-    major: u16,
-    volume_id: VolumeId,
-    operation: OperationId,
-    parent: ChangeCursor,
-    cursor: ChangeCursor,
-    root: NodeId,
-    expected_nodes: Vec<NodePrecondition>,
-    expected_directories: Vec<DirectoryPrecondition>,
-    put_nodes: Vec<NodeRecord>,
-    remove_nodes: Vec<NodeId>,
-    put_directories: Vec<StoredDirectoryHeader>,
-    remove_directories: Vec<NodeId>,
-    put_directory_entries: Vec<StoredNamedDirectoryEntry>,
-    remove_directory_entries: Vec<StoredDirectoryEntryKey>,
-    put_file_versions: Vec<FileVersionRecord>,
-    remove_file_versions: Vec<FileVersionId>,
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 struct StoredManifest {
     major: u16,
     volume_id: VolumeId,
@@ -1440,7 +1420,7 @@ struct StoredCommittedResult {
 }
 
 impl StoredCommittedResult {
-    fn from_transaction(transaction: &StoredTransaction) -> Result<Self, ManagedError> {
+    fn from_transaction(transaction: &NamespaceChange) -> Result<Self, ManagedError> {
         Ok(Self {
             cursor: transaction.cursor,
             request_sha256: transaction_sha256(transaction, "checkpoint Managed namespace")?,
@@ -1459,7 +1439,7 @@ impl StoredCommittedResult {
 }
 
 fn transaction_sha256(
-    transaction: &StoredTransaction,
+    transaction: &NamespaceChange,
     action: &'static str,
 ) -> Result<[u8; 32], ManagedError> {
     encode_table_value(transaction, action).map(|bytes| sha256(&bytes))
@@ -1504,151 +1484,11 @@ fn validate_tables(tables: &[TableRef]) -> Result<(), ManagedError> {
     Ok(())
 }
 
-impl StoredTransaction {
-    fn from_publication(
-        publication: &NamespacePublication,
-        base: Option<&NamespaceSnapshot>,
-    ) -> Self {
-        let change = NamespaceChange::from_publication(publication, base);
-        Self {
-            major: FORMAT_MAJOR,
-            volume_id: change.volume_id,
-            operation: change.operation,
-            parent: change.parent,
-            cursor: change.cursor,
-            root: change.root,
-            expected_nodes: change.expected_nodes,
-            expected_directories: change.expected_directories,
-            put_nodes: change.put_nodes,
-            remove_nodes: change.remove_nodes,
-            put_directories: change
-                .put_directories
-                .iter()
-                .map(StoredDirectoryHeader::from)
-                .collect(),
-            remove_directories: change.remove_directories,
-            put_directory_entries: change
-                .put_directories
-                .iter()
-                .flat_map(|directory| {
-                    let base = base.and_then(|snapshot| snapshot.directories.get(&directory.node));
-                    directory
-                        .entries
-                        .iter()
-                        .filter(move |(name, entry)| {
-                            base.and_then(|base| base.entries.get(*name)) != Some(*entry)
-                        })
-                        .map(move |(name, entry)| StoredNamedDirectoryEntry {
-                            directory: directory.node,
-                            name: name.clone(),
-                            entry: *entry,
-                        })
-                })
-                .collect(),
-            remove_directory_entries: change
-                .put_directories
-                .iter()
-                .flat_map(|directory| {
-                    base.and_then(|snapshot| snapshot.directories.get(&directory.node))
-                        .into_iter()
-                        .flat_map(move |base| {
-                            base.entries
-                                .keys()
-                                .filter(move |name| !directory.entries.contains_key(*name))
-                                .map(move |name| StoredDirectoryEntryKey {
-                                    directory: directory.node,
-                                    name: name.clone(),
-                                })
-                        })
-                })
-                .collect(),
-            put_file_versions: change.put_file_versions,
-            remove_file_versions: change.remove_file_versions,
-        }
-    }
-
-    fn validate(&self, volume_id: VolumeId) -> Result<(), ManagedError> {
-        let parent = self.parent;
-        let cursor = self.cursor;
-        if self.major != FORMAT_MAJOR
-            || self.volume_id != volume_id
-            || cursor.operation() != Some(self.operation)
-            || parent.sequence().checked_add(1) != Some(cursor.sequence())
-        {
-            return Err(corrupt(
-                "read Managed transaction",
-                "transaction ancestry is invalid",
-            ));
-        }
-        Ok(())
-    }
-
-    fn to_change(&self, base: Option<&NamespaceSnapshot>) -> Result<NamespaceChange, ManagedError> {
-        let volume_id = self.volume_id;
-        self.validate(volume_id)?;
-        let mut put_directories = BTreeMap::new();
-        for header in &self.put_directories {
-            let node = header.node;
-            if put_directories.contains_key(&node) {
-                return Err(corrupt(
-                    "read Managed transaction",
-                    "transaction repeats a directory header",
-                ));
-            }
-            let mut directory = base
-                .and_then(|snapshot| snapshot.directories.get(&node))
-                .cloned()
-                .unwrap_or_else(|| header.to_record());
-            directory.generation = header.generation.clone();
-            put_directories.insert(node, directory);
-        }
-        for removed in &self.remove_directory_entries {
-            let directory = put_directories.get_mut(&removed.directory).ok_or_else(|| {
-                corrupt(
-                    "read Managed transaction",
-                    "directory entry removal has no directory header",
-                )
-            })?;
-            if directory.entries.remove(&removed.name).is_none() {
-                return Err(corrupt(
-                    "read Managed transaction",
-                    "directory entry removal is stale",
-                ));
-            }
-        }
-        for stored in &self.put_directory_entries {
-            let directory = put_directories.get_mut(&stored.directory).ok_or_else(|| {
-                corrupt(
-                    "read Managed transaction",
-                    "directory entry update has no directory header",
-                )
-            })?;
-            directory.entries.insert(stored.name.clone(), stored.entry);
-        }
-        Ok(NamespaceChange {
-            volume_id,
-            operation: self.operation,
-            parent: self.parent,
-            cursor: self.cursor,
-            root: self.root,
-            expected_nodes: self.expected_nodes.clone(),
-            expected_directories: self.expected_directories.clone(),
-            put_nodes: self.put_nodes.clone(),
-            remove_nodes: self.remove_nodes.clone(),
-            put_directories: put_directories.into_values().collect(),
-            remove_directories: self.remove_directories.clone(),
-            put_file_versions: self.put_file_versions.clone(),
-            remove_file_versions: self.remove_file_versions.clone(),
-        })
-    }
-}
-
 fn apply_transaction(
     base: Option<NamespaceSnapshot>,
-    transaction: &StoredTransaction,
+    transaction: &NamespaceChange,
 ) -> Result<NamespaceSnapshot, ManagedError> {
-    let change = transaction.to_change(base.as_ref())?;
-    change.apply(base)
+    transaction.clone().apply(base)
 }
 
 fn replay_tail_from(
@@ -1686,47 +1526,6 @@ fn replay_tail_from(
         ));
     }
     Ok(Some(snapshot))
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct StoredDirectoryHeader {
-    node: NodeId,
-    generation: Generation,
-}
-
-impl From<&DirectoryRecord> for StoredDirectoryHeader {
-    fn from(directory: &DirectoryRecord) -> Self {
-        Self {
-            node: directory.node,
-            generation: directory.generation.clone(),
-        }
-    }
-}
-
-impl StoredDirectoryHeader {
-    fn to_record(&self) -> DirectoryRecord {
-        DirectoryRecord {
-            node: self.node,
-            generation: self.generation.clone(),
-            entries: BTreeMap::new(),
-        }
-    }
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct StoredNamedDirectoryEntry {
-    directory: NodeId,
-    name: String,
-    entry: DirectoryEntry,
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct StoredDirectoryEntryKey {
-    directory: NodeId,
-    name: String,
 }
 
 #[cfg(test)]
@@ -1817,7 +1616,7 @@ mod tests {
         };
         let checkpoint = apply_transaction(
             None,
-            &StoredTransaction::from_publication(&first_publication, None),
+            &NamespaceChange::from_publication(&first_publication, None),
         )
         .unwrap();
         let second = OperationId::from_bytes([5; 16]);
@@ -1832,7 +1631,7 @@ mod tests {
         };
         let recovered = apply_transaction(
             Some(checkpoint),
-            &StoredTransaction::from_publication(&publication, Some(&first_snapshot)),
+            &NamespaceChange::from_publication(&publication, Some(&first_snapshot)),
         )
         .unwrap();
         assert_eq!(recovered, target);
@@ -1925,8 +1724,7 @@ mod tests {
             expected_directories: Vec::new(),
             target: second_snapshot,
         };
-        let stored =
-            StoredTransaction::from_publication(&second_publication, Some(&first_snapshot));
+        let stored = NamespaceChange::from_publication(&second_publication, Some(&first_snapshot));
         let head = StoredHead::new(
             namespace.volume_id,
             stored.cursor,
