@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -98,13 +100,14 @@ pub(crate) struct D1Session {
 }
 
 impl D1Metadata {
-    pub fn new(config: D1Config) -> Self {
-        Self {
-            session: D1Session {
-                client: reqwest::Client::new(),
-                config,
-            },
-        }
+    pub fn new(config: D1Config) -> Result<Self, ManagedError> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|_| unavailable("open D1 metadata"))?;
+        Ok(Self {
+            session: D1Session { client, config },
+        })
     }
 
     pub(crate) fn session(&self) -> D1Session {

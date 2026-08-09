@@ -70,58 +70,20 @@ pub(crate) fn validate_publication(
 }
 
 pub(crate) fn validate_snapshot(snapshot: &NamespaceSnapshot) -> Result<(), ManagedError> {
-    let root = snapshot
-        .nodes
-        .get(&snapshot.root)
-        .filter(|node| node.kind == NodeKind::Directory)
-        .ok_or_else(|| invalid("read Managed namespace", "root directory is missing"))?;
-    if root.id != snapshot.root || !snapshot.directories.contains_key(&snapshot.root) {
-        return Err(invalid(
-            "read Managed namespace",
-            "root directory is invalid",
-        ));
-    }
-    for (id, node) in &snapshot.nodes {
-        if *id != node.id || managed_generation_number(&node.generation).is_none() {
+    snapshot
+        .validate_structure()
+        .map_err(|_| invalid("read Managed namespace", "namespace structure is invalid"))?;
+    for node in snapshot.nodes.values() {
+        if managed_generation_number(&node.generation).is_none() {
             return Err(invalid("read Managed namespace", "node record is invalid"));
         }
-        match node.kind {
-            NodeKind::Directory if node.file_version.is_none() => {}
-            NodeKind::RegularFile
-                if node
-                    .file_version
-                    .is_some_and(|version| snapshot.file_versions.contains_key(&version)) => {}
-            _ => return Err(invalid("read Managed namespace", "node content is invalid")),
-        }
     }
-    for (id, directory) in &snapshot.directories {
-        if *id != directory.node
-            || managed_generation_number(&directory.generation).is_none()
-            || !snapshot
-                .nodes
-                .get(id)
-                .is_some_and(|node| node.kind == NodeKind::Directory)
-        {
+    for directory in snapshot.directories.values() {
+        if managed_generation_number(&directory.generation).is_none() {
             return Err(invalid(
                 "read Managed namespace",
                 "directory record is invalid",
             ));
-        }
-        for (name, entry) in &directory.entries {
-            if name.is_empty()
-                || name == "."
-                || name == ".."
-                || name.contains('/')
-                || !snapshot
-                    .nodes
-                    .get(&entry.node)
-                    .is_some_and(|node| node.kind == entry.kind)
-            {
-                return Err(invalid(
-                    "read Managed namespace",
-                    "directory entry is invalid",
-                ));
-            }
         }
     }
     for (id, version) in &snapshot.file_versions {

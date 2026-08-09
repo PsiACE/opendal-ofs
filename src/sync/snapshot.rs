@@ -6,42 +6,12 @@
 // "License"); you may not use this file except in compliance
 // with the License.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 
-use crate::filesystem::{NodeId, NodeKind, VolumeSnapshot};
+use crate::filesystem::{NodeId, VolumeSnapshot};
 
 pub(crate) fn snapshot_paths(snapshot: &VolumeSnapshot) -> Result<BTreeMap<String, NodeId>> {
-    let mut paths = BTreeMap::new();
-    let mut pending = vec![(String::new(), snapshot.root)];
-    let mut expanded = BTreeSet::new();
-    while let Some((path, node)) = pending.pop() {
-        if !path.is_empty() && paths.insert(path.clone(), node).is_some() {
-            bail!("authoritative namespace contains a duplicate path");
-        }
-        let record = snapshot
-            .nodes
-            .get(&node)
-            .context("authoritative namespace references a missing node")?;
-        if record.kind != NodeKind::Directory {
-            continue;
-        }
-        if !expanded.insert(node) {
-            bail!("authoritative namespace is not a directory tree");
-        }
-        let directory = snapshot
-            .directories
-            .get(&node)
-            .context("authoritative namespace references a missing directory")?;
-        for (name, entry) in directory.entries.iter().rev() {
-            let child = if path.is_empty() {
-                name.clone()
-            } else {
-                format!("{path}/{name}")
-            };
-            pending.push((child, entry.node));
-        }
-    }
-    Ok(paths)
+    snapshot.paths().map_err(Into::into)
 }

@@ -18,7 +18,7 @@
 use std::collections::BTreeSet;
 use std::io::Cursor;
 
-use opendal::{ErrorKind, Operator};
+use opendal::Operator;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sha2::{Digest as _, Sha256};
@@ -34,6 +34,7 @@ use crate::filesystem::{
     BranchBinding, BranchId, BranchName, ChangeCursor, CommitOutcome, OperationId, VolumeId,
 };
 use crate::managed::metadata::namespace::{NamespacePublication, NamespaceSnapshot};
+use crate::managed::metadata::object;
 use crate::managed::{ManagedData, ManagedError, ManagedErrorKind, SegmentGcMaintenance};
 
 const ROOT: &str = ".ofs/managed/metadata/v1/extensions/branch/v1";
@@ -340,17 +341,13 @@ impl ObjectBranchStore {
     pub fn new(volume_id: VolumeId, operator: Operator) -> Result<Self, ManagedError> {
         let capability = operator.info().full_capability();
         if !capability.read
-            || !capability.read_with_if_match
-            || !capability.stat
             || !capability.write
             || !capability.write_with_if_not_exists
             || !capability.write_with_if_match
-            || !capability.list
-            || !capability.delete
         {
             return Err(invalid(
                 "open Managed branches",
-                "object branch metadata requires versioned read, stat, create-only write, conditional replace, list, and delete",
+                "object branch metadata requires read, create-only write, and conditional replace",
             ));
         }
         Ok(Self {
@@ -684,7 +681,7 @@ impl ObjectBranchStore {
                 return Ok(registry);
             }
             let bytes = encode(REGISTRY_MAGIC, &registry, MAX_REGISTRY_BYTES, action)?;
-            match self.replace(REGISTRY_KEY, &revision, bytes, action).await {
+            match object::replace(&self.operator, REGISTRY_KEY, &revision, bytes, action).await {
                 Ok(true) => return Ok(registry),
                 Ok(false) => continue,
                 Err(error) => return Err(error),
@@ -904,6 +901,13 @@ impl ObjectBranchStore {
         data_operator: Operator,
         fence: ObjectBranchGcFence,
     ) -> Result<SegmentGcMaintenance, ManagedError> {
+        let capability = self.operator.info().full_capability();
+        if !capability.list || !capability.delete {
+            return Err(invalid(
+                "garbage collect Managed branches",
+                "object branch garbage collection requires list and delete",
+            ));
+        }
         let roots = self.gc_roots(fence).await?;
         let data = ManagedData::new(data_operator)?;
         let maintenance = data
@@ -1126,24 +1130,15 @@ impl ObjectBranchStore {
     }
 
     async fn read_checkpoint_root(&self, id: [u8; 32]) -> Result<CheckpointRoot, ManagedError> {
-        let bytes = self
-            .operator
-            .read(&checkpoint_key(id))
-            .await
-            .map_err(|error| {
-                if error.kind() == ErrorKind::NotFound {
-                    corrupt("read Managed branch", "branch checkpoint is missing")
-                } else {
-                    unavailable("read Managed branch")
-                }
-            })?
-            .to_bytes();
-        if Sha256::digest(&bytes).as_slice() != id {
-            return Err(corrupt(
-                "read Managed branch",
-                "branch checkpoint identity is invalid",
-            ));
-        }
+        let bytes = object::read_content_addressed(
+            &self.operator,
+            &checkpoint_key(id),
+            &id,
+            "read Managed branch",
+            "branch checkpoint is missing",
+            "branch checkpoint identity is invalid",
+        )
+        .await?;
         let root: CheckpointRoot = decode(
             CHECKPOINT_MAGIC,
             &bytes,
@@ -1163,24 +1158,15 @@ impl ObjectBranchStore {
         let root = self.read_checkpoint_root(id).await?;
         let mut parts = Vec::with_capacity(root.parts.len());
         for reference in &root.parts {
-            let bytes = self
-                .operator
-                .read(&checkpoint_part_key(reference.id))
-                .await
-                .map_err(|error| {
-                    if error.kind() == ErrorKind::NotFound {
-                        corrupt("read Managed branch", "branch checkpoint part is missing")
-                    } else {
-                        unavailable("read Managed branch")
-                    }
-                })?
-                .to_bytes();
-            if Sha256::digest(&bytes).as_slice() != reference.id {
-                return Err(corrupt(
-                    "read Managed branch",
-                    "branch checkpoint part identity is invalid",
-                ));
-            }
+            let bytes = object::read_content_addressed(
+                &self.operator,
+                &checkpoint_part_key(reference.id),
+                &reference.id,
+                "read Managed branch",
+                "branch checkpoint part is missing",
+                "branch checkpoint part identity is invalid",
+            )
+            .await?;
             parts.push(decode(
                 CHECKPOINT_PART_MAGIC,
                 &bytes,
@@ -1230,24 +1216,15 @@ impl ObjectBranchStore {
     }
 
     async fn read_history(&self, id: [u8; 32]) -> Result<StoredHistory, ManagedError> {
-        let bytes = self
-            .operator
-            .read(&history_key(id))
-            .await
-            .map_err(|error| {
-                if error.kind() == ErrorKind::NotFound {
-                    corrupt("read Managed branch", "branch history is missing")
-                } else {
-                    unavailable("read Managed branch")
-                }
-            })?
-            .to_bytes();
-        if Sha256::digest(&bytes).as_slice() != id {
-            return Err(corrupt(
-                "read Managed branch",
-                "branch history identity is invalid",
-            ));
-        }
+        let bytes = object::read_content_addressed(
+            &self.operator,
+            &history_key(id),
+            &id,
+            "read Managed branch",
+            "branch history is missing",
+            "branch history identity is invalid",
+        )
+        .await?;
         let history: StoredHistory = decode(
             HISTORY_MAGIC,
             &bytes,
@@ -1277,20 +1254,15 @@ impl ObjectBranchStore {
         expected: &[u8],
         action: &'static str,
     ) -> Result<(), ManagedError> {
-        if self.create(key, expected.to_vec(), action).await? {
-            return Ok(());
-        }
-        let observed = self
-            .operator
-            .read(key)
-            .await
-            .map_err(|_| unavailable(action))?
-            .to_bytes();
-        if observed.as_ref() == expected {
-            Ok(())
-        } else {
-            Err(corrupt(action, "immutable branch object changed"))
-        }
+        object::ensure_immutable(
+            &self.operator,
+            key,
+            expected,
+            action,
+            ManagedErrorKind::Corrupt,
+            "immutable branch object changed",
+        )
+        .await
     }
 
     async fn registry(&self) -> Result<(StoredBranchRegistry, String), ManagedError> {
@@ -1300,7 +1272,9 @@ impl ObjectBranchStore {
     }
 
     async fn read_registry(&self) -> Result<Option<(StoredBranchRegistry, String)>, ManagedError> {
-        let Some((bytes, revision)) = self.read(REGISTRY_KEY, "read Managed branches").await?
+        let Some((bytes, revision)) =
+            object::read_with_revision(&self.operator, REGISTRY_KEY, "read Managed branches")
+                .await?
         else {
             return Ok(None);
         };
@@ -1318,9 +1292,9 @@ impl ObjectBranchStore {
         &self,
         branch_id: BranchId,
     ) -> Result<Option<(StoredBranchHead, String)>, ManagedError> {
-        let Some((bytes, revision)) = self
-            .read(&head_key(branch_id), "read Managed branch")
-            .await?
+        let Some((bytes, revision)) =
+            object::read_with_revision(&self.operator, &head_key(branch_id), "read Managed branch")
+                .await?
         else {
             return Ok(None);
         };
@@ -1330,53 +1304,13 @@ impl ObjectBranchStore {
         Ok(Some((head, revision)))
     }
 
-    async fn read(
-        &self,
-        key: &str,
-        action: &'static str,
-    ) -> Result<Option<(Vec<u8>, String)>, ManagedError> {
-        loop {
-            let metadata = match self.operator.stat(key).await {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-                Err(_) => return Err(unavailable(action)),
-            };
-            let revision = metadata
-                .etag()
-                .ok_or_else(|| unavailable(action))?
-                .to_owned();
-            match self.operator.read_with(key).if_match(&revision).await {
-                Ok(bytes) => return Ok(Some((bytes.to_bytes().to_vec(), revision))),
-                Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-                Err(error) if error.kind() == ErrorKind::ConditionNotMatch => continue,
-                Err(_) => return Err(unavailable(action)),
-            }
-        }
-    }
-
     async fn create(
         &self,
         key: &str,
         bytes: Vec<u8>,
         action: &'static str,
     ) -> Result<bool, ManagedError> {
-        match self
-            .operator
-            .write_with(key, bytes)
-            .if_not_exists(true)
-            .await
-        {
-            Ok(_) => Ok(true),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    ErrorKind::AlreadyExists | ErrorKind::ConditionNotMatch
-                ) =>
-            {
-                Ok(false)
-            }
-            Err(_) => Err(unavailable(action)),
-        }
+        object::create(&self.operator, key, bytes, action).await
     }
 
     async fn replace(
@@ -1386,16 +1320,7 @@ impl ObjectBranchStore {
         bytes: Vec<u8>,
         action: &'static str,
     ) -> Result<bool, ManagedError> {
-        match self
-            .operator
-            .write_with(key, bytes)
-            .if_match(expected_revision)
-            .await
-        {
-            Ok(_) => Ok(true),
-            Err(error) if error.kind() == ErrorKind::ConditionNotMatch => Ok(false),
-            Err(_) => Err(unavailable(action)),
-        }
+        object::replace(&self.operator, key, expected_revision, bytes, action).await
     }
 }
 
@@ -1543,22 +1468,32 @@ mod tests {
     use opendal::services::Memory;
 
     use crate::filesystem::{DirectoryEntry, NodeAttributes, NodeKind};
+    use crate::managed::format::ExtentMap;
     use crate::managed::metadata::namespace::{
-        DirectoryRecord, NamespaceSnapshot, NodeRecord, managed_generation,
+        DirectoryRecord, FileVersionRecord, NamespaceSnapshot, NodeRecord, managed_generation,
     };
 
     fn checkpoint_snapshot(entries: usize) -> NamespaceSnapshot {
         let volume_id = VolumeId::from_bytes([9; 16]);
         let root = crate::filesystem::NodeId::from_bytes([8; 16]);
+        let file = crate::filesystem::NodeId::from_bytes([6; 16]);
         let operation = OperationId::from_bytes([7; 16]);
         let cursor = ChangeCursor::at(std::num::NonZeroU64::new(1).unwrap(), operation);
+        let version = FileVersionRecord::from_extents(
+            0,
+            Sha256::digest([]).into(),
+            ExtentMap {
+                extents: Vec::new(),
+            },
+        )
+        .unwrap();
         let entries = (0..entries)
             .map(|index| {
                 (
                     format!("{index:08}-{}", "x".repeat(96)),
                     DirectoryEntry {
-                        node: root,
-                        kind: NodeKind::Directory,
+                        node: file,
+                        kind: NodeKind::RegularFile,
                     },
                 )
             })
@@ -1567,16 +1502,28 @@ mod tests {
             volume_id,
             cursor,
             root,
-            nodes: BTreeMap::from([(
-                root,
-                NodeRecord {
-                    id: root,
-                    generation: managed_generation(1),
-                    kind: NodeKind::Directory,
-                    attributes: NodeAttributes::default(),
-                    file_version: None,
-                },
-            )]),
+            nodes: BTreeMap::from([
+                (
+                    root,
+                    NodeRecord {
+                        id: root,
+                        generation: managed_generation(1),
+                        kind: NodeKind::Directory,
+                        attributes: NodeAttributes::default(),
+                        file_version: None,
+                    },
+                ),
+                (
+                    file,
+                    NodeRecord {
+                        id: file,
+                        generation: managed_generation(1),
+                        kind: NodeKind::RegularFile,
+                        attributes: NodeAttributes::default(),
+                        file_version: Some(version.id),
+                    },
+                ),
+            ]),
             directories: BTreeMap::from([(
                 root,
                 DirectoryRecord {
@@ -1585,7 +1532,7 @@ mod tests {
                     entries,
                 },
             )]),
-            file_versions: BTreeMap::new(),
+            file_versions: BTreeMap::from([(version.id, version)]),
         }
     }
 

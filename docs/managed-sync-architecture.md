@@ -33,6 +33,23 @@ Managed namespace contract and extent map are the reuse boundary between
 metadata implementations and Managed frontends. An unimplemented product cell
 has no alternate command or storage layout.
 
+## Design constraints
+
+The implementation follows four constraints:
+
+1. RFC 016 owns the vocabulary and the separation between Volume and Access
+   models. Sync does not interpret provider metadata, and Managed does not own
+   local reconciliation state.
+2. `managed/1` owns durable compatibility. Chunk sizes, segment packing,
+   request coalescing, caches, and concurrency are policies and never become
+   serialized requirements.
+3. Each filesystem fact has one in-memory model. Managed parameterizes the
+   shared snapshot and publication types with its decoded file-version record;
+   it does not maintain a parallel node, directory, or precondition graph.
+4. Orchestration remains readable in execution order. Helpers isolate an
+   actual capability or format boundary; they do not turn a linear command
+   into a framework.
+
 ## Ownership
 
 | Component | Owns | Does not own |
@@ -86,7 +103,10 @@ authoritative namespace position.
 A publication contains a complete target snapshot and preconditions for every
 changed node and directory. Metadata validates the snapshot, cursor ancestry,
 generation changes, preconditions, and file version references before commit.
-This validation is shared by Object Metadata and D1.
+The filesystem core validates tree shape, record identity, backing records,
+entry names, entry kinds, and reachability once. Managed validation adds only
+managed generations, immutable file-version descriptors, ancestry, and
+publication preconditions. Object Metadata and D1 call the same validation.
 
 An `OperationId` is the idempotency identity for one publication. Repeating a
 committed operation returns its committed cursor. Reusing the same identity
@@ -94,23 +114,44 @@ for another payload is a conflict.
 
 ## Data path
 
-Sync freezes changed files before remote mutation. Files below the chunking
+Sync freezes changed files into a reconstructable local cache before remote
+mutation. Reading the live file once to create that cache and reading the cache
+to stage immutable data are distinct durability steps: publication never
+depends on a live path that may change or disappear. Files below the chunking
 threshold produce one content extent. Larger files use FastCDC. These are
 placement policies, not different storage formats.
 
 Staging performs the following work:
 
-1. Read each frozen changed file.
-2. Reuse content already referenced by the fixed authority snapshot.
-3. Deduplicate new content across the publication.
-4. Seal and upload segment batches as prepared files arrive.
-5. Return file versions with complete logical-to-physical extent maps.
+1. Concurrent readers stream chunks from frozen files into a bounded channel.
+2. One segment builder reuses content referenced by the fixed authority
+   snapshot and deduplicates new content across the publication.
+3. The builder seals a segment as soon as its placement target is reached and
+   uploads it with create-only semantics.
+4. File completion records supply the logical length and whole-file digest.
+5. The builder returns file versions with complete logical-to-physical extent
+   maps.
 
-Materialization reads file extents in logical order and writes each file
-incrementally through an OpenDAL writer. A shared transfer semaphore bounds
-all in-flight range reads for the operation. OFS verifies every returned
-content digest, logical length, and assembled whole-file digest before closing
-the writer. A failed read or digest check aborts the staged output.
+Backpressure bounds buffered file data to the active segment, the channel, and
+at most one chunk held by each reader; only the resulting extent metadata grows
+with the publication. Readers remain concurrent, while a single builder
+preserves cross-file packing and deduplication.
+
+Materialization builds one read plan for the requested tree, reads file extents
+in logical order, and writes each file incrementally through an OpenDAL writer.
+The plan chooses complete-segment or coalesced-range reads by transferred bytes
+and request count. Complete segments use one lazily initialized, 64 MiB
+OpenDAL Foyer cache shared by the `ManagedData` instance and its clones; the
+layer merges concurrent cold reads and handles eviction. Backends without
+`stat` use the coalesced-range path instead. Each sparse range is fetched once,
+shared by every planned consumer across file windows, and released after its
+last consumer. Sparse segment ranges are submitted together through OpenDAL
+`Reader::fetch`; OpenDAL removes overlap, coalesces nearby ranges with a 256 KiB
+gap, and returns zero-copy slices. File writes remain windowed at 16 MiB.
+The operator's OpenDAL concurrency and retry layers govern remote transfers.
+OFS verifies segment structure, every returned content digest, logical length,
+and the assembled whole-file digest before closing the writer. A failed read
+or digest check aborts the staged output.
 
 The read path does not list objects or read a segment footer to locate file
 bytes. The file version already contains the segment identity, byte offset,
@@ -154,6 +195,32 @@ operations.
 D1 does not emulate Object HEAD, manifests, object keys, or SSTable requests.
 Object Metadata does not emulate database transactions. The two authorities
 share records and validation, not storage mechanics.
+
+D1 requests have an explicit operation timeout. Schema creation remains
+idempotent and is submitted in the same transactional batch as the operation
+that first needs each table, so a new store has no separate migration race.
+
+## OpenDAL boundary
+
+Storage locators are opened with OpenDAL's URI constructor. Provider-specific
+URI parsing, including filesystem roots and S3 bucket/root mapping, therefore
+has one upstream implementation. OFS adds the configured concurrency limit and
+retry layer once at this boundary.
+
+The filesystem service is a required build dependency because Sync always uses
+it for its durable local staging area. Remote services such as S3 remain Cargo
+features. All supported feature combinations therefore retain the local Sync
+capability instead of compiling a partially usable binary.
+
+Capability admission is scoped to the operation that needs it. Normal Object
+namespace reads and publication require read and conditional writes; listing
+and deletion are checked only when garbage collection starts. Data garbage
+collection streams the provider listing and submits bounded bulk-delete
+batches through OpenDAL.
+
+Object authority reads that also need a revision use one OpenDAL `Reader`: the
+object body and ETag come from the same GET response. They do not issue a
+preflight stat or maintain a private conditional-read retry loop.
 
 ## Sync transaction
 
@@ -213,6 +280,51 @@ cannot finish or continue metadata maintenance. An unpublished namespace is a
 successful empty collection.
 
 Foreground publication and materialization do not list the data prefix.
+
+## Extensions
+
+A Managed extension adds authority semantics without adding another filesystem
+model. Branch binding selects a base or branch authority before Sync calls the
+same `Volume` contract. Branch snapshots and publications use the shared node,
+directory, precondition, and Managed file-version records. Object and D1 may
+encode their authority mechanics differently, but both preserve the same
+branch identity, ancestry, operation-id, fork, deletion, and fencing behavior.
+
+The branch feature controls commands and extension code only. It does not
+change `managed/1` base-volume readability or create an alternate data plane.
+Segments remain shared immutable content, and collection treats every retained
+base or branch snapshot as a root.
+
+## Acceptance and regression coverage
+
+Tests protect contracts visible outside an implementation boundary:
+
+- behavior acceptance runs the CLI against real OpenDAL operators and checks
+  create/open, push, pull, conflict, recovery, branch, and garbage-collection
+  workflows by their files, exit status, and durable results;
+- format acceptance opens and mutates persisted `managed/1` fixtures through
+  both metadata authorities where applicable;
+- regression tests are added for a concrete failure that could recur, and name
+  the user-visible or durable invariant that failed;
+- the build matrix checks default, minimal, and optional remote-service feature
+  combinations.
+
+Tests do not prescribe buffer allocation, private helper calls, request order
+when the protocol permits reordering, placement-policy constants, or private
+error variants. Those details may change without changing Sync behavior or the
+Managed format. Removed routes, fields, and implementations receive no
+absence-only tests unless their absence is itself a current security,
+persistence, or public API contract.
+
+## Completion criteria
+
+A Managed Sync change is complete when a fresh client can register or create a
+volume, converge local and remote changes, recover an interrupted publication,
+materialize verified bytes, and collect only unreachable data through each
+enabled metadata authority. The same stored volume remains readable by its
+declared `managed/1` format, buffered file data remains bounded by configured
+concurrency and placement windows rather than dataset size, and every supported
+Cargo feature combination builds.
 
 ## Related documents
 

@@ -6,7 +6,6 @@
 // "License"); you may not use this file except in compliance
 // with the License.
 
-use std::collections::BTreeMap;
 use std::env;
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -564,9 +563,9 @@ fn create_direct_volume(
 fn open_metadata(data: Operator, metadata: Option<&Url>) -> Result<MetadataAuthority> {
     match metadata {
         None => Ok(MetadataAuthority::Object(ObjectMetadata::new(data))),
-        Some(url) if url.scheme() == "d1" => {
-            Ok(MetadataAuthority::D1(D1Metadata::new(d1_config(url)?)))
-        }
+        Some(url) if url.scheme() == "d1" => D1Metadata::new(d1_config(url)?)
+            .map(MetadataAuthority::D1)
+            .map_err(Into::into),
         Some(_) => bail!("--metadata must use d1://ACCOUNT/DATABASE/STORE"),
     }
 }
@@ -659,19 +658,7 @@ fn load_catalog(config: &Path) -> Result<Catalog> {
 }
 
 fn open_operator(url: &Url, transfer_concurrency: NonZeroUsize) -> Result<Operator> {
-    let mut arguments = url.query_pairs().into_owned().collect::<Vec<_>>();
-    if url.scheme() == "s3" {
-        if let Some(bucket) = url.host_str()
-            && !arguments.iter().any(|(key, _)| key == "bucket")
-        {
-            arguments.push(("bucket".into(), bucket.into()));
-        }
-        let root = url.path().trim_matches('/');
-        if !root.is_empty() && !arguments.iter().any(|(key, _)| key == "root") {
-            arguments.push(("root".into(), root.into()));
-        }
-    }
-    Operator::via_iter(url.scheme(), arguments)
+    Operator::from_uri(url.as_str())
         .map(|operator| {
             operator
                 .layer(ConcurrentLimitLayer::new(transfer_concurrency.get()))
@@ -694,8 +681,10 @@ fn d1_config(url: &Url) -> Result<D1Config> {
     if path.len() != 2 {
         bail!("--metadata path must be /DATABASE/STORE");
     }
-    let query = url.query_pairs().collect::<BTreeMap<_, _>>();
-    if query.contains_key("token") {
+    let api_base = url
+        .query_pairs()
+        .find_map(|(key, value)| (key == "api_base").then(|| value.into_owned()));
+    if url.query_pairs().any(|(key, _)| key == "token") {
         bail!("remove token from --metadata and set OFS_D1_TOKEN instead");
     }
     let token = env::var("OFS_D1_TOKEN")
@@ -703,9 +692,9 @@ fn d1_config(url: &Url) -> Result<D1Config> {
     let mut config = D1Config::new(account, path[0], path[1], token).map_err(|_| {
         anyhow!("invalid D1 metadata configuration; check account, database, store, and token")
     })?;
-    if let Some(api_base) = query.get("api_base") {
+    if let Some(api_base) = api_base {
         config = config
-            .with_api_base(api_base.as_ref())
+            .with_api_base(api_base)
             .map_err(|_| anyhow!("invalid D1 api_base; provide an absolute Query API base URL"))?;
     }
     Ok(config)

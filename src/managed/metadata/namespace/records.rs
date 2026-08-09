@@ -15,31 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::BTreeMap;
-
 use sha2::{Digest as _, Sha256};
 
-use crate::filesystem::{
-    ChangeCursor, DirectoryEntry, FileVersionId, Generation, NodeAttributes, NodeId, NodeKind,
-    OperationId, VolumeId,
-};
+use crate::filesystem::{ChangeCursor, FileVersionId, Generation};
 use crate::managed::format::{ContentRef, ExtentMap};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct NodeRecord {
-    pub(crate) id: NodeId,
-    pub(crate) generation: Generation,
-    pub(crate) kind: NodeKind,
-    pub(crate) attributes: NodeAttributes,
-    pub(crate) file_version: Option<FileVersionId>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct DirectoryRecord {
-    pub(crate) node: NodeId,
-    pub(crate) generation: Generation,
-    pub(crate) entries: BTreeMap<String, DirectoryEntry>,
-}
+pub(crate) type NodeRecord = crate::filesystem::NodeRecord;
+pub(crate) type DirectoryRecord = crate::filesystem::DirectoryRecord;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FileVersionRecord {
@@ -140,36 +122,10 @@ fn encode_content(encoded: &mut Vec<u8>, content: &ContentRef) {
     encoded.extend_from_slice(&content.length.to_be_bytes());
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct NamespaceSnapshot {
-    pub(crate) volume_id: VolumeId,
-    pub(crate) cursor: ChangeCursor,
-    pub(crate) root: NodeId,
-    pub(crate) nodes: BTreeMap<NodeId, NodeRecord>,
-    pub(crate) directories: BTreeMap<NodeId, DirectoryRecord>,
-    pub(crate) file_versions: BTreeMap<FileVersionId, FileVersionRecord>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct NodePrecondition {
-    pub(crate) node: NodeId,
-    pub(crate) expected_generation: Option<Generation>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct DirectoryPrecondition {
-    pub(crate) directory: NodeId,
-    pub(crate) expected_generation: Option<Generation>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct NamespacePublication {
-    pub(crate) operation: OperationId,
-    pub(crate) parent: ChangeCursor,
-    pub(crate) expected_nodes: Vec<NodePrecondition>,
-    pub(crate) expected_directories: Vec<DirectoryPrecondition>,
-    pub(crate) target: NamespaceSnapshot,
-}
+pub(crate) type NamespaceSnapshot = crate::filesystem::VolumeSnapshot<FileVersionRecord>;
+pub(crate) type NodePrecondition = crate::filesystem::NodePrecondition;
+pub(crate) type DirectoryPrecondition = crate::filesystem::DirectoryPrecondition;
+pub(crate) type NamespacePublication = crate::filesystem::VolumePublication<FileVersionRecord>;
 
 /// Durable identity of one namespace garbage-collection sweep.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

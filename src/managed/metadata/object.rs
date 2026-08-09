@@ -16,6 +16,7 @@
 // under the License.
 
 use opendal::{ErrorKind, Operator};
+use sha2::{Digest as _, Sha256};
 
 use super::require_same_format;
 use crate::managed::metadata::superblock::SUPERBLOCK_KEY;
@@ -49,22 +50,17 @@ impl ObjectMetadata {
             ));
         }
         let encoded = desired.encode()?;
-        match self
-            .operator
-            .write_with(SUPERBLOCK_KEY, encoded)
-            .if_not_exists(true)
-            .await
+        if create(
+            &self.operator,
+            SUPERBLOCK_KEY,
+            encoded,
+            "create Managed format",
+        )
+        .await?
         {
-            Ok(_) => Ok(desired.clone()),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    ErrorKind::AlreadyExists | ErrorKind::ConditionNotMatch
-                ) =>
-            {
-                require_same_format(desired, self.read_format().await?)
-            }
-            Err(_) => Err(unavailable("create Managed format")),
+            Ok(desired.clone())
+        } else {
+            require_same_format(desired, self.read_format().await?)
         }
     }
 
@@ -75,11 +71,130 @@ impl ObjectMetadata {
     }
 
     pub async fn read_format_optional(&self) -> Result<Option<ManagedFormat>, ManagedError> {
-        match self.operator.read(SUPERBLOCK_KEY).await {
-            Ok(bytes) => ManagedFormat::decode(&bytes.to_bytes()).map(Some),
-            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-            Err(_) => Err(unavailable("read Managed format")),
+        read(&self.operator, SUPERBLOCK_KEY, "read Managed format")
+            .await?
+            .map(|bytes| ManagedFormat::decode(&bytes))
+            .transpose()
+    }
+}
+
+pub(crate) async fn read(
+    operator: &Operator,
+    key: &str,
+    action: &'static str,
+) -> Result<Option<Vec<u8>>, ManagedError> {
+    match operator.read(key).await {
+        Ok(bytes) => Ok(Some(bytes.to_bytes().to_vec())),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(unavailable(action)),
+    }
+}
+
+pub(crate) async fn read_with_revision(
+    operator: &Operator,
+    key: &str,
+    action: &'static str,
+) -> Result<Option<(Vec<u8>, String)>, ManagedError> {
+    let reader = match operator.reader(key).await {
+        Ok(reader) => reader,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(unavailable(action)),
+    };
+    let bytes = match reader.read(..).await {
+        Ok(bytes) => bytes.to_bytes().to_vec(),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(unavailable(action)),
+    };
+    let revision = reader
+        .metadata()
+        .and_then(|metadata| metadata.etag())
+        .ok_or_else(|| unavailable(action))?
+        .to_owned();
+    Ok(Some((bytes, revision)))
+}
+
+pub(crate) async fn read_content_addressed(
+    operator: &Operator,
+    key: &str,
+    expected: &[u8; 32],
+    action: &'static str,
+    missing: &'static str,
+    invalid: &'static str,
+) -> Result<Vec<u8>, ManagedError> {
+    let bytes = read(operator, key, action)
+        .await?
+        .ok_or_else(|| ManagedError::new(ManagedErrorKind::Corrupt, action, missing))?;
+    if Sha256::digest(&bytes).as_slice() != expected {
+        return Err(ManagedError::new(
+            ManagedErrorKind::Corrupt,
+            action,
+            invalid,
+        ));
+    }
+    Ok(bytes)
+}
+
+pub(crate) async fn create(
+    operator: &Operator,
+    key: &str,
+    bytes: Vec<u8>,
+    action: &'static str,
+) -> Result<bool, ManagedError> {
+    match operator.write_with(key, bytes).if_not_exists(true).await {
+        Ok(_) => Ok(true),
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::AlreadyExists | ErrorKind::ConditionNotMatch
+            ) =>
+        {
+            Ok(false)
         }
+        Err(_) => Err(unavailable(action)),
+    }
+}
+
+pub(crate) async fn replace(
+    operator: &Operator,
+    key: &str,
+    expected_revision: &str,
+    bytes: Vec<u8>,
+    action: &'static str,
+) -> Result<bool, ManagedError> {
+    match operator
+        .write_with(key, bytes)
+        .if_match(expected_revision)
+        .await
+    {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::ConditionNotMatch => Ok(false),
+        Err(_) => Err(unavailable(action)),
+    }
+}
+
+pub(crate) async fn ensure_immutable(
+    operator: &Operator,
+    key: &str,
+    expected: &[u8],
+    action: &'static str,
+    mismatch_kind: ManagedErrorKind,
+    mismatch_message: &'static str,
+) -> Result<(), ManagedError> {
+    if operator
+        .write_with(key, expected.to_vec())
+        .if_not_exists(true)
+        .await
+        .is_ok()
+    {
+        return Ok(());
+    }
+    let observed = read(operator, key, action)
+        .await?
+        .ok_or_else(|| unavailable(action))?;
+    if observed == expected {
+        Ok(())
+    } else {
+        Err(ManagedError::new(mismatch_kind, action, mismatch_message))
     }
 }
 

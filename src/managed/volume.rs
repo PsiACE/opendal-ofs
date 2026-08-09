@@ -37,8 +37,7 @@ use super::{
 };
 use crate::filesystem::{AuthorityIdentity, CommitOutcome, OperationId, VolumeId};
 use crate::filesystem::{
-    DirectoryRecord as FsDirectoryRecord, FileVersion, MaterializeRequest,
-    NodeRecord as FsNodeRecord, Volume, VolumeError, VolumeErrorKind, VolumeObservation,
+    FileVersion, MaterializeRequest, Volume, VolumeError, VolumeErrorKind, VolumeObservation,
     VolumePublication, VolumeSnapshot,
 };
 
@@ -596,36 +595,8 @@ fn to_volume_snapshot(snapshot: &NamespaceSnapshot) -> Result<VolumeSnapshot, Ma
         volume_id: snapshot.volume_id,
         cursor: snapshot.cursor,
         root: snapshot.root,
-        nodes: snapshot
-            .nodes
-            .iter()
-            .map(|(id, record)| {
-                (
-                    *id,
-                    FsNodeRecord {
-                        id: record.id,
-                        generation: record.generation.clone(),
-                        kind: record.kind,
-                        attributes: record.attributes,
-                        file_version: record.file_version,
-                    },
-                )
-            })
-            .collect(),
-        directories: snapshot
-            .directories
-            .iter()
-            .map(|(id, record)| {
-                (
-                    *id,
-                    FsDirectoryRecord {
-                        node: record.node,
-                        generation: record.generation.clone(),
-                        entries: record.entries.clone(),
-                    },
-                )
-            })
-            .collect(),
+        nodes: snapshot.nodes.clone(),
+        directories: snapshot.directories.clone(),
         file_versions: snapshot
             .file_versions
             .iter()
@@ -639,36 +610,8 @@ fn to_managed_snapshot(snapshot: &VolumeSnapshot) -> Result<NamespaceSnapshot, V
         volume_id: snapshot.volume_id,
         cursor: snapshot.cursor,
         root: snapshot.root,
-        nodes: snapshot
-            .nodes
-            .iter()
-            .map(|(id, record)| {
-                (
-                    *id,
-                    super::metadata::namespace::NodeRecord {
-                        id: record.id,
-                        generation: record.generation.clone(),
-                        kind: record.kind,
-                        attributes: record.attributes,
-                        file_version: record.file_version,
-                    },
-                )
-            })
-            .collect(),
-        directories: snapshot
-            .directories
-            .iter()
-            .map(|(id, record)| {
-                (
-                    *id,
-                    super::metadata::namespace::DirectoryRecord {
-                        node: record.node,
-                        generation: record.generation.clone(),
-                        entries: record.entries.clone(),
-                    },
-                )
-            })
-            .collect(),
+        nodes: snapshot.nodes.clone(),
+        directories: snapshot.directories.clone(),
         file_versions: snapshot
             .file_versions
             .iter()
@@ -683,26 +626,8 @@ fn to_managed_publication(
     Ok(NamespacePublication {
         operation: publication.operation,
         parent: publication.parent,
-        expected_nodes: publication
-            .expected_nodes
-            .iter()
-            .map(
-                |precondition| super::metadata::namespace::NodePrecondition {
-                    node: precondition.node,
-                    expected_generation: precondition.expected_generation.clone(),
-                },
-            )
-            .collect(),
-        expected_directories: publication
-            .expected_directories
-            .iter()
-            .map(
-                |precondition| super::metadata::namespace::DirectoryPrecondition {
-                    directory: precondition.directory,
-                    expected_generation: precondition.expected_generation.clone(),
-                },
-            )
-            .collect(),
+        expected_nodes: publication.expected_nodes.clone(),
+        expected_directories: publication.expected_directories.clone(),
         target: to_managed_snapshot(&publication.target)?,
     })
 }

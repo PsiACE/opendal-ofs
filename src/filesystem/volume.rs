@@ -17,7 +17,7 @@
 
 //! Backend-neutral filesystem view and operations exposed to access models.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::num::NonZeroUsize;
@@ -78,14 +78,140 @@ pub struct DirectoryRecord {
 }
 
 /// A backend-neutral, complete filesystem observation.
+///
+/// `F` is the volume-owned file-version representation. Access frontends use
+/// the default opaque [`FileVersion`], while a volume implementation may use
+/// its decoded representation internally without copying the namespace model.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct VolumeSnapshot {
+pub struct VolumeSnapshot<F = FileVersion> {
     pub volume_id: VolumeId,
     pub cursor: ChangeCursor,
     pub root: NodeId,
     pub nodes: BTreeMap<NodeId, NodeRecord>,
     pub directories: BTreeMap<NodeId, DirectoryRecord>,
-    pub file_versions: BTreeMap<FileVersionId, FileVersion>,
+    pub file_versions: BTreeMap<FileVersionId, F>,
+}
+
+impl<F> VolumeSnapshot<F> {
+    /// Return every non-root path in this namespace.
+    ///
+    /// Walking also proves that directories form a tree. Regular files may be
+    /// linked from more than one directory.
+    pub(crate) fn paths(&self) -> Result<BTreeMap<String, NodeId>, VolumeError> {
+        let mut paths = BTreeMap::new();
+        let mut pending = vec![(String::new(), self.root)];
+        let mut expanded = BTreeSet::new();
+        while let Some((path, node)) = pending.pop() {
+            if !path.is_empty() && paths.insert(path.clone(), node).is_some() {
+                return Err(invalid_snapshot("namespace contains a duplicate path"));
+            }
+            let record = self
+                .nodes
+                .get(&node)
+                .ok_or_else(|| invalid_snapshot("namespace references a missing node"))?;
+            if record.kind != NodeKind::Directory {
+                continue;
+            }
+            if !expanded.insert(node) {
+                return Err(invalid_snapshot("namespace directories do not form a tree"));
+            }
+            let directory = self
+                .directories
+                .get(&node)
+                .ok_or_else(|| invalid_snapshot("namespace references a missing directory"))?;
+            for (name, entry) in directory.entries.iter().rev() {
+                let child = if path.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{path}/{name}")
+                };
+                pending.push((child, entry.node));
+            }
+        }
+        Ok(paths)
+    }
+
+    /// Validate the backend-neutral structure shared by all volume formats.
+    pub(crate) fn validate_structure(&self) -> Result<(), VolumeError> {
+        let root = self
+            .nodes
+            .get(&self.root)
+            .ok_or_else(|| invalid_snapshot("root node is missing"))?;
+        if root.kind != NodeKind::Directory || !self.directories.contains_key(&self.root) {
+            return Err(invalid_snapshot("root node is not a directory"));
+        }
+
+        for (id, node) in &self.nodes {
+            if *id != node.id {
+                return Err(invalid_snapshot(
+                    "node map key does not match its record identity",
+                ));
+            }
+            match node.kind {
+                NodeKind::Directory => {
+                    if node.file_version.is_some() || !self.directories.contains_key(id) {
+                        return Err(invalid_snapshot(
+                            "directory node has invalid backing records",
+                        ));
+                    }
+                }
+                NodeKind::RegularFile => {
+                    let version = node
+                        .file_version
+                        .ok_or_else(|| invalid_snapshot("file node has no file version"))?;
+                    if !self.file_versions.contains_key(&version)
+                        || self.directories.contains_key(id)
+                    {
+                        return Err(invalid_snapshot("file node has invalid backing records"));
+                    }
+                }
+            }
+        }
+
+        for (id, directory) in &self.directories {
+            if *id != directory.node {
+                return Err(invalid_snapshot(
+                    "directory map key does not match its record identity",
+                ));
+            }
+            if !self
+                .nodes
+                .get(id)
+                .is_some_and(|node| node.kind == NodeKind::Directory)
+            {
+                return Err(invalid_snapshot("directory has no directory node"));
+            }
+            for (name, entry) in &directory.entries {
+                if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+                    return Err(invalid_snapshot("directory entry name is invalid"));
+                }
+                let child = self
+                    .nodes
+                    .get(&entry.node)
+                    .ok_or_else(|| invalid_snapshot("directory entry references a missing node"))?;
+                if child.kind != entry.kind {
+                    return Err(invalid_snapshot(
+                        "directory entry kind disagrees with its node",
+                    ));
+                }
+            }
+        }
+
+        let paths = self.paths()?;
+        let reachable = paths
+            .values()
+            .copied()
+            .chain(std::iter::once(self.root))
+            .collect::<BTreeSet<_>>();
+        if reachable.len() != self.nodes.len() {
+            return Err(invalid_snapshot("namespace contains unreachable nodes"));
+        }
+        Ok(())
+    }
+}
+
+fn invalid_snapshot(message: &'static str) -> VolumeError {
+    VolumeError::new(VolumeErrorKind::Invalid, message)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -102,12 +228,12 @@ pub struct DirectoryPrecondition {
 
 /// One generation-checked filesystem publication.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct VolumePublication {
+pub struct VolumePublication<F = FileVersion> {
     pub operation: OperationId,
     pub parent: ChangeCursor,
     pub expected_nodes: Vec<NodePrecondition>,
     pub expected_directories: Vec<DirectoryPrecondition>,
-    pub target: VolumeSnapshot,
+    pub target: VolumeSnapshot<F>,
 }
 
 #[derive(Clone, Debug)]

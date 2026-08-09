@@ -20,7 +20,7 @@ use std::io::Cursor;
 use std::num::NonZeroU64;
 
 use futures::{StreamExt as _, TryStreamExt as _, stream};
-use opendal::{ErrorKind, Operator};
+use opendal::Operator;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -41,6 +41,9 @@ use crate::filesystem::{
 use crate::managed::format::ExtentMap;
 use crate::managed::format::sstable::{
     self, Record as TableRecord, RecordGroup as TableRecordGroup, TableRef,
+};
+use crate::managed::metadata::object::{
+    create, ensure_immutable, read, read_content_addressed, read_with_revision, replace,
 };
 use crate::managed::{ManagedError, ManagedErrorKind};
 
@@ -115,14 +118,13 @@ impl ObjectNamespace {
     pub(crate) fn new(volume_id: VolumeId, operator: Operator) -> Result<Self, ManagedError> {
         let capability = operator.info().full_capability();
         if !capability.read
-            || !capability.stat
             || !capability.write
             || !capability.write_with_if_not_exists
             || !capability.write_with_if_match
         {
             return Err(invalid(
                 "open Managed namespace",
-                "object metadata requires read, stat, create-only write, and conditional replace",
+                "object metadata requires read, create-only write, and conditional replace",
             ));
         }
         Ok(Self {
@@ -257,8 +259,15 @@ impl ObjectNamespace {
                 .await?;
             let bytes = encode_cbor(MANIFEST_MAGIC, &checkpoint, "checkpoint Managed namespace")?;
             let checkpoint_id = sha256(&bytes);
-            self.ensure_immutable(&manifest_key(&checkpoint_id), &bytes)
-                .await?;
+            ensure_immutable(
+                &self.operator,
+                &manifest_key(&checkpoint_id),
+                &bytes,
+                "publish Managed namespace",
+                ManagedErrorKind::Conflict,
+                "operation identity was reused with another payload",
+            )
+            .await?;
             (checkpoint_id, publication.target.cursor.into(), Vec::new())
         } else {
             let observed = observed.expect("checkpoint policy has an observation");
@@ -283,8 +292,17 @@ impl ObjectNamespace {
         );
         let head = encode_head(&head)?;
         let replaced = match observed {
-            Some(observed) => self.replace_head(&observed.revision, head).await,
-            None => self.create_head(head).await,
+            Some(observed) => {
+                replace(
+                    &self.operator,
+                    HEAD_KEY,
+                    &observed.revision,
+                    head,
+                    "publish Managed namespace",
+                )
+                .await
+            }
+            None => create(&self.operator, HEAD_KEY, head, "publish Managed namespace").await,
         };
         match replaced {
             Ok(true) => Ok(CommitOutcome::Committed(publication.target.cursor)),
@@ -442,37 +460,6 @@ impl ObjectNamespace {
             .await?
             .map_or(ChangeCursor::Genesis, |value| value.snapshot.cursor);
         Ok(CommitOutcome::Conflict { observed })
-    }
-
-    async fn ensure_immutable(&self, key: &str, expected: &[u8]) -> Result<(), ManagedError> {
-        match self
-            .operator
-            .write_with(key, expected.to_vec())
-            .if_not_exists(true)
-            .await
-        {
-            Ok(_) => return Ok(()),
-            Err(error)
-                if !matches!(
-                    error.kind(),
-                    ErrorKind::AlreadyExists | ErrorKind::ConditionNotMatch
-                ) => {}
-            Err(_) => {}
-        }
-        let existing = self
-            .operator
-            .read(key)
-            .await
-            .map_err(|_| unavailable("publish Managed namespace"))?;
-        if existing.to_bytes().as_ref() == expected {
-            Ok(())
-        } else {
-            Err(ManagedError::new(
-                ManagedErrorKind::Conflict,
-                "publish Managed namespace",
-                "operation identity was reused with another payload",
-            ))
-        }
     }
 
     async fn recover(
@@ -640,8 +627,15 @@ impl ObjectNamespace {
                 {
                     return Ok(existing.clone());
                 }
-                self.ensure_immutable(&sstable_key(&encoded.reference.id), &encoded.bytes)
-                    .await?;
+                ensure_immutable(
+                    &self.operator,
+                    &sstable_key(&encoded.reference.id),
+                    &encoded.bytes,
+                    "publish Managed namespace",
+                    ManagedErrorKind::Conflict,
+                    "operation identity was reused with another payload",
+                )
+                .await?;
                 Ok(encoded.reference)
             })
             .buffered(MAX_CHECKPOINT_UPLOADS)
@@ -766,24 +760,15 @@ impl ObjectNamespace {
     }
 
     async fn read_manifest(&self, id: &[u8; 32]) -> Result<StoredManifest, ManagedError> {
-        let bytes = self
-            .operator
-            .read(&manifest_key(id))
-            .await
-            .map_err(|error| {
-                if error.kind() == ErrorKind::NotFound {
-                    corrupt("read Managed namespace", "checkpoint is missing")
-                } else {
-                    unavailable("read Managed namespace")
-                }
-            })?
-            .to_bytes();
-        if sha256(&bytes) != *id {
-            return Err(corrupt(
-                "read Managed namespace",
-                "checkpoint key and content disagree",
-            ));
-        }
+        let bytes = read_content_addressed(
+            &self.operator,
+            &manifest_key(id),
+            id,
+            "read Managed namespace",
+            "checkpoint is missing",
+            "checkpoint key and content disagree",
+        )
+        .await?;
         decode_cbor(MANIFEST_MAGIC, &bytes, "read Managed namespace")
     }
 
@@ -893,39 +878,14 @@ impl ObjectNamespace {
     }
 
     async fn read_head(&self) -> Result<Option<(Vec<u8>, String)>, ManagedError> {
-        let reader = match self.operator.reader(HEAD_KEY).await {
-            Ok(reader) => reader,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(_) => return Err(unavailable("read Managed namespace")),
-        };
-        let bytes = match reader.read(..).await {
-            Ok(bytes) => bytes.to_bytes().to_vec(),
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(_) => return Err(unavailable("read Managed namespace")),
-        };
-        let revision = reader
-            .metadata()
-            .and_then(|metadata| metadata.etag())
-            .ok_or_else(|| unavailable("read Managed namespace"))?
-            .to_owned();
-        Ok(Some((bytes, revision)))
+        read_with_revision(&self.operator, HEAD_KEY, "read Managed namespace").await
     }
 
     async fn read_current_head(&self) -> Result<Option<StoredHead>, ManagedError> {
-        match self.operator.read(HEAD_KEY).await {
-            Ok(bytes) => decode_head(&bytes.to_bytes()).map(Some),
-            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-            Err(_) => Err(unavailable("read Managed namespace")),
-        }
-    }
-
-    async fn create_head(&self, bytes: Vec<u8>) -> Result<bool, ManagedError> {
-        conditional_result(
-            self.operator
-                .write_with(HEAD_KEY, bytes)
-                .if_not_exists(true)
-                .await,
-        )
+        read(&self.operator, HEAD_KEY, "read Managed namespace")
+            .await?
+            .map(|bytes| decode_head(&bytes))
+            .transpose()
     }
 
     async fn replace_head(
@@ -933,27 +893,14 @@ impl ObjectNamespace {
         expected_revision: &str,
         bytes: Vec<u8>,
     ) -> Result<bool, ManagedError> {
-        conditional_result(
-            self.operator
-                .write_with(HEAD_KEY, bytes)
-                .if_match(expected_revision)
-                .await,
+        replace(
+            &self.operator,
+            HEAD_KEY,
+            expected_revision,
+            bytes,
+            "publish Managed namespace",
         )
-    }
-}
-
-fn conditional_result(result: opendal::Result<opendal::Metadata>) -> Result<bool, ManagedError> {
-    match result {
-        Ok(_) => Ok(true),
-        Err(error)
-            if matches!(
-                error.kind(),
-                ErrorKind::AlreadyExists | ErrorKind::ConditionNotMatch
-            ) =>
-        {
-            Ok(false)
-        }
-        Err(_) => Err(unavailable("publish Managed namespace")),
+        .await
     }
 }
 
@@ -1226,14 +1173,6 @@ fn require_same_operation(
 
 fn conflict(action: &'static str, message: &'static str) -> ManagedError {
     ManagedError::new(ManagedErrorKind::Conflict, action, message)
-}
-
-fn unavailable(action: &'static str) -> ManagedError {
-    ManagedError::new(
-        ManagedErrorKind::Unavailable,
-        action,
-        "object metadata is unavailable",
-    )
 }
 
 #[derive(Clone, Deserialize, Serialize)]

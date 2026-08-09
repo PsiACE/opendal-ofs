@@ -646,46 +646,7 @@ fn validate_base(snapshot: &VolumeSnapshot, base: &BTreeMap<String, BaseEntry>) 
 }
 
 fn validate_snapshot(snapshot: &VolumeSnapshot) -> Result<()> {
-    let root = snapshot
-        .nodes
-        .get(&snapshot.root)
-        .context("root node is missing")?;
-    if root.kind != NodeKind::Directory || !snapshot.directories.contains_key(&snapshot.root) {
-        bail!("root node is not a directory");
-    }
-    for (id, node) in &snapshot.nodes {
-        if *id != node.id {
-            bail!("node map key does not match its record identity");
-        }
-        match node.kind {
-            NodeKind::Directory => {
-                if node.file_version.is_some() || !snapshot.directories.contains_key(id) {
-                    bail!("directory node has invalid backing records");
-                }
-            }
-            NodeKind::RegularFile => {
-                let version = node.file_version.context("file node has no file version")?;
-                if !snapshot.file_versions.contains_key(&version) {
-                    bail!("file node references a missing file version");
-                }
-            }
-        }
-    }
-    for (id, directory) in &snapshot.directories {
-        if *id != directory.node {
-            bail!("directory map key does not match its record identity");
-        }
-        for entry in directory.entries.values() {
-            let child = snapshot
-                .nodes
-                .get(&entry.node)
-                .context("directory entry references a missing node")?;
-            if child.kind != entry.kind {
-                bail!("directory entry kind disagrees with its node");
-            }
-        }
-    }
-    Ok(())
+    snapshot.validate_structure().map_err(Into::into)
 }
 
 #[cfg(unix)]
