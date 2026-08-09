@@ -277,7 +277,10 @@ impl ObjectNamespace {
             checkpoint_cursor,
             tail,
         )?
-        .with_maintenance_epoch(observed.map_or(0, |value| value.authority.head.maintenance_epoch));
+        .with_maintenance(
+            observed.map_or(0, |value| value.authority.head.maintenance_epoch),
+            observed.and_then(|value| value.authority.head.maintenance_owner),
+        );
         let head = encode_head(&head)?;
         let replaced = match observed {
             Some(observed) => self.replace_head(&observed.revision, head).await,
@@ -303,25 +306,49 @@ impl ObjectNamespace {
                 "observation belongs to another volume",
             ));
         }
-        if let Some(sweep) = observed.gc_sweep() {
-            return Ok(sweep);
+        if observed.gc_sweep().is_some() {
+            return Err(conflict(
+                "begin Managed namespace GC",
+                "another namespace GC is active",
+            ));
         }
         let mut head = observed.authority.head.clone();
-        let sweep = head.begin_gc()?;
+        let sweep = head.begin_gc(*OperationId::generate().as_bytes())?;
         if self
             .replace_head(&observed.revision, encode_head(&head)?)
             .await?
         {
             return Ok(sweep);
         }
-        let current = self
-            .observe()
+        Err(conflict(
+            "begin Managed namespace GC",
+            "namespace authority changed",
+        ))
+    }
+
+    pub(crate) async fn resume_gc(
+        &self,
+        observed: &NamespaceObservation,
+    ) -> Result<NamespaceGcSweep, ManagedError> {
+        if observed.snapshot.volume_id != self.volume_id {
+            return Err(invalid(
+                "resume Managed namespace GC",
+                "observation belongs to another volume",
+            ));
+        }
+        let mut head = observed.authority.head.clone();
+        let sweep = head.resume_gc(*OperationId::generate().as_bytes())?;
+        if self
+            .replace_head(&observed.revision, encode_head(&head)?)
             .await?
-            .ok_or_else(|| conflict("begin Managed namespace GC", "namespace authority changed"))?;
-        current
-            .gc_sweep()
-            .filter(|value| value.fixed_cursor() == observed.snapshot.cursor)
-            .ok_or_else(|| conflict("begin Managed namespace GC", "namespace authority changed"))
+        {
+            Ok(sweep)
+        } else {
+            Err(conflict(
+                "resume Managed namespace GC",
+                "namespace authority changed",
+            ))
+        }
     }
 
     pub(crate) async fn finish_gc(&self, sweep: NamespaceGcSweep) -> Result<(), ManagedError> {
@@ -1220,6 +1247,8 @@ struct StoredHead {
     tail: Vec<StoredTransaction>,
     maintenance_epoch: u64,
     maintenance_state: StoredMaintenanceState,
+    #[serde(default)]
+    maintenance_owner: Option<[u8; 16]>,
     maintenance_fixed_cursor: Option<StoredCursor>,
 }
 
@@ -1260,14 +1289,16 @@ impl StoredHead {
             tail,
             maintenance_epoch: 0,
             maintenance_state: StoredMaintenanceState::Idle,
+            maintenance_owner: None,
             maintenance_fixed_cursor: None,
         };
         head.validate_shape()?;
         Ok(head)
     }
 
-    fn with_maintenance_epoch(mut self, epoch: u64) -> Self {
+    fn with_maintenance(mut self, epoch: u64, owner: Option<[u8; 16]>) -> Self {
         self.maintenance_epoch = epoch;
+        self.maintenance_owner = owner;
         self
     }
 
@@ -1325,13 +1356,18 @@ impl StoredHead {
     }
 
     fn gc_sweep(&self) -> Result<Option<NamespaceGcSweep>, ManagedError> {
-        match (self.maintenance_state, self.maintenance_fixed_cursor) {
-            (StoredMaintenanceState::Idle, None) => Ok(None),
-            (StoredMaintenanceState::Sweeping, Some(fixed))
+        match (
+            self.maintenance_state,
+            self.maintenance_owner,
+            self.maintenance_fixed_cursor,
+        ) {
+            (StoredMaintenanceState::Idle, _, None) => Ok(None),
+            (StoredMaintenanceState::Sweeping, Some(owner), Some(fixed))
                 if self.maintenance_epoch > 0 && fixed == self.cursor =>
             {
                 Ok(Some(NamespaceGcSweep::new(
                     self.maintenance_epoch,
+                    owner,
                     fixed.into_cursor()?,
                 )))
             }
@@ -1342,9 +1378,12 @@ impl StoredHead {
         }
     }
 
-    fn begin_gc(&mut self) -> Result<NamespaceGcSweep, ManagedError> {
-        if let Some(sweep) = self.gc_sweep()? {
-            return Ok(sweep);
+    fn begin_gc(&mut self, owner: [u8; 16]) -> Result<NamespaceGcSweep, ManagedError> {
+        if self.gc_sweep()?.is_some() {
+            return Err(conflict(
+                "begin Managed namespace GC",
+                "another namespace GC is active",
+            ));
         }
         self.maintenance_epoch = self.maintenance_epoch.checked_add(1).ok_or_else(|| {
             corrupt(
@@ -1353,10 +1392,27 @@ impl StoredHead {
             )
         })?;
         self.maintenance_state = StoredMaintenanceState::Sweeping;
+        self.maintenance_owner = Some(owner);
         self.maintenance_fixed_cursor = Some(self.cursor);
         Ok(NamespaceGcSweep::new(
             self.maintenance_epoch,
+            owner,
             self.cursor.into_cursor()?,
+        ))
+    }
+
+    fn resume_gc(&mut self, owner: [u8; 16]) -> Result<NamespaceGcSweep, ManagedError> {
+        let active = self.gc_sweep()?.ok_or_else(|| {
+            conflict(
+                "resume Managed namespace GC",
+                "no interrupted namespace GC is active",
+            )
+        })?;
+        self.maintenance_owner = Some(owner);
+        Ok(NamespaceGcSweep::new(
+            active.epoch(),
+            owner,
+            active.fixed_cursor(),
         ))
     }
 
@@ -1925,16 +1981,29 @@ mod tests {
         let mut head =
             StoredHead::new(volume, cursor.into(), [4; 32], cursor.into(), Vec::new()).unwrap();
 
-        let sweep = head.begin_gc().unwrap();
+        let sweep = head.begin_gc([5; 16]).unwrap();
         let mut recovered = decode_head(&encode_head(&head).unwrap()).unwrap();
         recovered.validate(volume).unwrap();
         assert_eq!(recovered.gc_sweep().unwrap(), Some(sweep));
 
-        recovered.finish_gc(sweep).unwrap();
+        assert_eq!(
+            recovered.begin_gc([6; 16]).unwrap_err().kind(),
+            ManagedErrorKind::Conflict
+        );
+        let resumed = recovered.resume_gc([7; 16]).unwrap();
+        assert_eq!(resumed.epoch(), sweep.epoch());
+        assert_eq!(resumed.fixed_cursor(), sweep.fixed_cursor());
+        assert_ne!(resumed, sweep);
+        assert_eq!(
+            recovered.finish_gc(sweep).unwrap_err().kind(),
+            ManagedErrorKind::Conflict
+        );
+
+        recovered.finish_gc(resumed).unwrap();
         let idle = decode_head(&encode_head(&recovered).unwrap()).unwrap();
         idle.validate(volume).unwrap();
         assert_eq!(idle.gc_sweep().unwrap(), None);
-        assert_eq!(idle.maintenance_epoch, sweep.epoch());
+        assert_eq!(idle.maintenance_epoch, resumed.epoch());
     }
 
     #[test]

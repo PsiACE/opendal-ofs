@@ -24,6 +24,7 @@ use std::num::NonZeroUsize;
 
 use opendal::Operator;
 
+use super::AuthorityIdentity;
 use super::{
     ChangeCursor, CommitOutcome, DirectoryEntry, FileVersionId, Generation, NodeAttributes, NodeId,
     NodeKind, OperationId, VolumeId,
@@ -171,6 +172,11 @@ pub trait Volume: Clone + Send + Sync {
     type Observation: VolumeObservation;
 
     fn id(&self) -> VolumeId;
+
+    /// Stable identity of the authority used by this bound volume.
+    fn authority(&self) -> AuthorityIdentity {
+        AuthorityIdentity::base(self.id())
+    }
 
     fn initial_generation(&self) -> Generation;
 

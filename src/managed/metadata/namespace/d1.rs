@@ -57,6 +57,7 @@ pub(crate) struct D1NamespaceObservation {
     pub(crate) snapshot: NamespaceSnapshot,
     revision: u64,
     maintenance_epoch: u64,
+    maintenance_owner: Option<[u8; 16]>,
     gc_sweep: Option<NamespaceGcSweep>,
 }
 
@@ -82,7 +83,7 @@ impl D1Namespace {
         batch.extend([
             statement(
             format!(
-                "SELECT h.revision, h.target_sequence, h.target_operation, h.root_node, h.checkpoint_sequence, h.maintenance_epoch, h.maintenance_state, h.maintenance_fixed_sequence, h.maintenance_fixed_operation, c.snapshot_json FROM {HEADS} h JOIN {CHECKPOINTS} c ON c.store_key = h.store_key AND c.target_sequence = h.checkpoint_sequence WHERE h.store_key = ? AND h.volume_id = ?"
+                "SELECT h.revision, h.target_sequence, h.target_operation, h.root_node, h.checkpoint_sequence, h.maintenance_epoch, h.maintenance_state, h.maintenance_owner, h.maintenance_fixed_sequence, h.maintenance_fixed_operation, c.snapshot_json FROM {HEADS} h JOIN {CHECKPOINTS} c ON c.store_key = h.store_key AND c.target_sequence = h.checkpoint_sequence WHERE h.store_key = ? AND h.volume_id = ?"
             ),
             vec![self.store_key().into(), self.volume().into()],
             ),
@@ -109,6 +110,9 @@ impl D1Namespace {
             Some(text(head, "target_operation", "read Managed namespace")?),
         )?;
         let maintenance_epoch = integer(head, "maintenance_epoch", "read Managed namespace")?;
+        let maintenance_owner = nullable_text(head, "maintenance_owner", "read Managed namespace")?
+            .map(decode_hex)
+            .transpose()?;
         let gc_sweep = gc_sweep(head, maintenance_epoch, cursor)?;
         let root = node_id(text(head, "root_node", "read Managed namespace")?)?;
         let checkpoint_sequence = integer(head, "checkpoint_sequence", "read Managed namespace")?;
@@ -136,6 +140,7 @@ impl D1Namespace {
             snapshot,
             revision,
             maintenance_epoch,
+            maintenance_owner,
             gc_sweep,
         }))
     }
@@ -272,7 +277,7 @@ impl D1Namespace {
             ),
             None => statement(
                 format!(
-                    "INSERT OR IGNORE INTO {HEADS} (store_key, volume_id, revision, target_sequence, target_operation, root_node, checkpoint_sequence, maintenance_epoch, maintenance_state, maintenance_fixed_sequence, maintenance_fixed_operation) SELECT ?, ?, 1, ?, ?, ?, 0, 0, 'idle', NULL, NULL WHERE ? = 0 AND ? IS NULL AND {guard} RETURNING revision"
+                    "INSERT OR IGNORE INTO {HEADS} (store_key, volume_id, revision, target_sequence, target_operation, root_node, checkpoint_sequence, maintenance_epoch, maintenance_state, maintenance_owner, maintenance_fixed_sequence, maintenance_fixed_operation) SELECT ?, ?, 1, ?, ?, ?, 0, 0, 'idle', NULL, NULL, NULL WHERE ? = 0 AND ? IS NULL AND {guard} RETURNING revision"
                 ),
                 guarded_params(vec![
                     self.store_key().into(),
@@ -421,15 +426,20 @@ impl D1Namespace {
                 "observation belongs to another volume",
             ));
         }
-        if let Some(sweep) = observed.gc_sweep() {
-            return Ok(sweep);
+        if observed.gc_sweep().is_some() {
+            return Err(conflict(
+                "begin Managed namespace GC",
+                "another namespace GC is active",
+            ));
         }
+        let owner = *OperationId::generate().as_bytes();
         let mut batch = schema_statements();
         batch.push(statement(
             format!(
-                "UPDATE {HEADS} SET revision = revision + 1, maintenance_epoch = maintenance_epoch + 1, maintenance_state = 'sweeping', maintenance_fixed_sequence = target_sequence, maintenance_fixed_operation = target_operation WHERE store_key = ? AND volume_id = ? AND revision = ? AND target_sequence = ? AND target_operation = ? AND maintenance_epoch = ? AND maintenance_state = 'idle' RETURNING maintenance_epoch"
+                "UPDATE {HEADS} SET revision = revision + 1, maintenance_epoch = maintenance_epoch + 1, maintenance_state = 'sweeping', maintenance_owner = ?, maintenance_fixed_sequence = target_sequence, maintenance_fixed_operation = target_operation WHERE store_key = ? AND volume_id = ? AND revision = ? AND target_sequence = ? AND target_operation = ? AND maintenance_epoch = ? AND maintenance_state = 'idle' RETURNING maintenance_epoch"
             ),
             vec![
+                hex(&owner).into(),
                 self.store_key().into(),
                 self.volume().into(),
                 sqlite_integer(observed.revision)?.into(),
@@ -454,6 +464,7 @@ impl D1Namespace {
         if let [row] = changed {
             return Ok(NamespaceGcSweep::new(
                 integer(row, "maintenance_epoch", "begin Managed namespace GC")?,
+                owner,
                 observed.snapshot.cursor,
             ));
         }
@@ -463,23 +474,85 @@ impl D1Namespace {
                 "D1 returned duplicate namespace heads",
             ));
         }
-        self.observe()
-            .await?
-            .and_then(|value| value.gc_sweep())
-            .filter(|value| value.fixed_cursor() == observed.snapshot.cursor)
-            .ok_or_else(|| conflict("begin Managed namespace GC", "namespace authority changed"))
+        Err(conflict(
+            "begin Managed namespace GC",
+            "namespace authority changed",
+        ))
+    }
+
+    pub(crate) async fn resume_gc(
+        &self,
+        observed: &D1NamespaceObservation,
+    ) -> Result<NamespaceGcSweep, ManagedError> {
+        if observed.snapshot.volume_id != self.volume_id {
+            return Err(invalid(
+                "resume Managed namespace GC",
+                "observation belongs to another volume",
+            ));
+        }
+        let active = observed.gc_sweep().ok_or_else(|| {
+            conflict(
+                "resume Managed namespace GC",
+                "no interrupted namespace GC is active",
+            )
+        })?;
+        let owner = *OperationId::generate().as_bytes();
+        let mut batch = schema_statements();
+        batch.push(statement(
+            format!(
+                "UPDATE {HEADS} SET revision = revision + 1, maintenance_owner = ? WHERE store_key = ? AND volume_id = ? AND revision = ? AND maintenance_epoch = ? AND maintenance_state = 'sweeping' AND maintenance_owner = ? AND maintenance_fixed_sequence = ? AND maintenance_fixed_operation = ? RETURNING revision"
+            ),
+            vec![
+                hex(&owner).into(),
+                self.store_key().into(),
+                self.volume().into(),
+                sqlite_integer(observed.revision)?.into(),
+                sqlite_integer(active.epoch())?.into(),
+                hex(&active.owner()).into(),
+                sqlite_integer(active.fixed_cursor().sequence())?.into(),
+                hex(
+                    active
+                        .fixed_cursor()
+                        .operation()
+                        .expect("a namespace GC cursor is not genesis")
+                        .as_bytes(),
+                )
+                .into(),
+            ],
+        ));
+        let results = self
+            .session
+            .query(batch, "resume Managed namespace GC")
+            .await?;
+        let changed = rows(&results, SCHEMA_RESULTS, "resume Managed namespace GC")?;
+        match changed {
+            [_] => Ok(NamespaceGcSweep::new(
+                active.epoch(),
+                owner,
+                active.fixed_cursor(),
+            )),
+            [] => Err(conflict(
+                "resume Managed namespace GC",
+                "namespace authority changed",
+            )),
+            _ => Err(corrupt(
+                "resume Managed namespace GC",
+                "D1 returned duplicate namespace heads",
+            )),
+        }
     }
 
     pub(crate) async fn finish_gc(&self, sweep: NamespaceGcSweep) -> Result<(), ManagedError> {
         let mut batch = schema_statements();
         batch.push(statement(
             format!(
-                "UPDATE {HEADS} SET revision = revision + 1, maintenance_state = 'idle', maintenance_fixed_sequence = NULL, maintenance_fixed_operation = NULL WHERE store_key = ? AND volume_id = ? AND maintenance_epoch = ? AND maintenance_state = 'sweeping' AND maintenance_fixed_sequence = ? AND maintenance_fixed_operation = ? RETURNING revision"
+                "UPDATE {HEADS} SET revision = revision + 1, maintenance_state = 'idle', maintenance_fixed_sequence = NULL, maintenance_fixed_operation = NULL WHERE store_key = ? AND volume_id = ? AND maintenance_epoch = ? AND maintenance_owner = ? AND maintenance_state = 'sweeping' AND maintenance_fixed_sequence = ? AND maintenance_fixed_operation = ? RETURNING revision"
             ),
             vec![
                 self.store_key().into(),
                 self.volume().into(),
                 sqlite_integer(sweep.epoch())?.into(),
+                hex(&sweep.owner()).into(),
                 sqlite_integer(sweep.fixed_cursor().sequence())?.into(),
                 hex(
                     sweep
@@ -508,7 +581,10 @@ impl D1Namespace {
         let current = self.observe().await?.ok_or_else(|| {
             conflict("finish Managed namespace GC", "namespace authority changed")
         })?;
-        if current.maintenance_epoch == sweep.epoch() && current.gc_sweep().is_none() {
+        if current.maintenance_epoch == sweep.epoch()
+            && current.gc_sweep().is_none()
+            && current.maintenance_owner == Some(sweep.owner())
+        {
             Ok(())
         } else {
             Err(conflict(
@@ -592,7 +668,7 @@ fn schema_statements() -> Vec<D1Statement> {
     vec![
         statement(
             format!(
-                "CREATE TABLE IF NOT EXISTS {HEADS} (store_key TEXT PRIMARY KEY, volume_id TEXT NOT NULL, revision INTEGER NOT NULL, target_sequence INTEGER NOT NULL, target_operation TEXT NOT NULL, root_node TEXT NOT NULL, checkpoint_sequence INTEGER NOT NULL, maintenance_epoch INTEGER NOT NULL, maintenance_state TEXT NOT NULL CHECK (maintenance_state IN ('idle', 'sweeping')), maintenance_fixed_sequence INTEGER, maintenance_fixed_operation TEXT)"
+                "CREATE TABLE IF NOT EXISTS {HEADS} (store_key TEXT PRIMARY KEY, volume_id TEXT NOT NULL, revision INTEGER NOT NULL, target_sequence INTEGER NOT NULL, target_operation TEXT NOT NULL, root_node TEXT NOT NULL, checkpoint_sequence INTEGER NOT NULL, maintenance_epoch INTEGER NOT NULL, maintenance_state TEXT NOT NULL CHECK (maintenance_state IN ('idle', 'sweeping')), maintenance_owner TEXT, maintenance_fixed_sequence INTEGER, maintenance_fixed_operation TEXT)"
             ),
             Vec::new(),
         ),
@@ -858,13 +934,17 @@ fn gc_sweep(
         nullable_integer(row, "maintenance_fixed_sequence", "read Managed namespace")?;
     let fixed_operation =
         nullable_text(row, "maintenance_fixed_operation", "read Managed namespace")?;
+    let owner = nullable_text(row, "maintenance_owner", "read Managed namespace")?
+        .map(decode_hex)
+        .transpose()?;
     match (
         text(row, "maintenance_state", "read Managed namespace")?,
+        owner,
         fixed_sequence,
         fixed_operation,
     ) {
-        ("idle", None, None) => Ok(None),
-        ("sweeping", Some(sequence), operation) if epoch > 0 => {
+        ("idle", _, None, None) => Ok(None),
+        ("sweeping", Some(owner), Some(sequence), operation) if epoch > 0 => {
             let fixed = stored_cursor(sequence, operation)?;
             if fixed != head {
                 return Err(corrupt(
@@ -872,7 +952,7 @@ fn gc_sweep(
                     "GC sweep is not fixed at the namespace head",
                 ));
             }
-            Ok(Some(NamespaceGcSweep::new(epoch, fixed)))
+            Ok(Some(NamespaceGcSweep::new(epoch, owner, fixed)))
         }
         _ => Err(corrupt(
             "read Managed namespace",
@@ -1455,6 +1535,7 @@ mod tests {
         let fixed = cursor(7, 7);
         let sweeping = serde_json::json!({
             "maintenance_state": "sweeping",
+            "maintenance_owner": hex(&[9; 16]),
             "maintenance_fixed_sequence": 7,
             "maintenance_fixed_operation": hex(operation(7).as_bytes()),
         });
@@ -1464,6 +1545,7 @@ mod tests {
 
         let idle = serde_json::json!({
             "maintenance_state": "idle",
+            "maintenance_owner": hex(&[9; 16]),
             "maintenance_fixed_sequence": null,
             "maintenance_fixed_operation": null,
         });

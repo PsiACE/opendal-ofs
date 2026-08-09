@@ -15,29 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod d1;
-pub(crate) mod namespace;
-mod object;
-mod superblock;
+//! Required Managed capabilities layered over a bound metadata namespace.
 
-pub use d1::{D1Config, D1Metadata};
-pub use namespace::NamespaceGcSweep;
-pub use object::ObjectMetadata;
-pub use superblock::{ManagedExtension, ManagedFormat, MetadataFormat};
-
-use super::ManagedError;
-
-fn require_same_format(
-    desired: &ManagedFormat,
-    observed: ManagedFormat,
-) -> Result<ManagedFormat, ManagedError> {
-    if &observed == desired {
-        Ok(observed)
-    } else {
-        Err(ManagedError::new(
-            super::ManagedErrorKind::Conflict,
-            "create Managed format",
-            "metadata is bound to another Managed volume",
-        ))
-    }
-}
+#[cfg(feature = "managed-branch")]
+#[cfg(feature = "managed-branch")]
+pub mod branch;

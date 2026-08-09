@@ -78,6 +78,10 @@ JSON representation is a strict UTF-8 object:
 be strictly ordered without duplicates. Readers reject unknown fields,
 identifiers, formats, and required extensions.
 
+The optional required extension `branch/v1` replaces the single namespace
+authority with durable named authorities. Its format and lifecycle rules are
+described in [Managed branches](managed-branches.md).
+
 The superblock does not contain credentials, endpoints, local paths,
 client-local aliases, index inventory, or policy settings.
 

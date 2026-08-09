@@ -10,20 +10,21 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write as _};
 use std::num::NonZeroU64;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::filesystem::{
-    ChangeCursor, DirectoryEntry, DirectoryRecord, FileVersion, FileVersionId, Generation,
-    NodeAttributes, NodeId, NodeKind, NodeRecord, OperationId, VolumeId, VolumeSnapshot,
+    AuthorityIdentity, BranchBinding, BranchId, BranchName, ChangeCursor, DirectoryEntry,
+    DirectoryRecord, FileVersion, FileVersionId, Generation, NodeAttributes, NodeId, NodeKind,
+    NodeRecord, OperationId, VolumeId, VolumeSnapshot,
 };
 use crate::sync::local::NativeIdentity;
 
 const STATE_FORMAT: &str = "ofs-sync-replica";
-const STATE_MAJOR: u16 = 3;
+const STATE_MAJOR: u16 = 5;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -55,6 +56,7 @@ pub struct ConflictRecord {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReplicaState {
     pub volume: VolumeId,
+    pub branch: Option<BranchBinding>,
     pub common: ChangeCursor,
     pub(crate) authority: Option<VolumeSnapshot>,
     pub(crate) base: BTreeMap<String, BaseEntry>,
@@ -66,6 +68,7 @@ impl ReplicaState {
     pub fn empty(volume: VolumeId) -> Self {
         Self {
             volume,
+            branch: None,
             common: ChangeCursor::Genesis,
             authority: None,
             base: BTreeMap::new(),
@@ -74,14 +77,56 @@ impl ReplicaState {
         }
     }
 
+    pub fn empty_for(authority: AuthorityIdentity) -> Self {
+        Self {
+            volume: authority.volume,
+            branch: authority.branch,
+            common: ChangeCursor::Genesis,
+            authority: None,
+            base: BTreeMap::new(),
+            pending: None,
+            conflicts: Vec::new(),
+        }
+    }
+
+    pub fn authority_identity(&self) -> AuthorityIdentity {
+        AuthorityIdentity {
+            volume: self.volume,
+            branch: self.branch.clone(),
+        }
+    }
+
     pub fn load(path: impl AsRef<Path>) -> Result<Option<Self>> {
-        let bytes = match fs::read(path.as_ref()) {
+        let path = path.as_ref();
+        let bytes = match fs::read(path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error).context("read replica state"),
         };
         let wire: StateWire = serde_json::from_slice(&bytes).context("parse replica state JSON")?;
-        wire.try_into().map(Some)
+        let major = wire.major;
+        let mut state: Self = wire.try_into()?;
+        if let Some(intent) = &mut state.pending {
+            if major >= STATE_MAJOR {
+                let mut components = intent.staging.components();
+                if !matches!(components.next(), Some(Component::Normal(_)))
+                    || components.next().is_some()
+                {
+                    bail!("replica state contains an invalid pending cache name");
+                }
+            }
+            let cache_name = intent
+                .staging
+                .file_name()
+                .context("replica state contains an invalid pending cache path")?
+                .to_owned();
+            let parent = path
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            intent.staging = parent.join(cache_name);
+        }
+        Ok(Some(state))
     }
 
     pub fn install(&self, path: impl AsRef<Path>) -> Result<()> {
@@ -124,11 +169,20 @@ struct StateWire {
     format: String,
     major: u16,
     volume: [u8; 16],
+    #[serde(default)]
+    branch: Option<BranchWire>,
     common: CursorWire,
     authority: Option<SnapshotWire>,
     base: BTreeMap<String, BaseWire>,
     pending: Option<IntentWire>,
     conflicts: Vec<ConflictWire>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BranchWire {
+    name: BranchName,
+    id: [u8; 16],
 }
 
 #[derive(Deserialize, Serialize)]
@@ -231,6 +285,10 @@ impl From<&ReplicaState> for StateWire {
             format: STATE_FORMAT.into(),
             major: STATE_MAJOR,
             volume: *state.volume.as_bytes(),
+            branch: state.branch.as_ref().map(|branch| BranchWire {
+                name: branch.name.clone(),
+                id: *branch.id.as_bytes(),
+            }),
             common: CursorWire::from(state.common),
             authority: state.authority.as_ref().map(SnapshotWire::from),
             base: state
@@ -262,7 +320,11 @@ impl From<&ReplicaState> for StateWire {
                 .collect(),
             pending: state.pending.as_ref().map(|intent| IntentWire {
                 operation: *intent.operation.as_bytes(),
-                staging: intent.staging.clone(),
+                staging: intent
+                    .staging
+                    .file_name()
+                    .map(PathBuf::from)
+                    .expect("pending cache is a named sibling of replica state"),
                 renames: intent.renames.clone(),
             }),
             conflicts: state
@@ -282,7 +344,10 @@ impl TryFrom<StateWire> for ReplicaState {
     type Error = anyhow::Error;
 
     fn try_from(wire: StateWire) -> Result<Self> {
-        if wire.format != STATE_FORMAT || wire.major != STATE_MAJOR {
+        if wire.format != STATE_FORMAT || !matches!(wire.major, 3 | 4 | STATE_MAJOR) {
+            bail!("replica state format is unsupported");
+        }
+        if wire.major == 3 && wire.branch.is_some() {
             bail!("replica state format is unsupported");
         }
         let base = wire
@@ -336,6 +401,10 @@ impl TryFrom<StateWire> for ReplicaState {
         }
         Ok(Self {
             volume,
+            branch: wire.branch.map(|branch| BranchBinding {
+                name: branch.name,
+                id: BranchId::from_bytes(branch.id),
+            }),
             common,
             authority,
             base,

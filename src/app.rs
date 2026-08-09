@@ -13,16 +13,24 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 use ofs::catalog::{Catalog, VolumeDefinition};
-use ofs::filesystem::{VolumeId, VolumeModel};
+#[cfg(feature = "managed-branch")]
+use ofs::filesystem::BranchName;
+use ofs::filesystem::{Volume, VolumeId, VolumeModel};
+#[cfg(feature = "managed-branch")]
+use ofs::managed::extensions::branch::{
+    BranchInfo, D1BoundNamespace, D1BranchStore, ForkPoint, ObjectBoundNamespace, ObjectBranchStore,
+};
 use ofs::managed::{
     D1Config, D1Metadata, ManagedErrorKind, ManagedFormat, ManagedVolume, MetadataFormat,
-    ObjectMetadata,
+    ObjectMetadata, SegmentGcMaintenance,
 };
 use ofs::sync::{ReplicaState, SyncEngine};
 use opendal::Operator;
 use opendal::layers::{ConcurrentLimitLayer, RetryLayer};
 use url::Url;
 
+#[cfg(feature = "managed-branch")]
+use crate::cli::BranchCommand;
 use crate::cli::{
     Cli, Command, MountArgs, StatusArgs, SyncArgs, VolumeCommand, VolumeCreateArgs, VolumeGcArgs,
 };
@@ -30,6 +38,90 @@ use crate::cli::{
 enum MetadataAuthority {
     Object(ObjectMetadata),
     D1(D1Metadata),
+}
+
+struct ManagedContext {
+    format: ManagedFormat,
+    data: Operator,
+    metadata: MetadataAuthority,
+}
+
+#[cfg(feature = "managed-branch")]
+enum BranchAuthority {
+    Object(ObjectBranchStore),
+    D1(D1BranchStore),
+}
+
+#[cfg(feature = "managed-branch")]
+enum BoundBranchNamespace {
+    Object(ObjectBoundNamespace),
+    D1(D1BoundNamespace),
+}
+
+#[cfg(feature = "managed-branch")]
+impl BranchAuthority {
+    async fn initialize(&self, name: BranchName) -> Result<BranchInfo> {
+        match self {
+            Self::Object(store) => Ok(store.initialize(name).await?),
+            Self::D1(store) => Ok(store.initialize(name).await?),
+        }
+    }
+
+    async fn list(&self) -> Result<Vec<BranchInfo>> {
+        match self {
+            Self::Object(store) => Ok(store.list().await?),
+            Self::D1(store) => Ok(store.list().await?),
+        }
+    }
+
+    async fn get(&self, name: &BranchName) -> Result<BranchInfo> {
+        match self {
+            Self::Object(store) => Ok(store.get(name).await?),
+            Self::D1(store) => Ok(store.get(name).await?),
+        }
+    }
+
+    async fn bind(&self, name: &BranchName) -> Result<BoundBranchNamespace> {
+        match self {
+            Self::Object(store) => Ok(BoundBranchNamespace::Object(store.bind(name).await?)),
+            Self::D1(store) => Ok(BoundBranchNamespace::D1(store.bind(name).await?)),
+        }
+    }
+
+    async fn fork(
+        &self,
+        source: &BranchName,
+        point: ForkPoint,
+        target: BranchName,
+    ) -> Result<BranchInfo> {
+        match self {
+            Self::Object(store) => Ok(store.fork(source, point, target).await?),
+            Self::D1(store) => Ok(store.fork(source, point, target).await?),
+        }
+    }
+
+    async fn delete(&self, name: &BranchName) -> Result<()> {
+        match self {
+            Self::Object(store) => Ok(store.delete(name).await?),
+            Self::D1(store) => Ok(store.delete(name).await?),
+        }
+    }
+
+    async fn default_name(&self) -> Result<BranchName> {
+        match self {
+            Self::Object(store) => Ok(store.default_name().await?),
+            Self::D1(store) => Ok(store.default_name().await?),
+        }
+    }
+
+    async fn garbage_collect(&self, data: Operator, resume: bool) -> Result<SegmentGcMaintenance> {
+        match (self, resume) {
+            (Self::Object(store), false) => Ok(store.garbage_collect(data).await?),
+            (Self::Object(store), true) => Ok(store.resume_garbage_collect(data).await?),
+            (Self::D1(store), false) => Ok(store.garbage_collect(data).await?),
+            (Self::D1(store), true) => Ok(store.resume_garbage_collect(data).await?),
+        }
+    }
 }
 
 impl MetadataAuthority {
@@ -76,6 +168,19 @@ impl MetadataAuthority {
             Self::D1(metadata) => ManagedVolume::d1(format, data, metadata.clone()).map(|_| ()),
         }
     }
+
+    #[cfg(feature = "managed-branch")]
+    fn branches(&self, volume_id: VolumeId, data: Operator) -> Result<BranchAuthority> {
+        match self {
+            Self::Object(_) => Ok(BranchAuthority::Object(ObjectBranchStore::new(
+                volume_id, data,
+            )?)),
+            Self::D1(metadata) => Ok(BranchAuthority::D1(D1BranchStore::new(
+                volume_id,
+                metadata.clone(),
+            ))),
+        }
+    }
 }
 
 pub(crate) async fn run(cli: Cli) -> Result<()> {
@@ -87,52 +192,189 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
         Command::Volume {
             command: VolumeCommand::Gc(args),
         } => gc_volume(&config, args).await,
+        #[cfg(feature = "managed-branch")]
+        Command::Branch { command } => branch_command(&config, command).await,
         Command::Mount(args) => mount_volume(&config, args).await,
         Command::Sync(args) => sync_volume(&config, args).await,
         Command::Status(args) => status(&config, args),
     }
 }
 
+#[cfg(feature = "managed-branch")]
+async fn branch_command(config: &Path, command: BranchCommand) -> Result<()> {
+    let (alias, concurrency) = match &command {
+        BranchCommand::List(args) => (&args.alias, args.runtime.transfer_concurrency),
+        BranchCommand::Show(args) => (&args.alias, args.runtime.transfer_concurrency),
+        BranchCommand::Create(args) => (&args.alias, args.runtime.transfer_concurrency),
+        BranchCommand::Delete(args) => (&args.alias, args.runtime.transfer_concurrency),
+    };
+    let branches = open_branch_authority(config, alias, concurrency).await?;
+    match command {
+        BranchCommand::List(args) => {
+            let listed = branches.list().await?;
+            if args.json {
+                let default = listed
+                    .iter()
+                    .find(|branch| branch.is_default)
+                    .context("Managed branch registry has no default branch")?;
+                let entries = listed.iter().map(branch_json).collect::<Vec<_>>();
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "default_branch": default.binding.name.as_str(),
+                        "branches": entries,
+                    }))?
+                );
+            } else {
+                for branch in listed {
+                    println!(
+                        "{}{} {} change {}",
+                        if branch.is_default { "* " } else { "  " },
+                        branch.binding.name,
+                        branch.binding.id,
+                        branch.cursor.sequence(),
+                    );
+                }
+            }
+            Ok(())
+        }
+        BranchCommand::Show(args) => {
+            let name = parse_branch_name(&args.branch)?;
+            let branch = branches.get(&name).await?;
+            if args.json {
+                println!("{}", serde_json::to_string(&branch_json(&branch))?);
+            } else {
+                println!(
+                    "branch {:?} {} at change {}{}",
+                    branch.binding.name.as_str(),
+                    branch.binding.id,
+                    branch.cursor.sequence(),
+                    if branch.is_default { " (default)" } else { "" },
+                );
+            }
+            Ok(())
+        }
+        BranchCommand::Create(args) => {
+            let target = parse_branch_name(&args.branch)?;
+            let source = match args.from {
+                Some(source) => parse_branch_name(&source)?,
+                None => branches.default_name().await?,
+            };
+            let point = args.at.map_or(ForkPoint::Head, ForkPoint::Sequence);
+            let created = branches.fork(&source, point, target).await?;
+            println!(
+                "created branch {:?} {} from {:?} at change {}",
+                created.binding.name.as_str(),
+                created.binding.id,
+                source.as_str(),
+                created.cursor.sequence(),
+            );
+            Ok(())
+        }
+        BranchCommand::Delete(args) => {
+            let name = parse_branch_name(&args.branch)?;
+            branches.delete(&name).await?;
+            println!("deleted branch {:?}", name.as_str());
+            Ok(())
+        }
+    }
+}
+
+#[cfg(feature = "managed-branch")]
+fn parse_branch_name(value: &str) -> Result<BranchName> {
+    value
+        .parse()
+        .map_err(|error| anyhow!("invalid branch name {value:?}: {error}"))
+}
+
+#[cfg(feature = "managed-branch")]
+fn branch_json(branch: &BranchInfo) -> serde_json::Value {
+    serde_json::json!({
+        "name": branch.binding.name.as_str(),
+        "id": branch.binding.id.to_string(),
+        "sequence": branch.cursor.sequence(),
+        "default": branch.is_default,
+        "lifecycle": match branch.lifecycle {
+            ofs::managed::extensions::branch::BranchLifecycle::Active => "active",
+            ofs::managed::extensions::branch::BranchLifecycle::Sealed => "sealed",
+        },
+    })
+}
+
 async fn gc_volume(config: &Path, args: VolumeGcArgs) -> Result<()> {
+    #[cfg(feature = "managed-branch")]
+    {
+        let ManagedContext {
+            format,
+            data,
+            metadata,
+        } = open_managed_context(config, &args.alias, args.runtime.transfer_concurrency).await?;
+        if format.requires_extension(ofs::managed::ManagedExtension::BranchV1) {
+            let collected = metadata
+                .branches(format.volume_id(), data.clone())?
+                .garbage_collect(data, args.resume)
+                .await?;
+            print_gc_result(&args.alias, collected);
+            return Ok(());
+        }
+    }
     let volume =
-        open_managed_volume(config, &args.alias, args.runtime.transfer_concurrency).await?;
-    let observed = volume
-        .observe()
-        .await?
-        .context("Managed volume has no published namespace to collect")?;
-    let sweep = volume.begin_gc(&observed).await?;
+        open_managed_volume(config, &args.alias, None, args.runtime.transfer_concurrency).await?;
+    let Some(observed) = volume.observe().await? else {
+        print_gc_result(&args.alias, SegmentGcMaintenance::default());
+        return Ok(());
+    };
+    let sweep = if args.resume {
+        volume.resume_gc(&observed).await?
+    } else {
+        volume.begin_gc(&observed).await?
+    };
     let fixed = volume
         .observe()
         .await?
         .context("Managed namespace disappeared after starting collection")?;
     let collected = volume.collect_unreachable_segments(&fixed, sweep).await?;
     volume.finish_gc(sweep).await?;
+    print_gc_result(&args.alias, collected);
+    Ok(())
+}
+
+fn print_gc_result(alias: &str, collected: SegmentGcMaintenance) {
     println!(
         "garbage collected {:?}: scanned={} deleted={} bytes={}",
-        args.alias, collected.scanned, collected.deleted, collected.deleted_bytes,
+        alias, collected.scanned, collected.deleted, collected.deleted_bytes,
     );
-    Ok(())
 }
 
 async fn open_managed_volume(
     config: &Path,
     alias: &str,
+    branch: Option<&str>,
     transfer_concurrency: NonZeroUsize,
 ) -> Result<ManagedVolume> {
-    let catalog = load_catalog(config)?;
-    let definition = catalog
-        .get(alias)
-        .with_context(|| format!("volume alias {alias:?} is not in the catalog"))?
-        .clone();
-    let settings = definition
-        .managed_settings()
-        .context("this operation requires a Managed volume")?;
-    let data = open_operator(&definition.storage, transfer_concurrency)?;
-    let metadata = open_metadata(data.clone(), settings.metadata.as_ref())?;
-    let format = metadata.read_format().await?;
-    let expected = ManagedFormat::v1(definition.volume_id, metadata.metadata_format());
-    if format != expected {
-        bail!("volume catalog and Managed format v1 binding disagree");
+    let ManagedContext {
+        format,
+        data,
+        metadata,
+    } = open_managed_context(config, alias, transfer_concurrency).await?;
+    #[cfg(feature = "managed-branch")]
+    if format.requires_extension(ofs::managed::ManagedExtension::BranchV1) {
+        let branches = metadata.branches(format.volume_id(), data.clone())?;
+        let name = match branch {
+            Some(name) => parse_branch_name(name)?,
+            None => branches.default_name().await?,
+        };
+        return match branches.bind(&name).await? {
+            BoundBranchNamespace::Object(namespace) => {
+                ManagedVolume::object_branch(format, data, namespace).map_err(Into::into)
+            }
+            BoundBranchNamespace::D1(namespace) => {
+                ManagedVolume::d1_branch(format, data, namespace).map_err(Into::into)
+            }
+        };
+    }
+    if branch.is_some() {
+        bail!("Managed volume does not enable branch/v1");
     }
     match metadata {
         MetadataAuthority::Object(_) => ManagedVolume::object(format, data),
@@ -141,7 +383,62 @@ async fn open_managed_volume(
     .map_err(Into::into)
 }
 
+#[cfg(feature = "managed-branch")]
+async fn open_branch_authority(
+    config: &Path,
+    alias: &str,
+    transfer_concurrency: NonZeroUsize,
+) -> Result<BranchAuthority> {
+    let ManagedContext {
+        format,
+        data,
+        metadata,
+    } = open_managed_context(config, alias, transfer_concurrency).await?;
+    if !format.requires_extension(ofs::managed::ManagedExtension::BranchV1) {
+        bail!("Managed volume does not enable branch/v1");
+    }
+    metadata.branches(format.volume_id(), data)
+}
+
+async fn open_managed_context(
+    config: &Path,
+    alias: &str,
+    transfer_concurrency: NonZeroUsize,
+) -> Result<ManagedContext> {
+    let catalog = load_catalog(config)?;
+    let definition = catalog
+        .get(alias)
+        .with_context(|| format!("volume alias {alias:?} is not in the catalog"))?;
+    let settings = definition
+        .managed_settings()
+        .context("this operation requires a Managed volume")?;
+    let data = open_operator(&definition.storage, transfer_concurrency)?;
+    let metadata = open_metadata(data.clone(), settings.metadata.as_ref())?;
+    let format = metadata.read_format().await?;
+    if format.volume_id() != definition.volume_id
+        || format.metadata_format() != metadata.metadata_format()
+    {
+        bail!("volume catalog and Managed format v1 binding disagree");
+    }
+    Ok(ManagedContext {
+        format,
+        data,
+        metadata,
+    })
+}
+
 async fn create_volume(config: &Path, mut args: VolumeCreateArgs) -> Result<()> {
+    if args.enable.len() > 1 {
+        bail!("--enable branch may be specified only once");
+    }
+    let branch_enabled = !args.enable.is_empty();
+    if args.model == VolumeModel::Direct && branch_enabled {
+        bail!("--enable branch requires --model managed");
+    }
+    #[cfg(not(feature = "managed-branch"))]
+    if branch_enabled {
+        bail!("this ofs build does not include the managed-branch feature");
+    }
     if args.model == VolumeModel::Managed && args.metadata.is_none() {
         args.metadata = env::var_os("OFS_METADATA_URL")
             .filter(|value| !value.is_empty())
@@ -180,25 +477,45 @@ async fn create_volume(config: &Path, mut args: VolumeCreateArgs) -> Result<()> 
     let data = open_operator(&args.storage, NonZeroUsize::MIN)?;
     let metadata = open_metadata(data.clone(), args.metadata.as_ref())?;
     let desired = ManagedFormat::v1(provisional_id, metadata.metadata_format());
-    let format = match configured {
-        Some(_) => {
-            let observed = metadata.read_format().await?;
-            if observed != desired {
-                bail!("volume catalog and Managed format v1 binding disagree");
+    #[cfg(feature = "managed-branch")]
+    let desired = if branch_enabled {
+        desired.with_extension(ofs::managed::ManagedExtension::BranchV1)
+    } else {
+        desired
+    };
+    let observed = metadata.read_format_optional().await?;
+    let format = match observed {
+        Some(observed) => observed,
+        None if configured.is_some() => metadata.read_format().await?,
+        None => match metadata.create_format(&desired).await {
+            Ok(created) => created,
+            Err(error) if error.kind() == ManagedErrorKind::Conflict => {
+                metadata.read_format().await?
             }
-            observed
-        }
-        None => match metadata.read_format_optional().await? {
-            Some(observed) => observed,
-            None => match metadata.create_format(&desired).await {
-                Ok(created) => created,
-                Err(error) if error.kind() == ManagedErrorKind::Conflict => {
-                    metadata.read_format().await?
-                }
-                Err(error) => return Err(error.into()),
-            },
+            Err(error) => return Err(error.into()),
         },
     };
+    if format.metadata_format() != metadata.metadata_format()
+        || configured
+            .as_ref()
+            .is_some_and(|definition| definition.volume_id != format.volume_id())
+    {
+        bail!("volume catalog and Managed format v1 binding disagree");
+    }
+    #[cfg(feature = "managed-branch")]
+    if branch_enabled && !format.requires_extension(ofs::managed::ManagedExtension::BranchV1) {
+        bail!("existing Managed volume does not enable requested extension branch/v1");
+    }
+    #[cfg(feature = "managed-branch")]
+    if format.requires_extension(ofs::managed::ManagedExtension::BranchV1) {
+        metadata
+            .branches(format.volume_id(), data.clone())?
+            .initialize(BranchName::parse("main").expect("main is a valid branch name"))
+            .await?;
+    } else {
+        metadata.validate_volume(format.clone(), data)?;
+    }
+    #[cfg(not(feature = "managed-branch"))]
     metadata.validate_volume(format.clone(), data)?;
     let volume_id = format.volume_id();
     let definition = VolumeDefinition::managed(volume_id, args.storage, args.metadata)?;
@@ -256,7 +573,19 @@ fn open_metadata(data: Operator, metadata: Option<&Url>) -> Result<MetadataAutho
 
 async fn sync_volume(config: &Path, args: SyncArgs) -> Result<()> {
     let transfer_concurrency = args.runtime.transfer_concurrency;
-    let volume = open_managed_volume(config, &args.alias, transfer_concurrency).await?;
+    let volume = open_managed_volume(
+        config,
+        &args.alias,
+        args.branch.as_deref(),
+        transfer_concurrency,
+    )
+    .await?;
+    let branch_label = volume
+        .authority()
+        .branch
+        .as_ref()
+        .map(|branch| format!(" branch {:?}", branch.name.as_str()))
+        .unwrap_or_default();
     let engine = SyncEngine::new(volume).with_transfer_concurrency(transfer_concurrency);
     let result = engine
         .sync(&args.replica, &args.state, &args.resolve)
@@ -271,8 +600,9 @@ async fn sync_volume(config: &Path, args: SyncArgs) -> Result<()> {
         bail!("publication result is unknown; repeat sync to resolve its durable intent");
     }
     println!(
-        "synced {:?} at change {}{}",
+        "synced {:?}{} at change {}{}",
         args.alias,
+        branch_label,
         result.common.sequence(),
         if result.published { " (published)" } else { "" }
     );
@@ -292,17 +622,25 @@ fn status(config: &Path, args: StatusArgs) -> Result<()> {
     let value = serde_json::json!({
         "volume_alias": alias,
         "volume_id": state.volume.to_string(),
+        "branch_name": state.branch.as_ref().map(|branch| branch.name.as_str()),
+        "branch_id": state.branch.as_ref().map(|branch| branch.id.to_string()),
         "volume_model": "managed",
         "access_model": "sync",
         "common_sequence": state.common.sequence(),
+        "common_operation": state.common.operation().map(|operation| hex_bytes(operation.as_bytes())),
         "pending": state.pending.is_some(),
         "conflicts": state.conflicts.len(),
     });
     if args.json {
         println!("{}", serde_json::to_string(&value)?);
     } else {
+        let branch = state
+            .branch
+            .as_ref()
+            .map(|branch| format!(" branch {:?}", branch.name.as_str()))
+            .unwrap_or_default();
         println!(
-            "managed sync alias {alias:?} for volume {} at change {}, {} pending, {} conflict(s)",
+            "managed sync alias {alias:?} for volume {}{branch} at change {}, {} pending, {} conflict(s)",
             state.volume,
             state.common.sequence(),
             usize::from(state.pending.is_some()),
@@ -310,6 +648,10 @@ fn status(config: &Path, args: StatusArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn load_catalog(config: &Path) -> Result<Catalog> {

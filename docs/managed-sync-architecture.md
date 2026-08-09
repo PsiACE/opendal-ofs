@@ -65,6 +65,11 @@ locators against the remote format. It never recreates a missing superblock
 from local catalog state. One catalog keeps at most one alias for a `VolumeId`,
 while independent catalogs choose their aliases independently.
 
+Required extensions are also observed from the superblock. An explicit
+extension request must match an existing remote format, while omitting the
+request still opens extensions already required by that format. Extension
+metadata is initialized idempotently before the local alias is saved.
+
 Replica state stores `VolumeId`, not the alias or catalog path. Before Sync
 reads or mutates either side, the application resolves the current alias and
 checks that its `VolumeId` matches the replica state. Losing a catalog therefore
@@ -98,14 +103,14 @@ Staging performs the following work:
 1. Read each frozen changed file.
 2. Reuse content already referenced by the fixed authority snapshot.
 3. Deduplicate new content across the publication.
-4. Sort new content and write a small number of immutable segments.
+4. Seal and upload segment batches as prepared files arrive.
 5. Return file versions with complete logical-to-physical extent maps.
 
-Materialization groups extents by segment. A full reconstruction downloads
-each selected segment once. An incremental reconstruction sends the selected
-ranges for one segment to `OpenDAL::Reader::fetch`. OpenDAL may merge nearby
-ranges before issuing provider requests. OFS verifies every returned content
-digest and the assembled whole-file digest.
+Materialization reads file extents in logical order and writes each file
+incrementally through an OpenDAL writer. A shared transfer semaphore bounds
+all in-flight range reads for the operation. OFS verifies every returned
+content digest, logical length, and assembled whole-file digest before closing
+the writer. A failed read or digest check aborts the staged output.
 
 The read path does not list objects or read a segment footer to locate file
 bytes. The file version already contains the segment identity, byte offset,
@@ -161,15 +166,15 @@ resolve pending operation, if any
        |
 observe one authority snapshot
        |
-freeze and scan the local tree
+freeze and scan the local tree into a reconstructable cache
        |
 three-way reconcile(base, local, remote)
        |
        +--> conflicts: retain local candidates and stop
        |
-stage immutable segments
-       |
 save pending OperationId
+       |
+stage immutable segments
        |
 publish metadata with generation preconditions
        |
@@ -182,13 +187,30 @@ Data is written before metadata, so metadata never references an object that
 has not been staged. A failed metadata commit may leave unreachable immutable
 segments. It cannot create another namespace authority.
 
+The pending cache is stored beside replica state by relative name. It is not
+authority. If it is missing before commit, Sync scans and freezes the local
+tree again. If the operation committed, Sync reconstructs from the
+authoritative snapshot when doing so cannot overwrite a local change. Replica
+state formats with the old absolute cache path are rebased beside the state
+file when read.
+
+Directory presence is merged per path. Additions and deletions in disjoint
+subtrees converge. Deleting a directory while the other side changes its
+subtree is rejected before either the replica or its durable state is changed.
+
 ## Garbage collection
 
 Garbage collection acquires a maintenance fence from Metadata and fixes one
 namespace cursor. Data walks the reachable namespace, records referenced
-segments, lists the segment prefix once, and submits unreferenced objects to
-OpenDAL's bulk deletion interface. A segment remains live if any reachable
-file version references it.
+segments, and streams the segment listing. Each unreachable object is deleted
+without collecting the full provider listing in memory. A segment remains live
+if any reachable file version references it.
+
+The fence contains an epoch and owner token. A normal start conflicts with an
+active fence. `--resume` conditionally replaces the owner only after the
+operator has confirmed that the previous collector stopped; an old owner
+cannot finish or continue metadata maintenance. An unpublished namespace is a
+successful empty collection.
 
 Foreground publication and materialization do not list the data prefix.
 

@@ -9,7 +9,7 @@
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use ofs::filesystem::VolumeModel;
 use url::Url;
 
@@ -30,6 +30,12 @@ pub(crate) enum Command {
     Volume {
         #[command(subcommand)]
         command: VolumeCommand,
+    },
+    /// Manage durable branches of a Managed volume.
+    #[cfg(feature = "managed-branch")]
+    Branch {
+        #[command(subcommand)]
+        command: BranchCommand,
     },
     /// Mount a named Direct volume as a read-only online filesystem.
     Mount(MountArgs),
@@ -55,14 +61,96 @@ pub(crate) struct MountArgs {
 pub(crate) enum VolumeCommand {
     /// Register an alias and save its credential-free volume binding.
     Create(VolumeCreateArgs),
-    /// Remove data segments unreachable from the current Managed namespace root.
+    /// Remove data segments unreachable from all retained Managed namespace roots.
     Gc(VolumeGcArgs),
+}
+
+#[cfg(feature = "managed-branch")]
+#[derive(Debug, Subcommand)]
+pub(crate) enum BranchCommand {
+    /// List the branches of a Managed volume.
+    List(BranchListArgs),
+    /// Show one branch and its current durable position.
+    Show(BranchShowArgs),
+    /// Fork a new branch from a current or retained position.
+    Create(BranchCreateArgs),
+    /// Delete a branch without immediately deleting shared data.
+    Delete(BranchDeleteArgs),
+}
+
+#[cfg(feature = "managed-branch")]
+#[derive(Debug, Args)]
+pub(crate) struct BranchListArgs {
+    /// Named Managed volume from the local catalog.
+    pub alias: String,
+
+    /// Emit a machine-readable branch list.
+    #[arg(long)]
+    pub json: bool,
+
+    #[command(flatten)]
+    pub runtime: StorageOptions,
+}
+
+#[cfg(feature = "managed-branch")]
+#[derive(Debug, Args)]
+pub(crate) struct BranchShowArgs {
+    /// Named Managed volume from the local catalog.
+    pub alias: String,
+
+    /// Branch to show.
+    pub branch: String,
+
+    /// Emit a machine-readable branch description.
+    #[arg(long)]
+    pub json: bool,
+
+    #[command(flatten)]
+    pub runtime: StorageOptions,
+}
+
+#[cfg(feature = "managed-branch")]
+#[derive(Debug, Args)]
+pub(crate) struct BranchCreateArgs {
+    /// Named Managed volume from the local catalog.
+    pub alias: String,
+
+    /// Name of the new branch.
+    pub branch: String,
+
+    /// Source branch. Defaults to the volume's default branch.
+    #[arg(long, value_name = "BRANCH")]
+    pub from: Option<String>,
+
+    /// Retained source sequence. Defaults to the current source position.
+    #[arg(long, value_name = "SEQUENCE")]
+    pub at: Option<u64>,
+
+    #[command(flatten)]
+    pub runtime: StorageOptions,
+}
+
+#[cfg(feature = "managed-branch")]
+#[derive(Debug, Args)]
+pub(crate) struct BranchDeleteArgs {
+    /// Named Managed volume from the local catalog.
+    pub alias: String,
+
+    /// Branch to delete.
+    pub branch: String,
+
+    #[command(flatten)]
+    pub runtime: StorageOptions,
 }
 
 #[derive(Debug, Args)]
 pub(crate) struct VolumeGcArgs {
     /// Named Managed volume from the local catalog.
     pub alias: String,
+
+    /// Resume a fenced collection after confirming its prior process stopped.
+    #[arg(long)]
+    pub resume: bool,
 
     #[command(flatten)]
     pub runtime: StorageOptions,
@@ -76,6 +164,10 @@ pub(crate) struct VolumeCreateArgs {
     #[arg(long, value_parser = parse_volume_model, value_name = "MODEL")]
     pub model: VolumeModel,
 
+    /// Managed volume feature to require. May be repeated.
+    #[arg(long, value_enum, value_name = "FEATURE")]
+    pub enable: Vec<EnableFeature>,
+
     /// OpenDAL data URL. Credentials are not stored in the catalog.
     #[arg(long, env = "OFS_STORAGE_URL", value_name = "URL")]
     pub storage: Url,
@@ -85,6 +177,12 @@ pub(crate) struct VolumeCreateArgs {
     pub metadata: Option<Url>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum EnableFeature {
+    /// Durable named branches (`branch/v1`).
+    Branch,
+}
+
 #[derive(Debug, Args)]
 pub(crate) struct SyncArgs {
     /// Named Managed volume from the local catalog.
@@ -92,6 +190,10 @@ pub(crate) struct SyncArgs {
 
     /// Local directory used as the Sync replica.
     pub replica: PathBuf,
+
+    /// Branch to synchronize. Defaults to the volume's default branch.
+    #[arg(long, value_name = "BRANCH")]
+    pub branch: Option<String>,
 
     /// Durable replica state stored outside the replica directory.
     #[arg(long, value_name = "PATH")]
