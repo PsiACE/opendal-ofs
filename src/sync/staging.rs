@@ -26,7 +26,7 @@ use crate::filesystem::{FileVersion, Volume, VolumeSnapshot};
 const COPY_CHUNK: usize = 1024 * 1024;
 const COPY_CONCURRENCY: usize = 8;
 const MANIFEST_FORMAT: &str = "ofs-staged-tree";
-const MANIFEST_MAJOR: u16 = 3;
+const MANIFEST_MAJOR: u16 = 1;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -226,11 +226,7 @@ impl StagedTree {
             logical: LocalTree::from_entries(root, stored.entries),
             files: stored.files,
             content_paths: stored.content_paths,
-            prepared: stored
-                .prepared
-                .into_iter()
-                .map(|(path, version)| (path, version.into()))
-                .collect(),
+            prepared: stored.prepared,
         };
         staged.validate()?;
         Ok(staged)
@@ -426,38 +422,7 @@ struct StoredStagedTree {
     entries: BTreeMap<String, LocalEntry>,
     files: BTreeMap<String, StagedFile>,
     content_paths: BTreeSet<String>,
-    prepared: BTreeMap<String, StoredFileVersion>,
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct StoredFileVersion {
-    id: [u8; 32],
-    logical_size: u64,
-    logical_digest: [u8; 32],
-    descriptor: Vec<u8>,
-}
-
-impl From<&FileVersion> for StoredFileVersion {
-    fn from(version: &FileVersion) -> Self {
-        Self {
-            id: *version.id.as_bytes(),
-            logical_size: version.logical_size,
-            logical_digest: version.logical_digest,
-            descriptor: version.descriptor().to_vec(),
-        }
-    }
-}
-
-impl From<StoredFileVersion> for FileVersion {
-    fn from(version: StoredFileVersion) -> Self {
-        Self::from_parts(
-            crate::filesystem::FileVersionId::from_bytes(version.id),
-            version.logical_size,
-            version.logical_digest,
-            version.descriptor,
-        )
-    }
+    prepared: BTreeMap<String, FileVersion>,
 }
 
 impl From<&StagedTree> for StoredStagedTree {
@@ -468,11 +433,7 @@ impl From<&StagedTree> for StoredStagedTree {
             entries: staged.logical.entries().clone(),
             files: staged.files.clone(),
             content_paths: staged.content_paths.clone(),
-            prepared: staged
-                .prepared
-                .iter()
-                .map(|(path, version)| (path.clone(), version.into()))
-                .collect(),
+            prepared: staged.prepared.clone(),
         }
     }
 }

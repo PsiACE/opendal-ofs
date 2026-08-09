@@ -18,10 +18,13 @@
 use std::fmt;
 use std::num::NonZeroU64;
 
+use serde::{Deserialize, Serialize};
+
 macro_rules! fixed_identity {
     ($(#[$meta:meta])* $name:ident, $length:literal) => {
         $(#[$meta])*
-        #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+        #[serde(transparent)]
         pub struct $name([u8; $length]);
 
         impl $name {
@@ -113,7 +116,8 @@ fixed_identity!(
 /// Callers may retain and compare the token, but must not infer ordering from
 /// its bytes. A Managed volume may encode a local counter while a Direct
 /// volume may use a storage version or ETag.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(transparent)]
 pub struct Generation(Box<[u8]>);
 
 impl Generation {
@@ -127,7 +131,8 @@ impl Generation {
 }
 
 /// A position in a volume's ordered change stream.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ChangeCursor {
     Genesis,
     At {

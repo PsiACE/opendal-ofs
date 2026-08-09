@@ -29,7 +29,7 @@ pub use object::ObjectBranchStore;
 pub type ObjectBoundNamespace = BoundNamespace<ObjectBranchStore>;
 pub type ObjectBranchObservation = BranchObservation<String>;
 pub type D1BoundNamespace = BoundNamespace<D1BranchStore>;
-pub type D1BranchObservation = BranchObservation<(u64, u64)>;
+pub type D1BranchObservation = BranchObservation<u64>;
 pub use records::{BranchInfo, BranchLifecycle, ForkPoint};
 
 /// Required Managed superblock extension implemented by this module.

@@ -165,7 +165,7 @@ impl<S: BranchNamespaceStore> BoundNamespace<S> {
                 let checkpoint = StoredCheckpoint::new(&publication.target, results)?;
                 StoredNamespaceState {
                     checkpoint: self.store.write_checkpoint(&checkpoint).await?,
-                    checkpoint_cursor: publication.target.cursor.into(),
+                    checkpoint_cursor: publication.target.cursor,
                     tail: Vec::new(),
                     previous_history: None,
                 }
@@ -174,9 +174,12 @@ impl<S: BranchNamespaceStore> BoundNamespace<S> {
                 let appended_bytes = current
                     .tail
                     .iter()
-                    .map(|change| change.payload.len())
-                    .sum::<usize>()
-                    + change.payload.len();
+                    .try_fold(0_usize, |total, change| {
+                        change
+                            .encoded_len()
+                            .map(|length| total.saturating_add(length))
+                    })?
+                    .saturating_add(change.encoded_len()?);
                 if current.tail.len() + 1 >= MAX_TAIL_TRANSACTIONS
                     || appended_bytes > MAX_TAIL_BYTES
                 {
@@ -187,7 +190,7 @@ impl<S: BranchNamespaceStore> BoundNamespace<S> {
                     let checkpoint = StoredCheckpoint::new(&publication.target, results)?;
                     StoredNamespaceState {
                         checkpoint: self.store.write_checkpoint(&checkpoint).await?,
-                        checkpoint_cursor: publication.target.cursor.into(),
+                        checkpoint_cursor: publication.target.cursor,
                         tail: Vec::new(),
                         previous_history: Some(history),
                     }
@@ -237,19 +240,20 @@ impl<S: BranchNamespaceStore> BoundNamespace<S> {
         let Some(state) = head.state else {
             return Ok(CommitOutcome::Absent);
         };
-        if let Some(change) = state.tail.iter().find(|change| {
-            change.origin_branch == *self.binding.id.as_bytes()
-                && change.operation == *operation.as_bytes()
-        }) {
+        if let Some(change) = state
+            .tail
+            .iter()
+            .find(|change| change.origin_branch == self.binding.id && change.operation == operation)
+        {
             require_request_digest(expected, change.request_digest()?)?;
-            return Ok(CommitOutcome::Committed(change.cursor.decode()?));
+            return Ok(CommitOutcome::Committed(change.cursor));
         }
         let checkpoint = self.store.read_checkpoint(state.checkpoint).await?;
         let Some(result) = checkpoint.resolve(self.binding.id, operation)? else {
             return Ok(CommitOutcome::Absent);
         };
         require_request_digest(expected, result.request_sha256)?;
-        Ok(CommitOutcome::Committed(result.cursor.decode()?))
+        Ok(CommitOutcome::Committed(result.cursor))
     }
 
     async fn outcome_after_race(

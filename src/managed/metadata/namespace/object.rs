@@ -17,7 +17,6 @@
 
 use std::collections::BTreeMap;
 use std::io::Cursor;
-use std::num::NonZeroU64;
 
 use futures::{StreamExt as _, TryStreamExt as _, stream};
 use opendal::Operator;
@@ -26,31 +25,23 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::change::NamespaceChange;
-use super::stored::{
-    StoredDirectoryEntry, StoredDirectoryPrecondition, StoredFileVersion, StoredNode,
-    StoredNodeAttributes, StoredNodeKind, StoredNodePrecondition,
-};
 use super::validation::{validate_publication, validate_snapshot};
 use super::{
-    DirectoryRecord, FileVersionRecord, NamespaceGcSweep, NamespacePublication, NamespaceSnapshot,
-    NodeRecord, managed_generation, managed_generation_number,
+    DirectoryPrecondition, DirectoryRecord, FileVersionRecord, NamespaceGcSweep,
+    NamespacePublication, NamespaceSnapshot, NodePrecondition, NodeRecord,
 };
 use crate::filesystem::{
-    ChangeCursor, CommitOutcome, FileVersionId, NodeId, OperationId, VolumeId,
+    ChangeCursor, CommitOutcome, DirectoryEntry, FileVersionId, Generation, NodeId, OperationId,
+    VolumeId,
 };
-use crate::managed::format::ExtentMap;
 use crate::managed::format::sstable::{
     self, Record as TableRecord, RecordGroup as TableRecordGroup, TableRef,
 };
-use crate::managed::metadata::object::{
-    create, ensure_immutable, read, read_content_addressed, read_with_revision, replace,
-};
+use crate::managed::metadata::object::{self, ensure_immutable, read_content_addressed};
 use crate::managed::{ManagedError, ManagedErrorKind};
 
 #[cfg(test)]
-use super::{DirectoryPrecondition, NodePrecondition};
-#[cfg(test)]
-use crate::filesystem::{DirectoryEntry, NodeAttributes, NodeKind};
+use crate::filesystem::{NodeAttributes, NodeKind};
 
 const HEAD_KEY: &str = ".ofs/managed/metadata/v1/head.ofs";
 const MANIFEST_ROOT: &str = ".ofs/managed/metadata/v1/manifests/sha256";
@@ -73,13 +64,13 @@ const SNAPSHOT_PARTITION_PREFIX: u8 = 1;
 const OPERATION_PARTITION_PREFIX: u8 = 2;
 
 #[derive(Clone, Debug)]
-pub(crate) struct NamespaceObservation {
+pub(crate) struct NamespaceObservation<R = String> {
     pub snapshot: NamespaceSnapshot,
-    revision: String,
+    revision: R,
     authority: Box<ObservationAuthority>,
 }
 
-impl NamespaceObservation {
+impl<R> NamespaceObservation<R> {
     pub(crate) fn gc_sweep(&self) -> Option<NamespaceGcSweep> {
         self.authority
             .head
@@ -108,13 +99,67 @@ impl std::fmt::Debug for ObservationAuthority {
     }
 }
 
+#[allow(async_fn_in_trait)]
+pub(crate) trait NamespaceHeadBackend: Clone + Send + Sync {
+    type Revision: Clone + Send + Sync;
+
+    async fn read(
+        &self,
+        action: &'static str,
+    ) -> Result<Option<(Vec<u8>, Self::Revision)>, ManagedError>;
+    async fn read_bytes(&self, action: &'static str) -> Result<Option<Vec<u8>>, ManagedError>;
+    async fn create(&self, bytes: Vec<u8>, action: &'static str) -> Result<bool, ManagedError>;
+    async fn replace(
+        &self,
+        revision: &Self::Revision,
+        bytes: Vec<u8>,
+        action: &'static str,
+    ) -> Result<bool, ManagedError>;
+}
+
 #[derive(Clone)]
-pub(crate) struct ObjectNamespace {
-    volume_id: VolumeId,
+pub(crate) struct NamespaceStore<B> {
+    pub(crate) volume_id: VolumeId,
+    pub(crate) operator: Operator,
+    pub(crate) backend: B,
+}
+
+#[derive(Clone)]
+pub(crate) struct ObjectHeadBackend {
     operator: Operator,
 }
 
-impl ObjectNamespace {
+pub(crate) type ObjectNamespace = NamespaceStore<ObjectHeadBackend>;
+
+impl NamespaceHeadBackend for ObjectHeadBackend {
+    type Revision = String;
+
+    async fn read(
+        &self,
+        action: &'static str,
+    ) -> Result<Option<(Vec<u8>, Self::Revision)>, ManagedError> {
+        object::read_with_revision(&self.operator, HEAD_KEY, action).await
+    }
+
+    async fn read_bytes(&self, action: &'static str) -> Result<Option<Vec<u8>>, ManagedError> {
+        object::read(&self.operator, HEAD_KEY, action).await
+    }
+
+    async fn create(&self, bytes: Vec<u8>, action: &'static str) -> Result<bool, ManagedError> {
+        object::create(&self.operator, HEAD_KEY, bytes, action).await
+    }
+
+    async fn replace(
+        &self,
+        revision: &Self::Revision,
+        bytes: Vec<u8>,
+        action: &'static str,
+    ) -> Result<bool, ManagedError> {
+        object::replace(&self.operator, HEAD_KEY, revision, bytes, action).await
+    }
+}
+
+impl NamespaceStore<ObjectHeadBackend> {
     pub(crate) fn new(volume_id: VolumeId, operator: Operator) -> Result<Self, ManagedError> {
         let capability = operator.info().full_capability();
         if !capability.read
@@ -129,11 +174,17 @@ impl ObjectNamespace {
         }
         Ok(Self {
             volume_id,
-            operator,
+            operator: operator.clone(),
+            backend: ObjectHeadBackend { operator },
         })
     }
+}
 
-    pub(crate) async fn observe(&self) -> Result<Option<NamespaceObservation>, ManagedError> {
+#[allow(private_bounds)]
+impl<B: NamespaceHeadBackend> NamespaceStore<B> {
+    pub(crate) async fn observe(
+        &self,
+    ) -> Result<Option<NamespaceObservation<B::Revision>>, ManagedError> {
         let Some((bytes, revision)) = self.read_head().await? else {
             return Ok(None);
         };
@@ -144,7 +195,7 @@ impl ObjectNamespace {
     pub(crate) async fn observe_from(
         &self,
         base: &NamespaceSnapshot,
-    ) -> Result<Option<NamespaceObservation>, ManagedError> {
+    ) -> Result<Option<NamespaceObservation<B::Revision>>, ManagedError> {
         let Some((bytes, revision)) = self.read_head().await? else {
             return Ok(None);
         };
@@ -169,8 +220,8 @@ impl ObjectNamespace {
     async fn recover_observation(
         &self,
         head: StoredHead,
-        revision: String,
-    ) -> Result<NamespaceObservation, ManagedError> {
+        revision: B::Revision,
+    ) -> Result<NamespaceObservation<B::Revision>, ManagedError> {
         let (snapshot, manifest) = self.recover(&head).await?;
         Ok(NamespaceObservation {
             snapshot,
@@ -184,7 +235,7 @@ impl ObjectNamespace {
 
     pub(crate) async fn publish(
         &self,
-        observed: Option<&NamespaceObservation>,
+        observed: Option<&NamespaceObservation<B::Revision>>,
         publication: &NamespacePublication,
     ) -> Result<CommitOutcome, ManagedError> {
         if publication.target.volume_id != self.volume_id {
@@ -242,7 +293,7 @@ impl ObjectNamespace {
             if let Some(observed) = observed {
                 for transaction in &observed.authority.head.tail {
                     committed.insert(
-                        OperationId::from_bytes(transaction.operation),
+                        transaction.operation,
                         StoredCommittedResult::from_transaction(transaction)?,
                     );
                 }
@@ -268,7 +319,7 @@ impl ObjectNamespace {
                 "operation identity was reused with another payload",
             )
             .await?;
-            (checkpoint_id, publication.target.cursor.into(), Vec::new())
+            (checkpoint_id, publication.target.cursor, Vec::new())
         } else {
             let observed = observed.expect("checkpoint policy has an observation");
             let mut tail = observed.authority.head.tail.clone();
@@ -293,16 +344,11 @@ impl ObjectNamespace {
         let head = encode_head(&head)?;
         let replaced = match observed {
             Some(observed) => {
-                replace(
-                    &self.operator,
-                    HEAD_KEY,
-                    &observed.revision,
-                    head,
-                    "publish Managed namespace",
-                )
-                .await
+                self.backend
+                    .replace(&observed.revision, head, "publish Managed namespace")
+                    .await
             }
-            None => create(&self.operator, HEAD_KEY, head, "publish Managed namespace").await,
+            None => self.backend.create(head, "publish Managed namespace").await,
         };
         match replaced {
             Ok(true) => Ok(CommitOutcome::Committed(publication.target.cursor)),
@@ -316,7 +362,7 @@ impl ObjectNamespace {
 
     pub(crate) async fn begin_gc(
         &self,
-        observed: &NamespaceObservation,
+        observed: &NamespaceObservation<B::Revision>,
     ) -> Result<NamespaceGcSweep, ManagedError> {
         if observed.snapshot.volume_id != self.volume_id {
             return Err(invalid(
@@ -346,7 +392,7 @@ impl ObjectNamespace {
 
     pub(crate) async fn resume_gc(
         &self,
-        observed: &NamespaceObservation,
+        observed: &NamespaceObservation<B::Revision>,
     ) -> Result<NamespaceGcSweep, ManagedError> {
         if observed.snapshot.volume_id != self.volume_id {
             return Err(invalid(
@@ -430,16 +476,16 @@ impl ObjectNamespace {
         if let Some(transaction) = head
             .tail
             .iter()
-            .find(|transaction| transaction.operation == *operation.as_bytes())
+            .find(|transaction| transaction.operation == operation)
         {
             let observed_sha256 = transaction_sha256(transaction, "resolve Managed publication")?;
             require_same_operation(expected_sha256, observed_sha256)?;
-            return Ok(CommitOutcome::Committed(transaction.cursor.into_cursor()?));
+            return Ok(CommitOutcome::Committed(transaction.cursor));
         }
         let manifest = self.read_manifest(&head.checkpoint).await?;
         if let Some(result) = self.read_operation_result(&manifest, operation).await? {
             require_same_operation(expected_sha256, result.request_sha256)?;
-            return Ok(CommitOutcome::Committed(result.cursor.into_cursor()?));
+            return Ok(CommitOutcome::Committed(result.cursor));
         }
         Ok(CommitOutcome::Absent)
     }
@@ -476,7 +522,7 @@ impl ObjectNamespace {
     ) -> Result<(NamespaceSnapshot, StoredManifest), ManagedError> {
         let checkpoint = self.read_manifest(&head.checkpoint).await?;
         if checkpoint.major != FORMAT_MAJOR
-            || checkpoint.volume_id != *self.volume_id.as_bytes()
+            || checkpoint.volume_id != self.volume_id
             || checkpoint.cursor != head.checkpoint_cursor
         {
             return Err(corrupt(
@@ -489,7 +535,7 @@ impl ObjectNamespace {
             .map_err(|_| corrupt("read Managed namespace", "checkpoint is invalid"))?;
 
         for transaction in &head.tail {
-            if transaction.parent.into_cursor()? != snapshot.cursor {
+            if transaction.parent != snapshot.cursor {
                 return Err(corrupt(
                     "read Managed namespace",
                     "transaction tail is not consecutive",
@@ -497,7 +543,7 @@ impl ObjectNamespace {
             }
             snapshot = apply_transaction(Some(snapshot), transaction)?;
         }
-        if snapshot.cursor != head.cursor.into_cursor()? {
+        if snapshot.cursor != head.cursor {
             return Err(corrupt(
                 "read Managed namespace",
                 "checkpoint and transaction tail do not reach HEAD",
@@ -527,10 +573,7 @@ impl ObjectNamespace {
                 .or_default()
                 .push(TableRecord {
                     key: typed_key(NODE_PREFIX, node.id.as_bytes()),
-                    value: encode_table_value(
-                        &SnapshotNodeRecord::from(node),
-                        "checkpoint Managed namespace",
-                    )?,
+                    value: encode_table_value(node, "checkpoint Managed namespace")?,
                 });
         }
         for directory in snapshot.directories.values() {
@@ -546,7 +589,7 @@ impl ObjectNamespace {
                 .push(TableRecord {
                     key: typed_key(DIRECTORY_PREFIX, directory.node.as_bytes()),
                     value: encode_table_value(
-                        &SnapshotDirectoryRecord::from(directory),
+                        &directory.generation,
                         "checkpoint Managed namespace",
                     )?,
                 });
@@ -554,10 +597,7 @@ impl ObjectNamespace {
                 let partition = child_partition_key(partition, name)?;
                 groups.entry(partition).or_default().push(TableRecord {
                     key: directory_entry_key(directory.node, name),
-                    value: encode_table_value(
-                        &StoredDirectoryEntry::from(*entry),
-                        "checkpoint Managed namespace",
-                    )?,
+                    value: encode_table_value(entry, "checkpoint Managed namespace")?,
                 });
             }
         }
@@ -592,10 +632,7 @@ impl ObjectNamespace {
                 .or_default()
                 .push(TableRecord {
                     key: typed_key(FILE_VERSION_PREFIX, version.id.as_bytes()),
-                    value: encode_table_value(
-                        &SnapshotFileVersionRecord::from(version),
-                        "checkpoint Managed namespace",
-                    )?,
+                    value: encode_table_value(version, "checkpoint Managed namespace")?,
                 });
         }
         for (operation, result) in committed {
@@ -647,9 +684,9 @@ impl ObjectNamespace {
         );
         Ok(StoredManifest {
             major: FORMAT_MAJOR,
-            volume_id: scope,
-            cursor: snapshot.cursor.into(),
-            root: *snapshot.root.as_bytes(),
+            volume_id: snapshot.volume_id,
+            cursor: snapshot.cursor,
+            root: snapshot.root,
             tables,
         })
     }
@@ -683,23 +720,25 @@ impl ObjectNamespace {
                     .ok_or_else(|| corrupt("read Managed namespace", "SSTable key is empty"))?;
                 match prefix {
                     NODE_PREFIX => {
-                        let stored: SnapshotNodeRecord =
+                        let node: NodeRecord =
                             decode_table_value(&record.value, "read Managed namespace")?;
                         let id = table_node_id(key, "node table key is invalid")?;
-                        if nodes.contains_key(&id) {
+                        if node.id != id || nodes.insert(id, node).is_some() {
                             return Err(corrupt(
                                 "read Managed namespace",
                                 "node table key is invalid",
                             ));
                         }
-                        let node = stored.into_record(id);
-                        nodes.insert(node.id, node);
                     }
                     DIRECTORY_PREFIX => {
-                        let stored: SnapshotDirectoryRecord =
+                        let generation =
                             decode_table_value(&record.value, "read Managed namespace")?;
                         let node = table_node_id(key, "directory table key is invalid")?;
-                        let directory = stored.into_record(node);
+                        let directory = DirectoryRecord {
+                            node,
+                            generation,
+                            entries: BTreeMap::new(),
+                        };
                         if directories.insert(directory.node, directory).is_some() {
                             return Err(corrupt(
                                 "read Managed namespace",
@@ -708,17 +747,15 @@ impl ObjectNamespace {
                         }
                     }
                     DIRECTORY_ENTRY_PREFIX => {
-                        let stored: StoredDirectoryEntry =
-                            decode_table_value(&record.value, "read Managed namespace")?;
+                        let entry = decode_table_value(&record.value, "read Managed namespace")?;
                         let (directory, name) = table_directory_entry_key(key)?;
-                        entries.push((directory, name, stored));
+                        entries.push((directory, name, entry));
                     }
                     FILE_VERSION_PREFIX => {
-                        let stored: SnapshotFileVersionRecord =
+                        let version: FileVersionRecord =
                             decode_table_value(&record.value, "read Managed namespace")?;
                         let id = table_file_version_id(key)?;
-                        let version = stored.into_record(id);
-                        if file_versions.insert(version.id, version).is_some() {
+                        if version.id != id || file_versions.insert(id, version).is_some() {
                             return Err(corrupt(
                                 "read Managed namespace",
                                 "duplicate file version record",
@@ -742,7 +779,7 @@ impl ObjectNamespace {
                     "entry references a missing directory",
                 )
             })?;
-            if directory.entries.insert(name, stored.into()).is_some() {
+            if directory.entries.insert(name, stored).is_some() {
                 return Err(corrupt(
                     "read Managed namespace",
                     "duplicate directory entry",
@@ -750,9 +787,9 @@ impl ObjectNamespace {
             }
         }
         Ok(NamespaceSnapshot {
-            volume_id: VolumeId::from_bytes(checkpoint.volume_id),
-            cursor: checkpoint.cursor.into_cursor()?,
-            root: NodeId::from_bytes(checkpoint.root),
+            volume_id: checkpoint.volume_id,
+            cursor: checkpoint.cursor,
+            root: checkpoint.root,
             nodes,
             directories,
             file_versions,
@@ -877,12 +914,13 @@ impl ObjectNamespace {
         Ok(None)
     }
 
-    async fn read_head(&self) -> Result<Option<(Vec<u8>, String)>, ManagedError> {
-        read_with_revision(&self.operator, HEAD_KEY, "read Managed namespace").await
+    async fn read_head(&self) -> Result<Option<(Vec<u8>, B::Revision)>, ManagedError> {
+        self.backend.read("read Managed namespace").await
     }
 
     async fn read_current_head(&self) -> Result<Option<StoredHead>, ManagedError> {
-        read(&self.operator, HEAD_KEY, "read Managed namespace")
+        self.backend
+            .read_bytes("read Managed namespace")
             .await?
             .map(|bytes| decode_head(&bytes))
             .transpose()
@@ -890,17 +928,12 @@ impl ObjectNamespace {
 
     async fn replace_head(
         &self,
-        expected_revision: &str,
+        expected_revision: &B::Revision,
         bytes: Vec<u8>,
     ) -> Result<bool, ManagedError> {
-        replace(
-            &self.operator,
-            HEAD_KEY,
-            expected_revision,
-            bytes,
-            "publish Managed namespace",
-        )
-        .await
+        self.backend
+            .replace(expected_revision, bytes, "publish Managed namespace")
+            .await
     }
 }
 
@@ -1179,16 +1212,16 @@ fn conflict(action: &'static str, message: &'static str) -> ManagedError {
 #[serde(deny_unknown_fields)]
 struct StoredHead {
     major: u16,
-    volume_id: [u8; 16],
-    cursor: StoredCursor,
+    volume_id: VolumeId,
+    cursor: ChangeCursor,
     checkpoint: [u8; 32],
-    checkpoint_cursor: StoredCursor,
+    checkpoint_cursor: ChangeCursor,
     tail: Vec<StoredTransaction>,
     maintenance_epoch: u64,
     maintenance_state: StoredMaintenanceState,
     #[serde(default)]
     maintenance_owner: Option<[u8; 16]>,
-    maintenance_fixed_cursor: Option<StoredCursor>,
+    maintenance_fixed_cursor: Option<ChangeCursor>,
 }
 
 impl std::fmt::Debug for StoredHead {
@@ -1214,14 +1247,14 @@ enum StoredMaintenanceState {
 impl StoredHead {
     fn new(
         volume_id: VolumeId,
-        cursor: StoredCursor,
+        cursor: ChangeCursor,
         checkpoint: [u8; 32],
-        checkpoint_cursor: StoredCursor,
+        checkpoint_cursor: ChangeCursor,
         tail: Vec<StoredTransaction>,
     ) -> Result<Self, ManagedError> {
         let head = Self {
             major: FORMAT_MAJOR,
-            volume_id: *volume_id.as_bytes(),
+            volume_id,
             cursor,
             checkpoint,
             checkpoint_cursor,
@@ -1243,7 +1276,7 @@ impl StoredHead {
 
     fn validate(&self, volume_id: VolumeId) -> Result<(), ManagedError> {
         self.validate_shape()?;
-        if self.volume_id != *volume_id.as_bytes() {
+        if self.volume_id != volume_id {
             return Err(corrupt(
                 "read Managed namespace",
                 "HEAD integrity is invalid",
@@ -1253,8 +1286,8 @@ impl StoredHead {
     }
 
     fn validate_shape(&self) -> Result<(), ManagedError> {
-        let cursor = self.cursor.into_cursor()?;
-        let checkpoint = self.checkpoint_cursor.into_cursor()?;
+        let cursor = self.cursor;
+        let checkpoint = self.checkpoint_cursor;
         if self.major != FORMAT_MAJOR
             || self.tail.len() > usize::from(MAX_TAIL_TRANSACTIONS)
             || self.tail_bytes() > MAX_TAIL_BYTES
@@ -1265,14 +1298,14 @@ impl StoredHead {
         }
         let mut parent = checkpoint;
         for change in &self.tail {
-            change.validate(VolumeId::from_bytes(self.volume_id))?;
-            if change.parent.into_cursor()? != parent {
+            change.validate(self.volume_id)?;
+            if change.parent != parent {
                 return Err(corrupt(
                     "read Managed namespace",
                     "HEAD change tail is not consecutive",
                 ));
             }
-            parent = change.cursor.into_cursor()?;
+            parent = change.cursor;
         }
         if parent != cursor {
             return Err(corrupt(
@@ -1307,7 +1340,7 @@ impl StoredHead {
                 Ok(Some(NamespaceGcSweep::new(
                     self.maintenance_epoch,
                     owner,
-                    fixed.into_cursor()?,
+                    fixed,
                 )))
             }
             _ => Err(corrupt(
@@ -1336,7 +1369,7 @@ impl StoredHead {
         Ok(NamespaceGcSweep::new(
             self.maintenance_epoch,
             owner,
-            self.cursor.into_cursor()?,
+            self.cursor,
         ))
     }
 
@@ -1372,37 +1405,37 @@ impl StoredHead {
 #[serde(deny_unknown_fields)]
 struct StoredTransaction {
     major: u16,
-    volume_id: [u8; 16],
-    operation: [u8; 16],
-    parent: StoredCursor,
-    cursor: StoredCursor,
-    root: [u8; 16],
-    expected_nodes: Vec<StoredNodePrecondition>,
-    expected_directories: Vec<StoredDirectoryPrecondition>,
-    put_nodes: Vec<StoredNode>,
-    remove_nodes: Vec<[u8; 16]>,
+    volume_id: VolumeId,
+    operation: OperationId,
+    parent: ChangeCursor,
+    cursor: ChangeCursor,
+    root: NodeId,
+    expected_nodes: Vec<NodePrecondition>,
+    expected_directories: Vec<DirectoryPrecondition>,
+    put_nodes: Vec<NodeRecord>,
+    remove_nodes: Vec<NodeId>,
     put_directories: Vec<StoredDirectoryHeader>,
-    remove_directories: Vec<[u8; 16]>,
+    remove_directories: Vec<NodeId>,
     put_directory_entries: Vec<StoredNamedDirectoryEntry>,
     remove_directory_entries: Vec<StoredDirectoryEntryKey>,
-    put_file_versions: Vec<StoredFileVersion>,
-    remove_file_versions: Vec<[u8; 32]>,
+    put_file_versions: Vec<FileVersionRecord>,
+    remove_file_versions: Vec<FileVersionId>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct StoredManifest {
     major: u16,
-    volume_id: [u8; 16],
-    cursor: StoredCursor,
-    root: [u8; 16],
+    volume_id: VolumeId,
+    cursor: ChangeCursor,
+    root: NodeId,
     tables: Vec<TableRef>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct StoredCommittedResult {
-    cursor: StoredCursor,
+    cursor: ChangeCursor,
     request_sha256: [u8; 32],
 }
 
@@ -1415,7 +1448,7 @@ impl StoredCommittedResult {
     }
 
     fn validate(&self, operation: OperationId) -> Result<(), ManagedError> {
-        if self.cursor.into_cursor()?.operation() != Some(operation) {
+        if self.cursor.operation() != Some(operation) {
             return Err(corrupt(
                 "read Managed operation results",
                 "operation result cursor is invalid",
@@ -1479,37 +1512,21 @@ impl StoredTransaction {
         let change = NamespaceChange::from_publication(publication, base);
         Self {
             major: FORMAT_MAJOR,
-            volume_id: *change.volume_id.as_bytes(),
-            operation: *change.operation.as_bytes(),
-            parent: change.parent.into(),
-            cursor: change.cursor.into(),
-            root: *change.root.as_bytes(),
-            expected_nodes: change
-                .expected_nodes
-                .iter()
-                .map(StoredNodePrecondition::from)
-                .collect(),
-            expected_directories: change
-                .expected_directories
-                .iter()
-                .map(StoredDirectoryPrecondition::from)
-                .collect(),
-            put_nodes: change.put_nodes.iter().map(StoredNode::from).collect(),
-            remove_nodes: change
-                .remove_nodes
-                .iter()
-                .map(|id| *id.as_bytes())
-                .collect(),
+            volume_id: change.volume_id,
+            operation: change.operation,
+            parent: change.parent,
+            cursor: change.cursor,
+            root: change.root,
+            expected_nodes: change.expected_nodes,
+            expected_directories: change.expected_directories,
+            put_nodes: change.put_nodes,
+            remove_nodes: change.remove_nodes,
             put_directories: change
                 .put_directories
                 .iter()
                 .map(StoredDirectoryHeader::from)
                 .collect(),
-            remove_directories: change
-                .remove_directories
-                .iter()
-                .map(|id| *id.as_bytes())
-                .collect(),
+            remove_directories: change.remove_directories,
             put_directory_entries: change
                 .put_directories
                 .iter()
@@ -1522,9 +1539,9 @@ impl StoredTransaction {
                             base.and_then(|base| base.entries.get(*name)) != Some(*entry)
                         })
                         .map(move |(name, entry)| StoredNamedDirectoryEntry {
-                            directory: *directory.node.as_bytes(),
+                            directory: directory.node,
                             name: name.clone(),
-                            entry: (*entry).into(),
+                            entry: *entry,
                         })
                 })
                 .collect(),
@@ -1539,31 +1556,23 @@ impl StoredTransaction {
                                 .keys()
                                 .filter(move |name| !directory.entries.contains_key(*name))
                                 .map(move |name| StoredDirectoryEntryKey {
-                                    directory: *directory.node.as_bytes(),
+                                    directory: directory.node,
                                     name: name.clone(),
                                 })
                         })
                 })
                 .collect(),
-            put_file_versions: change
-                .put_file_versions
-                .iter()
-                .map(StoredFileVersion::from)
-                .collect(),
-            remove_file_versions: change
-                .remove_file_versions
-                .iter()
-                .map(|id| *id.as_bytes())
-                .collect(),
+            put_file_versions: change.put_file_versions,
+            remove_file_versions: change.remove_file_versions,
         }
     }
 
     fn validate(&self, volume_id: VolumeId) -> Result<(), ManagedError> {
-        let parent = self.parent.into_cursor()?;
-        let cursor = self.cursor.into_cursor()?;
+        let parent = self.parent;
+        let cursor = self.cursor;
         if self.major != FORMAT_MAJOR
-            || self.volume_id != *volume_id.as_bytes()
-            || cursor.operation() != Some(OperationId::from_bytes(self.operation))
+            || self.volume_id != volume_id
+            || cursor.operation() != Some(self.operation)
             || parent.sequence().checked_add(1) != Some(cursor.sequence())
         {
             return Err(corrupt(
@@ -1575,11 +1584,11 @@ impl StoredTransaction {
     }
 
     fn to_change(&self, base: Option<&NamespaceSnapshot>) -> Result<NamespaceChange, ManagedError> {
-        let volume_id = VolumeId::from_bytes(self.volume_id);
+        let volume_id = self.volume_id;
         self.validate(volume_id)?;
         let mut put_directories = BTreeMap::new();
         for header in &self.put_directories {
-            let node = NodeId::from_bytes(header.node);
+            let node = header.node;
             if put_directories.contains_key(&node) {
                 return Err(corrupt(
                     "read Managed transaction",
@@ -1589,19 +1598,17 @@ impl StoredTransaction {
             let mut directory = base
                 .and_then(|snapshot| snapshot.directories.get(&node))
                 .cloned()
-                .unwrap_or_else(|| header.into_record());
-            directory.generation = managed_generation(header.generation);
+                .unwrap_or_else(|| header.to_record());
+            directory.generation = header.generation.clone();
             put_directories.insert(node, directory);
         }
         for removed in &self.remove_directory_entries {
-            let directory = put_directories
-                .get_mut(&NodeId::from_bytes(removed.directory))
-                .ok_or_else(|| {
-                    corrupt(
-                        "read Managed transaction",
-                        "directory entry removal has no directory header",
-                    )
-                })?;
+            let directory = put_directories.get_mut(&removed.directory).ok_or_else(|| {
+                corrupt(
+                    "read Managed transaction",
+                    "directory entry removal has no directory header",
+                )
+            })?;
             if directory.entries.remove(&removed.name).is_none() {
                 return Err(corrupt(
                     "read Managed transaction",
@@ -1610,67 +1617,28 @@ impl StoredTransaction {
             }
         }
         for stored in &self.put_directory_entries {
-            let directory = put_directories
-                .get_mut(&NodeId::from_bytes(stored.directory))
-                .ok_or_else(|| {
-                    corrupt(
-                        "read Managed transaction",
-                        "directory entry update has no directory header",
-                    )
-                })?;
-            directory
-                .entries
-                .insert(stored.name.clone(), stored.entry.into());
+            let directory = put_directories.get_mut(&stored.directory).ok_or_else(|| {
+                corrupt(
+                    "read Managed transaction",
+                    "directory entry update has no directory header",
+                )
+            })?;
+            directory.entries.insert(stored.name.clone(), stored.entry);
         }
         Ok(NamespaceChange {
             volume_id,
-            operation: OperationId::from_bytes(self.operation),
-            parent: self.parent.into_cursor()?,
-            cursor: self.cursor.into_cursor()?,
-            root: NodeId::from_bytes(self.root),
-            expected_nodes: self
-                .expected_nodes
-                .iter()
-                .cloned()
-                .map(StoredNodePrecondition::into_record)
-                .collect(),
-            expected_directories: self
-                .expected_directories
-                .iter()
-                .cloned()
-                .map(StoredDirectoryPrecondition::into_record)
-                .collect(),
-            put_nodes: self
-                .put_nodes
-                .iter()
-                .cloned()
-                .map(StoredNode::into_record)
-                .collect(),
-            remove_nodes: self
-                .remove_nodes
-                .iter()
-                .copied()
-                .map(NodeId::from_bytes)
-                .collect(),
+            operation: self.operation,
+            parent: self.parent,
+            cursor: self.cursor,
+            root: self.root,
+            expected_nodes: self.expected_nodes.clone(),
+            expected_directories: self.expected_directories.clone(),
+            put_nodes: self.put_nodes.clone(),
+            remove_nodes: self.remove_nodes.clone(),
             put_directories: put_directories.into_values().collect(),
-            remove_directories: self
-                .remove_directories
-                .iter()
-                .copied()
-                .map(NodeId::from_bytes)
-                .collect(),
-            put_file_versions: self
-                .put_file_versions
-                .iter()
-                .cloned()
-                .map(StoredFileVersion::into_record)
-                .collect(),
-            remove_file_versions: self
-                .remove_file_versions
-                .iter()
-                .copied()
-                .map(FileVersionId::from_bytes)
-                .collect(),
+            remove_directories: self.remove_directories.clone(),
+            put_file_versions: self.put_file_versions.clone(),
+            remove_file_versions: self.remove_file_versions.clone(),
         })
     }
 }
@@ -1687,13 +1655,13 @@ fn replay_tail_from(
     base: &NamespaceSnapshot,
     head: &StoredHead,
 ) -> Result<Option<NamespaceSnapshot>, ManagedError> {
-    let target = head.cursor.into_cursor()?;
+    let target = head.cursor;
     if base.cursor == target {
         return Ok(Some(base.clone()));
     }
     let mut start = None;
     for (index, transaction) in head.tail.iter().enumerate() {
-        if transaction.parent.into_cursor()? == base.cursor {
+        if transaction.parent == base.cursor {
             start = Some(index);
             break;
         }
@@ -1703,7 +1671,7 @@ fn replay_tail_from(
     };
     let mut snapshot = base.clone();
     for transaction in &head.tail[start..] {
-        if transaction.parent.into_cursor()? != snapshot.cursor {
+        if transaction.parent != snapshot.cursor {
             return Err(corrupt(
                 "read Managed namespace",
                 "transaction tail is not consecutive",
@@ -1720,116 +1688,27 @@ fn replay_tail_from(
     Ok(Some(snapshot))
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct StoredCursor {
-    sequence: u64,
-    operation: Option<[u8; 16]>,
-}
-
-impl From<ChangeCursor> for StoredCursor {
-    fn from(cursor: ChangeCursor) -> Self {
-        Self {
-            sequence: cursor.sequence(),
-            operation: cursor.operation().map(|operation| *operation.as_bytes()),
-        }
-    }
-}
-
-impl StoredCursor {
-    fn into_cursor(self) -> Result<ChangeCursor, ManagedError> {
-        match (self.sequence, self.operation) {
-            (0, None) => Ok(ChangeCursor::Genesis),
-            (sequence, Some(operation)) => Ok(ChangeCursor::at(
-                NonZeroU64::new(sequence)
-                    .ok_or_else(|| corrupt("read Managed namespace", "cursor is invalid"))?,
-                OperationId::from_bytes(operation),
-            )),
-            _ => Err(corrupt("read Managed namespace", "cursor is invalid")),
-        }
-    }
-}
-
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct SnapshotNodeRecord {
-    generation: u64,
-    kind: StoredNodeKind,
-    attributes: StoredNodeAttributes,
-    file_version: Option<[u8; 32]>,
-}
-
-impl From<&NodeRecord> for SnapshotNodeRecord {
-    fn from(node: &NodeRecord) -> Self {
-        Self {
-            generation: managed_generation_number(&node.generation)
-                .expect("validated Managed node generation"),
-            kind: node.kind.into(),
-            attributes: node.attributes.into(),
-            file_version: node.file_version.map(|version| *version.as_bytes()),
-        }
-    }
-}
-
-impl SnapshotNodeRecord {
-    fn into_record(self, id: NodeId) -> NodeRecord {
-        NodeRecord {
-            id,
-            generation: managed_generation(self.generation),
-            kind: self.kind.into(),
-            attributes: self.attributes.into(),
-            file_version: self.file_version.map(FileVersionId::from_bytes),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 struct StoredDirectoryHeader {
-    node: [u8; 16],
-    generation: u64,
+    node: NodeId,
+    generation: Generation,
 }
 
 impl From<&DirectoryRecord> for StoredDirectoryHeader {
     fn from(directory: &DirectoryRecord) -> Self {
         Self {
-            node: *directory.node.as_bytes(),
-            generation: managed_generation_number(&directory.generation)
-                .expect("validated Managed directory generation"),
+            node: directory.node,
+            generation: directory.generation.clone(),
         }
     }
 }
 
 impl StoredDirectoryHeader {
-    fn into_record(self) -> DirectoryRecord {
+    fn to_record(&self) -> DirectoryRecord {
         DirectoryRecord {
-            node: NodeId::from_bytes(self.node),
-            generation: managed_generation(self.generation),
-            entries: BTreeMap::new(),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct SnapshotDirectoryRecord {
-    generation: u64,
-}
-
-impl From<&DirectoryRecord> for SnapshotDirectoryRecord {
-    fn from(directory: &DirectoryRecord) -> Self {
-        Self {
-            generation: managed_generation_number(&directory.generation)
-                .expect("validated Managed directory generation"),
-        }
-    }
-}
-
-impl SnapshotDirectoryRecord {
-    fn into_record(self, node: NodeId) -> DirectoryRecord {
-        DirectoryRecord {
-            node,
-            generation: managed_generation(self.generation),
+            node: self.node,
+            generation: self.generation.clone(),
             entries: BTreeMap::new(),
         }
     }
@@ -1838,50 +1717,24 @@ impl SnapshotDirectoryRecord {
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct StoredNamedDirectoryEntry {
-    directory: [u8; 16],
+    directory: NodeId,
     name: String,
-    entry: StoredDirectoryEntry,
+    entry: DirectoryEntry,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct StoredDirectoryEntryKey {
-    directory: [u8; 16],
+    directory: NodeId,
     name: String,
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct SnapshotFileVersionRecord {
-    logical_size: u64,
-    logical_digest: [u8; 32],
-    extent_map: ExtentMap,
-}
-
-impl From<&FileVersionRecord> for SnapshotFileVersionRecord {
-    fn from(version: &FileVersionRecord) -> Self {
-        Self {
-            logical_size: version.logical_size,
-            logical_digest: version.logical_digest,
-            extent_map: version.extent_map.clone(),
-        }
-    }
-}
-
-impl SnapshotFileVersionRecord {
-    fn into_record(self, id: FileVersionId) -> FileVersionRecord {
-        FileVersionRecord {
-            id,
-            logical_size: self.logical_size,
-            logical_digest: self.logical_digest,
-            extent_map: self.extent_map,
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU64;
+
     use super::*;
+    use crate::managed::metadata::namespace::managed_generation;
     use opendal::services::Memory;
 
     fn root_snapshot(cursor: ChangeCursor) -> NamespaceSnapshot {
@@ -1917,8 +1770,7 @@ mod tests {
         let volume = VolumeId::from_bytes([1; 16]);
         let operation = OperationId::from_bytes([2; 16]);
         let cursor = ChangeCursor::at(NonZeroU64::new(1).unwrap(), operation);
-        let mut head =
-            StoredHead::new(volume, cursor.into(), [4; 32], cursor.into(), Vec::new()).unwrap();
+        let mut head = StoredHead::new(volume, cursor, [4; 32], cursor, Vec::new()).unwrap();
 
         let sweep = head.begin_gc([5; 16]).unwrap();
         let mut recovered = decode_head(&encode_head(&head).unwrap()).unwrap();
@@ -2007,6 +1859,9 @@ mod tests {
         let namespace = ObjectNamespace {
             volume_id: snapshot.volume_id,
             operator: operator.clone(),
+            backend: ObjectHeadBackend {
+                operator: operator.clone(),
+            },
         };
         let checkpoint = namespace
             .checkpoint_full(&snapshot, &BTreeMap::new(), None)
@@ -2046,7 +1901,8 @@ mod tests {
         let operator = Operator::new(Memory::default()).unwrap().finish();
         let namespace = ObjectNamespace {
             volume_id: first_snapshot.volume_id,
-            operator,
+            operator: operator.clone(),
+            backend: ObjectHeadBackend { operator },
         };
         assert_eq!(
             namespace.publish(None, &first_publication).await.unwrap(),
@@ -2116,6 +1972,9 @@ mod tests {
         let namespace = ObjectNamespace {
             volume_id: snapshot.volume_id,
             operator: operator.clone(),
+            backend: ObjectHeadBackend {
+                operator: operator.clone(),
+            },
         };
         assert_eq!(
             namespace.publish(None, &publication).await.unwrap(),

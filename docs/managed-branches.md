@@ -50,9 +50,9 @@ pieces are named authorities, retained tails after checkpoint rotation, and a
 garbage collector that treats all branches as roots.
 
 The extension reuses the common namespace snapshot, validation, publication,
-file-version, and data-segment model. Its checkpoint wire record is currently
-extension-owned. It does not yet reuse the base Object manifest/SSTable
-repository or the base D1 projection tables.
+file-version, data-segment, and SSTable models. Its checkpoint root and
+retained-history records are extension-owned because they preserve multiple
+branch-local positions.
 
 The extension boundary keeps these rules out of base Managed volumes. The base
 and extension formats may share code, but they do not share mutable authority
@@ -376,9 +376,10 @@ has been created and verified. History is also immutable and
 content-addressed. The base Managed `head.ofs` is not read or mirrored for a
 branching volume.
 
-Object and D1 share the record-set builder and recovery validation. They do not
-share storage calls or mutable authority. Checkpoint capacity is the sum of
-its immutable parts rather than one encoded snapshot value.
+Object and D1 share the record-set builder, recovery validation, and mutable
+record state machine. Their adapters provide only native read, create,
+revision-CAS replace, list, and delete operations. Checkpoint capacity is the
+sum of its immutable parts rather than one encoded snapshot value.
 
 Reads obtain an ETag with `stat` and then issue an `If-Match` read. The decoded
 bytes and the revision used by the next conditional write therefore belong to
@@ -391,26 +392,17 @@ roots. Listing is used only during garbage collection of unreachable objects.
 
 ## D1 representation
 
-D1 uses five extension-owned table families:
+D1 uses one extension-owned record table:
 
 ```text
-ofs_managed_branch_v1_registry
-ofs_managed_branch_v1_heads
-ofs_managed_branch_v1_checkpoints
-ofs_managed_branch_v1_checkpoint_parts
-ofs_managed_branch_v1_history
+ofs_managed_branch_v1_records
 ```
 
-Rows are scoped by the existing D1 store key and `VolumeId`. Lifecycle and
-publication use revision predicates and D1 batch transactions. The base D1
-namespace tables are neither copied nor used as fallback authority.
-
-Each immutable part is written and verified in its own idempotent request.
-The checkpoint root is published in a later request, and reads fetch part
-references in pages. Missing, duplicated, reordered, or modified parts are
-corruption. D1 values use the provider's 2,000,000-byte boundary; checkpoint
-record sets split well below it. See the
-[Cloudflare D1 limits](https://developers.cloudflare.com/d1/platform/limits/).
+Rows are scoped by the existing D1 store key, `VolumeId`, and the same logical
+record key used by Object Metadata. Lifecycle and publication use revision
+predicates. Immutable parts are written and verified idempotently before a
+checkpoint root is published. Missing, duplicated, reordered, or modified
+parts are corruption.
 
 The registry remains one small mutable authority record. D1's value limit and
 the selected Object provider's conditional-write limit are its real
@@ -425,21 +417,19 @@ linearization point. A source publication can order before or after the fork;
 an existing target name, source deletion, or active GC fence prevents the
 registry update.
 
-Object deletion first seals the exact registered head, then conditionally
-removes that exact name-to-id mapping. A crash between those operations leaves
-a sealed branch that a repeated delete can finish. D1 performs the registry
-removal and head seal in one transaction. In both cases, publication either
-wins the head update before the seal or conflicts with it.
+Deletion first seals the exact registered head, then conditionally removes
+that exact name-to-id mapping. A crash between those operations leaves a sealed
+branch that a repeated delete can finish. Publication either wins the head
+update before the seal or conflicts with it.
 
 Name reuse is safe because deletion compares the registered `BranchId`. A
 retry for an old incarnation never removes a replacement with the same name.
 
 ## Garbage collection
 
-GC is fenced at the branch registry with an epoch and an owner token. Object
-Metadata also marks every current head with the same token because registry
-and heads are separate objects. D1 enforces the token through transactional
-registry predicates.
+GC is fenced at the branch registry with an epoch and an owner token. Every
+current head is marked with the same token because registry and heads are
+separate revision-CAS records.
 
 The collector recovers every snapshot represented by each current head and
 each retained history interval. It unions reachable `SegmentRef` values and
@@ -468,10 +458,9 @@ request size is not a namespace-format limit.
 
 Sync owns replica state, local conflict retention, and the local durability
 boundary. The branch binding is validated before replica directory creation,
-scan, materialization, or state update. State format 5 records an optional
-branch binding and a relative pending-cache name. Formats 3 and 4 remain
-readable and their old absolute cache path is rebased beside the current state
-file.
+scan, materialization, or state update. State format 1 records an optional
+branch binding and a relative pending-cache name. Development-time layouts are
+not compatibility formats and are rejected.
 
 The pending staging tree is a cache, not authority. If it is missing or
 damaged before publication, Sync rebuilds it from the current replica. If the

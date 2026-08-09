@@ -289,25 +289,20 @@ and read that table.
 
 ## Transactional Metadata layout
 
-Transactional Metadata stores the superblock and namespace in these D1 tables:
+Transactional Metadata stores the superblock and mutable namespace commit
+point in these D1 tables:
 
 ```text
 ofs_managed_v1_formats
-ofs_managed_v1_heads
-ofs_managed_v1_nodes
-ofs_managed_v1_directories
-ofs_managed_v1_change_transactions
-ofs_managed_v1_operation_results
-ofs_managed_v1_checkpoints
+ofs_managed_v1_namespace_heads
 ```
 
-`STORE_KEY` scopes one Managed volume inside the shared tables. The head row is
-the commit point. D1 stores node and directory projections, ordered committed
-transactions, operation results, and periodic snapshots. Publication uses one
-native transaction with revision, cursor, and generation predicates.
-
-The Data segment layout is identical for Object and Transactional Metadata.
-D1 stores no copy of the Object HEAD, manifest, or SSTable format.
+`STORE_KEY` and `VolumeId` scope one Managed volume inside the shared tables.
+The namespace row contains the same encoded HEAD used by the shared namespace
+interpreter and a monotonically increasing CAS revision. Immutable manifests
+and SSTables remain checksummed, content-addressed objects in the configured
+OpenDAL storage. The Data segment layout is also identical for Object and
+Transactional Metadata.
 
 ## Publication and reachability
 

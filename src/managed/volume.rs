@@ -158,7 +158,11 @@ impl ManagedVolume {
         let volume_id = format.volume_id();
         Ok(Self {
             volume_id,
-            namespace: NamespaceAuthority::D1(D1Namespace::new(volume_id, metadata.session())),
+            namespace: NamespaceAuthority::D1(D1Namespace::new(
+                volume_id,
+                data_operator.clone(),
+                metadata.session(),
+            )),
             data: ManagedData::new(data_operator)?,
         })
     }

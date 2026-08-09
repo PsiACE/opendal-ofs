@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::filesystem::{ChangeCursor, FileVersionId, Generation};
@@ -23,7 +24,8 @@ use crate::managed::format::{ContentRef, ExtentMap};
 pub(crate) type NodeRecord = crate::filesystem::NodeRecord;
 pub(crate) type DirectoryRecord = crate::filesystem::DirectoryRecord;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct FileVersionRecord {
     pub(crate) id: FileVersionId,
     pub(crate) logical_size: u64,
@@ -150,10 +152,6 @@ impl NamespaceGcSweep {
             owner,
             fixed,
         }
-    }
-
-    pub(crate) const fn owner(self) -> [u8; 16] {
-        self.owner
     }
 }
 

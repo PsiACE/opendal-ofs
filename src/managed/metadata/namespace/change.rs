@@ -17,6 +17,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::{Deserialize, Serialize};
+
 use super::validation::validate_publication;
 use super::{
     DirectoryPrecondition, DirectoryRecord, FileVersionRecord, NamespacePublication,
@@ -25,6 +27,8 @@ use super::{
 use crate::filesystem::{ChangeCursor, FileVersionId, NodeId, OperationId, VolumeId};
 use crate::managed::{ManagedError, ManagedErrorKind};
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct NamespaceChange {
     pub(crate) volume_id: VolumeId,
     pub(crate) operation: OperationId,

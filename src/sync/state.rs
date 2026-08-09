@@ -9,7 +9,6 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write as _};
-use std::num::NonZeroU64;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -17,17 +16,17 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::filesystem::{
-    AuthorityIdentity, BranchBinding, BranchId, BranchName, ChangeCursor, DirectoryEntry,
-    DirectoryRecord, FileVersion, FileVersionId, Generation, NodeAttributes, NodeId, NodeKind,
-    NodeRecord, OperationId, VolumeId, VolumeSnapshot,
+    AuthorityIdentity, BranchBinding, ChangeCursor, DirectoryRecord, FileVersion, Generation,
+    NodeId, NodeRecord, OperationId, VolumeId, VolumeSnapshot,
 };
 use crate::sync::local::NativeIdentity;
 
 const STATE_FORMAT: &str = "ofs-sync-replica";
-const STATE_MAJOR: u16 = 5;
+const STATE_MAJOR: u16 = 1;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct BaseEntry {
     pub node: NodeId,
     pub generation: Generation,
@@ -39,14 +38,16 @@ pub(crate) struct BaseEntry {
     pub local_executable: Option<bool>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PendingIntent {
     pub operation: OperationId,
     pub staging: PathBuf,
     pub renames: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConflictRecord {
     pub path: String,
     pub local_digest: Option<[u8; 32]>,
@@ -103,17 +104,15 @@ impl ReplicaState {
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error).context("read replica state"),
         };
-        let wire: StateWire = serde_json::from_slice(&bytes).context("parse replica state JSON")?;
-        let major = wire.major;
-        let mut state: Self = wire.try_into()?;
+        let stored: StoredState =
+            serde_json::from_slice(&bytes).context("parse replica state JSON")?;
+        let mut state: Self = stored.try_into()?;
         if let Some(intent) = &mut state.pending {
-            if major >= STATE_MAJOR {
-                let mut components = intent.staging.components();
-                if !matches!(components.next(), Some(Component::Normal(_)))
-                    || components.next().is_some()
-                {
-                    bail!("replica state contains an invalid pending cache name");
-                }
+            let mut components = intent.staging.components();
+            if !matches!(components.next(), Some(Component::Normal(_)))
+                || components.next().is_some()
+            {
+                bail!("replica state contains an invalid pending cache name");
             }
             let cache_name = intent
                 .staging
@@ -148,7 +147,7 @@ impl ReplicaState {
         }
         let result = (|| -> Result<()> {
             let mut file = options.open(&temporary)?;
-            serde_json::to_writer(&mut file, &StateWire::from(self))?;
+            serde_json::to_writer(&mut file, &StoredState::from(self))?;
             file.write_all(b"\n")?;
             file.sync_all()?;
             drop(file);
@@ -165,161 +164,40 @@ impl ReplicaState {
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct StateWire {
+struct StoredState {
     format: String,
     major: u16,
-    volume: [u8; 16],
-    #[serde(default)]
-    branch: Option<BranchWire>,
-    common: CursorWire,
-    authority: Option<SnapshotWire>,
-    base: BTreeMap<String, BaseWire>,
-    pending: Option<IntentWire>,
-    conflicts: Vec<ConflictWire>,
+    volume: VolumeId,
+    branch: Option<BranchBinding>,
+    common: ChangeCursor,
+    authority: Option<StoredSnapshot>,
+    base: BTreeMap<String, BaseEntry>,
+    pending: Option<PendingIntent>,
+    conflicts: Vec<ConflictRecord>,
 }
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct BranchWire {
-    name: BranchName,
-    id: [u8; 16],
+struct StoredSnapshot {
+    cursor: ChangeCursor,
+    root: NodeId,
+    nodes: Vec<NodeRecord>,
+    directories: Vec<DirectoryRecord>,
+    file_versions: Vec<FileVersion>,
 }
 
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct CursorWire {
-    sequence: u64,
-    operation: Option<[u8; 16]>,
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct BaseWire {
-    node: [u8; 16],
-    generation: Vec<u8>,
-    directory_generation: Option<Vec<u8>>,
-    digest: Option<[u8; 32]>,
-    local_identity: Option<NativeIdentityWire>,
-    local_size: Option<u64>,
-    local_modified: Option<String>,
-    local_executable: Option<bool>,
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct SnapshotWire {
-    cursor: CursorWire,
-    root: [u8; 16],
-    nodes: Vec<NodeWire>,
-    directories: Vec<DirectoryWire>,
-    file_versions: Vec<FileVersionWire>,
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct NodeWire {
-    id: [u8; 16],
-    generation: Vec<u8>,
-    kind: NodeKindWire,
-    executable: bool,
-    file_version: Option<[u8; 32]>,
-}
-
-#[derive(Clone, Copy, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum NodeKindWire {
-    Directory,
-    RegularFile,
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct DirectoryWire {
-    node: [u8; 16],
-    generation: Vec<u8>,
-    entries: BTreeMap<String, DirectoryEntryWire>,
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct DirectoryEntryWire {
-    node: [u8; 16],
-    kind: NodeKindWire,
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct FileVersionWire {
-    id: [u8; 32],
-    logical_size: u64,
-    logical_digest: [u8; 32],
-    descriptor: Vec<u8>,
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct IntentWire {
-    operation: [u8; 16],
-    staging: PathBuf,
-    renames: BTreeMap<String, String>,
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct NativeIdentityWire {
-    device: u64,
-    inode: u64,
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct ConflictWire {
-    path: String,
-    local_digest: Option<[u8; 32]>,
-    remote_digest: Option<[u8; 32]>,
-}
-
-impl From<&ReplicaState> for StateWire {
+impl From<&ReplicaState> for StoredState {
     fn from(state: &ReplicaState) -> Self {
         Self {
             format: STATE_FORMAT.into(),
             major: STATE_MAJOR,
-            volume: *state.volume.as_bytes(),
-            branch: state.branch.as_ref().map(|branch| BranchWire {
-                name: branch.name.clone(),
-                id: *branch.id.as_bytes(),
-            }),
-            common: CursorWire::from(state.common),
-            authority: state.authority.as_ref().map(SnapshotWire::from),
-            base: state
-                .base
-                .iter()
-                .map(|(path, entry)| {
-                    (
-                        path.clone(),
-                        BaseWire {
-                            node: *entry.node.as_bytes(),
-                            generation: entry.generation.as_bytes().into(),
-                            directory_generation: entry
-                                .directory_generation
-                                .as_ref()
-                                .map(|generation| generation.as_bytes().into()),
-                            digest: entry.digest,
-                            local_identity: entry.local_identity.map(|identity| {
-                                NativeIdentityWire {
-                                    device: identity.device,
-                                    inode: identity.inode,
-                                }
-                            }),
-                            local_size: entry.local_size,
-                            local_modified: entry.local_modified.clone(),
-                            local_executable: entry.local_executable,
-                        },
-                    )
-                })
-                .collect(),
-            pending: state.pending.as_ref().map(|intent| IntentWire {
-                operation: *intent.operation.as_bytes(),
+            volume: state.volume,
+            branch: state.branch.clone(),
+            common: state.common,
+            authority: state.authority.as_ref().map(StoredSnapshot::from),
+            base: state.base.clone(),
+            pending: state.pending.as_ref().map(|intent| PendingIntent {
+                operation: intent.operation,
                 staging: intent
                     .staging
                     .file_name()
@@ -327,242 +205,74 @@ impl From<&ReplicaState> for StateWire {
                     .expect("pending cache is a named sibling of replica state"),
                 renames: intent.renames.clone(),
             }),
-            conflicts: state
-                .conflicts
-                .iter()
-                .map(|conflict| ConflictWire {
-                    path: conflict.path.clone(),
-                    local_digest: conflict.local_digest,
-                    remote_digest: conflict.remote_digest,
-                })
-                .collect(),
+            conflicts: state.conflicts.clone(),
         }
     }
 }
 
-impl TryFrom<StateWire> for ReplicaState {
+impl TryFrom<StoredState> for ReplicaState {
     type Error = anyhow::Error;
 
-    fn try_from(wire: StateWire) -> Result<Self> {
-        if wire.format != STATE_FORMAT || !matches!(wire.major, 3 | 4 | STATE_MAJOR) {
+    fn try_from(stored: StoredState) -> Result<Self> {
+        if stored.format != STATE_FORMAT || stored.major != STATE_MAJOR {
             bail!("replica state format is unsupported");
         }
-        if wire.major == 3 && wire.branch.is_some() {
-            bail!("replica state format is unsupported");
-        }
-        let base = wire
-            .base
-            .into_iter()
-            .map(|(path, entry)| {
-                Ok((
-                    path,
-                    BaseEntry {
-                        node: NodeId::from_bytes(entry.node),
-                        generation: Generation::from_bytes(entry.generation),
-                        directory_generation: entry
-                            .directory_generation
-                            .map(Generation::from_bytes),
-                        digest: entry.digest,
-                        local_identity: entry.local_identity.map(|identity| NativeIdentity {
-                            device: identity.device,
-                            inode: identity.inode,
-                        }),
-                        local_size: entry.local_size,
-                        local_modified: entry.local_modified,
-                        local_executable: entry.local_executable,
-                    },
-                ))
-            })
-            .collect::<Result<_>>()?;
-        let pending = wire
-            .pending
-            .map(|intent| -> Result<PendingIntent> {
-                Ok(PendingIntent {
-                    operation: OperationId::from_bytes(intent.operation),
-                    staging: intent.staging,
-                    renames: intent.renames,
-                })
-            })
-            .transpose()?;
-        let volume = VolumeId::from_bytes(wire.volume);
-        let common = wire.common.try_into()?;
-        let authority = wire
+        let authority = stored
             .authority
-            .map(|snapshot| snapshot.into_snapshot(volume))
+            .map(|snapshot| snapshot.into_snapshot(stored.volume))
             .transpose()?;
         if authority
             .as_ref()
-            .is_some_and(|snapshot| snapshot.cursor != common)
+            .is_some_and(|snapshot| snapshot.cursor != stored.common)
         {
             bail!("replica authority snapshot does not match its common cursor");
         }
         if let Some(snapshot) = &authority {
-            validate_base(snapshot, &base)?;
+            validate_base(snapshot, &stored.base)?;
         }
         Ok(Self {
-            volume,
-            branch: wire.branch.map(|branch| BranchBinding {
-                name: branch.name,
-                id: BranchId::from_bytes(branch.id),
-            }),
-            common,
+            volume: stored.volume,
+            branch: stored.branch,
+            common: stored.common,
             authority,
-            base,
-            pending,
-            conflicts: wire
-                .conflicts
-                .into_iter()
-                .map(|conflict| ConflictRecord {
-                    path: conflict.path,
-                    local_digest: conflict.local_digest,
-                    remote_digest: conflict.remote_digest,
-                })
-                .collect(),
+            base: stored.base,
+            pending: stored.pending,
+            conflicts: stored.conflicts,
         })
     }
 }
 
-impl From<ChangeCursor> for CursorWire {
-    fn from(cursor: ChangeCursor) -> Self {
-        Self {
-            sequence: cursor.sequence(),
-            operation: cursor.operation().map(|value| *value.as_bytes()),
-        }
-    }
-}
-
-impl TryFrom<CursorWire> for ChangeCursor {
-    type Error = anyhow::Error;
-
-    fn try_from(wire: CursorWire) -> Result<Self> {
-        match (wire.sequence, wire.operation) {
-            (0, None) => Ok(Self::Genesis),
-            (sequence, Some(operation)) => Ok(Self::at(
-                NonZeroU64::new(sequence).context("replica cursor sequence is zero")?,
-                OperationId::from_bytes(operation),
-            )),
-            _ => bail!("replica cursor sequence and operation disagree"),
-        }
-    }
-}
-
-impl From<&VolumeSnapshot> for SnapshotWire {
+impl From<&VolumeSnapshot> for StoredSnapshot {
     fn from(snapshot: &VolumeSnapshot) -> Self {
         Self {
-            cursor: CursorWire::from(snapshot.cursor),
-            root: *snapshot.root.as_bytes(),
-            nodes: snapshot
-                .nodes
-                .values()
-                .map(|record| NodeWire {
-                    id: *record.id.as_bytes(),
-                    generation: record.generation.as_bytes().into(),
-                    kind: record.kind.into(),
-                    executable: record.attributes.executable,
-                    file_version: record.file_version.map(|value| *value.as_bytes()),
-                })
-                .collect(),
-            directories: snapshot
-                .directories
-                .values()
-                .map(|record| DirectoryWire {
-                    node: *record.node.as_bytes(),
-                    generation: record.generation.as_bytes().into(),
-                    entries: record
-                        .entries
-                        .iter()
-                        .map(|(name, entry)| {
-                            (
-                                name.clone(),
-                                DirectoryEntryWire {
-                                    node: *entry.node.as_bytes(),
-                                    kind: entry.kind.into(),
-                                },
-                            )
-                        })
-                        .collect(),
-                })
-                .collect(),
-            file_versions: snapshot
-                .file_versions
-                .values()
-                .map(|record| FileVersionWire {
-                    id: *record.id.as_bytes(),
-                    logical_size: record.logical_size,
-                    logical_digest: record.logical_digest,
-                    descriptor: record.descriptor().into(),
-                })
-                .collect(),
+            cursor: snapshot.cursor,
+            root: snapshot.root,
+            nodes: snapshot.nodes.values().cloned().collect(),
+            directories: snapshot.directories.values().cloned().collect(),
+            file_versions: snapshot.file_versions.values().cloned().collect(),
         }
     }
 }
 
-impl SnapshotWire {
+impl StoredSnapshot {
     fn into_snapshot(self, volume_id: VolumeId) -> Result<VolumeSnapshot> {
         let node_count = self.nodes.len();
         let nodes = self
             .nodes
             .into_iter()
-            .map(|record| {
-                let id = NodeId::from_bytes(record.id);
-                (
-                    id,
-                    NodeRecord {
-                        id,
-                        generation: Generation::from_bytes(record.generation),
-                        kind: record.kind.into(),
-                        attributes: NodeAttributes {
-                            executable: record.executable,
-                        },
-                        file_version: record.file_version.map(FileVersionId::from_bytes),
-                    },
-                )
-            })
+            .map(|record| (record.id, record))
             .collect::<BTreeMap<_, _>>();
         let directory_count = self.directories.len();
         let directories = self
             .directories
             .into_iter()
-            .map(|record| {
-                let node = NodeId::from_bytes(record.node);
-                (
-                    node,
-                    DirectoryRecord {
-                        node,
-                        generation: Generation::from_bytes(record.generation),
-                        entries: record
-                            .entries
-                            .into_iter()
-                            .map(|(name, entry)| {
-                                (
-                                    name,
-                                    DirectoryEntry {
-                                        node: NodeId::from_bytes(entry.node),
-                                        kind: entry.kind.into(),
-                                    },
-                                )
-                            })
-                            .collect(),
-                    },
-                )
-            })
+            .map(|record| (record.node, record))
             .collect::<BTreeMap<_, _>>();
         let version_count = self.file_versions.len();
         let file_versions = self
             .file_versions
             .into_iter()
-            .map(|record| {
-                let id = FileVersionId::from_bytes(record.id);
-                (
-                    id,
-                    FileVersion::from_parts(
-                        id,
-                        record.logical_size,
-                        record.logical_digest,
-                        record.descriptor,
-                    ),
-                )
-            })
+            .map(|record| (record.id, record))
             .collect::<BTreeMap<_, _>>();
         if nodes.len() != node_count
             || directories.len() != directory_count
@@ -572,32 +282,14 @@ impl SnapshotWire {
         }
         let snapshot = VolumeSnapshot {
             volume_id,
-            cursor: self.cursor.try_into()?,
-            root: NodeId::from_bytes(self.root),
+            cursor: self.cursor,
+            root: self.root,
             nodes,
             directories,
             file_versions,
         };
         validate_snapshot(&snapshot).context("replica authority snapshot is invalid")?;
         Ok(snapshot)
-    }
-}
-
-impl From<NodeKind> for NodeKindWire {
-    fn from(kind: NodeKind) -> Self {
-        match kind {
-            NodeKind::Directory => Self::Directory,
-            NodeKind::RegularFile => Self::RegularFile,
-        }
-    }
-}
-
-impl From<NodeKindWire> for NodeKind {
-    fn from(kind: NodeKindWire) -> Self {
-        match kind {
-            NodeKindWire::Directory => Self::Directory,
-            NodeKindWire::RegularFile => Self::RegularFile,
-        }
     }
 }
 

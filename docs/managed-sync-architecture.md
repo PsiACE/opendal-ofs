@@ -191,18 +191,15 @@ submitted together through OpenDAL's range fetch interface.
 
 ### Transactional Metadata
 
-D1 stores the same filesystem facts in native tables. Publication uses one
-database transaction with revision and generation predicates. Snapshot reads,
-operation resolution, and garbage-collection fencing remain native database
-operations.
+D1 supplies the mutable namespace commit point as one revision-CAS HEAD row.
+The HEAD bytes, immutable manifests, and immutable SSTables are interpreted by
+the same namespace state machine as Object Metadata. Immutable objects stay in
+the volume's OpenDAL operator, so choosing D1 does not create another
+filesystem model or checkpoint format.
 
-D1 does not emulate Object HEAD, manifests, object keys, or SSTable requests.
-Object Metadata does not emulate database transactions. The two authorities
-share records and validation, not storage mechanics.
-
-D1 requests have an explicit operation timeout. Schema creation remains
-idempotent and is submitted in the same transactional batch as the operation
-that first needs each table, so a new store has no separate migration race.
+D1 requests have an explicit operation timeout. Schema creation is idempotent
+and is submitted with the operation that first needs the HEAD table, so a new
+store has no separate migration race.
 
 ## OpenDAL boundary
 
@@ -289,13 +286,10 @@ A Managed extension adds authority semantics without adding another filesystem
 model. A branch binding wraps a backend-native authority behind one
 `BoundNamespace<S>` state machine before Sync calls the same `Volume` contract.
 Observe, publication validation, receipt resolution, tail rotation, and
-unknown-commit recovery are shared. Object implements conditional object
-replacement; D1 implements its native transactional predicate. Branch
-checkpoints use the same checksummed Managed SSTable builder and decoder as
-Object namespace checkpoints. Object stores the table bytes directly, while
-D1 stores those immutable bytes under its native transactional authority.
-Branch snapshots and publications use the shared node, directory,
-precondition, and Managed file-version records.
+unknown-commit recovery are shared. Object and D1 implement the same small
+revision-CAS record operations. Branch checkpoints use the checksummed Managed
+SSTable builder and decoder, and branch snapshots and publications use the
+shared node, directory, precondition, and Managed file-version records.
 
 The branch feature controls commands and extension code only. It does not
 change `managed/1` base-volume readability or create an alternate data plane.

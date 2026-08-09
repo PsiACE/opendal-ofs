@@ -111,7 +111,8 @@ impl fmt::Display for InvalidBranchName {
 impl Error for InvalidBranchName {}
 
 /// Stable binding to one branch incarnation.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct BranchBinding {
     pub name: BranchName,
     pub id: BranchId,

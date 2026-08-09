@@ -25,11 +25,14 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::records::{
-    FORMAT_MAJOR, StoredCheckpoint, StoredCommittedResult, StoredDirectory, StoredDirectoryEntry,
-    StoredFileVersion, StoredNode, StoredSnapshot,
+use super::records::{FORMAT_MAJOR, StoredCheckpoint, StoredCommittedResult};
+use crate::filesystem::{
+    ChangeCursor, DirectoryEntry, FileVersionId, Generation, NodeId, VolumeId,
 };
 use crate::managed::format::{Extent, ExtentMap, sstable};
+use crate::managed::metadata::namespace::{
+    DirectoryRecord, FileVersionRecord, NamespaceSnapshot, NodeRecord,
+};
 use crate::managed::{ManagedError, ManagedErrorKind};
 
 /// Keeps D1 values comfortably below its row/request limits while producing
@@ -41,9 +44,9 @@ const TARGET_PART_BYTES: usize = 512 * 1024;
 #[serde(deny_unknown_fields)]
 pub(crate) struct CheckpointRoot {
     pub(crate) major: u16,
-    pub(crate) volume_id: [u8; 16],
-    pub(crate) cursor: super::records::StoredCursor,
-    pub(crate) root: [u8; 16],
+    pub(crate) volume_id: VolumeId,
+    pub(crate) cursor: ChangeCursor,
+    pub(crate) root: NodeId,
     pub(crate) parts: Vec<sstable::TableRef>,
 }
 
@@ -56,24 +59,24 @@ pub(crate) struct CheckpointPart {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub(crate) enum CheckpointRecord {
-    Node(StoredNode),
+    Node(NodeRecord),
     Directory {
-        node: [u8; 16],
-        generation: u64,
+        node: NodeId,
+        generation: Generation,
     },
     DirectoryEntry {
-        directory: [u8; 16],
+        directory: NodeId,
         name: String,
-        entry: StoredDirectoryEntry,
+        entry: DirectoryEntry,
     },
     FileVersion {
-        id: [u8; 32],
+        id: FileVersionId,
         logical_size: u64,
         logical_digest: [u8; 32],
         extents: u64,
     },
     FileExtent {
-        file_version: [u8; 32],
+        file_version: FileVersionId,
         ordinal: u64,
         extent: Extent,
     },
@@ -82,9 +85,9 @@ pub(crate) enum CheckpointRecord {
 
 pub(crate) struct PendingCheckpoint {
     major: u16,
-    volume_id: [u8; 16],
-    cursor: super::records::StoredCursor,
-    root: [u8; 16],
+    volume_id: VolumeId,
+    cursor: ChangeCursor,
+    root: NodeId,
     pub(crate) parts: Vec<CheckpointPart>,
 }
 
@@ -95,14 +98,14 @@ impl PendingCheckpoint {
             checkpoint
                 .snapshot
                 .nodes
-                .iter()
+                .values()
                 .cloned()
                 .map(CheckpointRecord::Node),
         );
-        for directory in &checkpoint.snapshot.directories {
+        for directory in checkpoint.snapshot.directories.values() {
             records.push(CheckpointRecord::Directory {
                 node: directory.node,
-                generation: directory.generation,
+                generation: directory.generation.clone(),
             });
             records.extend(directory.entries.iter().map(|(name, entry)| {
                 CheckpointRecord::DirectoryEntry {
@@ -112,7 +115,7 @@ impl PendingCheckpoint {
                 }
             }));
         }
-        for version in &checkpoint.snapshot.file_versions {
+        for version in checkpoint.snapshot.file_versions.values() {
             records.push(CheckpointRecord::FileVersion {
                 id: version.id,
                 logical_size: version.logical_size,
@@ -168,7 +171,7 @@ impl PendingCheckpoint {
                 .key
                 .clone();
             let tables = sstable::build_set(
-                checkpoint.volume_id,
+                *checkpoint.snapshot.volume_id.as_bytes(),
                 vec![sstable::RecordGroup {
                     partition_key,
                     records,
@@ -186,7 +189,7 @@ impl PendingCheckpoint {
         }
         Ok(Self {
             major: checkpoint.major,
-            volume_id: checkpoint.volume_id,
+            volume_id: checkpoint.snapshot.volume_id,
             cursor: checkpoint.snapshot.cursor,
             root: checkpoint.snapshot.root,
             parts,
@@ -214,8 +217,8 @@ impl CheckpointRoot {
         }
 
         let mut nodes = Vec::new();
-        let mut directories = BTreeMap::<[u8; 16], StoredDirectory>::new();
-        let mut file_versions = BTreeMap::<[u8; 32], PendingFileVersion>::new();
+        let mut directories = BTreeMap::<NodeId, DirectoryRecord>::new();
+        let mut file_versions = BTreeMap::<FileVersionId, PendingFileVersion>::new();
         let mut results = Vec::new();
         for (reference, part) in self.parts.iter().zip(parts) {
             if reference != &part.reference {
@@ -224,7 +227,7 @@ impl CheckpointRoot {
             for record in sstable::decode(
                 reference,
                 &part.bytes,
-                self.volume_id,
+                *self.volume_id.as_bytes(),
                 "read Managed branch",
             )? {
                 let record: CheckpointRecord = ciborium::from_reader(record.value.as_slice())
@@ -235,7 +238,7 @@ impl CheckpointRoot {
                         if directories
                             .insert(
                                 node,
-                                StoredDirectory {
+                                DirectoryRecord {
                                     node,
                                     generation,
                                     entries: BTreeMap::new(),
@@ -308,7 +311,7 @@ impl CheckpointRoot {
                 if version.expected_extents != version.extents.len() as u64 {
                     return Err(corrupt("branch checkpoint extent count is invalid"));
                 }
-                Ok(StoredFileVersion {
+                Ok(FileVersionRecord {
                     id,
                     logical_size: version.logical_size,
                     logical_digest: version.logical_digest,
@@ -320,13 +323,16 @@ impl CheckpointRoot {
             .collect::<Result<Vec<_>, ManagedError>>()?;
         Ok(StoredCheckpoint {
             major: self.major,
-            volume_id: self.volume_id,
-            snapshot: StoredSnapshot {
+            snapshot: NamespaceSnapshot {
+                volume_id: self.volume_id,
                 cursor: self.cursor,
                 root: self.root,
-                nodes,
-                directories: directories.into_values().collect(),
-                file_versions,
+                nodes: nodes.into_iter().map(|node| (node.id, node)).collect(),
+                directories,
+                file_versions: file_versions
+                    .into_iter()
+                    .map(|version| (version.id, version))
+                    .collect(),
             },
             results,
         })
@@ -360,12 +366,9 @@ mod tests {
     fn rejects_a_missing_part() {
         let root = CheckpointRoot {
             major: FORMAT_MAJOR,
-            volume_id: [1; 16],
-            cursor: super::super::records::StoredCursor {
-                sequence: 0,
-                operation: None,
-            },
-            root: [2; 16],
+            volume_id: VolumeId::from_bytes([1; 16]),
+            cursor: ChangeCursor::Genesis,
+            root: NodeId::from_bytes([2; 16]),
             parts: vec![sstable::TableRef {
                 id: [3; 32],
                 encoded_bytes: 1,

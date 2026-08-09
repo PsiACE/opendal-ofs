@@ -23,6 +23,7 @@ use std::fmt;
 use std::num::NonZeroUsize;
 
 use opendal::Operator;
+use serde::{Deserialize, Serialize};
 
 use super::AuthorityIdentity;
 use super::{
@@ -33,7 +34,8 @@ use super::{
 /// An immutable file version whose durable descriptor is owned by its volume.
 ///
 /// Access models may persist and return `descriptor`, but must not interpret it.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct FileVersion {
     pub id: FileVersionId,
     pub logical_size: u64,
@@ -61,7 +63,8 @@ impl FileVersion {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeRecord {
     pub id: NodeId,
     pub generation: Generation,
@@ -70,7 +73,8 @@ pub struct NodeRecord {
     pub file_version: Option<FileVersionId>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DirectoryRecord {
     pub node: NodeId,
     pub generation: Generation,
@@ -82,7 +86,8 @@ pub struct DirectoryRecord {
 /// `F` is the volume-owned file-version representation. Access frontends use
 /// the default opaque [`FileVersion`], while a volume implementation may use
 /// its decoded representation internally without copying the namespace model.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct VolumeSnapshot<F = FileVersion> {
     pub volume_id: VolumeId,
     pub cursor: ChangeCursor,
@@ -214,13 +219,15 @@ fn invalid_snapshot(message: &'static str) -> VolumeError {
     VolumeError::new(VolumeErrorKind::Invalid, message)
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodePrecondition {
     pub node: NodeId,
     pub expected_generation: Option<Generation>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DirectoryPrecondition {
     pub directory: NodeId,
     pub expected_generation: Option<Generation>,

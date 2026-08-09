@@ -23,8 +23,8 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sha2::{Digest as _, Sha256};
 
-use super::ObjectBoundNamespace;
 use super::checkpoint::{CheckpointPart, CheckpointRoot, PendingCheckpoint};
+use super::namespace::BoundNamespace;
 use super::namespace::BranchNamespaceStore;
 use super::records::{
     BranchInfo, BranchLifecycle, ForkPoint, StoredBranchHead, StoredBranchRegistry,
@@ -48,10 +48,109 @@ const MAX_HEAD_BYTES: usize = 256 * 1024;
 const MAX_CHECKPOINT_ROOT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_HISTORY_BYTES: usize = 512 * 1024;
 
+#[allow(async_fn_in_trait)]
+pub(crate) trait BranchBackend: Clone + Send + Sync {
+    type Revision: Clone + std::fmt::Debug + Eq + Send + Sync;
+
+    async fn read(
+        &self,
+        key: &str,
+        action: &'static str,
+    ) -> Result<Option<(Vec<u8>, Self::Revision)>, ManagedError>;
+    async fn read_bytes(
+        &self,
+        key: &str,
+        action: &'static str,
+    ) -> Result<Option<Vec<u8>>, ManagedError>;
+    async fn create(
+        &self,
+        key: &str,
+        bytes: Vec<u8>,
+        action: &'static str,
+    ) -> Result<bool, ManagedError>;
+    async fn replace(
+        &self,
+        key: &str,
+        revision: &Self::Revision,
+        bytes: Vec<u8>,
+        action: &'static str,
+    ) -> Result<bool, ManagedError>;
+    async fn list(&self, prefix: &str, action: &'static str) -> Result<Vec<String>, ManagedError>;
+    async fn delete(&self, keys: Vec<String>, action: &'static str) -> Result<(), ManagedError>;
+}
+
 #[derive(Clone)]
-pub struct ObjectBranchStore {
-    volume_id: VolumeId,
+pub struct BranchStore<B> {
+    pub(crate) volume_id: VolumeId,
+    pub(crate) backend: B,
+}
+
+#[derive(Clone)]
+pub struct ObjectBranchBackend {
     operator: Operator,
+}
+
+pub type ObjectBranchStore = BranchStore<ObjectBranchBackend>;
+
+impl BranchBackend for ObjectBranchBackend {
+    type Revision = String;
+
+    async fn read(
+        &self,
+        key: &str,
+        action: &'static str,
+    ) -> Result<Option<(Vec<u8>, Self::Revision)>, ManagedError> {
+        object::read_with_revision(&self.operator, key, action).await
+    }
+
+    async fn read_bytes(
+        &self,
+        key: &str,
+        action: &'static str,
+    ) -> Result<Option<Vec<u8>>, ManagedError> {
+        object::read(&self.operator, key, action).await
+    }
+
+    async fn create(
+        &self,
+        key: &str,
+        bytes: Vec<u8>,
+        action: &'static str,
+    ) -> Result<bool, ManagedError> {
+        object::create(&self.operator, key, bytes, action).await
+    }
+
+    async fn replace(
+        &self,
+        key: &str,
+        revision: &Self::Revision,
+        bytes: Vec<u8>,
+        action: &'static str,
+    ) -> Result<bool, ManagedError> {
+        object::replace(&self.operator, key, revision, bytes, action).await
+    }
+
+    async fn list(&self, prefix: &str, action: &'static str) -> Result<Vec<String>, ManagedError> {
+        self.operator
+            .list_with(prefix)
+            .recursive(true)
+            .await
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .filter(|entry| entry.metadata().is_file())
+                    .map(|entry| entry.path().to_owned())
+                    .collect()
+            })
+            .map_err(|_| unavailable(action))
+    }
+
+    async fn delete(&self, keys: Vec<String>, action: &'static str) -> Result<(), ManagedError> {
+        self.operator
+            .delete_iter(keys.iter().map(String::as_str))
+            .await
+            .map_err(|_| unavailable(action))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -78,8 +177,8 @@ struct ObjectGcRoots {
     histories: BTreeSet<String>,
 }
 
-impl BranchNamespaceStore for ObjectBranchStore {
-    type Revision = String;
+impl<B: BranchBackend> BranchNamespaceStore for BranchStore<B> {
+    type Revision = B::Revision;
 
     fn volume_id(&self) -> VolumeId {
         self.volume_id
@@ -115,22 +214,22 @@ impl BranchNamespaceStore for ObjectBranchStore {
     }
 
     async fn read_checkpoint(&self, id: [u8; 32]) -> Result<StoredCheckpoint, ManagedError> {
-        ObjectBranchStore::read_checkpoint(self, id).await
+        BranchStore::read_checkpoint(self, id).await
     }
 
     async fn write_checkpoint(
         &self,
         checkpoint: &StoredCheckpoint,
     ) -> Result<[u8; 32], ManagedError> {
-        ObjectBranchStore::write_checkpoint(self, checkpoint).await
+        BranchStore::write_checkpoint(self, checkpoint).await
     }
 
     async fn write_history(&self, history: &StoredHistory) -> Result<[u8; 32], ManagedError> {
-        ObjectBranchStore::write_history(self, history).await
+        BranchStore::write_history(self, history).await
     }
 }
 
-impl ObjectBranchStore {
+impl BranchStore<ObjectBranchBackend> {
     pub fn new(volume_id: VolumeId, operator: Operator) -> Result<Self, ManagedError> {
         let capability = operator.info().full_capability();
         if !capability.read
@@ -145,10 +244,13 @@ impl ObjectBranchStore {
         }
         Ok(Self {
             volume_id,
-            operator,
+            backend: ObjectBranchBackend { operator },
         })
     }
+}
 
+#[allow(private_bounds)]
+impl<B: BranchBackend> BranchStore<B> {
     /// Idempotently create the first unborn branch. The head is prepared
     /// before the registry, making the registry the branch-existence authority.
     pub async fn initialize(&self, default_name: BranchName) -> Result<BranchInfo, ManagedError> {
@@ -202,7 +304,7 @@ impl ObjectBranchStore {
             .await?
             .ok_or_else(|| unavailable("initialize Managed branches"))?;
         let expected = registry.branch_id(&default_name);
-        if expected != Some(BranchId::from_bytes(registry.default_branch)) {
+        if expected != Some(registry.default_branch) {
             return Err(conflict(
                 "initialize Managed branches",
                 "the volume has another default branch",
@@ -213,10 +315,9 @@ impl ObjectBranchStore {
 
     pub async fn list(&self) -> Result<Vec<BranchInfo>, ManagedError> {
         let (registry, _) = self.registry().await?;
-        let default = BranchId::from_bytes(registry.default_branch);
+        let default = registry.default_branch;
         let mut branches = Vec::with_capacity(registry.branches.len());
-        for (name, bytes) in registry.branches {
-            let id = BranchId::from_bytes(bytes);
+        for (name, id) in registry.branches {
             let (head, _) = self.read_head(id).await?.ok_or_else(|| {
                 corrupt("list Managed branches", "registered branch HEAD is missing")
             })?;
@@ -244,15 +345,10 @@ impl ObjectBranchStore {
             .await?
             .ok_or_else(|| corrupt("show Managed branch", "registered branch HEAD is missing"))?;
         head.validate(self.volume_id, id)?;
-        info(
-            name.clone(),
-            id,
-            &head,
-            BranchId::from_bytes(registry.default_branch),
-        )
+        info(name.clone(), id, &head, registry.default_branch)
     }
 
-    pub async fn bind(&self, name: &BranchName) -> Result<ObjectBoundNamespace, ManagedError> {
+    pub async fn bind(&self, name: &BranchName) -> Result<BoundNamespace<Self>, ManagedError> {
         let branch = self.get(name).await?;
         if branch.lifecycle != BranchLifecycle::Active {
             return Err(conflict(
@@ -260,7 +356,7 @@ impl ObjectBranchStore {
                 "branch is sealed for deletion",
             ));
         }
-        Ok(ObjectBoundNamespace {
+        Ok(BoundNamespace {
             store: self.clone(),
             binding: branch.binding,
         })
@@ -277,7 +373,7 @@ impl ObjectBranchStore {
         let branch_id = registry
             .branch_id(name)
             .ok_or_else(|| not_found("delete Managed branch"))?;
-        if registry.default_branch == *branch_id.as_bytes() {
+        if registry.default_branch == branch_id {
             return Err(invalid(
                 "delete Managed branch",
                 "default branch cannot be deleted",
@@ -414,7 +510,7 @@ impl ObjectBranchStore {
         let mut fixed = registry.clone();
         'registry: loop {
             for (name, branch) in fixed.branches.clone() {
-                let branch_id = BranchId::from_bytes(branch);
+                let branch_id = branch;
                 loop {
                     let (mut head, revision) = self
                         .read_head(branch_id)
@@ -474,7 +570,7 @@ impl ObjectBranchStore {
                 return Ok(registry);
             }
             let bytes = encode(REGISTRY_MAGIC, &registry, MAX_REGISTRY_BYTES, action)?;
-            match object::replace(&self.operator, REGISTRY_KEY, &revision, bytes, action).await {
+            match self.replace(REGISTRY_KEY, &revision, bytes, action).await {
                 Ok(true) => return Ok(registry),
                 Ok(false) => continue,
                 Err(error) => return Err(error),
@@ -498,7 +594,7 @@ impl ObjectBranchStore {
             histories: BTreeSet::new(),
         };
         for branch in registry.branches.values() {
-            let branch_id = BranchId::from_bytes(*branch);
+            let branch_id = *branch;
             roots.heads.insert(head_key(branch_id));
             let (head, _) = self.read_head(branch_id).await?.ok_or_else(|| {
                 corrupt(
@@ -607,7 +703,7 @@ impl ObjectBranchStore {
         };
 
         for branch in branches.values() {
-            let branch_id = BranchId::from_bytes(*branch);
+            let branch_id = *branch;
             loop {
                 let Some((mut head, revision)) = self.read_head(branch_id).await? else {
                     break;
@@ -694,13 +790,6 @@ impl ObjectBranchStore {
         data_operator: Operator,
         fence: ObjectBranchGcFence,
     ) -> Result<SegmentGcMaintenance, ManagedError> {
-        let capability = self.operator.info().full_capability();
-        if !capability.list || !capability.delete {
-            return Err(invalid(
-                "garbage collect Managed branches",
-                "object branch garbage collection requires list and delete",
-            ));
-        }
         let roots = self.gc_roots(fence).await?;
         let data = ManagedData::new(data_operator)?;
         let maintenance = data
@@ -739,10 +828,9 @@ impl ObjectBranchStore {
             .collect::<Vec<_>>();
         self.ensure_gc_fence(fence, "sweep Managed branch GC metadata")
             .await?;
-        self.operator
-            .delete_iter(unreachable.iter().map(String::as_str))
-            .await
-            .map_err(|_| unavailable("sweep Managed branch GC metadata"))?;
+        self.backend
+            .delete(unreachable, "sweep Managed branch GC metadata")
+            .await?;
         self.ensure_gc_fence(fence, "sweep Managed branch GC metadata")
             .await
     }
@@ -753,18 +841,12 @@ impl ObjectBranchStore {
         identity_bytes: usize,
     ) -> Result<BTreeSet<String>, ManagedError> {
         let entries = self
-            .operator
-            .list_with(prefix)
-            .recursive(true)
-            .await
-            .map_err(|_| unavailable("scan Managed branch GC metadata"))?;
+            .backend
+            .list(prefix, "scan Managed branch GC metadata")
+            .await?;
         Ok(entries
             .into_iter()
-            .filter(|entry| entry.metadata().is_file())
-            .filter_map(|entry| {
-                canonical_metadata_key(entry.path(), prefix, identity_bytes)
-                    .then(|| entry.path().to_owned())
-            })
+            .filter(|key| canonical_metadata_key(key, prefix, identity_bytes))
             .collect())
     }
 
@@ -843,7 +925,7 @@ impl ObjectBranchStore {
         let target_head = StoredBranchHead {
             major: source_head.major,
             volume_id: source_head.volume_id,
-            branch_id: *target_id.as_bytes(),
+            branch_id: target_id,
             lifecycle: BranchLifecycle::Active,
             state,
             maintenance_epoch: 0,
@@ -865,9 +947,7 @@ impl ObjectBranchStore {
                 "target branch identity already exists",
             ));
         }
-        registry
-            .branches
-            .insert(target.clone(), *target_id.as_bytes());
+        registry.branches.insert(target.clone(), target_id);
         let bytes = encode(
             REGISTRY_MAGIC,
             &registry,
@@ -897,12 +977,7 @@ impl ObjectBranchStore {
                 };
             }
         }
-        info(
-            target,
-            target_id,
-            &target_head,
-            BranchId::from_bytes(registry.default_branch),
-        )
+        info(target, target_id, &target_head, registry.default_branch)
     }
 
     async fn find_history_state(
@@ -923,22 +998,22 @@ impl ObjectBranchStore {
     }
 
     async fn read_checkpoint_root(&self, id: [u8; 32]) -> Result<CheckpointRoot, ManagedError> {
-        let bytes = object::read_content_addressed(
-            &self.operator,
-            &checkpoint_key(id),
-            &id,
-            "read Managed branch",
-            "branch checkpoint is missing",
-            "branch checkpoint identity is invalid",
-        )
-        .await?;
+        let bytes = self
+            .read_content_addressed(
+                &checkpoint_key(id),
+                &id,
+                "read Managed branch",
+                "branch checkpoint is missing",
+                "branch checkpoint identity is invalid",
+            )
+            .await?;
         let root: CheckpointRoot = decode(
             CHECKPOINT_MAGIC,
             &bytes,
             MAX_CHECKPOINT_ROOT_BYTES,
             "read Managed branch",
         )?;
-        if root.volume_id != *self.volume_id.as_bytes() {
+        if root.volume_id != self.volume_id {
             return Err(corrupt(
                 "read Managed branch",
                 "branch checkpoint volume is invalid",
@@ -951,13 +1026,13 @@ impl ObjectBranchStore {
         let root = self.read_checkpoint_root(id).await?;
         let mut parts = Vec::with_capacity(root.parts.len());
         for reference in &root.parts {
-            let bytes = object::read(
-                &self.operator,
-                &checkpoint_part_key(reference.id),
-                "read Managed branch",
-            )
-            .await?
-            .ok_or_else(|| corrupt("read Managed branch", "branch checkpoint part is missing"))?;
+            let bytes = self
+                .backend
+                .read_bytes(&checkpoint_part_key(reference.id), "read Managed branch")
+                .await?
+                .ok_or_else(|| {
+                    corrupt("read Managed branch", "branch checkpoint part is missing")
+                })?;
             parts.push(CheckpointPart {
                 reference: reference.clone(),
                 bytes,
@@ -993,15 +1068,15 @@ impl ObjectBranchStore {
     }
 
     async fn read_history(&self, id: [u8; 32]) -> Result<StoredHistory, ManagedError> {
-        let bytes = object::read_content_addressed(
-            &self.operator,
-            &history_key(id),
-            &id,
-            "read Managed branch",
-            "branch history is missing",
-            "branch history identity is invalid",
-        )
-        .await?;
+        let bytes = self
+            .read_content_addressed(
+                &history_key(id),
+                &id,
+                "read Managed branch",
+                "branch history is missing",
+                "branch history identity is invalid",
+            )
+            .await?;
         let history: StoredHistory = decode(
             HISTORY_MAGIC,
             &bytes,
@@ -1031,27 +1106,48 @@ impl ObjectBranchStore {
         expected: &[u8],
         action: &'static str,
     ) -> Result<(), ManagedError> {
-        object::ensure_immutable(
-            &self.operator,
-            key,
-            expected,
-            action,
-            ManagedErrorKind::Corrupt,
-            "immutable branch object changed",
-        )
-        .await
+        if self.backend.create(key, expected.to_vec(), action).await? {
+            return Ok(());
+        }
+        match self.backend.read_bytes(key, action).await? {
+            Some(observed) if observed == expected => Ok(()),
+            Some(_) => Err(corrupt(action, "immutable branch object changed")),
+            None => Err(unavailable(action)),
+        }
     }
 
-    async fn registry(&self) -> Result<(StoredBranchRegistry, String), ManagedError> {
+    async fn read_content_addressed(
+        &self,
+        key: &str,
+        expected: &[u8; 32],
+        action: &'static str,
+        missing: &'static str,
+        invalid: &'static str,
+    ) -> Result<Vec<u8>, ManagedError> {
+        let bytes = self
+            .backend
+            .read_bytes(key, action)
+            .await?
+            .ok_or_else(|| corrupt(action, missing))?;
+        if Sha256::digest(&bytes).as_slice() != expected {
+            return Err(corrupt(action, invalid));
+        }
+        Ok(bytes)
+    }
+
+    async fn registry(&self) -> Result<(StoredBranchRegistry, B::Revision), ManagedError> {
         self.read_registry()
             .await?
             .ok_or_else(|| corrupt("read Managed branches", "branch registry is missing"))
     }
 
-    async fn read_registry(&self) -> Result<Option<(StoredBranchRegistry, String)>, ManagedError> {
-        let Some((bytes, revision)) =
-            object::read_with_revision(&self.operator, REGISTRY_KEY, "read Managed branches")
-                .await?
+    async fn read_registry(
+        &self,
+    ) -> Result<Option<(StoredBranchRegistry, B::Revision)>, ManagedError> {
+        let Some((bytes, revision)) = self
+            .backend
+            .read(REGISTRY_KEY, "read Managed branches")
+            .await?
         else {
             return Ok(None);
         };
@@ -1068,10 +1164,11 @@ impl ObjectBranchStore {
     async fn read_head(
         &self,
         branch_id: BranchId,
-    ) -> Result<Option<(StoredBranchHead, String)>, ManagedError> {
-        let Some((bytes, revision)) =
-            object::read_with_revision(&self.operator, &head_key(branch_id), "read Managed branch")
-                .await?
+    ) -> Result<Option<(StoredBranchHead, B::Revision)>, ManagedError> {
+        let Some((bytes, revision)) = self
+            .backend
+            .read(&head_key(branch_id), "read Managed branch")
+            .await?
         else {
             return Ok(None);
         };
@@ -1087,17 +1184,19 @@ impl ObjectBranchStore {
         bytes: Vec<u8>,
         action: &'static str,
     ) -> Result<bool, ManagedError> {
-        object::create(&self.operator, key, bytes, action).await
+        self.backend.create(key, bytes, action).await
     }
 
     async fn replace(
         &self,
         key: &str,
-        expected_revision: &str,
+        expected_revision: &B::Revision,
         bytes: Vec<u8>,
         action: &'static str,
     ) -> Result<bool, ManagedError> {
-        object::replace(&self.operator, key, expected_revision, bytes, action).await
+        self.backend
+            .replace(key, expected_revision, bytes, action)
+            .await
     }
 }
 
@@ -1110,7 +1209,7 @@ fn remove_sealed_incarnation(
     if registry.branch_id(name) != Some(branch_id) {
         return Ok(false);
     }
-    if registry.default_branch == *branch_id.as_bytes() {
+    if registry.default_branch == branch_id {
         return Err(corrupt(action, "default branch HEAD is sealed"));
     }
     Ok(registry.remove_if(name, branch_id))
@@ -1319,7 +1418,9 @@ mod tests {
         let operator = Operator::new(Memory::default()).unwrap().finish();
         let store = ObjectBranchStore {
             volume_id: snapshot.volume_id,
-            operator: operator.clone(),
+            backend: ObjectBranchBackend {
+                operator: operator.clone(),
+            },
         };
         let checkpoint = StoredCheckpoint::new(&snapshot, BTreeMap::new()).unwrap();
         let id = store.write_checkpoint(&checkpoint).await.unwrap();
@@ -1385,9 +1486,10 @@ mod tests {
             let mut id = [0; 16];
             id[..8].copy_from_slice(&index.to_be_bytes());
             id[8..].copy_from_slice(&index.to_be_bytes());
-            registry
-                .branches
-                .insert(BranchName::parse(format!("branch-{index:08}")).unwrap(), id);
+            registry.branches.insert(
+                BranchName::parse(format!("branch-{index:08}")).unwrap(),
+                BranchId::from_bytes(id),
+            );
         }
 
         let bytes = encode(
@@ -1430,13 +1532,11 @@ mod tests {
         let name = BranchName::parse("work").unwrap();
         let mut registry = StoredBranchRegistry::initial(volume, main.clone(), default);
 
-        registry.branches.insert(name.clone(), *old.as_bytes());
+        registry.branches.insert(name.clone(), old);
         assert!(remove_sealed_incarnation(&mut registry, &name, old, "test branch GC").unwrap());
         assert_eq!(registry.branch_id(&name), None);
 
-        registry
-            .branches
-            .insert(name.clone(), *replacement.as_bytes());
+        registry.branches.insert(name.clone(), replacement);
         assert!(!remove_sealed_incarnation(&mut registry, &name, old, "test branch GC").unwrap());
         assert_eq!(registry.branch_id(&name), Some(replacement));
 

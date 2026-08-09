@@ -16,22 +16,26 @@
 // under the License.
 
 use super::NodeId;
+use serde::{Deserialize, Serialize};
 
 /// Kind of node visible through a filesystem namespace.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum NodeKind {
     Directory,
     RegularFile,
 }
 
 /// Portable attributes shared by namespace implementations and access models.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeAttributes {
     pub executable: bool,
 }
 
 /// One named edge from a directory to a filesystem node.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DirectoryEntry {
     pub node: NodeId,
     pub kind: NodeKind,

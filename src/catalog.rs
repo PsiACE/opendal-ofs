@@ -28,7 +28,7 @@ use url::Url;
 
 use crate::filesystem::{VolumeId, VolumeModel};
 
-const SCHEMA_MAJOR: u16 = 4;
+const SCHEMA_MAJOR: u16 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VolumeDefinition {
