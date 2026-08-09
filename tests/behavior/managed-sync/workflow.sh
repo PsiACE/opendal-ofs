@@ -184,6 +184,16 @@ cmp "$replica_a/nested/level/entry.txt" "$replica_b/nested/level/entry.txt" || \
 cmp "$replica_a/large.bin" "$replica_b/large.bin" || fail 'large file did not round trip'
 if [[ "$(uname -s)" != MINGW* && "$(uname -s)" != MSYS* ]]; then
   [[ -x "$replica_b/tools/run.sh" ]] || fail 'executable bit did not round trip'
+
+  printf '%s\n' 'regression: apply remote executable changes without retransferring file content'
+  chmod u-x "$replica_a/tools/run.sh"
+  OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a"
+  OFS_CONFIG="$peer_config" "$OFS_BIN" sync "$peer_alias" "$replica_b" --state "$state_b"
+  [[ ! -x "$replica_b/tools/run.sh" ]] || fail 'remote executable removal was not applied'
+  chmod u+x "$replica_a/tools/run.sh"
+  OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a"
+  OFS_CONFIG="$peer_config" "$OFS_BIN" sync "$peer_alias" "$replica_b" --state "$state_b"
+  [[ -x "$replica_b/tools/run.sh" ]] || fail 'remote executable restoration was not applied'
 fi
 
 printf '%s\n' 'acceptance: merge disjoint directory changes from two replicas'

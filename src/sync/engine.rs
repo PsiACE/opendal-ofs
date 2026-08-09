@@ -159,13 +159,13 @@ impl<V: Volume> SyncEngine<V> {
             }
             None => {
                 let local = LocalTree::scan(replica_path).await?;
-                if resolve_paths.is_empty() && state.conflicts.is_empty() {
-                    if let Some(snapshot) = remote
-                        && snapshot.cursor == state.common
-                        && local_matches_state(&local, &state)?
-                    {
-                        return Ok(result(&state, false));
-                    }
+                if resolve_paths.is_empty()
+                    && state.conflicts.is_empty()
+                    && let Some(snapshot) = remote
+                    && snapshot.cursor == state.common
+                    && local_matches_state(&local, &state)?
+                {
+                    return Ok(result(&state, false));
                 }
                 let staging_path = fresh_sibling(state_path, "publish");
                 let known_digests = known_local_digests(&local, &state)?;
@@ -218,28 +218,29 @@ impl<V: Volume> SyncEngine<V> {
                     ReconcileAction::PublishRename => publish = true,
                     ReconcileAction::InstallRemote {
                         path,
-                        node,
                         version,
                         digest,
-                        ..
+                        executable,
                     } => {
                         let file = remote
                             .file_versions
                             .get(&version)
                             .context("reconciliation references a missing remote file version")?
                             .clone();
-                        let executable = remote
-                            .nodes
-                            .get(&node)
-                            .context("reconciliation references a missing remote node")?
-                            .attributes
-                            .executable;
                         installs.push((path, file, digest, executable));
                     }
                     ReconcileAction::DeleteLocal { path } => {
                         target.delete(&path).await?;
                         staged.remove_logical_path(&path);
                         known_digests.remove(&path);
+                        install_remote = true;
+                    }
+                    ReconcileAction::ApplyRemoteAttributes {
+                        path,
+                        digest,
+                        executable,
+                    } => {
+                        staged.apply_remote_attributes(&path, digest, executable)?;
                         install_remote = true;
                     }
                     ReconcileAction::Conflict(conflict) if requested.contains(&conflict.path) => {
@@ -497,6 +498,7 @@ async fn committed_tree_is_safe(
                     ReconcileAction::KeepLocal
                         | ReconcileAction::InstallRemote { .. }
                         | ReconcileAction::DeleteLocal { .. }
+                        | ReconcileAction::ApplyRemoteAttributes { .. }
                 )
             });
             let directories_are_safe = directory_changes(state, &local, committed)
@@ -766,7 +768,6 @@ fn known_local_digests(
                 && base.local_identity == entry.native_identity
                 && base.local_size == Some(entry.size)
                 && base.local_modified.as_deref() == Some(entry.modified.as_str())
-                && base.local_executable == Some(entry.executable)
             {
                 let node = paths.get(path)?;
                 let version = authority.nodes[node].file_version?;

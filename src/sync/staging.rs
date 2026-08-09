@@ -346,6 +346,29 @@ impl StagedTree {
         Ok(())
     }
 
+    pub(crate) fn apply_remote_attributes(
+        &mut self,
+        path: &str,
+        digest: [u8; 32],
+        executable: bool,
+    ) -> Result<()> {
+        let file = self
+            .files
+            .get(path)
+            .with_context(|| format!("remote attributes reference a missing file {path:?}"))?;
+        if file.digest != digest {
+            bail!("remote attributes disagree with staged file {path:?}");
+        }
+        let kind = self
+            .logical
+            .set_executable(path, executable)
+            .with_context(|| format!("remote attributes reference a missing path {path:?}"))?;
+        if kind != LocalKind::File {
+            bail!("remote attributes reference a directory {path:?}");
+        }
+        Ok(())
+    }
+
     pub(crate) fn remove_logical_path(&mut self, path: &str) {
         self.logical.remove(path);
         self.files.remove(path);

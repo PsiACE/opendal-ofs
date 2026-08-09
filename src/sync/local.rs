@@ -140,6 +140,13 @@ impl LocalTree {
     pub(crate) fn remove(&mut self, path: &str) {
         self.entries.remove(path);
     }
+
+    pub(crate) fn set_executable(&mut self, path: &str, executable: bool) -> Option<LocalKind> {
+        self.entries.get_mut(path).map(|entry| {
+            entry.executable = executable;
+            entry.kind
+        })
+    }
 }
 
 pub(crate) async fn entry_at(root: &Path, path: &str) -> Result<LocalEntry> {

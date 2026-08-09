@@ -25,12 +25,17 @@ pub(crate) enum ReconcileAction {
     KeepLocal,
     InstallRemote {
         path: String,
-        node: NodeId,
         version: FileVersionId,
         digest: [u8; 32],
+        executable: bool,
     },
     DeleteLocal {
         path: String,
+    },
+    ApplyRemoteAttributes {
+        path: String,
+        digest: [u8; 32],
+        executable: bool,
     },
     PublishLocal,
     PublishRename,
@@ -47,6 +52,7 @@ struct RemoteFile {
     generation: Generation,
     version: FileVersionId,
     digest: [u8; 32],
+    executable: bool,
 }
 
 #[derive(Clone)]
@@ -96,7 +102,7 @@ pub(crate) fn reconcile(
     let mut handled = BTreeSet::new();
     reconcile_remote_renames(
         &base_paths,
-        &local_digests,
+        local,
         &remote_files,
         &mut handled,
         &mut actions,
@@ -121,6 +127,12 @@ pub(crate) fn reconcile(
         let local_digest = local_digests.get(&path).copied();
         let remote_path = remote_paths.get(&path);
         let remote_digest = remote_path.and_then(RemotePath::digest);
+        let local_executable =
+            local.logical().entries().get(&path).and_then(|entry| {
+                (entry.kind == super::LocalKind::File).then_some(entry.executable)
+            });
+        let base_executable = base.and_then(RemotePath::executable);
+        let remote_executable = remote_path.and_then(RemotePath::executable);
 
         if matches!(base, Some(RemotePath::Directory(_)))
             || matches!(remote_path, Some(RemotePath::Directory(_)))
@@ -135,16 +147,38 @@ pub(crate) fn reconcile(
         }
 
         let base_digest = base.and_then(RemotePath::digest);
-        let local_changed = local_digest != base_digest;
+        let local_changed = local_digest != base_digest || local_executable != base_executable;
         let remote_changed = remote_digest != base_digest
+            || remote_executable != base_executable
             || match (base, remote_path) {
                 (Some(base), Some(RemotePath::File(file))) => base.node() != file.node,
                 (None, Some(_)) | (Some(_), None) => true,
                 _ => false,
             };
 
-        let action = if local_digest.is_some() && local_digest == remote_digest {
-            Some(ReconcileAction::KeepLocal)
+        let action = if let Some(digest) = local_digest
+            && Some(digest) == remote_digest
+        {
+            match (base_executable, local_executable, remote_executable) {
+                (_, Some(local), Some(remote)) if local == remote => {
+                    Some(ReconcileAction::KeepLocal)
+                }
+                (Some(base), Some(local), Some(remote)) if local == base => {
+                    Some(ReconcileAction::ApplyRemoteAttributes {
+                        path,
+                        digest,
+                        executable: remote,
+                    })
+                }
+                (Some(base), Some(_), Some(remote)) if remote == base => {
+                    Some(ReconcileAction::PublishLocal)
+                }
+                _ => Some(ReconcileAction::Conflict(ConflictRecord {
+                    path,
+                    local_digest,
+                    remote_digest,
+                })),
+            }
         } else {
             match (local_changed, remote_changed) {
                 (false, false) if local_digest.is_some() => Some(ReconcileAction::KeepLocal),
@@ -176,9 +210,9 @@ fn remote_action(path: String, remote: Option<&RemotePath>) -> ReconcileAction {
     match remote {
         Some(RemotePath::File(file)) => ReconcileAction::InstallRemote {
             path,
-            node: file.node,
             version: file.version,
             digest: file.digest,
+            executable: file.executable,
         },
         None => ReconcileAction::DeleteLocal { path },
         Some(RemotePath::Directory(_)) => ReconcileAction::Unsupported {
@@ -190,7 +224,7 @@ fn remote_action(path: String, remote: Option<&RemotePath>) -> ReconcileAction {
 
 fn reconcile_remote_renames(
     base: &BTreeMap<String, RemotePath>,
-    local: &BTreeMap<String, [u8; 32]>,
+    local: &StagedTree,
     remote: &BTreeMap<String, RemoteFile>,
     handled: &mut BTreeSet<String>,
     actions: &mut Vec<ReconcileAction>,
@@ -208,16 +242,27 @@ fn reconcile_remote_renames(
         }
         handled.insert(old_path.clone());
         handled.insert(new_path.clone());
-        let old_local = local.get(old_path).copied();
-        let new_local = local.get(new_path).copied();
+        let old_local = local_file(local, old_path);
+        let new_local = local_file(local, new_path);
         let renamed = remote[new_path].clone();
-        if old_local == Some(base_digest) && new_local.is_none() {
+        let base_executable = base
+            .executable()
+            .expect("a file digest has file attributes");
+        if old_local == Some((base_digest, base_executable)) && new_local.is_none() {
             actions.push(ReconcileAction::DeleteLocal {
                 path: old_path.clone(),
             });
             actions.push(install_remote(new_path.clone(), renamed));
-        } else if old_local.is_none() && new_local == Some(renamed.digest) {
-            actions.push(ReconcileAction::KeepLocal);
+        } else if old_local.is_none() && new_local.is_some_and(|file| file.0 == renamed.digest) {
+            if new_local.is_some_and(|file| file.1 == renamed.executable) {
+                actions.push(ReconcileAction::KeepLocal);
+            } else {
+                actions.push(ReconcileAction::ApplyRemoteAttributes {
+                    path: new_path.clone(),
+                    digest: renamed.digest,
+                    executable: renamed.executable,
+                });
+            }
         } else {
             actions.push(ReconcileAction::Unsupported {
                 path: old_path.clone(),
@@ -372,12 +417,15 @@ fn remote_matches_base(remote: &RemotePath, base: &RemotePath) -> bool {
 
 fn local_matches_remote(local: &StagedTree, path: &str, remote: &RemotePath) -> bool {
     match remote {
-        RemotePath::File(file) => local
-            .files()
-            .get(path)
-            .is_some_and(|local| local.digest == file.digest),
+        RemotePath::File(file) => local_file(local, path) == Some((file.digest, file.executable)),
         RemotePath::Directory(_) => !local.files().contains_key(path),
     }
+}
+
+fn local_file(local: &StagedTree, path: &str) -> Option<([u8; 32], bool)> {
+    let file = local.files().get(path)?;
+    let entry = local.logical().entries().get(path)?;
+    (entry.kind == super::LocalKind::File).then_some((file.digest, entry.executable))
 }
 
 fn reject_unidentified_moves(
@@ -457,9 +505,9 @@ fn unique_remote_nodes(remote: &BTreeMap<String, RemoteFile>) -> BTreeMap<NodeId
 fn install_remote(path: String, file: RemoteFile) -> ReconcileAction {
     ReconcileAction::InstallRemote {
         path,
-        node: file.node,
         version: file.version,
         digest: file.digest,
+        executable: file.executable,
     }
 }
 
@@ -490,6 +538,13 @@ impl RemotePath {
             Self::File(file) => Some(file.digest),
         }
     }
+
+    fn executable(&self) -> Option<bool> {
+        match self {
+            Self::Directory(_) => None,
+            Self::File(file) => Some(file.executable),
+        }
+    }
 }
 
 fn remote_paths(snapshot: &VolumeSnapshot) -> Result<BTreeMap<String, RemotePath>> {
@@ -515,6 +570,7 @@ fn remote_paths(snapshot: &VolumeSnapshot) -> Result<BTreeMap<String, RemotePath
                         generation: record.generation.clone(),
                         version: version_id,
                         digest: version.logical_digest,
+                        executable: record.attributes.executable,
                     }),
                 );
             }
