@@ -15,15 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Backend-neutral branch authority plus the Object Metadata constructor.
+
 use std::collections::BTreeSet;
 use std::io::Cursor;
 
+use futures::{StreamExt as _, TryStreamExt as _, stream};
 use opendal::Operator;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sha2::{Digest as _, Sha256};
 
-use super::checkpoint::{CheckpointPart, CheckpointRoot, PendingCheckpoint};
 use super::namespace::BoundNamespace;
 use super::namespace::BranchNamespaceStore;
 use super::records::{
@@ -31,53 +33,23 @@ use super::records::{
     StoredCheckpoint, StoredHistory, StoredNamespaceState, info, recover_retained,
 };
 use crate::filesystem::{BranchBinding, BranchId, BranchName, OperationId, VolumeId};
-use crate::managed::metadata::namespace::NamespaceSnapshot;
-use crate::managed::metadata::object;
+use crate::managed::metadata::namespace::{
+    CheckpointPart, CheckpointRoot, NamespaceSnapshot, PendingCheckpoint,
+};
+use crate::managed::metadata::record::{BranchRecordBackend, ObjectRecordBackend};
 use crate::managed::{ManagedData, ManagedError, ManagedErrorKind, SegmentGcMaintenance};
 
 const ROOT: &str = ".ofs/managed/metadata/v1/extensions/branch/v1";
 const REGISTRY_KEY: &str = ".ofs/managed/metadata/v1/extensions/branch/v1/registry.ofs";
 const REGISTRY_MAGIC: &[u8; 8] = b"OFS1BRG1";
 const HEAD_MAGIC: &[u8; 8] = b"OFS1BRH1";
-const CHECKPOINT_MAGIC: &[u8; 8] = b"OFS1BRC1";
 const HISTORY_MAGIC: &[u8; 8] = b"OFS1BRY1";
 // The registry remains the small mutable branch authority. Its actual backend
 // write is the limit; unlike checkpoint data, it has no format-level byte cap.
 const MAX_REGISTRY_BYTES: usize = usize::MAX;
 const MAX_HEAD_BYTES: usize = 256 * 1024;
-const MAX_CHECKPOINT_ROOT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_HISTORY_BYTES: usize = 512 * 1024;
-
-#[allow(async_fn_in_trait)]
-pub(crate) trait BranchBackend: Clone + Send + Sync {
-    type Revision: Clone + std::fmt::Debug + Eq + Send + Sync;
-
-    async fn read(
-        &self,
-        key: &str,
-        action: &'static str,
-    ) -> Result<Option<(Vec<u8>, Self::Revision)>, ManagedError>;
-    async fn read_bytes(
-        &self,
-        key: &str,
-        action: &'static str,
-    ) -> Result<Option<Vec<u8>>, ManagedError>;
-    async fn create(
-        &self,
-        key: &str,
-        bytes: Vec<u8>,
-        action: &'static str,
-    ) -> Result<bool, ManagedError>;
-    async fn replace(
-        &self,
-        key: &str,
-        revision: &Self::Revision,
-        bytes: Vec<u8>,
-        action: &'static str,
-    ) -> Result<bool, ManagedError>;
-    async fn list(&self, prefix: &str, action: &'static str) -> Result<Vec<String>, ManagedError>;
-    async fn delete(&self, keys: Vec<String>, action: &'static str) -> Result<(), ManagedError>;
-}
+const MAX_CHECKPOINT_IO: usize = 8;
 
 #[derive(Clone)]
 pub struct BranchStore<B> {
@@ -85,73 +57,7 @@ pub struct BranchStore<B> {
     pub(crate) backend: B,
 }
 
-#[derive(Clone)]
-pub struct ObjectBranchBackend {
-    operator: Operator,
-}
-
-pub type ObjectBranchStore = BranchStore<ObjectBranchBackend>;
-
-impl BranchBackend for ObjectBranchBackend {
-    type Revision = String;
-
-    async fn read(
-        &self,
-        key: &str,
-        action: &'static str,
-    ) -> Result<Option<(Vec<u8>, Self::Revision)>, ManagedError> {
-        object::read_with_revision(&self.operator, key, action).await
-    }
-
-    async fn read_bytes(
-        &self,
-        key: &str,
-        action: &'static str,
-    ) -> Result<Option<Vec<u8>>, ManagedError> {
-        object::read(&self.operator, key, action).await
-    }
-
-    async fn create(
-        &self,
-        key: &str,
-        bytes: Vec<u8>,
-        action: &'static str,
-    ) -> Result<bool, ManagedError> {
-        object::create(&self.operator, key, bytes, action).await
-    }
-
-    async fn replace(
-        &self,
-        key: &str,
-        revision: &Self::Revision,
-        bytes: Vec<u8>,
-        action: &'static str,
-    ) -> Result<bool, ManagedError> {
-        object::replace(&self.operator, key, revision, bytes, action).await
-    }
-
-    async fn list(&self, prefix: &str, action: &'static str) -> Result<Vec<String>, ManagedError> {
-        self.operator
-            .list_with(prefix)
-            .recursive(true)
-            .await
-            .map(|entries| {
-                entries
-                    .into_iter()
-                    .filter(|entry| entry.metadata().is_file())
-                    .map(|entry| entry.path().to_owned())
-                    .collect()
-            })
-            .map_err(|_| unavailable(action))
-    }
-
-    async fn delete(&self, keys: Vec<String>, action: &'static str) -> Result<(), ManagedError> {
-        self.operator
-            .delete_iter(keys.iter().map(String::as_str))
-            .await
-            .map_err(|_| unavailable(action))
-    }
-}
+pub type ObjectBranchStore = BranchStore<ObjectRecordBackend>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ObjectBranchGcFence {
@@ -177,7 +83,7 @@ struct ObjectGcRoots {
     histories: BTreeSet<String>,
 }
 
-impl<B: BranchBackend> BranchNamespaceStore for BranchStore<B> {
+impl<B: BranchRecordBackend> BranchNamespaceStore for BranchStore<B> {
     type Revision = B::Revision;
 
     fn volume_id(&self) -> VolumeId {
@@ -229,7 +135,7 @@ impl<B: BranchBackend> BranchNamespaceStore for BranchStore<B> {
     }
 }
 
-impl BranchStore<ObjectBranchBackend> {
+impl BranchStore<ObjectRecordBackend> {
     pub fn new(volume_id: VolumeId, operator: Operator) -> Result<Self, ManagedError> {
         let capability = operator.info().full_capability();
         if !capability.read
@@ -244,13 +150,13 @@ impl BranchStore<ObjectBranchBackend> {
         }
         Ok(Self {
             volume_id,
-            backend: ObjectBranchBackend { operator },
+            backend: ObjectRecordBackend::new(operator),
         })
     }
 }
 
 #[allow(private_bounds)]
-impl<B: BranchBackend> BranchStore<B> {
+impl<B: BranchRecordBackend> BranchStore<B> {
     /// Idempotently create the first unborn branch. The head is prepared
     /// before the registry, making the registry the branch-existence authority.
     pub async fn initialize(&self, default_name: BranchName) -> Result<BranchInfo, ManagedError> {
@@ -1007,12 +913,7 @@ impl<B: BranchBackend> BranchStore<B> {
                 "branch checkpoint identity is invalid",
             )
             .await?;
-        let root: CheckpointRoot = decode(
-            CHECKPOINT_MAGIC,
-            &bytes,
-            MAX_CHECKPOINT_ROOT_BYTES,
-            "read Managed branch",
-        )?;
+        let root = CheckpointRoot::decode(&bytes)?;
         if root.volume_id != self.volume_id {
             return Err(corrupt(
                 "read Managed branch",
@@ -1024,43 +925,42 @@ impl<B: BranchBackend> BranchStore<B> {
 
     async fn read_checkpoint(&self, id: [u8; 32]) -> Result<StoredCheckpoint, ManagedError> {
         let root = self.read_checkpoint_root(id).await?;
-        let mut parts = Vec::with_capacity(root.parts.len());
-        for reference in &root.parts {
-            let bytes = self
-                .backend
-                .read_bytes(&checkpoint_part_key(reference.id), "read Managed branch")
-                .await?
-                .ok_or_else(|| {
-                    corrupt("read Managed branch", "branch checkpoint part is missing")
-                })?;
-            parts.push(CheckpointPart {
-                reference: reference.clone(),
-                bytes,
-            });
-        }
-        root.recover(parts)
+        let parts = stream::iter(root.parts.iter().cloned())
+            .map(|reference| async move {
+                let bytes = self
+                    .backend
+                    .read_bytes(&checkpoint_part_key(reference.id), "read Managed branch")
+                    .await?
+                    .ok_or_else(|| {
+                        corrupt("read Managed branch", "branch checkpoint part is missing")
+                    })?;
+                Ok(CheckpointPart { reference, bytes })
+            })
+            .buffered(MAX_CHECKPOINT_IO)
+            .try_collect()
+            .await?;
+        let (snapshot, results) = root.recover(parts)?;
+        Ok(StoredCheckpoint { snapshot, results })
     }
 
     async fn write_checkpoint(
         &self,
         checkpoint: &StoredCheckpoint,
     ) -> Result<[u8; 32], ManagedError> {
-        let pending = PendingCheckpoint::from_checkpoint(checkpoint)?;
-        for part in &pending.parts {
-            self.ensure_immutable(
-                &checkpoint_part_key(part.reference.id),
-                &part.bytes,
-                "checkpoint Managed branch",
-            )
+        let pending = PendingCheckpoint::new(&checkpoint.snapshot, &checkpoint.results)?;
+        stream::iter(&pending.parts)
+            .map(Ok::<_, ManagedError>)
+            .try_for_each_concurrent(MAX_CHECKPOINT_IO, |part| async move {
+                self.ensure_immutable(
+                    &checkpoint_part_key(part.reference.id),
+                    &part.bytes,
+                    "checkpoint Managed branch",
+                )
+                .await
+            })
             .await?;
-        }
         let root = pending.finish();
-        let bytes = encode(
-            CHECKPOINT_MAGIC,
-            &root,
-            MAX_CHECKPOINT_ROOT_BYTES,
-            "checkpoint Managed branch",
-        )?;
+        let bytes = root.encode()?;
         let id: [u8; 32] = Sha256::digest(&bytes).into();
         self.ensure_immutable(&checkpoint_key(id), &bytes, "checkpoint Managed branch")
             .await?;
@@ -1224,7 +1124,7 @@ fn checkpoint_key(id: [u8; 32]) -> String {
 }
 
 fn checkpoint_part_key(id: [u8; 32]) -> String {
-    format!("{ROOT}/checkpoint-parts/sha256/{}.sst", hex(&id))
+    format!("{ROOT}/checkpoint-parts/sha256/{}.ofs", hex(&id))
 }
 
 fn history_key(id: [u8; 32]) -> String {
@@ -1418,9 +1318,7 @@ mod tests {
         let operator = Operator::new(Memory::default()).unwrap().finish();
         let store = ObjectBranchStore {
             volume_id: snapshot.volume_id,
-            backend: ObjectBranchBackend {
-                operator: operator.clone(),
-            },
+            backend: ObjectRecordBackend::new(operator.clone()),
         };
         let checkpoint = StoredCheckpoint::new(&snapshot, BTreeMap::new()).unwrap();
         let id = store.write_checkpoint(&checkpoint).await.unwrap();

@@ -165,40 +165,38 @@ and length.
 
 ### Object Metadata
 
-Object Metadata has one mutable `head.ofs` and immutable manifests and
-SSTables. HEAD contains the current cursor, a checkpoint reference, an ordered
+Object Metadata has one mutable `head.ofs` and immutable checkpoint roots and
+parts. HEAD contains the current cursor, a checkpoint reference, an ordered
 tail of committed namespace changes, and garbage-collection maintenance state.
 
 Publication writes immutable data first. It writes new checkpoint objects only
 when checkpoint policy requires them, then replaces HEAD with an ETag
 precondition. The conditional replacement is the namespace commit point.
 
-Each checkpoint is a complete snapshot partitioned into stable path ranges.
-The writer groups the records for a path, chooses deterministic boundaries,
-reuses an unchanged range's content-addressed SSTable, and uploads only changed
-ranges. Opaque node and file-version identities remain record keys, but they do
-not control physical placement. This distinction keeps edits near the affected
-paths even when another replica created the nodes. One manifest is sufficient,
-partition ranges never overlap, and there are no delta tables or tombstone
-layers. A failed conditional HEAD replacement may leave unreferenced immutable
-checkpoint objects, but it cannot expose a partial checkpoint.
+Each checkpoint is one complete snapshot expressed directly as shared node,
+directory, file-version, and operation-receipt records. The writer packs those
+natural records into bounded immutable checkpoint parts and publishes one small
+content-addressed root after all parts are durable. There is no checkpoint-only
+filesystem model, delta table, or tombstone layer. A failed conditional HEAD
+replacement may leave unreferenced immutable checkpoint objects, but it cannot
+expose a partial checkpoint.
 
-An established replica can reuse its verified common snapshot when its cursor
-is still covered by the HEAD tail. A cold reader loads the manifest and the
-typed-key blocks needed to reconstruct the snapshot. Reads from separate
-SSTable objects run with bounded concurrency. Blocks from one object are
-submitted together through OpenDAL's range fetch interface.
+An established replica reuses its verified common snapshot when its cursor is
+still covered by the HEAD tail. A cold reader loads the checkpoint root and all
+parts needed to reconstruct the snapshot. Independent part reads and writes
+run with bounded concurrency.
 
 ### Transactional Metadata
 
-D1 supplies the mutable namespace commit point as one revision-CAS HEAD row.
-The HEAD bytes, immutable manifests, and immutable SSTables are interpreted by
-the same namespace state machine as Object Metadata. Immutable objects stay in
-the volume's OpenDAL operator, so choosing D1 does not create another
-filesystem model or checkpoint format.
+D1 supplies the mutable namespace commit point as one revision-CAS record in
+`ofs_managed_v1_records`. Base and branch authorities use the same key/value
+adapter, checkpoint codec, and namespace records as Object Metadata. Base
+immutable checkpoint objects stay in the volume's OpenDAL operator; branch
+checkpoint records use the native authority backend. Choosing D1 does not
+create another filesystem model or checkpoint format.
 
 D1 requests have an explicit operation timeout. Schema creation is idempotent
-and is submitted with the operation that first needs the HEAD table, so a new
+and is submitted with the operation that first needs the record table, so a new
 store has no separate migration race.
 
 ## OpenDAL boundary
@@ -287,8 +285,8 @@ model. A branch binding wraps a backend-native authority behind one
 `BoundNamespace<S>` state machine before Sync calls the same `Volume` contract.
 Observe, publication validation, receipt resolution, tail rotation, and
 unknown-commit recovery are shared. Object and D1 implement the same small
-revision-CAS record operations. Branch checkpoints use the checksummed Managed
-SSTable builder and decoder, and branch snapshots and publications use the
+revision-CAS record operations. Base and branch checkpoints use one
+content-addressed part codec, and branch snapshots and publications use the
 shared node, directory, precondition, and Managed file-version records.
 
 The branch feature controls commands and extension code only. It does not

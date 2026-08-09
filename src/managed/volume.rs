@@ -161,7 +161,7 @@ impl ManagedVolume {
             namespace: NamespaceAuthority::D1(D1Namespace::new(
                 volume_id,
                 data_operator.clone(),
-                metadata.session(),
+                metadata,
             )),
             data: ManagedData::new(data_operator)?,
         })

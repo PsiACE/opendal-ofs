@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Backend-neutral namespace authority plus the Object Metadata constructor.
+
 use std::collections::BTreeMap;
 use std::io::Cursor;
 
@@ -27,42 +29,31 @@ use sha2::{Digest as _, Sha256};
 use super::change::NamespaceChange;
 use super::validation::{validate_publication, validate_snapshot};
 use super::{
-    DirectoryRecord, FileVersionRecord, NamespaceGcSweep, NamespacePublication, NamespaceSnapshot,
-    NodeRecord,
+    CheckpointPart, CheckpointRoot, NamespaceGcSweep, NamespacePublication, NamespaceSnapshot,
+    PendingCheckpoint,
 };
-use crate::filesystem::{
-    ChangeCursor, CommitOutcome, FileVersionId, NodeId, OperationId, VolumeId,
-};
-use crate::managed::format::sstable::{
-    self, Record as TableRecord, RecordGroup as TableRecordGroup, TableRef,
-};
+use crate::filesystem::{ChangeCursor, CommitOutcome, OperationId, VolumeId};
 use crate::managed::metadata::object::{self, ensure_immutable, read_content_addressed};
+use crate::managed::metadata::record::{ObjectRecordBackend, RecordBackend};
 use crate::managed::{ManagedError, ManagedErrorKind};
 
 #[cfg(test)]
 use crate::filesystem::{
-    DirectoryEntry, DirectoryPrecondition, NodeAttributes, NodeKind, NodePrecondition,
+    DirectoryPrecondition, DirectoryRecord, NodeAttributes, NodeId, NodeKind, NodePrecondition,
+    NodeRecord,
 };
 
 const HEAD_KEY: &str = ".ofs/managed/metadata/v1/head.ofs";
-const MANIFEST_ROOT: &str = ".ofs/managed/metadata/v1/manifests/sha256";
-const SSTABLE_ROOT: &str = ".ofs/managed/metadata/v1/sstables/sha256";
-const MANIFEST_MAGIC: &[u8] = b"OFS1MAN\0";
+const CHECKPOINT_ROOT: &str = ".ofs/managed/metadata/v1/checkpoints/sha256";
+const CHECKPOINT_PART_ROOT: &str = ".ofs/managed/metadata/v1/checkpoint-parts/sha256";
 const HEAD_MAGIC: &[u8; 8] = b"OFS1HDZ1";
 const FORMAT_MAJOR: u16 = 1;
 const MAX_TAIL_TRANSACTIONS: u16 = 32;
 const MAX_TAIL_BYTES: usize = 128 * 1024;
 const MAX_HEAD_BYTES: usize = 256 * 1024;
 const HEAD_COMPRESSION_LEVEL: i32 = 3;
-const MAX_CHECKPOINT_UPLOADS: usize = 8;
 const MAX_CHECKPOINT_READS: usize = 8;
-const NODE_PREFIX: u8 = 1;
-const DIRECTORY_PREFIX: u8 = 2;
-const DIRECTORY_ENTRY_PREFIX: u8 = 3;
-const FILE_VERSION_PREFIX: u8 = 4;
-const OPERATION_RESULT_PREFIX: u8 = 5;
-const SNAPSHOT_PARTITION_PREFIX: u8 = 1;
-const OPERATION_PARTITION_PREFIX: u8 = 2;
+const MAX_CHECKPOINT_WRITES: usize = 8;
 
 #[derive(Clone, Debug)]
 pub(crate) struct NamespaceObservation<R = String> {
@@ -83,7 +74,7 @@ impl<R> NamespaceObservation<R> {
 #[derive(Clone)]
 struct ObservationAuthority {
     head: StoredHead,
-    manifest: Option<StoredManifest>,
+    checkpoint: Option<StoredCheckpoint>,
 }
 
 impl std::fmt::Debug for ObservationAuthority {
@@ -91,31 +82,10 @@ impl std::fmt::Debug for ObservationAuthority {
         formatter
             .debug_struct("ObservationAuthority")
             .field("head", &self.head)
-            .field(
-                "manifest_tables",
-                &self.manifest.as_ref().map_or(0, |value| value.tables.len()),
-            )
+            .field("checkpoint_loaded", &self.checkpoint.is_some())
             .field("tail_changes", &self.head.tail.len())
             .finish()
     }
-}
-
-#[allow(async_fn_in_trait)]
-pub(crate) trait NamespaceHeadBackend: Clone + Send + Sync {
-    type Revision: Clone + Send + Sync;
-
-    async fn read(
-        &self,
-        action: &'static str,
-    ) -> Result<Option<(Vec<u8>, Self::Revision)>, ManagedError>;
-    async fn read_bytes(&self, action: &'static str) -> Result<Option<Vec<u8>>, ManagedError>;
-    async fn create(&self, bytes: Vec<u8>, action: &'static str) -> Result<bool, ManagedError>;
-    async fn replace(
-        &self,
-        revision: &Self::Revision,
-        bytes: Vec<u8>,
-        action: &'static str,
-    ) -> Result<bool, ManagedError>;
 }
 
 #[derive(Clone)]
@@ -125,42 +95,9 @@ pub(crate) struct NamespaceStore<B> {
     pub(crate) backend: B,
 }
 
-#[derive(Clone)]
-pub(crate) struct ObjectHeadBackend {
-    operator: Operator,
-}
+pub(crate) type ObjectNamespace = NamespaceStore<ObjectRecordBackend>;
 
-pub(crate) type ObjectNamespace = NamespaceStore<ObjectHeadBackend>;
-
-impl NamespaceHeadBackend for ObjectHeadBackend {
-    type Revision = String;
-
-    async fn read(
-        &self,
-        action: &'static str,
-    ) -> Result<Option<(Vec<u8>, Self::Revision)>, ManagedError> {
-        object::read_with_revision(&self.operator, HEAD_KEY, action).await
-    }
-
-    async fn read_bytes(&self, action: &'static str) -> Result<Option<Vec<u8>>, ManagedError> {
-        object::read(&self.operator, HEAD_KEY, action).await
-    }
-
-    async fn create(&self, bytes: Vec<u8>, action: &'static str) -> Result<bool, ManagedError> {
-        object::create(&self.operator, HEAD_KEY, bytes, action).await
-    }
-
-    async fn replace(
-        &self,
-        revision: &Self::Revision,
-        bytes: Vec<u8>,
-        action: &'static str,
-    ) -> Result<bool, ManagedError> {
-        object::replace(&self.operator, HEAD_KEY, revision, bytes, action).await
-    }
-}
-
-impl NamespaceStore<ObjectHeadBackend> {
+impl NamespaceStore<ObjectRecordBackend> {
     pub(crate) fn new(volume_id: VolumeId, operator: Operator) -> Result<Self, ManagedError> {
         let capability = operator.info().full_capability();
         if !capability.read
@@ -176,13 +113,13 @@ impl NamespaceStore<ObjectHeadBackend> {
         Ok(Self {
             volume_id,
             operator: operator.clone(),
-            backend: ObjectHeadBackend { operator },
+            backend: ObjectRecordBackend::new(operator),
         })
     }
 }
 
 #[allow(private_bounds)]
-impl<B: NamespaceHeadBackend> NamespaceStore<B> {
+impl<B: RecordBackend> NamespaceStore<B> {
     pub(crate) async fn observe(
         &self,
     ) -> Result<Option<NamespaceObservation<B::Revision>>, ManagedError> {
@@ -210,7 +147,7 @@ impl<B: NamespaceHeadBackend> NamespaceStore<B> {
                     revision,
                     authority: Box::new(ObservationAuthority {
                         head,
-                        manifest: None,
+                        checkpoint: None,
                     }),
                 }));
             }
@@ -223,13 +160,13 @@ impl<B: NamespaceHeadBackend> NamespaceStore<B> {
         head: StoredHead,
         revision: B::Revision,
     ) -> Result<NamespaceObservation<B::Revision>, ManagedError> {
-        let (snapshot, manifest) = self.recover(&head).await?;
+        let (snapshot, checkpoint) = self.recover(&head).await?;
         Ok(NamespaceObservation {
             snapshot,
             revision,
             authority: Box::new(ObservationAuthority {
                 head,
-                manifest: Some(manifest),
+                checkpoint: Some(checkpoint),
             }),
         })
     }
@@ -276,18 +213,18 @@ impl<B: NamespaceHeadBackend> NamespaceStore<B> {
             });
         let (checkpoint, checkpoint_cursor, tail) = if checkpoint_due {
             // The publication target and committed change tail are pinned by
-            // the observation used for CAS. Building a manifest never rereads
+            // the observation used for CAS. Building a checkpoint never rereads
             // the remote checkpoint or HEAD.
-            let mut previous_manifest = None;
             let mut committed = match observed {
                 Some(value) => {
-                    let manifest = match &value.authority.manifest {
-                        Some(manifest) => manifest.clone(),
-                        None => self.read_manifest(&value.authority.head.checkpoint).await?,
+                    let checkpoint = match &value.authority.checkpoint {
+                        Some(checkpoint) => checkpoint.clone(),
+                        None => {
+                            self.read_checkpoint(value.authority.head.checkpoint)
+                                .await?
+                        }
                     };
-                    let committed = self.read_operation_results(&manifest).await?;
-                    previous_manifest = Some(manifest);
-                    committed
+                    checkpoint.results
                 }
                 None => BTreeMap::new(),
             };
@@ -302,24 +239,14 @@ impl<B: NamespaceHeadBackend> NamespaceStore<B> {
             committed.insert(
                 publication.operation,
                 StoredCommittedResult {
+                    operation: publication.operation,
                     cursor: stored.cursor,
                     request_sha256,
                 },
             );
-            let checkpoint = self
-                .checkpoint_full(&publication.target, &committed, previous_manifest.as_ref())
+            let checkpoint_id = self
+                .write_checkpoint(&publication.target, &committed)
                 .await?;
-            let bytes = encode_cbor(MANIFEST_MAGIC, &checkpoint, "checkpoint Managed namespace")?;
-            let checkpoint_id = sha256(&bytes);
-            ensure_immutable(
-                &self.operator,
-                &manifest_key(&checkpoint_id),
-                &bytes,
-                "publish Managed namespace",
-                ManagedErrorKind::Conflict,
-                "operation identity was reused with another payload",
-            )
-            .await?;
             (checkpoint_id, publication.target.cursor, Vec::new())
         } else {
             let observed = observed.expect("checkpoint policy has an observation");
@@ -346,10 +273,19 @@ impl<B: NamespaceHeadBackend> NamespaceStore<B> {
         let replaced = match observed {
             Some(observed) => {
                 self.backend
-                    .replace(&observed.revision, head, "publish Managed namespace")
+                    .replace(
+                        HEAD_KEY,
+                        &observed.revision,
+                        head,
+                        "publish Managed namespace",
+                    )
                     .await
             }
-            None => self.backend.create(head, "publish Managed namespace").await,
+            None => {
+                self.backend
+                    .create(HEAD_KEY, head, "publish Managed namespace")
+                    .await
+            }
         };
         match replaced {
             Ok(true) => Ok(CommitOutcome::Committed(publication.target.cursor)),
@@ -483,8 +419,8 @@ impl<B: NamespaceHeadBackend> NamespaceStore<B> {
             require_same_operation(expected_sha256, observed_sha256)?;
             return Ok(CommitOutcome::Committed(transaction.cursor));
         }
-        let manifest = self.read_manifest(&head.checkpoint).await?;
-        if let Some(result) = self.read_operation_result(&manifest, operation).await? {
+        let checkpoint = self.read_checkpoint(head.checkpoint).await?;
+        if let Some(result) = checkpoint.results.get(&operation) {
             require_same_operation(expected_sha256, result.request_sha256)?;
             return Ok(CommitOutcome::Committed(result.cursor));
         }
@@ -512,7 +448,7 @@ impl<B: NamespaceHeadBackend> NamespaceStore<B> {
     async fn recover(
         &self,
         head: &StoredHead,
-    ) -> Result<(NamespaceSnapshot, StoredManifest), ManagedError> {
+    ) -> Result<(NamespaceSnapshot, StoredCheckpoint), ManagedError> {
         head.validate(self.volume_id)?;
         self.recover_bounded(head).await
     }
@@ -520,18 +456,17 @@ impl<B: NamespaceHeadBackend> NamespaceStore<B> {
     async fn recover_bounded(
         &self,
         head: &StoredHead,
-    ) -> Result<(NamespaceSnapshot, StoredManifest), ManagedError> {
-        let checkpoint = self.read_manifest(&head.checkpoint).await?;
-        if checkpoint.major != FORMAT_MAJOR
-            || checkpoint.volume_id != self.volume_id
-            || checkpoint.cursor != head.checkpoint_cursor
+    ) -> Result<(NamespaceSnapshot, StoredCheckpoint), ManagedError> {
+        let checkpoint = self.read_checkpoint(head.checkpoint).await?;
+        if checkpoint.snapshot.volume_id != self.volume_id
+            || checkpoint.snapshot.cursor != head.checkpoint_cursor
         {
             return Err(corrupt(
                 "read Managed namespace",
                 "checkpoint and HEAD disagree",
             ));
         }
-        let mut snapshot = self.read_snapshot(checkpoint.clone()).await?;
+        let mut snapshot = checkpoint.snapshot.clone();
         validate_snapshot(&snapshot)
             .map_err(|_| corrupt("read Managed namespace", "checkpoint is invalid"))?;
 
@@ -553,375 +488,91 @@ impl<B: NamespaceHeadBackend> NamespaceStore<B> {
         Ok((snapshot, checkpoint))
     }
 
-    async fn checkpoint_full(
+    async fn write_checkpoint(
         &self,
         snapshot: &NamespaceSnapshot,
-        committed: &BTreeMap<OperationId, StoredCommittedResult>,
-        previous: Option<&StoredManifest>,
-    ) -> Result<StoredManifest, ManagedError> {
-        let scope = *self.volume_id.as_bytes();
-        let paths = snapshot_partition_keys(snapshot)?;
-        let mut groups = BTreeMap::<Vec<u8>, Vec<TableRecord>>::new();
-        for node in snapshot.nodes.values() {
-            let partition = paths.get(&node.id).ok_or_else(|| {
-                invalid(
-                    "checkpoint Managed namespace",
-                    "snapshot node is not reachable from its root",
-                )
-            })?;
-            groups
-                .entry(partition.clone())
-                .or_default()
-                .push(TableRecord {
-                    key: typed_key(NODE_PREFIX, node.id.as_bytes()),
-                    value: encode_table_value(node, "checkpoint Managed namespace")?,
-                });
-        }
-        for directory in snapshot.directories.values() {
-            let partition = paths.get(&directory.node).ok_or_else(|| {
-                invalid(
-                    "checkpoint Managed namespace",
-                    "snapshot directory is not reachable from its root",
-                )
-            })?;
-            groups
-                .entry(partition.clone())
-                .or_default()
-                .push(TableRecord {
-                    key: typed_key(DIRECTORY_PREFIX, directory.node.as_bytes()),
-                    value: encode_table_value(
-                        &directory.generation,
-                        "checkpoint Managed namespace",
-                    )?,
-                });
-            for (name, entry) in &directory.entries {
-                let partition = child_partition_key(partition, name)?;
-                groups.entry(partition).or_default().push(TableRecord {
-                    key: directory_entry_key(directory.node, name),
-                    value: encode_table_value(entry, "checkpoint Managed namespace")?,
-                });
-            }
-        }
-        let mut version_partitions = BTreeMap::<FileVersionId, Vec<u8>>::new();
-        for node in snapshot.nodes.values() {
-            if let Some(version) = node.file_version {
-                let partition = paths.get(&node.id).ok_or_else(|| {
-                    invalid(
-                        "checkpoint Managed namespace",
-                        "snapshot file is not reachable from its root",
-                    )
-                })?;
-                version_partitions
-                    .entry(version)
-                    .and_modify(|current| {
-                        if partition < current {
-                            current.clone_from(partition);
-                        }
-                    })
-                    .or_insert_with(|| partition.clone());
-            }
-        }
-        for version in snapshot.file_versions.values() {
-            let partition = version_partitions.get(&version.id).ok_or_else(|| {
-                invalid(
-                    "checkpoint Managed namespace",
-                    "snapshot file version is not referenced by a file",
-                )
-            })?;
-            groups
-                .entry(partition.clone())
-                .or_default()
-                .push(TableRecord {
-                    key: typed_key(FILE_VERSION_PREFIX, version.id.as_bytes()),
-                    value: encode_table_value(version, "checkpoint Managed namespace")?,
-                });
-        }
-        for (operation, result) in committed {
-            let mut partition = Vec::with_capacity(1 + operation.as_bytes().len());
-            partition.push(OPERATION_PARTITION_PREFIX);
-            partition.extend_from_slice(operation.as_bytes());
-            groups.entry(partition).or_default().push(TableRecord {
-                key: typed_key(OPERATION_RESULT_PREFIX, operation.as_bytes()),
-                value: encode_table_value(result, "checkpoint Managed namespace")?,
-            });
-        }
-        let groups = groups
-            .into_iter()
-            .map(|(partition_key, mut records)| {
-                records.sort_by(|left, right| left.key.cmp(&right.key));
-                TableRecordGroup {
-                    partition_key,
-                    records,
-                }
-            })
-            .collect();
-        let encoded = sstable::build_set(scope, groups, "checkpoint Managed namespace")?;
-        let tables: Vec<TableRef> = stream::iter(encoded)
-            .map(|encoded| async move {
-                if let Some(existing) = previous
-                    .into_iter()
-                    .flat_map(|manifest| &manifest.tables)
-                    .find(|existing| *existing == &encoded.reference)
-                {
-                    return Ok(existing.clone());
-                }
+        results: &BTreeMap<OperationId, StoredCommittedResult>,
+    ) -> Result<[u8; 32], ManagedError> {
+        let results = results.values().cloned().collect::<Vec<_>>();
+        let pending = PendingCheckpoint::new(snapshot, &results)?;
+        stream::iter(&pending.parts)
+            .map(Ok::<_, ManagedError>)
+            .try_for_each_concurrent(MAX_CHECKPOINT_WRITES, |part| async move {
                 ensure_immutable(
                     &self.operator,
-                    &sstable_key(&encoded.reference.id),
-                    &encoded.bytes,
+                    &checkpoint_part_key(&part.reference.id),
+                    &part.bytes,
                     "publish Managed namespace",
                     ManagedErrorKind::Conflict,
                     "operation identity was reused with another payload",
                 )
-                .await?;
-                Ok(encoded.reference)
+                .await
             })
-            .buffered(MAX_CHECKPOINT_UPLOADS)
-            .try_collect()
             .await?;
-        debug_assert!(
-            !tables.is_empty(),
-            "a valid namespace contains its root node"
-        );
-        Ok(StoredManifest {
-            major: FORMAT_MAJOR,
-            volume_id: snapshot.volume_id,
-            cursor: snapshot.cursor,
-            root: snapshot.root,
-            tables,
-        })
+        let root = pending.finish();
+        let bytes = root.encode()?;
+        let id = sha256(&bytes);
+        ensure_immutable(
+            &self.operator,
+            &checkpoint_key(&id),
+            &bytes,
+            "publish Managed namespace",
+            ManagedErrorKind::Conflict,
+            "operation identity was reused with another payload",
+        )
+        .await?;
+        Ok(id)
     }
 
-    async fn read_snapshot(
-        &self,
-        checkpoint: StoredManifest,
-    ) -> Result<NamespaceSnapshot, ManagedError> {
-        validate_tables(&checkpoint.tables)?;
-        let mut nodes = BTreeMap::new();
-        let mut directories = BTreeMap::new();
-        let mut entries = Vec::new();
-        let mut file_versions = BTreeMap::new();
-        let tables: Vec<Vec<TableRecord>> = stream::iter(checkpoint.tables.iter().cloned())
-            .map(|table| {
-                self.read_table_range(
-                    table,
-                    NODE_PREFIX,
-                    OPERATION_RESULT_PREFIX,
-                    "read Managed namespace",
-                )
-            })
-            .buffered(MAX_CHECKPOINT_READS)
-            .try_collect()
-            .await?;
-        for records in tables {
-            for record in records {
-                let (&prefix, key) = record
-                    .key
-                    .split_first()
-                    .ok_or_else(|| corrupt("read Managed namespace", "SSTable key is empty"))?;
-                match prefix {
-                    NODE_PREFIX => {
-                        let node: NodeRecord =
-                            decode_table_value(&record.value, "read Managed namespace")?;
-                        let id = table_node_id(key, "node table key is invalid")?;
-                        if node.id != id || nodes.insert(id, node).is_some() {
-                            return Err(corrupt(
-                                "read Managed namespace",
-                                "node table key is invalid",
-                            ));
-                        }
-                    }
-                    DIRECTORY_PREFIX => {
-                        let generation =
-                            decode_table_value(&record.value, "read Managed namespace")?;
-                        let node = table_node_id(key, "directory table key is invalid")?;
-                        let directory = DirectoryRecord {
-                            node,
-                            generation,
-                            entries: BTreeMap::new(),
-                        };
-                        if directories.insert(directory.node, directory).is_some() {
-                            return Err(corrupt(
-                                "read Managed namespace",
-                                "duplicate directory record",
-                            ));
-                        }
-                    }
-                    DIRECTORY_ENTRY_PREFIX => {
-                        let entry = decode_table_value(&record.value, "read Managed namespace")?;
-                        let (directory, name) = table_directory_entry_key(key)?;
-                        entries.push((directory, name, entry));
-                    }
-                    FILE_VERSION_PREFIX => {
-                        let version: FileVersionRecord =
-                            decode_table_value(&record.value, "read Managed namespace")?;
-                        let id = table_file_version_id(key)?;
-                        if version.id != id || file_versions.insert(id, version).is_some() {
-                            return Err(corrupt(
-                                "read Managed namespace",
-                                "duplicate file version record",
-                            ));
-                        }
-                    }
-                    OPERATION_RESULT_PREFIX => continue,
-                    _ => {
-                        return Err(corrupt(
-                            "read Managed namespace",
-                            "SSTable key type is invalid",
-                        ));
-                    }
-                }
-            }
-        }
-        for (directory_id, name, stored) in entries {
-            let directory = directories.get_mut(&directory_id).ok_or_else(|| {
-                corrupt(
-                    "read Managed namespace",
-                    "entry references a missing directory",
-                )
-            })?;
-            if directory.entries.insert(name, stored).is_some() {
-                return Err(corrupt(
-                    "read Managed namespace",
-                    "duplicate directory entry",
-                ));
-            }
-        }
-        Ok(NamespaceSnapshot {
-            volume_id: checkpoint.volume_id,
-            cursor: checkpoint.cursor,
-            root: checkpoint.root,
-            nodes,
-            directories,
-            file_versions,
-        })
-    }
-
-    async fn read_manifest(&self, id: &[u8; 32]) -> Result<StoredManifest, ManagedError> {
+    async fn read_checkpoint(&self, id: [u8; 32]) -> Result<StoredCheckpoint, ManagedError> {
         let bytes = read_content_addressed(
             &self.operator,
-            &manifest_key(id),
-            id,
+            &checkpoint_key(&id),
+            &id,
             "read Managed namespace",
             "checkpoint is missing",
             "checkpoint key and content disagree",
         )
         .await?;
-        decode_cbor(MANIFEST_MAGIC, &bytes, "read Managed namespace")
-    }
-
-    async fn read_operation_results(
-        &self,
-        manifest: &StoredManifest,
-    ) -> Result<BTreeMap<OperationId, StoredCommittedResult>, ManagedError> {
-        validate_tables(&manifest.tables)?;
-        let mut results = BTreeMap::new();
-        let tables: Vec<Vec<TableRecord>> = stream::iter(manifest.tables.iter().cloned())
-            .map(|table| {
-                self.read_table_range(
-                    table,
-                    OPERATION_RESULT_PREFIX,
-                    OPERATION_RESULT_PREFIX + 1,
-                    "read Managed operation results",
+        let root = CheckpointRoot::decode(&bytes)?;
+        let parts = stream::iter(root.parts.iter().cloned())
+            .map(|reference| async move {
+                let bytes = object::read(
+                    &self.operator,
+                    &checkpoint_part_key(&reference.id),
+                    "read Managed namespace",
                 )
+                .await?
+                .ok_or_else(|| corrupt("read Managed namespace", "checkpoint part is missing"))?;
+                Ok(CheckpointPart { reference, bytes })
             })
             .buffered(MAX_CHECKPOINT_READS)
             .try_collect()
             .await?;
-        for records in tables {
-            for record in records {
-                if record.key.first() != Some(&OPERATION_RESULT_PREFIX) {
-                    continue;
-                }
-                let operation = operation_id_from_key(&record.key[1..])?;
-                let result: StoredCommittedResult =
-                    decode_table_value(&record.value, "read Managed operation results")?;
-                result.validate(operation)?;
-                if results.insert(operation, result).is_some() {
-                    return Err(corrupt(
-                        "read Managed operation results",
-                        "duplicate operation result",
-                    ));
-                }
+        let (snapshot, results) = root.recover::<StoredCommittedResult>(parts)?;
+        let mut indexed = BTreeMap::new();
+        for result in results {
+            result.validate(result.operation)?;
+            if indexed.insert(result.operation, result).is_some() {
+                return Err(corrupt(
+                    "read Managed operation results",
+                    "duplicate operation result",
+                ));
             }
         }
-        Ok(results)
-    }
-
-    async fn read_table_range(
-        &self,
-        table: TableRef,
-        lower: u8,
-        upper: u8,
-        action: &'static str,
-    ) -> Result<Vec<TableRecord>, ManagedError> {
-        let lower = [lower];
-        let upper = [upper];
-        let blocks = table
-            .blocks
-            .into_iter()
-            .filter(|block| {
-                block.last_key.as_slice() >= lower.as_slice()
-                    && block.first_key.as_slice() < upper.as_slice()
-            })
-            .collect();
-        Ok(sstable::fetch(
-            &self.operator,
-            &sstable_key(&table.id),
-            *self.volume_id.as_bytes(),
-            blocks,
-            action,
-        )
-        .await?
-        .into_iter()
-        .flat_map(|(_, records)| records)
-        .collect())
-    }
-
-    async fn read_operation_result(
-        &self,
-        manifest: &StoredManifest,
-        operation: OperationId,
-    ) -> Result<Option<StoredCommittedResult>, ManagedError> {
-        validate_tables(&manifest.tables)?;
-        let key = typed_key(OPERATION_RESULT_PREFIX, operation.as_bytes());
-        for table in &manifest.tables {
-            let blocks = table
-                .blocks
-                .iter()
-                .filter(|block| {
-                    block.first_key.as_slice() <= key.as_slice()
-                        && key.as_slice() <= block.last_key.as_slice()
-                })
-                .cloned()
-                .collect();
-            for (_, records) in sstable::fetch(
-                &self.operator,
-                &sstable_key(&table.id),
-                *self.volume_id.as_bytes(),
-                blocks,
-                "resolve Managed publication",
-            )
-            .await?
-            {
-                if let Ok(index) = records.binary_search_by(|record| record.key.cmp(&key)) {
-                    let result: StoredCommittedResult =
-                        decode_table_value(&records[index].value, "resolve Managed publication")?;
-                    result.validate(operation)?;
-                    return Ok(Some(result));
-                }
-            }
-        }
-        Ok(None)
+        Ok(StoredCheckpoint {
+            snapshot,
+            results: indexed,
+        })
     }
 
     async fn read_head(&self) -> Result<Option<(Vec<u8>, B::Revision)>, ManagedError> {
-        self.backend.read("read Managed namespace").await
+        self.backend.read(HEAD_KEY, "read Managed namespace").await
     }
 
     async fn read_current_head(&self) -> Result<Option<StoredHead>, ManagedError> {
         self.backend
-            .read_bytes("read Managed namespace")
+            .read_bytes(HEAD_KEY, "read Managed namespace")
             .await?
             .map(|bytes| decode_head(&bytes))
             .transpose()
@@ -933,120 +584,23 @@ impl<B: NamespaceHeadBackend> NamespaceStore<B> {
         bytes: Vec<u8>,
     ) -> Result<bool, ManagedError> {
         self.backend
-            .replace(expected_revision, bytes, "publish Managed namespace")
+            .replace(
+                HEAD_KEY,
+                expected_revision,
+                bytes,
+                "publish Managed namespace",
+            )
             .await
     }
 }
 
-fn manifest_key(id: &[u8; 32]) -> String {
-    format!("{MANIFEST_ROOT}/{}.ofs", hex(id))
+fn checkpoint_key(id: &[u8; 32]) -> String {
+    format!("{CHECKPOINT_ROOT}/{}.ofs", hex(id))
 }
 
-fn sstable_key(id: &[u8; 32]) -> String {
+fn checkpoint_part_key(id: &[u8; 32]) -> String {
     let encoded = hex(id);
-    format!("{SSTABLE_ROOT}/{encoded}.sst")
-}
-
-fn directory_entry_key(directory: NodeId, name: &str) -> Vec<u8> {
-    let mut key = Vec::with_capacity(1 + 16 + name.len());
-    key.push(DIRECTORY_ENTRY_PREFIX);
-    key.extend_from_slice(directory.as_bytes());
-    key.extend_from_slice(name.as_bytes());
-    key
-}
-
-fn snapshot_partition_keys(
-    snapshot: &NamespaceSnapshot,
-) -> Result<BTreeMap<NodeId, Vec<u8>>, ManagedError> {
-    let root = vec![SNAPSHOT_PARTITION_PREFIX];
-    let mut paths = BTreeMap::from([(snapshot.root, root)]);
-    let mut pending = vec![snapshot.root];
-    while let Some(directory_id) = pending.pop() {
-        let directory = snapshot.directories.get(&directory_id).ok_or_else(|| {
-            invalid(
-                "checkpoint Managed namespace",
-                "snapshot directory is missing",
-            )
-        })?;
-        let parent = paths
-            .get(&directory_id)
-            .expect("pending directories have a path")
-            .clone();
-        for (name, entry) in &directory.entries {
-            let path = child_partition_key(&parent, name)?;
-            if paths.insert(entry.node, path).is_none()
-                && snapshot.directories.contains_key(&entry.node)
-            {
-                pending.push(entry.node);
-            }
-        }
-    }
-    Ok(paths)
-}
-
-fn child_partition_key(parent: &[u8], name: &str) -> Result<Vec<u8>, ManagedError> {
-    if name.as_bytes().contains(&0) {
-        return Err(invalid(
-            "checkpoint Managed namespace",
-            "snapshot name contains an invalid byte",
-        ));
-    }
-    let mut key = Vec::with_capacity(parent.len() + name.len() + 1);
-    key.extend_from_slice(parent);
-    key.extend_from_slice(name.as_bytes());
-    key.push(0);
-    Ok(key)
-}
-
-fn typed_key(prefix: u8, body: &[u8]) -> Vec<u8> {
-    let mut key = Vec::with_capacity(1 + body.len());
-    key.push(prefix);
-    key.extend_from_slice(body);
-    key
-}
-
-fn operation_id_from_key(key: &[u8]) -> Result<OperationId, ManagedError> {
-    let bytes = key.try_into().map_err(|_| {
-        corrupt(
-            "read Managed operation results",
-            "operation result key is invalid",
-        )
-    })?;
-    Ok(OperationId::from_bytes(bytes))
-}
-
-fn table_node_id(key: &[u8], message: &'static str) -> Result<NodeId, ManagedError> {
-    let bytes = key
-        .try_into()
-        .map_err(|_| corrupt("read Managed namespace", message))?;
-    Ok(NodeId::from_bytes(bytes))
-}
-
-fn table_directory_entry_key(key: &[u8]) -> Result<(NodeId, String), ManagedError> {
-    let (directory, name) = key.split_at_checked(16).ok_or_else(|| {
-        corrupt(
-            "read Managed namespace",
-            "directory entry table key is invalid",
-        )
-    })?;
-    let directory = NodeId::from_bytes(directory.try_into().expect("fixed key prefix"));
-    let name = String::from_utf8(name.to_vec()).map_err(|_| {
-        corrupt(
-            "read Managed namespace",
-            "directory entry table key is invalid",
-        )
-    })?;
-    Ok((directory, name))
-}
-
-fn table_file_version_id(key: &[u8]) -> Result<FileVersionId, ManagedError> {
-    let bytes = key.try_into().map_err(|_| {
-        corrupt(
-            "read Managed namespace",
-            "file version table key is invalid",
-        )
-    })?;
-    Ok(FileVersionId::from_bytes(bytes))
+    format!("{CHECKPOINT_PART_ROOT}/{encoded}.ofs")
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -1119,26 +673,13 @@ fn decode_head(bytes: &[u8]) -> Result<StoredHead, ManagedError> {
     decode_table_value(&body, "read Managed namespace")
 }
 
-fn encode_cbor<T: Serialize>(
-    magic: &[u8],
-    value: &T,
-    action: &'static str,
-) -> Result<Vec<u8>, ManagedError> {
-    let mut bytes = Vec::from(magic);
-    ciborium::ser::into_writer(value, &mut bytes)
-        .map_err(|_| invalid(action, "durable record cannot be encoded"))?;
-    let checksum: [u8; 32] = Sha256::digest(&bytes).into();
-    bytes.extend_from_slice(&checksum);
-    Ok(bytes)
-}
-
 fn encode_table_value<T: Serialize>(
     value: &T,
     action: &'static str,
 ) -> Result<Vec<u8>, ManagedError> {
     let mut bytes = Vec::new();
     ciborium::ser::into_writer(value, &mut bytes)
-        .map_err(|_| invalid(action, "SSTable record cannot be encoded"))?;
+        .map_err(|_| invalid(action, "namespace change cannot be encoded"))?;
     Ok(bytes)
 }
 
@@ -1148,33 +689,9 @@ fn decode_table_value<T: DeserializeOwned>(
 ) -> Result<T, ManagedError> {
     let mut input = Cursor::new(bytes);
     let value = ciborium::de::from_reader(&mut input)
-        .map_err(|_| corrupt(action, "SSTable record cannot be decoded"))?;
+        .map_err(|_| corrupt(action, "namespace change cannot be decoded"))?;
     if input.position() != bytes.len() as u64 {
-        return Err(corrupt(action, "SSTable record has trailing bytes"));
-    }
-    Ok(value)
-}
-
-fn decode_cbor<T: DeserializeOwned>(
-    magic: &[u8],
-    bytes: &[u8],
-    action: &'static str,
-) -> Result<T, ManagedError> {
-    let body = bytes
-        .strip_prefix(magic)
-        .and_then(|bytes| bytes.get(..bytes.len().checked_sub(32)?))
-        .ok_or_else(|| corrupt(action, "durable record has the wrong format version"))?;
-    let expected = bytes
-        .get(bytes.len().saturating_sub(32)..)
-        .ok_or_else(|| corrupt(action, "durable record checksum is missing"))?;
-    if Sha256::digest(&bytes[..bytes.len() - 32]).as_slice() != expected {
-        return Err(corrupt(action, "durable record checksum does not match"));
-    }
-    let mut input = Cursor::new(body);
-    let value = ciborium::de::from_reader(&mut input)
-        .map_err(|_| corrupt(action, "durable record is invalid"))?;
-    if input.position() != body.len() as u64 {
-        return Err(corrupt(action, "durable record has trailing bytes"));
+        return Err(corrupt(action, "namespace change has trailing bytes"));
     }
     Ok(value)
 }
@@ -1402,19 +919,16 @@ impl StoredHead {
     }
 }
 
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct StoredManifest {
-    major: u16,
-    volume_id: VolumeId,
-    cursor: ChangeCursor,
-    root: NodeId,
-    tables: Vec<TableRef>,
+#[derive(Clone)]
+struct StoredCheckpoint {
+    snapshot: NamespaceSnapshot,
+    results: BTreeMap<OperationId, StoredCommittedResult>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct StoredCommittedResult {
+    operation: OperationId,
     cursor: ChangeCursor,
     request_sha256: [u8; 32],
 }
@@ -1422,6 +936,7 @@ struct StoredCommittedResult {
 impl StoredCommittedResult {
     fn from_transaction(transaction: &NamespaceChange) -> Result<Self, ManagedError> {
         Ok(Self {
+            operation: transaction.operation,
             cursor: transaction.cursor,
             request_sha256: transaction_sha256(transaction, "checkpoint Managed namespace")?,
         })
@@ -1443,45 +958,6 @@ fn transaction_sha256(
     action: &'static str,
 ) -> Result<[u8; 32], ManagedError> {
     encode_table_value(transaction, action).map(|bytes| sha256(&bytes))
-}
-
-fn validate_tables(tables: &[TableRef]) -> Result<(), ManagedError> {
-    let mut previous_partition_last: Option<&[u8]> = None;
-    for table in tables {
-        if table.encoded_bytes == 0
-            || table.first_partition_key.is_empty()
-            || table.first_partition_key > table.last_partition_key
-            || previous_partition_last
-                .is_some_and(|last| last >= table.first_partition_key.as_slice())
-            || table.blocks.is_empty()
-            || table.blocks.iter().any(|block| {
-                block.records == 0 || block.encoded_bytes == 0 || block.first_key > block.last_key
-            })
-        {
-            return Err(corrupt(
-                "read Managed namespace",
-                "manifest SSTable references are invalid",
-            ));
-        }
-        previous_partition_last = Some(&table.last_partition_key);
-        let mut end = 0_u64;
-        let mut previous_last: Option<&[u8]> = None;
-        for block in &table.blocks {
-            if block.offset < end
-                || block.offset.checked_add(block.encoded_bytes).is_none()
-                || block.offset + block.encoded_bytes > table.encoded_bytes
-                || previous_last.is_some_and(|last| last >= block.first_key.as_slice())
-            {
-                return Err(corrupt(
-                    "read Managed namespace",
-                    "manifest SSTable block ranges are invalid",
-                ));
-            }
-            end = block.offset + block.encoded_bytes;
-            previous_last = Some(&block.last_key);
-        }
-    }
-    Ok(())
 }
 
 fn apply_transaction(
@@ -1638,48 +1114,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manifest_sstables_round_trip_without_a_whole_snapshot_record() {
-        let operation = OperationId::from_bytes([8; 16]);
-        let cursor = ChangeCursor::at(NonZeroU64::new(1).unwrap(), operation);
-        let mut snapshot = root_snapshot(cursor);
-        snapshot
-            .directories
-            .get_mut(&snapshot.root)
-            .unwrap()
-            .entries
-            .insert(
-                "child".to_owned(),
-                DirectoryEntry {
-                    node: snapshot.root,
-                    kind: NodeKind::Directory,
-                },
-            );
-        let operator = Operator::new(Memory::default()).unwrap().finish();
-        let namespace = ObjectNamespace {
-            volume_id: snapshot.volume_id,
-            operator: operator.clone(),
-            backend: ObjectHeadBackend {
-                operator: operator.clone(),
-            },
-        };
-        let checkpoint = namespace
-            .checkpoint_full(&snapshot, &BTreeMap::new(), None)
-            .await
-            .unwrap();
-        assert_eq!(checkpoint.tables.len(), 1);
-        assert!(!checkpoint.tables[0].blocks.is_empty());
-        let missing = sstable_key(&checkpoint.tables[0].id);
-        operator.delete(&missing).await.unwrap();
-        let checkpoint = namespace
-            .checkpoint_full(&snapshot, &BTreeMap::new(), None)
-            .await
-            .unwrap();
-        assert!(operator.stat(&missing).await.is_ok());
-        let recovered = namespace.read_snapshot(checkpoint).await.unwrap();
-        assert_eq!(recovered, snapshot);
-    }
-
-    #[tokio::test]
     async fn committed_operations_resolve_from_checkpoint_and_inline_tail() {
         let first = OperationId::from_bytes([41; 16]);
         let first_cursor = ChangeCursor::at(NonZeroU64::new(1).unwrap(), first);
@@ -1701,7 +1135,7 @@ mod tests {
         let namespace = ObjectNamespace {
             volume_id: first_snapshot.volume_id,
             operator: operator.clone(),
-            backend: ObjectHeadBackend { operator },
+            backend: ObjectRecordBackend::new(operator),
         };
         assert_eq!(
             namespace.publish(None, &first_publication).await.unwrap(),
@@ -1749,7 +1183,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_manifest_sstable_is_reported_as_corruption() {
+    async fn missing_checkpoint_part_is_reported_as_corruption() {
         let operation = OperationId::from_bytes([10; 16]);
         let cursor = ChangeCursor::at(NonZeroU64::new(1).unwrap(), operation);
         let snapshot = root_snapshot(cursor);
@@ -1770,9 +1204,7 @@ mod tests {
         let namespace = ObjectNamespace {
             volume_id: snapshot.volume_id,
             operator: operator.clone(),
-            backend: ObjectHeadBackend {
-                operator: operator.clone(),
-            },
+            backend: ObjectRecordBackend::new(operator.clone()),
         };
         assert_eq!(
             namespace.publish(None, &publication).await.unwrap(),
@@ -1780,11 +1212,18 @@ mod tests {
         );
         let head = operator.read(HEAD_KEY).await.unwrap().to_bytes();
         let head = decode_head(&head).unwrap();
-        let checkpoint = namespace.read_manifest(&head.checkpoint).await.unwrap();
+        let checkpoint = namespace.read_checkpoint(head.checkpoint).await.unwrap();
+        let bytes = operator
+            .read(&checkpoint_key(&head.checkpoint))
+            .await
+            .unwrap()
+            .to_bytes();
+        let root = CheckpointRoot::decode(&bytes).unwrap();
         operator
-            .delete(&sstable_key(&checkpoint.tables[0].id))
+            .delete(&checkpoint_part_key(&root.parts[0].id))
             .await
             .unwrap();
+        assert_eq!(checkpoint.snapshot, snapshot);
         let error = namespace.recover(&head).await.err().unwrap();
         assert_eq!(error.kind(), ManagedErrorKind::Corrupt);
     }

@@ -18,19 +18,21 @@
 //! Managed namespace records and authoritative snapshot publication.
 
 mod change;
+mod checkpoint;
 mod d1;
-mod object;
 mod records;
+mod store;
 mod validation;
 
 #[cfg(feature = "managed-branch")]
 pub(crate) use change::NamespaceChange;
+pub(crate) use checkpoint::{CheckpointPart, CheckpointRoot, PendingCheckpoint};
 pub(crate) use d1::{D1Namespace, D1NamespaceObservation};
-pub(crate) use object::{NamespaceObservation, ObjectNamespace};
 pub use records::NamespaceGcSweep;
 pub(crate) use records::{
     DirectoryPrecondition, DirectoryRecord, FileVersionRecord, NamespacePublication,
     NamespaceSnapshot, NodePrecondition, NodeRecord, managed_generation, next_managed_generation,
 };
+pub(crate) use store::{NamespaceObservation, ObjectNamespace};
 #[cfg(feature = "managed-branch")]
 pub(crate) use validation::{validate_publication, validate_snapshot};

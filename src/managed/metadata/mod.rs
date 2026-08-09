@@ -18,6 +18,8 @@
 pub(crate) mod d1;
 pub(crate) mod namespace;
 pub(crate) mod object;
+#[doc(hidden)]
+pub mod record;
 mod superblock;
 
 pub use d1::{D1Config, D1Metadata};

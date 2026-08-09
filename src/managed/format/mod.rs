@@ -19,8 +19,6 @@
 
 use serde::{Deserialize, Serialize};
 
-pub(crate) mod sstable;
-
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ContentRef {

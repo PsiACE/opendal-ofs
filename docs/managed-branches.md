@@ -49,10 +49,10 @@ counting every shared segment would duplicate those mechanisms. The missing
 pieces are named authorities, retained tails after checkpoint rotation, and a
 garbage collector that treats all branches as roots.
 
-The extension reuses the common namespace snapshot, validation, publication,
-file-version, data-segment, and SSTable models. Its checkpoint root and
-retained-history records are extension-owned because they preserve multiple
-branch-local positions.
+The extension reuses the common namespace snapshot, change, validation,
+publication, file-version, data-segment, and checkpoint models. Only
+the registry, branch heads, retained history, lifecycle, and multi-root garbage
+collection are extension-owned.
 
 The extension boundary keeps these rules out of base Managed volumes. The base
 and extension formats may share code, but they do not share mutable authority
@@ -370,14 +370,15 @@ Object Metadata uses an extension-owned prefix:
 
 The registry and heads are mutable conditional-write objects. A checkpoint is
 a small content-addressed root over immutable content-addressed parts. Parts
-contain natural namespace records such as nodes, directory entries, file
-extents, and operation receipts. The root is published only after every part
+contain natural namespace records: nodes, complete directories, complete file
+versions, and operation receipts. The root is published only after every part
 has been created and verified. History is also immutable and
 content-addressed. The base Managed `head.ofs` is not read or mirrored for a
 branching volume.
 
-Object and D1 share the record-set builder, recovery validation, and mutable
-record state machine. Their adapters provide only native read, create,
+Base and branch namespaces share the checkpoint builder and recovery
+validation. Object and D1 share the mutable record interface; their adapters
+provide only native read, create,
 revision-CAS replace, list, and delete operations. Checkpoint capacity is the
 sum of its immutable parts rather than one encoded snapshot value.
 
@@ -392,10 +393,10 @@ roots. Listing is used only during garbage collection of unreachable objects.
 
 ## D1 representation
 
-D1 uses one extension-owned record table:
+D1 uses the Managed record table shared by base and extension authorities:
 
 ```text
-ofs_managed_branch_v1_records
+ofs_managed_v1_records
 ```
 
 Rows are scoped by the existing D1 store key, `VolumeId`, and the same logical
@@ -528,7 +529,7 @@ disposable index may improve lookup without becoming authority.
 Checkpoint storage is split and provider requests are bounded, but recovery
 still constructs one in-memory `NamespaceSnapshot`. This is suitable for Sync,
 but it is below lakeFS's range-indexed metadata lookup for very large
-namespaces. The record-set root can later point to indexed ranges without
+namespaces. The checkpoint root can later point to indexed ranges without
 changing registry, head, history, or branch binding semantics.
 
 The registry is a single mutable record. Branch lifecycle is therefore atomic

@@ -27,7 +27,7 @@ garbage-collection schedules are policy and are not stored in the superblock.
 | --- | --- | --- |
 | Superblock | Metadata | Immutable for the volume lifetime |
 | Namespace HEAD | Object Metadata | Mutable commit point |
-| Manifest and SSTable | Object Metadata | Immutable while referenced |
+| Checkpoint root and part | Metadata backend | Immutable while referenced |
 | Transactional namespace rows | Transactional Metadata | Managed by native transactions and checkpoints |
 | File version and extent map | Metadata | Immutable logical file version |
 | Segment | Data | Immutable until unreachable |
@@ -189,8 +189,8 @@ Object Metadata uses these keys:
 ```text
 .ofs/managed/metadata/v1/superblock.json
 .ofs/managed/metadata/v1/head.ofs
-.ofs/managed/metadata/v1/manifests/sha256/<digest>.ofs
-.ofs/managed/metadata/v1/sstables/sha256/<digest>.sst
+.ofs/managed/metadata/v1/checkpoints/sha256/<digest>.ofs
+.ofs/managed/metadata/v1/checkpoint-parts/sha256/<digest>.ofs
 ```
 
 `head.ofs` is the only mutable namespace object. A conditional replacement is
@@ -217,92 +217,61 @@ cursors, resulting root, generation preconditions, and ordered node,
 directory, directory-entry, and file-version effects. The chain MUST be
 consecutive from the checkpoint cursor to the current cursor.
 
-### Manifest
+### Checkpoint root
 
-A manifest has this envelope:
+A checkpoint root has this envelope:
 
 ```text
-"OFS1MAN\0"
-named-field CBOR manifest
+"OFS1CKP1"
+named-field CBOR checkpoint root
 SHA-256 of preceding bytes
 ```
 
-The manifest contains format major, volume identity, checkpoint cursor, root
-node, and ordered SSTable references. Each reference carries the encoded table
-length, the first and last physical partition keys, and the table's complete
-block index. The partition ranges MUST be strictly ordered and non-overlapping.
-Together, the referenced tables form one complete snapshot in which every
-namespace record appears exactly once. A reader does not merge overlays or
-apply tombstones. SHA-256 of the complete encoded manifest determines its
-object key.
+The checkpoint root contains format major `1`, volume identity, checkpoint
+cursor, root node, and ordered part references. Each reference carries the
+part digest and encoded length. SHA-256 of the complete encoded root determines
+its object key.
 
-Snapshot partition keys are derived from portable filesystem paths, not from
-local volume aliases or opaque node identities. The root partition starts with
-byte `1`. Each child appends its UTF-8 name followed by a zero byte. A directory
-entry is assigned to the child's path. Node and directory records use the
-node's path, and a file version uses the lowest path of any file that references
-it. Committed operation results use byte `2` followed by the operation identity.
-The naming policy excludes the zero byte, so this encoding is unambiguous.
+The parts form one complete snapshot. Records are the natural Managed domain
+records: one node, directory, file version, or committed-operation receipt per
+record. A directory record includes its complete entry map and a file-version
+record includes its complete extent list. The checkpoint format does not add a
+second header/entry/extent model.
 
-A checkpoint writer splits these ordered groups at deterministic,
-content-defined path boundaries with bounded target sizes. It never divides the
-records for one path. When a range has the same records and encoding as the
-preceding checkpoint, the writer reuses its existing SSTable reference. Changed
-ranges become new immutable SSTables. Adding, removing, renaming, or editing a
-path therefore changes its containing range and, at most, the ranges up to the
-next stable boundary. The new manifest still describes the complete namespace,
-so recovery never depends on an older manifest.
-
-### SSTable
-
-An SSTable contains ordered data blocks, a block index, and a table trailer.
-Each record frame is:
+Records are split at a target encoded size. The target and I/O concurrency are
+write policy, not persisted limits. A natural record is never split merely to
+meet the target. Each part has this envelope:
 
 ```text
-key length: u32
-value length: u32
-key bytes
-value bytes
+"OFS1CPP1"
+named-field CBOR { major, volume_id, records }
+SHA-256 of preceding bytes
 ```
 
-A data block contains `OFSBLK01`, format major, volume scope, record count,
-record frames, `OFSBLKTR`, and a SHA-256 checksum. The index starts with
-`OFSIDX01` and records each block's object range, key bounds, record count, and
-checksum. The table trailer contains `OFSTBL01`, format major, index offset,
-index length, and SHA-256 of the preceding table bytes.
-
-The format major in each block, index, and table envelope is followed by a
-reserved `u16` that MUST be zero. The table checksum determines the SSTable
-object key.
-
-Within each SSTable, records remain strictly ordered by typed record key. The
-namespace uses separate prefixes for nodes, directories, directory entries,
-file versions, and committed operation results. Typed record ranges may overlap
-between SSTables because physical partition order is path based. Readers use
-the block index to select typed-key ranges and fetch those byte ranges through
-OpenDAL.
-
-Table splitting thresholds and the boundary function are write policy. They
-are not persisted in the superblock and do not affect decoding. Every table
-reference carries all persisted partition and block metadata needed to validate
-and read that table.
+Recovery reads every referenced part, verifies its digest, encoded length,
+format major, and volume scope, rejects missing or duplicate natural records,
+validates the resulting snapshot, and applies no overlay or tombstones. A new
+checkpoint never depends on an older checkpoint. Readers and writers process
+independent parts through the metadata backend with bounded concurrency.
 
 ## Transactional Metadata layout
 
-Transactional Metadata stores the superblock and mutable namespace commit
-point in these D1 tables:
+Transactional Metadata stores the superblock and all mutable authority records
+in these D1 tables:
 
 ```text
 ofs_managed_v1_formats
-ofs_managed_v1_namespace_heads
+ofs_managed_v1_records
 ```
 
 `STORE_KEY` and `VolumeId` scope one Managed volume inside the shared tables.
-The namespace row contains the same encoded HEAD used by the shared namespace
-interpreter and a monotonically increasing CAS revision. Immutable manifests
-and SSTables remain checksummed, content-addressed objects in the configured
-OpenDAL storage. The Data segment layout is also identical for Object and
-Transactional Metadata.
+Each record row has the same logical key used by Object Metadata, its encoded
+value, and a monotonically increasing CAS revision. The base namespace uses
+the `head.ofs` logical key; extensions use their own key prefixes in the same
+table. Immutable checkpoint roots and parts are stored through the same record
+interface for extensions, while base immutable checkpoints remain in the
+configured OpenDAL storage. The filesystem and Data segment layouts are
+identical for Object and Transactional Metadata.
 
 ## Publication and reachability
 
@@ -329,7 +298,7 @@ A reader MUST reject:
 - unordered or duplicate records and invalid key ranges;
 - overflow, out-of-bounds extents, gaps, or overlaps;
 - an invalid cursor chain, generation transition, or filesystem invariant;
-- a missing referenced segment, manifest, or SSTable.
+- a missing referenced segment, checkpoint root, or checkpoint part.
 
 An immutable write may accept an existing object only after verifying that it
 has the expected identity and contents. Missing referenced objects are

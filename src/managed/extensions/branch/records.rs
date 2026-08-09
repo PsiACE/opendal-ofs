@@ -56,16 +56,13 @@ pub enum ForkPoint {
     Sequence(u64),
 }
 
-/// One replayable namespace change. `payload` uses the shared branch change
-/// codec and is interpreted identically by Object and transactional metadata.
+/// One replayable shared namespace change, annotated only with its branch of
+/// origin so receipts remain branch scoped.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct StoredChange {
     pub(crate) origin_branch: BranchId,
-    pub(crate) operation: OperationId,
-    pub(crate) parent: ChangeCursor,
-    pub(crate) cursor: ChangeCursor,
-    payload: NamespaceChange,
+    change: NamespaceChange,
 }
 
 impl StoredChange {
@@ -78,10 +75,7 @@ impl StoredChange {
         Ok((
             Self {
                 origin_branch: branch,
-                operation: publication.operation,
-                parent: publication.parent,
-                cursor: publication.target.cursor,
-                payload: NamespaceChange::from_publication(publication, base),
+                change: NamespaceChange::from_publication(publication, base),
             },
             valid,
         ))
@@ -91,10 +85,22 @@ impl StoredChange {
         &self,
         base: Option<NamespaceSnapshot>,
     ) -> Result<NamespaceSnapshot, ManagedError> {
-        self.payload
+        self.change
             .clone()
             .apply(base)
             .map_err(|_| corrupt("stored branch change is invalid"))
+    }
+
+    pub(crate) fn operation(&self) -> OperationId {
+        self.change.operation
+    }
+
+    pub(crate) fn parent(&self) -> ChangeCursor {
+        self.change.parent
+    }
+
+    pub(crate) fn cursor(&self) -> ChangeCursor {
+        self.change.cursor
     }
 
     pub(crate) fn encoded_len(&self) -> Result<usize, ManagedError> {
@@ -120,7 +126,7 @@ impl StoredNamespaceState {
         Ok(self
             .tail
             .last()
-            .map_or(self.checkpoint_cursor, |change| change.cursor))
+            .map_or(self.checkpoint_cursor, StoredChange::cursor))
     }
 
     pub(crate) fn validate_shape(&self) -> Result<(), ManagedError> {
@@ -135,11 +141,11 @@ impl StoredNamespaceState {
         }
         let mut parent = self.checkpoint_cursor;
         for change in &self.tail {
-            if change.parent != parent {
+            if change.parent() != parent {
                 return Err(corrupt("branch transaction tail is not consecutive"));
             }
-            let cursor = change.cursor;
-            if cursor.operation() != Some(change.operation)
+            let cursor = change.cursor();
+            if cursor.operation() != Some(change.operation())
                 || parent.sequence().checked_add(1) != Some(cursor.sequence())
             {
                 return Err(corrupt("branch transaction cursor is invalid"));
@@ -160,10 +166,8 @@ impl StoredNamespaceState {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug)]
 pub(crate) struct StoredCheckpoint {
-    pub(crate) major: u16,
     pub(crate) snapshot: NamespaceSnapshot,
     pub(crate) results: Vec<StoredCommittedResult>,
 }
@@ -175,7 +179,6 @@ impl StoredCheckpoint {
     ) -> Result<Self, ManagedError> {
         validate_snapshot(snapshot)?;
         Ok(Self {
-            major: FORMAT_MAJOR,
             snapshot: snapshot.clone(),
             results: results.into_values().collect(),
         })
@@ -185,7 +188,7 @@ impl StoredCheckpoint {
         self,
         volume_id: VolumeId,
     ) -> Result<(NamespaceSnapshot, StoredResults), ManagedError> {
-        if self.major != FORMAT_MAJOR || self.snapshot.volume_id != volume_id {
+        if self.snapshot.volume_id != volume_id {
             return Err(corrupt("branch checkpoint identity is invalid"));
         }
         let snapshot = self.snapshot;
@@ -291,8 +294,8 @@ impl StoredCommittedResult {
     pub(crate) fn from_change(change: &StoredChange) -> Result<Self, ManagedError> {
         let result = Self {
             origin_branch: change.origin_branch,
-            operation: change.operation,
-            cursor: change.cursor,
+            operation: change.operation(),
+            cursor: change.cursor(),
             request_sha256: change.request_digest()?,
         };
         result.validate()?;

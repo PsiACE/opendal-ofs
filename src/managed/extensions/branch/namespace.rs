@@ -240,13 +240,11 @@ impl<S: BranchNamespaceStore> BoundNamespace<S> {
         let Some(state) = head.state else {
             return Ok(CommitOutcome::Absent);
         };
-        if let Some(change) = state
-            .tail
-            .iter()
-            .find(|change| change.origin_branch == self.binding.id && change.operation == operation)
-        {
+        if let Some(change) = state.tail.iter().find(|change| {
+            change.origin_branch == self.binding.id && change.operation() == operation
+        }) {
             require_request_digest(expected, change.request_digest()?)?;
-            return Ok(CommitOutcome::Committed(change.cursor));
+            return Ok(CommitOutcome::Committed(change.cursor()));
         }
         let checkpoint = self.store.read_checkpoint(state.checkpoint).await?;
         let Some(result) = checkpoint.resolve(self.binding.id, operation)? else {

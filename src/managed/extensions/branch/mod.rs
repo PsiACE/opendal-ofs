@@ -17,15 +17,14 @@
 
 //! Durable named branches for Managed metadata.
 
-mod checkpoint;
 mod d1;
 mod namespace;
-mod object;
 pub(crate) mod records;
+mod store;
 
 pub use d1::D1BranchStore;
 pub use namespace::{BoundNamespace, BranchObservation};
-pub use object::ObjectBranchStore;
+pub use store::ObjectBranchStore;
 pub type ObjectBoundNamespace = BoundNamespace<ObjectBranchStore>;
 pub type ObjectBranchObservation = BranchObservation<String>;
 pub type D1BoundNamespace = BoundNamespace<D1BranchStore>;
