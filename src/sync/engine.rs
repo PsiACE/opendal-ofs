@@ -17,13 +17,14 @@ use anyhow::{Context, Result, bail};
 use opendal::{Operator, services};
 
 use super::local::{NativeIdentity, fs_operator, set_executable};
+use super::path::subtree;
 use super::{
     ConflictRecord, InstalledEntry, LocalKind, LocalTree, PendingIntent, ReconcileAction,
     ReplicaState, StagedTree, build_publication, reconcile, snapshot_paths,
 };
 use crate::filesystem::{
-    ChangeCursor, CommitOutcome, FileVersion, MaterializeRequest, NodeKind, OperationId, Volume,
-    VolumeObservation, VolumeSnapshot,
+    ChangeCursor, CommitOutcome, FileVersion, MaterializeRequest, NodeId, NodeKind, OperationId,
+    Volume, VolumeObservation, VolumeSnapshot,
 };
 
 #[derive(Clone, Debug)]
@@ -151,6 +152,13 @@ impl<V: Volume> SyncEngine<V> {
         if remote.is_none() && state.common != ChangeCursor::Genesis {
             bail!("authoritative namespace disappeared after this replica was initialized");
         }
+        let base_paths = state
+            .authority
+            .as_ref()
+            .map(snapshot_paths)
+            .transpose()?
+            .unwrap_or_default();
+        let remote_paths = remote.map(snapshot_paths).transpose()?.unwrap_or_default();
 
         let (local, staging_path, mut staged) = match prior_staging.as_ref() {
             Some(path) => {
@@ -163,12 +171,12 @@ impl<V: Volume> SyncEngine<V> {
                     && state.conflicts.is_empty()
                     && let Some(snapshot) = remote
                     && snapshot.cursor == state.common
-                    && local_matches_state(&local, &state)?
+                    && local_matches_state(&local, &state, &base_paths)?
                 {
                     return Ok(result(&state, false));
                 }
                 let staging_path = fresh_sibling(state_path, "publish");
-                let known_digests = known_local_digests(&local, &state)?;
+                let known_digests = known_local_digests(&local, &state, &base_paths)?;
                 let staged = StagedTree::prepare_for_publish(
                     &local,
                     &staging_path,
@@ -199,16 +207,12 @@ impl<V: Volume> SyncEngine<V> {
         let mut resolved = BTreeSet::new();
 
         if let Some(remote) = remote {
-            let plan = reconcile(&state, &staged, remote)?;
+            let plan = reconcile(&state, &staged, remote, &base_paths, &remote_paths)?;
             install_remote |= remote.cursor != state.common;
             let target = fs_operator(staged.root())?;
-            let (merge_remote_directories, publish_local_directories) =
-                directory_changes(&state, &local, remote)?;
-            publish |= publish_local_directories;
-            install_remote |= merge_remote_directories;
-            if merge_remote_directories {
-                create_remote_directories(&mut staged, &target, &state, remote).await?;
-            }
+            publish |= plan.publish_local_directories;
+            install_remote |= plan.merge_remote_directories;
+            let merge_remote_directories = plan.merge_remote_directories;
             local_renames = plan.local_renames;
             let mut installs = Vec::new();
             for action in plan.actions {
@@ -222,6 +226,14 @@ impl<V: Volume> SyncEngine<V> {
                         digest,
                         executable,
                     } => {
+                        if staged
+                            .logical()
+                            .entries()
+                            .get(&path)
+                            .is_some_and(|entry| entry.kind == LocalKind::Directory)
+                        {
+                            remove_staged_path(&mut staged, &target, &path).await?;
+                        }
                         let file = remote
                             .file_versions
                             .get(&version)
@@ -230,8 +242,7 @@ impl<V: Volume> SyncEngine<V> {
                         installs.push((path, file, digest, executable));
                     }
                     ReconcileAction::DeleteLocal { path } => {
-                        target.delete(&path).await?;
-                        staged.remove_logical_path(&path);
+                        remove_staged_path(&mut staged, &target, &path).await?;
                         known_digests.remove(&path);
                         install_remote = true;
                     }
@@ -253,6 +264,9 @@ impl<V: Volume> SyncEngine<V> {
                     }
                 }
             }
+            if merge_remote_directories {
+                create_remote_directories(&mut staged, &target, remote, &remote_paths).await?;
+            }
             let full_tree = state.installed.is_empty() && local.entries().is_empty();
             staged_full_tree = full_tree;
             let installed = materialize_files(
@@ -273,7 +287,15 @@ impl<V: Volume> SyncEngine<V> {
                 install_remote = true;
             }
             if merge_remote_directories {
-                delete_absent_directories(&mut staged, &target, &state, remote).await?;
+                delete_absent_directories(
+                    &mut staged,
+                    &target,
+                    &state,
+                    remote,
+                    &base_paths,
+                    &remote_paths,
+                )
+                .await?;
             }
         }
         if resolved != requested {
@@ -302,7 +324,7 @@ impl<V: Volume> SyncEngine<V> {
                         install_staged_changes(replica_path, &staged, &frozen_input)?;
                     }
                 }
-                state = state_from_snapshot(remote, replica_path, &state).await?;
+                state = state_from_snapshot(remote, &remote_paths, replica_path, &state).await?;
             } else {
                 state.pending = None;
             }
@@ -342,7 +364,10 @@ impl<V: Volume> SyncEngine<V> {
                 .collect(),
         );
         let requires_materialization = !merged_input.same_content(&frozen_input);
-        let remote_files = remote.map(snapshot_files).transpose()?.unwrap_or_default();
+        let remote_files = remote
+            .map(|snapshot| snapshot_files(snapshot, &remote_paths))
+            .transpose()?
+            .unwrap_or_default();
         let mut prepared = staged
             .prepared()
             .iter()
@@ -363,14 +388,12 @@ impl<V: Volume> SyncEngine<V> {
             }
         }
 
-        let mut publication_state = state.clone();
-        publication_state.common = remote.map_or(ChangeCursor::Genesis, |snapshot| snapshot.cursor);
         let publication = build_publication(
             &self.volume,
-            volume_id,
             operation,
-            remote,
-            &publication_state,
+            remote.map(|snapshot| (snapshot, &remote_paths)),
+            &base_paths,
+            &state,
             &merged,
             &prepared,
         )?;
@@ -405,7 +428,8 @@ async fn advance_common_base(
     state_path: &Path,
     previous: &ReplicaState,
 ) -> Result<ReplicaState> {
-    let state = state_from_snapshot(snapshot, replica, previous).await?;
+    let paths = snapshot_paths(snapshot)?;
+    let state = state_from_snapshot(snapshot, &paths, replica, previous).await?;
     state.install(state_path)?;
     Ok(state)
 }
@@ -490,7 +514,14 @@ async fn committed_tree_is_safe(
 ) -> Result<bool> {
     let local = LocalTree::scan(replica).await?;
     let staged = StagedTree::inspect(&local, concurrency).await?;
-    let safe = match reconcile(state, &staged, committed) {
+    let base_paths = state
+        .authority
+        .as_ref()
+        .map(snapshot_paths)
+        .transpose()?
+        .unwrap_or_default();
+    let committed_paths = snapshot_paths(committed)?;
+    let safe = match reconcile(state, &staged, committed, &base_paths, &committed_paths) {
         Ok(plan) => {
             let files_are_safe = plan.actions.iter().all(|action| {
                 matches!(
@@ -501,9 +532,7 @@ async fn committed_tree_is_safe(
                         | ReconcileAction::ApplyRemoteAttributes { .. }
                 )
             });
-            let directories_are_safe = directory_changes(state, &local, committed)
-                .map(|(_, publish_local)| !publish_local)
-                .unwrap_or(false);
+            let directories_are_safe = !plan.publish_local_directories;
             files_are_safe && directories_are_safe
         }
         Err(_) => false,
@@ -515,157 +544,40 @@ async fn matches_frozen(root: &Path, expected: &FrozenTree) -> Result<bool> {
     Ok(expected.matches_observation(&LocalTree::scan(root).await?))
 }
 
-fn directory_changes(
-    state: &ReplicaState,
-    local: &LocalTree,
-    remote: &VolumeSnapshot,
-) -> Result<(bool, bool)> {
-    let base_kinds = state
-        .authority
-        .as_ref()
-        .map(snapshot_kinds)
-        .transpose()?
-        .unwrap_or_default();
-    let local_kinds = local
-        .entries()
-        .iter()
-        .map(|(path, entry)| (path.clone(), entry.kind))
-        .collect::<BTreeMap<_, _>>();
-    let remote_kinds = snapshot_kinds(remote)?;
-    let paths = base_kinds
-        .keys()
-        .chain(local_kinds.keys())
-        .chain(remote_kinds.keys())
-        .collect::<BTreeSet<_>>();
-    for path in paths {
-        let base = base_kinds.get(path);
-        let local = local_kinds.get(path);
-        let remote = remote_kinds.get(path);
-        let has_directory = [base, local, remote]
-            .into_iter()
-            .flatten()
-            .any(|kind| *kind == LocalKind::Directory);
-        let has_file = [base, local, remote]
-            .into_iter()
-            .flatten()
-            .any(|kind| *kind == LocalKind::File);
-        if local != remote && has_directory && has_file {
-            bail!("cannot reconcile {path:?}: file and directory changes overlap");
-        }
-    }
-
-    for (path, kind) in &base_kinds {
-        if *kind != LocalKind::Directory {
-            continue;
-        }
-        let local_kept = local_kinds.get(path) == Some(&LocalKind::Directory);
-        let remote_kept = remote_kinds.get(path) == Some(&LocalKind::Directory);
-        if !remote_kept && local_kept && local_subtree_changed(state, local, path)? {
-            bail!("cannot reconcile {path:?}: remote directory deletion overlaps local changes");
-        }
-        if !local_kept && remote_kept && remote_subtree_changed(state, remote, path)? {
-            bail!("cannot reconcile {path:?}: local directory deletion overlaps remote changes");
-        }
-    }
-
-    let base = directories(&base_kinds);
-    let local = directories(&local_kinds);
-    let remote = directories(&remote_kinds);
-    if local == remote {
-        Ok((false, false))
-    } else {
-        Ok((remote != base, local != base))
-    }
-}
-
-fn local_subtree_changed(state: &ReplicaState, local: &LocalTree, directory: &str) -> Result<bool> {
-    let base_kinds = state
-        .authority
-        .as_ref()
-        .map(snapshot_kinds)
-        .transpose()?
-        .unwrap_or_default();
-    Ok(state
-        .installed
-        .keys()
-        .chain(local.entries().keys())
-        .filter(|path| path_is_within(path, directory))
-        .any(
-            |path| match (state.installed.get(path), local.entries().get(path)) {
-                (Some(base), Some(current)) => {
-                    let base_kind = base_kinds[path];
-                    current.kind != base_kind
-                        || current.kind == LocalKind::File
-                            && (base.local_identity != current.native_identity
-                                || base.local_size != Some(current.size)
-                                || base.local_modified.as_deref()
-                                    != Some(current.modified.as_str())
-                                || base.local_executable != Some(current.executable))
-                }
-                (None, None) => false,
-                _ => true,
-            },
-        ))
-}
-
-fn remote_subtree_changed(
-    state: &ReplicaState,
-    remote: &VolumeSnapshot,
-    directory: &str,
-) -> Result<bool> {
-    let remote_paths = snapshot_paths(remote)?;
-    let base = state.authority.as_ref();
-    let base_paths = base.map(snapshot_paths).transpose()?.unwrap_or_default();
-    let paths = base_paths
-        .keys()
-        .chain(remote_paths.keys())
-        .filter(|path| path_is_within(path, directory))
-        .collect::<BTreeSet<_>>();
-    for path in paths {
-        let changed = match (base_paths.get(path), remote_paths.get(path)) {
-            (Some(base_node), Some(remote_node)) => {
-                let base = base.expect("base paths require an authority snapshot");
-                base_node != remote_node
-                    || base.nodes.get(base_node) != remote.nodes.get(remote_node)
-                    || base.directories.get(base_node) != remote.directories.get(remote_node)
-            }
-            (None, None) => false,
-            _ => true,
-        };
-        if changed {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn path_is_within(path: &str, directory: &str) -> bool {
-    path == directory
-        || path
-            .strip_prefix(directory)
-            .is_some_and(|suffix| suffix.starts_with('/'))
-}
-
-fn directories(kinds: &BTreeMap<String, LocalKind>) -> BTreeSet<String> {
-    kinds
-        .iter()
-        .filter(|(_, kind)| **kind == LocalKind::Directory)
-        .map(|(path, _)| path.clone())
-        .collect()
-}
-
 async fn create_remote_directories(
     staged: &mut StagedTree,
     target: &Operator,
-    state: &ReplicaState,
     remote: &VolumeSnapshot,
+    remote_paths: &BTreeMap<String, NodeId>,
 ) -> Result<()> {
-    for (path, node) in snapshot_paths(remote)? {
-        if remote.nodes[&node].kind == NodeKind::Directory && !state.installed.contains_key(&path) {
+    for (path, node) in remote_paths {
+        if remote.nodes[node].kind == NodeKind::Directory
+            && !staged
+                .logical()
+                .entries()
+                .get(path)
+                .is_some_and(|entry| entry.kind == LocalKind::Directory)
+        {
             target.create_dir(&format!("{path}/")).await?;
-            staged.record_materialized_directory(path).await?;
+            staged.record_materialized_directory(path.clone()).await?;
         }
     }
+    Ok(())
+}
+
+async fn remove_staged_path(staged: &mut StagedTree, target: &Operator, path: &str) -> Result<()> {
+    let removed = subtree(staged.logical().entries(), path)
+        .rev()
+        .map(|(path, entry)| (path.clone(), entry.kind))
+        .collect::<Vec<_>>();
+    for (path, kind) in removed {
+        let target_path = match kind {
+            LocalKind::Directory => format!("{path}/"),
+            LocalKind::File => path,
+        };
+        target.delete(&target_path).await?;
+    }
+    staged.remove_logical_path(path);
     Ok(())
 }
 
@@ -674,24 +586,34 @@ async fn delete_absent_directories(
     target: &Operator,
     state: &ReplicaState,
     remote: &VolumeSnapshot,
+    base_paths: &BTreeMap<String, NodeId>,
+    remote_paths: &BTreeMap<String, NodeId>,
 ) -> Result<()> {
-    let remote = snapshot_paths(remote)?
-        .into_iter()
+    let remote = remote_paths
+        .iter()
         .filter(|(_, node)| remote.nodes[node].kind == NodeKind::Directory)
-        .map(|(path, _)| path)
+        .map(|(path, _)| path.clone())
         .collect::<BTreeSet<_>>();
     let base_kinds = state
         .authority
         .as_ref()
-        .map(snapshot_kinds)
+        .map(|snapshot| snapshot_kinds(snapshot, base_paths))
         .transpose()?
         .unwrap_or_default();
-    let mut removed = base_kinds
+    let removed = base_kinds
         .iter()
-        .filter(|(path, kind)| **kind == LocalKind::Directory && !remote.contains(*path))
+        .rev()
+        .filter(|(path, kind)| {
+            **kind == LocalKind::Directory
+                && !remote.contains(*path)
+                && staged
+                    .logical()
+                    .entries()
+                    .get(*path)
+                    .is_some_and(|entry| entry.kind == LocalKind::Directory)
+        })
         .map(|(path, _)| path.clone())
         .collect::<Vec<_>>();
-    removed.sort_by_key(|path| std::cmp::Reverse(path.matches('/').count()));
     for path in removed {
         target.delete(&format!("{path}/")).await?;
         staged.remove_logical_path(&path);
@@ -701,6 +623,7 @@ async fn delete_absent_directories(
 
 async fn state_from_snapshot(
     snapshot: &VolumeSnapshot,
+    paths: &BTreeMap<String, NodeId>,
     replica: &Path,
     previous: &ReplicaState,
 ) -> Result<ReplicaState> {
@@ -709,18 +632,18 @@ async fn state_from_snapshot(
     state.branch = previous.branch.clone();
     state.common = snapshot.cursor;
     state.authority = Some(snapshot.clone());
-    for (path, node) in snapshot_paths(snapshot)? {
-        let record = &snapshot.nodes[&node];
+    for (path, node) in paths {
+        let record = &snapshot.nodes[node];
         let local_kind = match record.kind {
             NodeKind::Directory => LocalKind::Directory,
             NodeKind::RegularFile => LocalKind::File,
         };
-        let local_entry = local.entries().get(&path);
+        let local_entry = local.entries().get(path);
         if local_entry.is_some_and(|entry| entry.kind != local_kind) {
             bail!("installed local path {path:?} has the wrong kind");
         }
         state.installed.insert(
-            path,
+            path.clone(),
             InstalledEntry {
                 local_identity: local_entry.and_then(|entry| entry.native_identity),
                 local_size: local_entry.map(|entry| entry.size),
@@ -732,11 +655,15 @@ async fn state_from_snapshot(
     Ok(state)
 }
 
-fn local_matches_state(local: &LocalTree, state: &ReplicaState) -> Result<bool> {
+fn local_matches_state(
+    local: &LocalTree,
+    state: &ReplicaState,
+    base_paths: &BTreeMap<String, NodeId>,
+) -> Result<bool> {
     let base_kinds = state
         .authority
         .as_ref()
-        .map(snapshot_kinds)
+        .map(|snapshot| snapshot_kinds(snapshot, base_paths))
         .transpose()?
         .unwrap_or_default();
     Ok(local.entries().len() == state.installed.len()
@@ -754,11 +681,11 @@ fn local_matches_state(local: &LocalTree, state: &ReplicaState) -> Result<bool> 
 fn known_local_digests(
     local: &LocalTree,
     state: &ReplicaState,
+    paths: &BTreeMap<String, NodeId>,
 ) -> Result<BTreeMap<String, [u8; 32]>> {
     let Some(authority) = &state.authority else {
         return Ok(BTreeMap::new());
     };
-    let paths = snapshot_paths(authority)?;
     Ok(local
         .entries()
         .iter()
@@ -782,28 +709,41 @@ fn known_local_digests(
         .collect())
 }
 
-fn snapshot_kinds(snapshot: &VolumeSnapshot) -> Result<BTreeMap<String, LocalKind>> {
-    Ok(snapshot_paths(snapshot)?
-        .into_iter()
+fn snapshot_kinds(
+    snapshot: &VolumeSnapshot,
+    paths: &BTreeMap<String, NodeId>,
+) -> Result<BTreeMap<String, LocalKind>> {
+    paths
+        .iter()
         .map(|(path, node)| {
-            let kind = match snapshot.nodes[&node].kind {
+            let kind = match snapshot
+                .nodes
+                .get(node)
+                .with_context(|| format!("snapshot path {path:?} references a missing node"))?
+                .kind
+            {
                 NodeKind::Directory => LocalKind::Directory,
                 NodeKind::RegularFile => LocalKind::File,
             };
-            (path, kind)
+            Ok((path.clone(), kind))
         })
-        .collect())
+        .collect()
 }
 
 fn install_staged_changes(replica: &Path, staged: &StagedTree, before: &FrozenTree) -> Result<()> {
     let after = FrozenTree::from_parts(staged.logical(), staged);
-    let mut removals = before
+    let removals = before
         .0
-        .keys()
-        .filter(|path| !after.0.contains_key(*path))
-        .cloned()
+        .iter()
+        .rev()
+        .filter(|(path, entry)| {
+            after
+                .0
+                .get(*path)
+                .is_none_or(|desired| desired.kind != entry.kind)
+        })
+        .map(|(path, _)| path.clone())
         .collect::<Vec<_>>();
-    removals.sort_by_key(|path| std::cmp::Reverse(path.matches('/').count()));
     for path in removals {
         let target = replica.join(path);
         match fs::symlink_metadata(&target) {
@@ -962,13 +902,16 @@ fn install_tree(replica: &Path, staging: &Path) -> Result<()> {
     Ok(())
 }
 
-fn snapshot_files(snapshot: &VolumeSnapshot) -> Result<BTreeMap<String, FileVersion>> {
-    snapshot_paths(snapshot)?
-        .into_iter()
+fn snapshot_files(
+    snapshot: &VolumeSnapshot,
+    paths: &BTreeMap<String, NodeId>,
+) -> Result<BTreeMap<String, FileVersion>> {
+    paths
+        .iter()
         .filter_map(|(path, node)| {
-            snapshot.nodes[&node]
+            snapshot.nodes[node]
                 .file_version
-                .map(|version| (path, version))
+                .map(|version| (path.clone(), version))
         })
         .map(|(path, version)| {
             snapshot

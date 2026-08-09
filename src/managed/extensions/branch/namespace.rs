@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use super::records::{
     BranchLifecycle, MAX_TAIL_BYTES, MAX_TAIL_TRANSACTIONS, StoredBranchHead, StoredChange,
     StoredCheckpoint, StoredCommittedResult, StoredHistory, StoredNamespaceState, StoredResults,
-    recover_namespace, require_request_digest, results_for_rotation,
+    recover_namespace, replay_tail_from, require_request_digest, results_for_rotation,
 };
 use super::store::BranchStore;
 use crate::filesystem::{BranchBinding, ChangeCursor, CommitOutcome, OperationId, VolumeId};
@@ -36,7 +36,7 @@ pub(crate) struct BranchObservation {
 pub(crate) struct BranchWitness {
     revision: crate::managed::metadata::record::Revision,
     head: StoredBranchHead,
-    checkpoint_results: StoredResults,
+    checkpoint_results: Option<StoredResults>,
 }
 
 impl BranchObservation {
@@ -70,16 +70,45 @@ impl BoundNamespace {
             witness: BranchWitness {
                 revision,
                 head,
-                checkpoint_results,
+                checkpoint_results: Some(checkpoint_results),
             },
         }))
     }
 
     pub(crate) async fn observe_from(
         &self,
-        _base: &NamespaceSnapshot,
+        base: &NamespaceSnapshot,
     ) -> Result<Option<BranchObservation>, ManagedError> {
-        self.observe().await
+        let (head, revision) = self
+            .store
+            .current_head(&self.binding, "read Managed branch")
+            .await?;
+        let Some(state) = &head.state else {
+            return Ok(None);
+        };
+        if base.volume_id == self.store.volume_id()
+            && let Some(snapshot) = replay_tail_from(base, state)?
+        {
+            return Ok(Some(BranchObservation {
+                snapshot,
+                witness: BranchWitness {
+                    revision,
+                    head,
+                    checkpoint_results: None,
+                },
+            }));
+        }
+        let checkpoint = self.store.read_checkpoint(state.checkpoint).await?;
+        let (snapshot, checkpoint_results) =
+            recover_namespace(checkpoint, state, self.store.volume_id())?;
+        Ok(Some(BranchObservation {
+            snapshot,
+            witness: BranchWitness {
+                revision,
+                head,
+                checkpoint_results: Some(checkpoint_results),
+            },
+        }))
     }
 
     pub(crate) async fn publish(
@@ -103,7 +132,7 @@ impl BoundNamespace {
                     witness.head.clone(),
                     witness.revision.clone(),
                     Some(snapshot),
-                    Some(witness.checkpoint_results.clone()),
+                    witness.checkpoint_results.clone(),
                 )
             }
             None => {
@@ -131,13 +160,6 @@ impl BoundNamespace {
                 observed: base.map_or(ChangeCursor::Genesis, |snapshot| snapshot.cursor),
             });
         }
-        if let CommitOutcome::Committed(cursor) = self
-            .resolve_known(publication.operation, Some(request_digest))
-            .await?
-        {
-            return Ok(CommitOutcome::Committed(cursor));
-        }
-
         let state = match (&head.state, checkpoint_results) {
             (None, None) => {
                 let result = StoredCommittedResult::from_change(&change)?;
@@ -150,7 +172,7 @@ impl BoundNamespace {
                     previous_history: None,
                 }
             }
-            (Some(current), Some(checkpoint_results)) => {
+            (Some(current), checkpoint_results) => {
                 let appended_bytes = current
                     .tail
                     .iter()
@@ -163,6 +185,16 @@ impl BoundNamespace {
                 if current.tail.len() + 1 >= MAX_TAIL_TRANSACTIONS
                     || appended_bytes > MAX_TAIL_BYTES
                 {
+                    let checkpoint_results = match checkpoint_results {
+                        Some(results) => results,
+                        None => {
+                            self.store
+                                .read_checkpoint(current.checkpoint)
+                                .await?
+                                .recover(self.store.volume_id())?
+                                .1
+                        }
+                    };
                     let history = StoredHistory::new(self.store.volume_id(), branch, current)?;
                     let history = self.store.write_history(&history).await?;
                     let results = results_for_rotation(checkpoint_results, current, &change)?;
@@ -179,7 +211,7 @@ impl BoundNamespace {
                     next
                 }
             }
-            _ => return Err(corrupt("branch observation and checkpoint disagree")),
+            _ => return Err(corrupt("branch observation and HEAD disagree")),
         };
         let next = StoredBranchHead {
             state: Some(state),

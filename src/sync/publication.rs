@@ -11,7 +11,7 @@ use std::num::NonZeroU64;
 
 use anyhow::{Context, Result, bail};
 
-use super::{LocalKind, LocalTree, ReplicaState, snapshot_paths};
+use super::{LocalKind, LocalTree, ReplicaState};
 use crate::filesystem::{
     ChangeCursor, DirectoryEntry, DirectoryPrecondition, DirectoryRecord, FileVersion,
     NodeAttributes, NodeId, NodeKind, NodePrecondition, NodeRecord, OperationId, Volume, VolumeId,
@@ -24,23 +24,30 @@ use crate::filesystem::{
 /// at an unchanged path, but never treats equal content as proof of a rename.
 pub(crate) fn build_publication<V: Volume>(
     volume_api: &V,
-    volume: VolumeId,
     operation: OperationId,
-    authoritative: Option<&VolumeSnapshot>,
+    authoritative: Option<(&VolumeSnapshot, &BTreeMap<String, NodeId>)>,
+    base_paths: &BTreeMap<String, NodeId>,
     replica: &ReplicaState,
     local: &LocalTree,
     prepared: &BTreeMap<String, FileVersion>,
 ) -> Result<VolumePublication> {
-    let parent = authoritative.map_or(ChangeCursor::Genesis, |state| state.cursor);
-    validate_ancestry(volume, parent, authoritative, replica)?;
+    let volume = volume_api.id();
+    let authoritative_snapshot = authoritative.map(|(snapshot, _)| snapshot);
+    let empty_paths = BTreeMap::new();
+    let old_paths = authoritative.map_or(&empty_paths, |(_, paths)| paths);
+    let parent = authoritative_snapshot.map_or(ChangeCursor::Genesis, |state| state.cursor);
+    validate_volume_bindings(volume, authoritative_snapshot, replica)?;
 
-    let old_paths = match authoritative {
-        Some(state) => snapshot_paths(state)?,
-        None => BTreeMap::new(),
-    };
     let kinds = local_kinds(local)?;
     validate_prepared(local, prepared)?;
-    reject_unresolved_renames(&kinds, &old_paths, authoritative, replica, prepared)?;
+    reject_unresolved_renames(
+        &kinds,
+        old_paths,
+        base_paths,
+        authoritative_snapshot,
+        replica,
+        prepared,
+    )?;
 
     let rename_sources = replica
         .pending
@@ -54,9 +61,9 @@ pub(crate) fn build_publication<V: Volume>(
         })
         .unwrap_or_default();
 
-    let old_nodes = authoritative.map(|state| &state.nodes);
-    let old_directories = authoritative.map(|state| &state.directories);
-    let root = authoritative.map_or_else(NodeId::generate, |state| state.root);
+    let old_nodes = authoritative_snapshot.map(|state| &state.nodes);
+    let old_directories = authoritative_snapshot.map(|state| &state.directories);
+    let root = authoritative_snapshot.map_or_else(NodeId::generate, |state| state.root);
     let mut identities = BTreeMap::from([(String::new(), root)]);
     let mut used = BTreeSet::from([root]);
     for (path, kind) in &kinds {
@@ -153,23 +160,19 @@ pub(crate) fn build_publication<V: Volume>(
     Ok(VolumePublication {
         operation,
         parent,
-        expected_nodes: node_preconditions(authoritative, &target),
-        expected_directories: directory_preconditions(authoritative, &target),
+        expected_nodes: node_preconditions(authoritative_snapshot, &target),
+        expected_directories: directory_preconditions(authoritative_snapshot, &target),
         target,
     })
 }
 
-fn validate_ancestry(
+fn validate_volume_bindings(
     volume: VolumeId,
-    parent: ChangeCursor,
     authoritative: Option<&VolumeSnapshot>,
     replica: &ReplicaState,
 ) -> Result<()> {
     if authoritative.is_some_and(|state| state.volume_id != volume) || replica.volume != volume {
         bail!("namespace, replica state, and requested volume disagree");
-    }
-    if replica.common != parent {
-        bail!("local replica is not based on the authoritative cursor; reconcile before publish");
     }
     Ok(())
 }
@@ -222,6 +225,7 @@ fn validate_prepared(local: &LocalTree, prepared: &BTreeMap<String, FileVersion>
 fn reject_unresolved_renames(
     local: &BTreeMap<String, NodeKind>,
     old_paths: &BTreeMap<String, NodeId>,
+    base_paths: &BTreeMap<String, NodeId>,
     authoritative: Option<&VolumeSnapshot>,
     replica: &ReplicaState,
     prepared: &BTreeMap<String, FileVersion>,
@@ -230,7 +234,6 @@ fn reject_unresolved_renames(
         return Ok(());
     };
     let base = replica.authority.as_ref();
-    let base_paths = base.map(snapshot_paths).transpose()?.unwrap_or_default();
     for (path, kind) in local {
         if old_paths.contains_key(path) || *kind != NodeKind::RegularFile {
             continue;

@@ -10,9 +10,9 @@
 
 mod engine;
 mod local;
+mod path;
 mod publication;
 mod reconcile;
-mod snapshot;
 mod staging;
 mod state;
 
@@ -20,8 +20,8 @@ pub use engine::{SyncEngine, SyncResult};
 pub use state::{ConflictRecord, PendingIntent, ReplicaState};
 
 pub(crate) use local::{LocalKind, LocalTree};
+pub(crate) use path::snapshot_paths;
 pub(crate) use publication::build_publication;
 pub(crate) use reconcile::{ReconcileAction, reconcile};
-pub(crate) use snapshot::snapshot_paths;
 pub(crate) use staging::StagedTree;
 pub(crate) use state::InstalledEntry;

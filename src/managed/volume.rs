@@ -316,27 +316,17 @@ impl ManagedVolume {
     /// Delete data segments unreachable from the snapshot fixed by this sweep.
     pub async fn collect_unreachable_segments(
         &self,
-        observed: &ManagedObservation,
         sweep: NamespaceGcSweep,
     ) -> Result<SegmentGcMaintenance, ManagedError> {
-        if observed.gc_sweep() != Some(sweep)
-            || observed.filesystem_snapshot.cursor != sweep.fixed_cursor()
-        {
-            return Err(ManagedError::new(
-                ManagedErrorKind::Invalid,
-                "collect unreachable data segments",
-                "observation does not hold this active GC sweep",
-            ));
-        }
-        let current = self.observe().await?.ok_or_else(|| {
+        let observed = self.observe().await?.ok_or_else(|| {
             ManagedError::new(
                 ManagedErrorKind::Conflict,
                 "collect unreachable data segments",
                 "namespace authority changed",
             )
         })?;
-        if current.gc_sweep() != Some(sweep)
-            || current.filesystem_snapshot.cursor != sweep.fixed_cursor()
+        if observed.gc_sweep() != Some(sweep)
+            || observed.filesystem_snapshot.cursor != sweep.fixed_cursor()
         {
             return Err(ManagedError::new(
                 ManagedErrorKind::Conflict,
@@ -344,7 +334,7 @@ impl ManagedVolume {
                 "GC sweep ownership changed",
             ));
         }
-        let snapshot = to_managed_snapshot(&current.filesystem_snapshot)?;
+        let snapshot = to_managed_snapshot(&observed.filesystem_snapshot)?;
         self.data.collect_unreachable_segments(&snapshot).await
     }
 }

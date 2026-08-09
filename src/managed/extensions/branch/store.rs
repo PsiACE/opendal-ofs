@@ -142,7 +142,9 @@ impl BranchStore {
                     "the volume has another default branch",
                 ));
             }
-            return self.get(&default_name).await;
+            return self
+                .registered_branch(&registry, &default_name, "initialize Managed branches")
+                .await;
         }
 
         let branch_id = BranchId::generate();
@@ -187,7 +189,8 @@ impl BranchStore {
                 "the volume has another default branch",
             ));
         }
-        self.get(&default_name).await
+        self.registered_branch(&registry, &default_name, "initialize Managed branches")
+            .await
     }
 
     pub async fn list(&self) -> Result<Vec<BranchInfo>, ManagedError> {
@@ -214,28 +217,48 @@ impl BranchStore {
 
     pub async fn get(&self, name: &BranchName) -> Result<BranchInfo, ManagedError> {
         let (registry, _) = self.registry().await?;
-        let id = registry
-            .branch_id(name)
-            .ok_or_else(|| not_found("show Managed branch"))?;
+        self.registered_branch(&registry, name, "show Managed branch")
+            .await
+    }
+
+    async fn registered_branch(
+        &self,
+        registry: &StoredBranchRegistry,
+        name: &BranchName,
+        action: &'static str,
+    ) -> Result<BranchInfo, ManagedError> {
+        let id = registry.branch_id(name).ok_or_else(|| not_found(action))?;
         let (head, _) = self
             .read_head(id)
             .await?
-            .ok_or_else(|| corrupt("show Managed branch", "registered branch HEAD is missing"))?;
-        head.validate(self.volume_id, id)?;
+            .ok_or_else(|| corrupt(action, "registered branch HEAD is missing"))?;
         info(name.clone(), id, &head, registry.default_branch)
     }
 
     pub async fn bind(&self, name: &BranchName) -> Result<BoundNamespace, ManagedError> {
-        let branch = self.get(name).await?;
-        if branch.lifecycle != BranchLifecycle::Active {
-            return Err(conflict(
-                "bind Managed branch",
-                "branch is sealed for deletion",
-            ));
-        }
+        let (registry, _) = self.registry().await?;
+        let id = registry
+            .branch_id(name)
+            .ok_or_else(|| not_found("bind Managed branch"))?;
         Ok(BoundNamespace {
             store: self.clone(),
-            binding: branch.binding,
+            binding: BranchBinding {
+                name: name.clone(),
+                id,
+            },
+        })
+    }
+
+    pub async fn bind_default(&self) -> Result<BoundNamespace, ManagedError> {
+        let (registry, _) = self.registry().await?;
+        let (name, id) = registry
+            .branches
+            .into_iter()
+            .find(|(_, id)| *id == registry.default_branch)
+            .ok_or_else(|| corrupt("bind default Managed branch", "default branch is missing"))?;
+        Ok(BoundNamespace {
+            store: self.clone(),
+            binding: BranchBinding { name, id },
         })
     }
 
@@ -491,40 +514,20 @@ impl BranchStore {
             let Some(state) = head.state else {
                 continue;
             };
-            roots.checkpoints.insert(checkpoint_key(state.checkpoint));
-            roots.checkpoint_parts.extend(
-                self.read_checkpoint_root(state.checkpoint)
-                    .await?
-                    .parts
-                    .into_iter()
-                    .map(|part| checkpoint_part_key(part.id)),
-            );
-            roots
-                .snapshots
-                .extend(self.snapshots_for_state(&state).await?);
+            self.retain_state_roots(&mut roots, &state).await?;
             let mut history_id = state.previous_history;
             let mut chain = BTreeSet::new();
             while let Some(id) = history_id {
                 visit_history(&mut chain, id, "mark Managed branch GC roots")?;
                 roots.histories.insert(history_key(id));
                 let history = self.read_history(id).await?;
-                roots.checkpoints.insert(checkpoint_key(history.checkpoint));
-                roots.checkpoint_parts.extend(
-                    self.read_checkpoint_root(history.checkpoint)
-                        .await?
-                        .parts
-                        .into_iter()
-                        .map(|part| checkpoint_part_key(part.id)),
-                );
                 let historical = StoredNamespaceState {
                     checkpoint: history.checkpoint,
                     checkpoint_cursor: history.checkpoint_cursor,
                     tail: history.changes.clone(),
                     previous_history: history.previous_history,
                 };
-                roots
-                    .snapshots
-                    .extend(self.snapshots_for_state(&historical).await?);
+                self.retain_state_roots(&mut roots, &historical).await?;
                 history_id = history.previous_history;
             }
         }
@@ -725,12 +728,21 @@ impl BranchStore {
         }
     }
 
-    async fn snapshots_for_state(
+    async fn retain_state_roots(
         &self,
+        roots: &mut GcRoots,
         state: &StoredNamespaceState,
-    ) -> Result<Vec<NamespaceSnapshot>, ManagedError> {
-        let checkpoint = self.read_checkpoint(state.checkpoint).await?;
-        recover_retained(checkpoint, state, self.volume_id)
+    ) -> Result<(), ManagedError> {
+        roots.checkpoints.insert(checkpoint_key(state.checkpoint));
+        let root = self.read_checkpoint_root(state.checkpoint).await?;
+        roots
+            .checkpoint_parts
+            .extend(root.parts.iter().map(|part| checkpoint_part_key(part.id)));
+        let checkpoint = self.read_checkpoint_from_root(root).await?;
+        roots
+            .snapshots
+            .extend(recover_retained(checkpoint, state, self.volume_id)?);
+        Ok(())
     }
 
     pub async fn fork(
@@ -884,6 +896,13 @@ impl BranchStore {
         id: [u8; 32],
     ) -> Result<StoredCheckpoint, ManagedError> {
         let root = self.read_checkpoint_root(id).await?;
+        self.read_checkpoint_from_root(root).await
+    }
+
+    async fn read_checkpoint_from_root(
+        &self,
+        root: CheckpointRoot,
+    ) -> Result<StoredCheckpoint, ManagedError> {
         let mut parts = Vec::with_capacity(root.parts.len());
         for reference in root.parts.iter().copied() {
             let bytes = self

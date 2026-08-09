@@ -21,6 +21,7 @@ use super::local::{
     LocalEntry, LocalKind, LocalTree, NativeIdentity, entry_at, fs_operator, native_identity_at,
     set_executable,
 };
+use super::path::descendants;
 use crate::filesystem::{FileVersion, Volume, VolumeSnapshot};
 
 const COPY_CHUNK: usize = 1024 * 1024;
@@ -382,12 +383,8 @@ impl StagedTree {
     }
 
     fn remove_descendants(&mut self, path: &str) {
-        let prefix = format!("{path}/");
-        let descendants = self
-            .logical
-            .entries()
-            .keys()
-            .filter(|candidate| candidate.starts_with(&prefix))
+        let descendants = descendants(self.logical.entries(), path)
+            .map(|(path, _)| path)
             .cloned()
             .collect::<Vec<_>>();
         for descendant in descendants {

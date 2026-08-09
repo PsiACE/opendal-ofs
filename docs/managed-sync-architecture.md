@@ -167,6 +167,21 @@ The read path does not list objects or read a segment footer to locate file
 bytes. The file version already contains the segment identity, byte offset,
 and length.
 
+Opening and observing a volume has one provider-independent shape:
+
+| Authority | Stable binding | Established-replica observation |
+| --- | --- | --- |
+| Base | Superblock | Read HEAD, then replay its retained tail from the verified common snapshot |
+| Branch | Superblock and registry name/id | Read branch HEAD, then replay its retained tail from the verified common snapshot |
+
+The registry resolves a branch incarnation; it does not pre-read mutable HEAD
+state that observation will immediately read again. A checkpoint root and its
+parts are loaded only for a cold replica or after its common cursor has fallen
+behind the retained tail. Checkpoint receipts are loaded lazily when tail
+rotation actually needs them. Normal publication does not issue an operation
+receipt lookup before CAS. Receipt resolution belongs only to pending-intent
+recovery, invalid retries, CAS races, and unknown commit results.
+
 ## Metadata authorities
 
 ### Object Metadata
@@ -244,11 +259,13 @@ three-way reconcile(base, local, remote)
        |
        +--> conflicts: retain local candidates and stop
        |
+materialize and verify the merged staging tree
+       |
 save pending OperationId
        |
 publish metadata with generation preconditions
        |
-materialize and verify the merged tree
+install staged file replacements and attributes locally
        |
 advance the durable common base
 ```
@@ -256,6 +273,11 @@ advance the durable common base
 Data is written before metadata, so metadata never references an object that
 has not been staged. A failed metadata commit may leave unreachable immutable
 segments. It cannot create another namespace authority.
+
+If reconciliation produces only remote changes, Sync skips the pending and
+publication steps, installs the verified staging result, and then advances the
+common base. If it produces a publication, the pending intent is durable before
+the CAS write and remains present until the committed target is safely installed.
 
 The pending cache is stored beside replica state by relative name. It is not
 authority. Its manifest contains the already verified opaque file versions;
@@ -270,6 +292,19 @@ subtree is rejected before either the replica or its durable state is changed.
 File content and executable state are reconciled together. A remote-only
 executable change updates local attributes without reading or retransferring
 unchanged file content.
+
+The publication builder receives the current authoritative observation as its
+parent and the durable replica state as its old local baseline. Reconciliation
+does not fabricate an intermediate replica state or advance `common` before
+the metadata commit succeeds. A local scan reads native identity, executable
+state, and link count from one native metadata observation per path.
+
+Each Sync pass expands the durable base and current authority into one
+path-sorted index apiece. Reconciliation, subtree conflict checks, directory
+installation, rename validation, publication, and final state installation
+reuse those indexes. Canonical `/`-separated descendants form a bounded
+`BTreeMap` range, so subtree lookup does not rescan the namespace and reverse
+iteration gives children-before-parent deletion without a second depth sort.
 
 ## Garbage collection
 
@@ -287,15 +322,20 @@ successful empty collection.
 
 Foreground publication and materialization do not list the data prefix.
 
+The collector itself performs the one current fence observation used for the
+sweep; callers cannot supply an older snapshot. Branch collection decodes each
+retained checkpoint root once and uses that same root both to mark checkpoint
+parts and to recover retained snapshots.
+
 ## Extensions
 
 A Managed extension adds authority semantics without adding another filesystem
 model. A branch binding wraps a backend-native authority behind one
-`BoundNamespace<S>` state machine before Sync calls the same `Volume` contract.
-Observe, publication validation, receipt resolution, tail rotation, and
-unknown-commit recovery are shared. Object and D1 implement the same small
-revision-CAS record operations. Base and branch checkpoints use one
-content-addressed part codec, and branch snapshots and publications use the
+`BoundNamespace` state machine before Sync calls the same `Volume` contract.
+Base and branch expose the same observation, CAS publication, receipt
+resolution, bounded-tail, and unknown-commit behavior. Object and D1 implement
+the same small revision-CAS record operations. Base and branch checkpoints use
+one content-addressed part codec, and branch snapshots and publications use the
 shared node, directory, precondition, and Managed file-version records.
 
 The branch feature controls commands and extension code only. It does not

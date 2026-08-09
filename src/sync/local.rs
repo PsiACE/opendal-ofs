@@ -73,18 +73,12 @@ impl LocalTree {
                 .last_modified()
                 .context("local filesystem did not report modification time")?
                 .to_string();
-            let native_identity = native_identity_at(root, path, kind)?;
+            let (native_identity, executable, link_count) = native_attributes_at(root, path, kind)?;
             if kind == LocalKind::File {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::MetadataExt as _;
-                    let metadata = fs::symlink_metadata(root.join(path))
-                        .with_context(|| format!("inspect local links for {path:?}"))?;
-                    if metadata.nlink() > 1 {
-                        bail!(
-                            "local path {path:?} is a hard link; Sync does not publish hard-linked files"
-                        );
-                    }
+                if link_count > 1 {
+                    bail!(
+                        "local path {path:?} is a hard link; Sync does not publish hard-linked files"
+                    );
                 }
                 if let Some(identity) = native_identity
                     && let Some(other) = file_identities.insert(identity, path.to_owned())
@@ -100,7 +94,7 @@ impl LocalTree {
                     kind,
                     size: metadata.content_length(),
                     modified,
-                    executable: executable_at(root, path, kind)?,
+                    executable,
                     native_identity,
                 },
             );
@@ -159,6 +153,7 @@ pub(crate) async fn entry_at(root: &Path, path: &str) -> Result<LocalEntry> {
         EntryMode::FILE => LocalKind::File,
         _ => bail!("materialized path {path:?} is a symbolic link or special file"),
     };
+    let (native_identity, executable, _) = native_attributes_at(root, path, kind)?;
     Ok(LocalEntry {
         kind,
         size: metadata.content_length(),
@@ -166,8 +161,8 @@ pub(crate) async fn entry_at(root: &Path, path: &str) -> Result<LocalEntry> {
             .last_modified()
             .context("local filesystem did not report modification time")?
             .to_string(),
-        executable: executable_at(root, path, kind)?,
-        native_identity: native_identity_at(root, path, kind)?,
+        executable,
+        native_identity,
     })
 }
 
@@ -176,11 +171,19 @@ pub(crate) fn native_identity_at(
     path: &str,
     kind: LocalKind,
 ) -> Result<Option<NativeIdentity>> {
+    native_attributes_at(root, path, kind).map(|(identity, _, _)| identity)
+}
+
+fn native_attributes_at(
+    root: &Path,
+    path: &str,
+    kind: LocalKind,
+) -> Result<(Option<NativeIdentity>, bool, u64)> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt as _;
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
         let metadata = fs::symlink_metadata(root.join(path))
-            .with_context(|| format!("inspect local identity for {path:?}"))?;
+            .with_context(|| format!("inspect local attributes for {path:?}"))?;
         let expected = match kind {
             LocalKind::Directory => metadata.file_type().is_dir(),
             LocalKind::File => metadata.file_type().is_file(),
@@ -188,36 +191,19 @@ pub(crate) fn native_identity_at(
         if !expected {
             bail!("local path {path:?} changed kind while it was being inspected; retry sync");
         }
-        Ok(Some(NativeIdentity {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        }))
+        Ok((
+            Some(NativeIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }),
+            kind == LocalKind::File && metadata.permissions().mode() & 0o111 != 0,
+            metadata.nlink(),
+        ))
     }
     #[cfg(not(unix))]
     {
         let _ = (root, path);
-        Ok(None)
-    }
-}
-
-pub(crate) fn executable_at(root: &Path, path: &str, kind: LocalKind) -> Result<bool> {
-    if kind != LocalKind::File {
-        return Ok(false);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let metadata = fs::symlink_metadata(root.join(path))
-            .with_context(|| format!("inspect local permissions for {path:?}"))?;
-        if metadata.file_type().is_symlink() {
-            bail!("local path {path:?} is a symbolic link; remove it before sync");
-        }
-        Ok(metadata.permissions().mode() & 0o111 != 0)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (root, path);
-        Ok(false)
+        Ok((None, false, 1))
     }
 }
 

@@ -245,11 +245,7 @@ async fn gc_volume(config: &Path, args: VolumeGcArgs) -> Result<()> {
     } else {
         volume.begin_gc(&observed).await?
     };
-    let fixed = volume
-        .observe()
-        .await?
-        .context("Managed namespace disappeared after starting collection")?;
-    let collected = volume.collect_unreachable_segments(&fixed, sweep).await?;
+    let collected = volume.collect_unreachable_segments(sweep).await?;
     volume.finish_gc(sweep).await?;
     print_gc_result(&args.alias, collected);
     Ok(())
@@ -276,12 +272,11 @@ async fn open_managed_volume(
     #[cfg(feature = "managed-branch")]
     if format.requires_extension(ofs::managed::ManagedExtension::BranchV1) {
         let branches = metadata.branches(format.volume_id(), data.clone())?;
-        let name = match branch {
-            Some(name) => parse_branch_name(name)?,
-            None => branches.default_name().await?,
+        let namespace = match branch {
+            Some(name) => branches.bind(&parse_branch_name(name)?).await?,
+            None => branches.bind_default().await?,
         };
-        return ManagedVolume::branch(format, data, branches.bind(&name).await?)
-            .map_err(Into::into);
+        return ManagedVolume::branch(format, data, namespace).map_err(Into::into);
     }
     if branch.is_some() {
         bail!("Managed volume does not enable branch/v1");

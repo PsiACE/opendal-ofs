@@ -235,6 +235,34 @@ pub(crate) fn recover_namespace(
     Ok((snapshot, results))
 }
 
+/// Advance an already verified snapshot through the part of this HEAD tail
+/// that follows it. A checkpoint read is only needed after the base has fallen
+/// behind the retained tail.
+pub(crate) fn replay_tail_from(
+    base: &NamespaceSnapshot,
+    state: &StoredNamespaceState,
+) -> Result<Option<NamespaceSnapshot>, ManagedError> {
+    validate_snapshot(base)?;
+    if base.cursor == state.cursor()? {
+        return Ok(Some(base.clone()));
+    }
+    let Some(start) = state
+        .tail
+        .iter()
+        .position(|change| change.parent() == base.cursor)
+    else {
+        return Ok(None);
+    };
+    let mut snapshot = base.clone();
+    for change in &state.tail[start..] {
+        snapshot = change.apply(Some(snapshot))?;
+    }
+    if snapshot.cursor != state.cursor()? {
+        return Err(corrupt("branch transaction tail does not reach HEAD"));
+    }
+    Ok(Some(snapshot))
+}
+
 pub(crate) fn recover_retained(
     checkpoint: StoredCheckpoint,
     state: &StoredNamespaceState,

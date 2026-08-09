@@ -212,6 +212,43 @@ cmp "$replica_a/from-a/value.txt" "$replica_b/from-a/value.txt" || \
 cmp "$replica_a/from-b/value.txt" "$replica_b/from-b/value.txt" || \
   fail 'replica a lost replica b nested directory change'
 
+printf '%s\n' 'regression: resume a partially applied remote directory change without republishing'
+mkdir -p "$replica_a/partial-before/child/empty"
+printf '%s\n' 'remote directory content' >"$replica_a/partial-before/child/value.txt"
+OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a"
+OFS_CONFIG="$peer_config" "$OFS_BIN" sync "$peer_alias" "$replica_b" --state "$state_b"
+mv "$replica_a/partial-before" "$replica_a/partial-after"
+OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a"
+mkdir "$replica_b/partial-after"
+partial_resume=$(OFS_CONFIG="$peer_config" "$OFS_BIN" sync "$peer_alias" "$replica_b" --state "$state_b")
+if grep -Fq '(published)' <<<"$partial_resume"; then
+  fail 'partial remote directory installation was republished as a local change'
+fi
+[[ ! -e "$replica_b/partial-before" ]] || fail 'partial remote directory removal did not resume'
+[[ -d "$replica_b/partial-after/child/empty" ]] || \
+  fail 'partial remote directory creation did not resume'
+cmp "$replica_a/partial-after/child/value.txt" "$replica_b/partial-after/child/value.txt" || \
+  fail 'resumed remote directory installation lost file content'
+
+printf '%s\n' 'acceptance: publish and install one-sided file and directory replacements'
+printf '%s\n' 'replace this file with a directory' >"$replica_a/file-to-directory"
+mkdir "$replica_a/directory-to-file"
+OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a"
+OFS_CONFIG="$peer_config" "$OFS_BIN" sync "$peer_alias" "$replica_b" --state "$state_b"
+rm "$replica_a/file-to-directory"
+mkdir "$replica_a/file-to-directory"
+printf '%s\n' 'now nested' >"$replica_a/file-to-directory/value.txt"
+rmdir "$replica_a/directory-to-file"
+printf '%s\n' 'now a file' >"$replica_a/directory-to-file"
+OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a"
+OFS_CONFIG="$peer_config" "$OFS_BIN" sync "$peer_alias" "$replica_b" --state "$state_b"
+[[ -d "$replica_b/file-to-directory" ]] || fail 'remote file-to-directory replacement was rejected'
+grep -Fxq 'now nested' "$replica_b/file-to-directory/value.txt" || \
+  fail 'remote replacement directory lost its content'
+[[ -f "$replica_b/directory-to-file" ]] || fail 'remote directory-to-file replacement was rejected'
+grep -Fxq 'now a file' "$replica_b/directory-to-file" || \
+  fail 'remote replacement file lost its content'
+
 printf '%s\n' 'regression: reject a directory deletion that overlaps a local subtree change'
 mkdir -p "$replica_a/overlap"
 printf '%s\n' 'base' >"$replica_a/overlap/value.txt"
