@@ -25,7 +25,8 @@ classify authoritative segments, legacy loose data, metadata, and indexes.
 Every run writes a content-hashed logical manifest;
 different final trees fail the comparison. The other gates reject more than 10
 percent lifecycle regression, more than 15 percent publication or catch-up p95
-regression, or any no-op data upload.
+regression, more than 10 percent growth in total requests, catch-up segment
+GETs, transferred bytes, or stored bytes, or any no-op data upload.
 
 Start with `comparison.json` and `results.json`. Raw recomputable evidence is
 in `requests.jsonl`, `requests.tsv`, `objects.tsv`, `samples.tsv`, and each run

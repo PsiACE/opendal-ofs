@@ -174,6 +174,7 @@ def comparison_summary(samples, requests, inventories, inputs, equal):
     request_totals = defaultdict(lambda: {"count": 0, "request_bytes": 0, "response_bytes": 0})
     request_methods = defaultdict(lambda: defaultdict(int))
     range_gets = defaultdict(int)
+    catchup_segment_gets = defaultdict(int)
     for row in requests:
         total = request_totals[row["run"]]
         total["count"] += row["count"]
@@ -182,6 +183,12 @@ def comparison_summary(samples, requests, inventories, inputs, equal):
         request_methods[row["run"]][row["method"]] += row["count"]
         if row["method"] == "GET" and row["range"]:
             range_gets[row["run"]] += row["count"]
+        if (
+            row["phase"] == "catchup"
+            and row["method"] == "GET"
+            and row["object_class"] == "segment_data"
+        ):
+            catchup_segment_gets[row["run"]] += row["count"]
 
     object_totals = defaultdict(
         lambda: {
@@ -228,6 +235,9 @@ def comparison_summary(samples, requests, inventories, inputs, equal):
                 },
                 "range_get_count_median": statistics.median(
                     range_gets[run] for run in runs
+                ),
+                "catchup_segment_get_count_median": statistics.median(
+                    catchup_segment_gets[run] for run in runs
                 ),
             },
             "remote_objects": {
@@ -277,6 +287,8 @@ def main() -> None:
         inputs[run].update(values)
     context = {key: value for key, value in read_tsv(directory / "context.tsv")}
     summary = comparison_summary(samples, requests, object_inventory, inputs, equal)
+    baseline_summary = summary["releases"]["baseline"]
+    candidate_summary = summary["releases"]["candidate"]
     gates = [
         relative_gate(
             "lifecycle_median",
@@ -295,6 +307,32 @@ def main() -> None:
             statistics_by_metric["baseline.catchup"]["p95_ms"],
             statistics_by_metric["candidate.catchup"]["p95_ms"],
             0.15,
+        ),
+        relative_gate(
+            "request_count_median",
+            baseline_summary["requests"]["count_median"],
+            candidate_summary["requests"]["count_median"],
+            0.10,
+        ),
+        relative_gate(
+            "catchup_segment_get_count_median",
+            baseline_summary["requests"]["catchup_segment_get_count_median"],
+            candidate_summary["requests"]["catchup_segment_get_count_median"],
+            0.10,
+        ),
+        relative_gate(
+            "transferred_bytes_median",
+            baseline_summary["requests"]["request_bytes_median"]
+            + baseline_summary["requests"]["response_bytes_median"],
+            candidate_summary["requests"]["request_bytes_median"]
+            + candidate_summary["requests"]["response_bytes_median"],
+            0.10,
+        ),
+        relative_gate(
+            "stored_bytes_median",
+            baseline_summary["remote_objects"]["total_bytes_median"],
+            candidate_summary["remote_objects"]["total_bytes_median"],
+            0.10,
         ),
         {
             "name": "noop_requests_observed",
