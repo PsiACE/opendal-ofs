@@ -54,7 +54,6 @@ pub struct ConflictRecord {
 pub struct ReplicaState {
     pub volume: VolumeId,
     pub branch: Option<BranchBinding>,
-    pub common: ChangeCursor,
     pub(crate) authority: Option<VolumeSnapshot>,
     pub(crate) installed: BTreeMap<String, InstalledEntry>,
     pub pending: Option<PendingIntent>,
@@ -63,22 +62,13 @@ pub struct ReplicaState {
 
 impl ReplicaState {
     pub fn empty(volume: VolumeId) -> Self {
-        Self {
-            volume,
-            branch: None,
-            common: ChangeCursor::Genesis,
-            authority: None,
-            installed: BTreeMap::new(),
-            pending: None,
-            conflicts: Vec::new(),
-        }
+        Self::empty_for(AuthorityIdentity::base(volume))
     }
 
     pub fn empty_for(authority: AuthorityIdentity) -> Self {
         Self {
             volume: authority.volume,
             branch: authority.branch,
-            common: ChangeCursor::Genesis,
             authority: None,
             installed: BTreeMap::new(),
             pending: None,
@@ -91,6 +81,13 @@ impl ReplicaState {
             volume: self.volume,
             branch: self.branch.clone(),
         }
+    }
+
+    pub fn common(&self) -> ChangeCursor {
+        self.authority
+            .as_ref()
+            .map(|snapshot| snapshot.cursor)
+            .unwrap_or(ChangeCursor::Genesis)
     }
 
     pub fn load(path: impl AsRef<Path>) -> Result<Option<Self>> {
@@ -165,7 +162,6 @@ struct StoredState {
     major: u16,
     volume: VolumeId,
     branch: Option<BranchBinding>,
-    common: ChangeCursor,
     authority: Option<StoredSnapshot>,
     installed: BTreeMap<String, InstalledEntry>,
     pending: Option<PendingIntent>,
@@ -189,7 +185,6 @@ impl From<&ReplicaState> for StoredState {
             major: STATE_MAJOR,
             volume: state.volume,
             branch: state.branch.clone(),
-            common: state.common,
             authority: state.authority.as_ref().map(StoredSnapshot::from),
             installed: state.installed.clone(),
             pending: state.pending.as_ref().map(|intent| PendingIntent {
@@ -217,19 +212,12 @@ impl TryFrom<StoredState> for ReplicaState {
             .authority
             .map(|snapshot| snapshot.into_snapshot(stored.volume))
             .transpose()?;
-        if authority
-            .as_ref()
-            .is_some_and(|snapshot| snapshot.cursor != stored.common)
-        {
-            bail!("replica authority snapshot does not match its common cursor");
-        }
         if let Some(snapshot) = &authority {
             validate_installed(snapshot, &stored.installed)?;
         }
         Ok(Self {
             volume: stored.volume,
             branch: stored.branch,
-            common: stored.common,
             authority,
             installed: stored.installed,
             pending: stored.pending,

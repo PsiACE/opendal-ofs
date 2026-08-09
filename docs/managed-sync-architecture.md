@@ -115,8 +115,10 @@ for another payload is a conflict.
 At the `Volume` boundary, an observation retains one RFC 016 `VolumeSnapshot`
 and a small metadata CAS witness. The decoded Managed snapshot is consumed
 while constructing that value rather than retained as a second namespace
-graph. Publication and GC decode opaque file-version descriptors only when
-they need extent maps.
+graph. Data staging decodes only the reachable file-version descriptors needed
+for content reuse; publication and GC decode a complete Managed snapshot when
+they need extent maps. None of these paths clones the namespace merely to
+select a metadata backend.
 
 ## Data path
 
@@ -183,6 +185,10 @@ receipt lookup before CAS. Receipt resolution belongs only to pending-intent
 recovery, invalid retries, CAS races, and unknown commit results.
 
 ## Metadata authorities
+
+Object or D1 selection is bound once as `ManagedMetadata`. Format creation,
+volume opening, and branch-store opening pass through that authority; the CLI
+and Sync engine do not dispatch on provider types.
 
 ### Object Metadata
 
@@ -294,10 +300,12 @@ executable change updates local attributes without reading or retransferring
 unchanged file content.
 
 The publication builder receives the current authoritative observation as its
-parent and the durable replica state as its old local baseline. Reconciliation
-does not fabricate an intermediate replica state or advance `common` before
-the metadata commit succeeds. A local scan reads native identity, executable
-state, and link count from one native metadata observation per path.
+parent and the durable replica state as its old local baseline. The common
+cursor is the cursor of that stored authority snapshot; it is not persisted as
+a second field. Reconciliation does not fabricate an intermediate replica
+state or install a new authority snapshot before the metadata commit succeeds.
+A local scan reads native identity, executable state, and link count from one
+native metadata observation per path.
 
 Each Sync pass expands the durable base and current authority into one
 path-sorted index apiece. Reconciliation, subtree conflict checks, directory

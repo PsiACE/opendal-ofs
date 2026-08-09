@@ -79,7 +79,7 @@ pub(crate) fn reconcile(
     if replica.volume != remote.volume_id {
         bail!("replica state and remote namespace belong to different volumes");
     }
-    if replica.common.sequence() > remote.cursor.sequence() {
+    if replica.common().sequence() > remote.cursor.sequence() {
         bail!("replica base cursor is ahead of the remote namespace");
     }
 

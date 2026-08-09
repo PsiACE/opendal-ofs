@@ -18,8 +18,7 @@ use ofs::filesystem::{Volume, VolumeId, VolumeModel};
 #[cfg(feature = "managed-branch")]
 use ofs::managed::extensions::branch::{BranchInfo, BranchStore, ForkPoint};
 use ofs::managed::{
-    D1Config, D1Metadata, ManagedErrorKind, ManagedFormat, ManagedVolume, MetadataFormat,
-    ObjectMetadata, SegmentGcMaintenance,
+    D1Config, ManagedErrorKind, ManagedFormat, ManagedMetadata, ManagedVolume, SegmentGcMaintenance,
 };
 use ofs::sync::{ReplicaState, SyncEngine};
 use opendal::Operator;
@@ -32,69 +31,10 @@ use crate::cli::{
     Cli, Command, MountArgs, StatusArgs, SyncArgs, VolumeCommand, VolumeCreateArgs, VolumeGcArgs,
 };
 
-enum MetadataAuthority {
-    Object(ObjectMetadata),
-    D1(D1Metadata),
-}
-
 struct ManagedContext {
     format: ManagedFormat,
     data: Operator,
-    metadata: MetadataAuthority,
-}
-
-impl MetadataAuthority {
-    const fn metadata_format(&self) -> MetadataFormat {
-        match self {
-            Self::Object(_) => MetadataFormat::ObjectV1,
-            Self::D1(_) => MetadataFormat::TransactionalV1,
-        }
-    }
-
-    async fn create_format(
-        &self,
-        desired: &ManagedFormat,
-    ) -> Result<ManagedFormat, ofs::managed::ManagedError> {
-        match self {
-            Self::Object(metadata) => metadata.create_format(desired).await,
-            Self::D1(metadata) => metadata.create_format(desired).await,
-        }
-    }
-
-    async fn read_format(&self) -> Result<ManagedFormat, ofs::managed::ManagedError> {
-        match self {
-            Self::Object(metadata) => metadata.read_format().await,
-            Self::D1(metadata) => metadata.read_format().await,
-        }
-    }
-
-    async fn read_format_optional(
-        &self,
-    ) -> Result<Option<ManagedFormat>, ofs::managed::ManagedError> {
-        match self {
-            Self::Object(metadata) => metadata.read_format_optional().await,
-            Self::D1(metadata) => metadata.read_format_optional().await,
-        }
-    }
-
-    fn validate_volume(
-        &self,
-        format: ManagedFormat,
-        data: Operator,
-    ) -> Result<(), ofs::managed::ManagedError> {
-        match self {
-            Self::Object(_) => ManagedVolume::object(format, data).map(|_| ()),
-            Self::D1(metadata) => ManagedVolume::d1(format, data, metadata.clone()).map(|_| ()),
-        }
-    }
-
-    #[cfg(feature = "managed-branch")]
-    fn branches(&self, volume_id: VolumeId, data: Operator) -> Result<BranchStore> {
-        match self {
-            Self::Object(_) => BranchStore::object(volume_id, data).map_err(Into::into),
-            Self::D1(metadata) => Ok(BranchStore::d1(volume_id, metadata.clone())),
-        }
-    }
+    metadata: ManagedMetadata,
 }
 
 pub(crate) async fn run(cli: Cli) -> Result<()> {
@@ -276,16 +216,14 @@ async fn open_managed_volume(
             Some(name) => branches.bind(&parse_branch_name(name)?).await?,
             None => branches.bind_default().await?,
         };
-        return ManagedVolume::branch(format, data, namespace).map_err(Into::into);
+        return metadata
+            .open_branch_volume(format, data, namespace)
+            .map_err(Into::into);
     }
     if branch.is_some() {
         bail!("Managed volume does not enable branch/v1");
     }
-    match metadata {
-        MetadataAuthority::Object(_) => ManagedVolume::object(format, data),
-        MetadataAuthority::D1(metadata) => ManagedVolume::d1(format, data, metadata),
-    }
-    .map_err(Into::into)
+    metadata.open_volume(format, data).map_err(Into::into)
 }
 
 #[cfg(feature = "managed-branch")]
@@ -302,7 +240,7 @@ async fn open_branch_authority(
     if !format.requires_extension(ofs::managed::ManagedExtension::BranchV1) {
         bail!("Managed volume does not enable branch/v1");
     }
-    metadata.branches(format.volume_id(), data)
+    Ok(metadata.branches(format.volume_id(), data)?)
 }
 
 async fn open_managed_context(
@@ -418,10 +356,10 @@ async fn create_volume(config: &Path, mut args: VolumeCreateArgs) -> Result<()> 
             .initialize(BranchName::parse("main").expect("main is a valid branch name"))
             .await?;
     } else {
-        metadata.validate_volume(format.clone(), data)?;
+        metadata.open_volume(format.clone(), data)?;
     }
     #[cfg(not(feature = "managed-branch"))]
-    metadata.validate_volume(format.clone(), data)?;
+    metadata.open_volume(format.clone(), data)?;
     let volume_id = format.volume_id();
     let definition = VolumeDefinition::managed(volume_id, args.storage, args.metadata)?;
     let registered = catalog.register(&args.alias, definition)?;
@@ -466,12 +404,12 @@ fn create_direct_volume(
     Ok(())
 }
 
-fn open_metadata(data: Operator, metadata: Option<&Url>) -> Result<MetadataAuthority> {
+fn open_metadata(data: Operator, metadata: Option<&Url>) -> Result<ManagedMetadata> {
     match metadata {
-        None => Ok(MetadataAuthority::Object(ObjectMetadata::new(data))),
-        Some(url) if url.scheme() == "d1" => D1Metadata::new(d1_config(url)?)
-            .map(MetadataAuthority::D1)
-            .map_err(Into::into),
+        None => Ok(ManagedMetadata::object(data)),
+        Some(url) if url.scheme() == "d1" => {
+            ManagedMetadata::d1(d1_config(url)?).map_err(Into::into)
+        }
         Some(_) => bail!("--metadata must use d1://ACCOUNT/DATABASE/STORE"),
     }
 }
@@ -531,8 +469,8 @@ fn status(config: &Path, args: StatusArgs) -> Result<()> {
         "branch_id": state.branch.as_ref().map(|branch| branch.id.to_string()),
         "volume_model": "managed",
         "access_model": "sync",
-        "common_sequence": state.common.sequence(),
-        "common_operation": state.common.operation().map(|operation| hex_bytes(operation.as_bytes())),
+        "common_sequence": state.common().sequence(),
+        "common_operation": state.common().operation().map(|operation| hex_bytes(operation.as_bytes())),
         "pending": state.pending.is_some(),
         "conflicts": state.conflicts.len(),
     });
@@ -547,7 +485,7 @@ fn status(config: &Path, args: StatusArgs) -> Result<()> {
         println!(
             "managed sync alias {alias:?} for volume {}{branch} at change {}, {} pending, {} conflict(s)",
             state.volume,
-            state.common.sequence(),
+            state.common().sequence(),
             usize::from(state.pending.is_some()),
             state.conflicts.len()
         );

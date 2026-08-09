@@ -27,7 +27,101 @@ pub use namespace::NamespaceGcSweep;
 pub use object::ObjectMetadata;
 pub use superblock::{ManagedExtension, ManagedFormat, MetadataFormat};
 
-use super::ManagedError;
+use opendal::Operator;
+
+#[cfg(feature = "managed-branch")]
+use super::extensions::branch::{BoundNamespace, BranchStore};
+use super::{ManagedError, ManagedVolume};
+#[cfg(feature = "managed-branch")]
+use crate::filesystem::VolumeId;
+
+/// The metadata authority selected for one Managed volume.
+///
+/// Backend selection ends here. Callers open formats, volumes, and optional
+/// extensions without repeating Object/D1 dispatch throughout the access
+/// model.
+#[derive(Clone)]
+pub struct ManagedMetadata(MetadataBackend);
+
+#[derive(Clone)]
+enum MetadataBackend {
+    Object(ObjectMetadata),
+    D1(D1Metadata),
+}
+
+impl ManagedMetadata {
+    pub const fn object(operator: Operator) -> Self {
+        Self(MetadataBackend::Object(ObjectMetadata::new(operator)))
+    }
+
+    pub fn d1(config: D1Config) -> Result<Self, ManagedError> {
+        D1Metadata::new(config).map(MetadataBackend::D1).map(Self)
+    }
+
+    pub const fn metadata_format(&self) -> MetadataFormat {
+        match &self.0 {
+            MetadataBackend::Object(_) => MetadataFormat::ObjectV1,
+            MetadataBackend::D1(_) => MetadataFormat::TransactionalV1,
+        }
+    }
+
+    pub async fn create_format(
+        &self,
+        desired: &ManagedFormat,
+    ) -> Result<ManagedFormat, ManagedError> {
+        match &self.0 {
+            MetadataBackend::Object(metadata) => metadata.create_format(desired).await,
+            MetadataBackend::D1(metadata) => metadata.create_format(desired).await,
+        }
+    }
+
+    pub async fn read_format(&self) -> Result<ManagedFormat, ManagedError> {
+        match &self.0 {
+            MetadataBackend::Object(metadata) => metadata.read_format().await,
+            MetadataBackend::D1(metadata) => metadata.read_format().await,
+        }
+    }
+
+    pub async fn read_format_optional(&self) -> Result<Option<ManagedFormat>, ManagedError> {
+        match &self.0 {
+            MetadataBackend::Object(metadata) => metadata.read_format_optional().await,
+            MetadataBackend::D1(metadata) => metadata.read_format_optional().await,
+        }
+    }
+
+    pub fn open_volume(
+        &self,
+        format: ManagedFormat,
+        data: Operator,
+    ) -> Result<ManagedVolume, ManagedError> {
+        match &self.0 {
+            MetadataBackend::Object(_) => ManagedVolume::object(format, data),
+            MetadataBackend::D1(metadata) => ManagedVolume::d1(format, data, metadata.clone()),
+        }
+    }
+
+    #[cfg(feature = "managed-branch")]
+    pub fn open_branch_volume(
+        &self,
+        format: ManagedFormat,
+        data: Operator,
+        namespace: BoundNamespace,
+    ) -> Result<ManagedVolume, ManagedError> {
+        ManagedVolume::branch(format, data, namespace)
+    }
+
+    #[cfg(feature = "managed-branch")]
+    pub fn branches(
+        &self,
+        volume_id: VolumeId,
+        data: Operator,
+    ) -> Result<BranchStore, ManagedError> {
+        match &self.0 {
+            MetadataBackend::Object(_) => BranchStore::object(volume_id, data),
+            MetadataBackend::D1(metadata) => Ok(BranchStore::d1(volume_id, metadata.clone())),
+        }
+    }
+}
 
 fn require_same_format(
     desired: &ManagedFormat,

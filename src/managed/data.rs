@@ -74,17 +74,20 @@ struct StoredContent {
 pub(crate) struct AuthorityKnownContent(BTreeMap<ContentRef, StoredContent>);
 
 impl AuthorityKnownContent {
-    pub(crate) fn from_snapshot(snapshot: &NamespaceSnapshot) -> Result<Self, ManagedError> {
-        let mut known = BTreeMap::new();
-        visit_reachable_file_versions(snapshot, "derive authority-known content", |version| {
-            for extent in &version.extent_map.extents {
-                known.entry(extent.content).or_insert(StoredContent {
-                    segment: extent.segment,
-                    offset: extent.segment_offset,
-                });
-            }
-        })?;
-        Ok(Self(known))
+    pub(crate) fn include(&mut self, version: &FileVersionRecord) -> Result<(), ManagedError> {
+        if !version.is_valid() {
+            return Err(corrupt(
+                "derive authority-known content",
+                "live node references an invalid file version",
+            ));
+        }
+        for extent in &version.extent_map.extents {
+            self.0.entry(extent.content).or_insert(StoredContent {
+                segment: extent.segment,
+                offset: extent.segment_offset,
+            });
+        }
+        Ok(())
     }
 
     fn get(&self, content: &ContentRef) -> Option<StoredContent> {

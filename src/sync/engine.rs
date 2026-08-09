@@ -149,7 +149,7 @@ impl<V: Volume> SyncEngine<V> {
         };
         let observed = self.volume.observe_from(state.authority.as_ref()).await?;
         let remote = observed.as_ref().map(|value| value.snapshot());
-        if remote.is_none() && state.common != ChangeCursor::Genesis {
+        if remote.is_none() && state.common() != ChangeCursor::Genesis {
             bail!("authoritative namespace disappeared after this replica was initialized");
         }
         let base_paths = state
@@ -170,7 +170,7 @@ impl<V: Volume> SyncEngine<V> {
                 if resolve_paths.is_empty()
                     && state.conflicts.is_empty()
                     && let Some(snapshot) = remote
-                    && snapshot.cursor == state.common
+                    && snapshot.cursor == state.common()
                     && local_matches_state(&local, &state, &base_paths)?
                 {
                     return Ok(result(&state, false));
@@ -208,7 +208,7 @@ impl<V: Volume> SyncEngine<V> {
 
         if let Some(remote) = remote {
             let plan = reconcile(&state, &staged, remote, &base_paths, &remote_paths)?;
-            install_remote |= remote.cursor != state.common;
+            install_remote |= remote.cursor != state.common();
             let target = fs_operator(staged.root())?;
             publish |= plan.publish_local_directories;
             install_remote |= plan.merge_remote_directories;
@@ -436,7 +436,7 @@ async fn advance_common_base(
 
 fn result(state: &ReplicaState, published: bool) -> SyncResult {
     SyncResult {
-        common: state.common,
+        common: state.common(),
         conflicts: state.conflicts.clone(),
         pending: state.pending.is_some(),
         published,
@@ -630,7 +630,6 @@ async fn state_from_snapshot(
     let local = LocalTree::scan(replica).await?;
     let mut state = ReplicaState::empty(snapshot.volume_id);
     state.branch = previous.branch.clone();
-    state.common = snapshot.cursor;
     state.authority = Some(snapshot.clone());
     for (path, node) in paths {
         let record = &snapshot.nodes[node];

@@ -28,8 +28,8 @@ mod volume;
 pub use data::SegmentGcMaintenance;
 pub(crate) use data::{AuthorityKnownContent, ManagedData};
 pub use error::{ManagedError, ManagedErrorKind};
+pub(crate) use metadata::D1Metadata;
 pub use metadata::{
-    D1Config, D1Metadata, ManagedExtension, ManagedFormat, MetadataFormat, NamespaceGcSweep,
-    ObjectMetadata,
+    D1Config, ManagedExtension, ManagedFormat, ManagedMetadata, MetadataFormat, NamespaceGcSweep,
 };
 pub use volume::{ManagedObservation, ManagedVolume};

@@ -17,7 +17,7 @@
 
 //! Concrete composition of the Managed namespace and data plane.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 
 use opendal::Operator;
@@ -77,7 +77,10 @@ impl ManagedObservation {
 }
 
 impl ManagedVolume {
-    pub fn object(format: ManagedFormat, data_operator: Operator) -> Result<Self, ManagedError> {
+    pub(crate) fn object(
+        format: ManagedFormat,
+        data_operator: Operator,
+    ) -> Result<Self, ManagedError> {
         if format.metadata_format() != MetadataFormat::ObjectV1
             || !format.required_extensions().is_empty()
         {
@@ -99,7 +102,7 @@ impl ManagedVolume {
     }
 
     #[cfg(feature = "managed-branch")]
-    pub fn branch(
+    pub(crate) fn branch(
         format: ManagedFormat,
         data_operator: Operator,
         namespace: BoundNamespace,
@@ -120,7 +123,7 @@ impl ManagedVolume {
         })
     }
 
-    pub fn d1(
+    pub(crate) fn d1(
         format: ManagedFormat,
         data_operator: Operator,
         metadata: D1Metadata,
@@ -147,25 +150,7 @@ impl ManagedVolume {
     }
 
     pub async fn observe(&self) -> Result<Option<ManagedObservation>, ManagedError> {
-        match &self.namespace {
-            NamespaceAuthority::Base(namespace) => namespace
-                .observe()
-                .await?
-                .map(|observed| {
-                    let (snapshot, witness) = observed.into_parts();
-                    managed_observation(snapshot, AuthorityObservation::Base(witness))
-                })
-                .transpose(),
-            #[cfg(feature = "managed-branch")]
-            NamespaceAuthority::Branch(namespace) => namespace
-                .observe()
-                .await?
-                .map(|observed| {
-                    let (snapshot, witness) = observed.into_parts();
-                    managed_observation(snapshot, AuthorityObservation::Branch(Box::new(witness)))
-                })
-                .transpose(),
-        }
+        self.observe_from(None).await
     }
 
     /// Observe the authority, reusing an already verified Sync common base when it is current.
@@ -173,25 +158,26 @@ impl ManagedVolume {
         &self,
         base: Option<&NamespaceSnapshot>,
     ) -> Result<Option<ManagedObservation>, ManagedError> {
-        match (&self.namespace, base) {
-            (NamespaceAuthority::Base(namespace), Some(base)) => namespace
-                .observe_from(base)
-                .await?
-                .map(|observed| {
-                    let (snapshot, witness) = observed.into_parts();
-                    managed_observation(snapshot, AuthorityObservation::Base(witness))
-                })
-                .transpose(),
+        match &self.namespace {
+            NamespaceAuthority::Base(namespace) => match base {
+                Some(base) => namespace.observe_from(base).await?,
+                None => namespace.observe().await?,
+            }
+            .map(|observed| {
+                let (snapshot, witness) = observed.into_parts();
+                managed_observation(snapshot, AuthorityObservation::Base(witness))
+            })
+            .transpose(),
             #[cfg(feature = "managed-branch")]
-            (NamespaceAuthority::Branch(namespace), Some(base)) => namespace
-                .observe_from(base)
-                .await?
-                .map(|observed| {
-                    let (snapshot, witness) = observed.into_parts();
-                    managed_observation(snapshot, AuthorityObservation::Branch(Box::new(witness)))
-                })
-                .transpose(),
-            _ => self.observe().await,
+            NamespaceAuthority::Branch(namespace) => match base {
+                Some(base) => namespace.observe_from(base).await?,
+                None => namespace.observe().await?,
+            }
+            .map(|observed| {
+                let (snapshot, witness) = observed.into_parts();
+                managed_observation(snapshot, AuthorityObservation::Branch(Box::new(witness)))
+            })
+            .transpose(),
         }
     }
 
@@ -415,10 +401,7 @@ impl Volume for ManagedVolume {
         concurrency: NonZeroUsize,
     ) -> Result<BTreeMap<String, FileVersion>, VolumeError> {
         let known = authority
-            .map(to_managed_snapshot)
-            .transpose()?
-            .as_ref()
-            .map(AuthorityKnownContent::from_snapshot)
+            .map(authority_known_content)
             .transpose()?
             .unwrap_or_default();
         self.data
@@ -455,6 +438,27 @@ impl Volume for ManagedVolume {
     ) -> Result<(), VolumeError> {
         materialize_managed_files(self, target, requests, full_tree, concurrency).await
     }
+}
+
+fn authority_known_content(
+    snapshot: &VolumeSnapshot,
+) -> Result<AuthorityKnownContent, ManagedError> {
+    let mut known = AuthorityKnownContent::default();
+    let mut visited = BTreeSet::new();
+    for id in snapshot.nodes.values().filter_map(|node| node.file_version) {
+        if !visited.insert(id) {
+            continue;
+        }
+        let version = snapshot.file_versions.get(&id).ok_or_else(|| {
+            ManagedError::new(
+                ManagedErrorKind::Corrupt,
+                "derive authority-known content",
+                "live node references a missing file version",
+            )
+        })?;
+        known.include(&decode_file_version(version)?)?;
+    }
+    Ok(known)
 }
 
 fn managed_observation(
