@@ -86,7 +86,6 @@ impl StoredChange {
         base: Option<NamespaceSnapshot>,
     ) -> Result<NamespaceSnapshot, ManagedError> {
         self.change
-            .clone()
             .apply(base)
             .map_err(|_| corrupt("stored branch change is invalid"))
     }

@@ -948,7 +948,7 @@ fn apply_transaction(
     base: Option<NamespaceSnapshot>,
     transaction: &NamespaceChange,
 ) -> Result<NamespaceSnapshot, ManagedError> {
-    transaction.clone().apply(base)
+    transaction.apply(base)
 }
 
 fn replay_tail_from(

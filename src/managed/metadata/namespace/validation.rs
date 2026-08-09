@@ -29,14 +29,29 @@ pub(crate) fn validate_publication(
     publication: &NamespacePublication,
     base: Option<&NamespaceSnapshot>,
 ) -> Result<bool, ManagedError> {
-    validate_snapshot(&publication.target)?;
-    if publication.target.cursor.operation() != Some(publication.operation)
-        || publication.parent.sequence().checked_add(1)
-            != Some(publication.target.cursor.sequence())
-        || base.is_some_and(|state| {
-            state.volume_id != publication.target.volume_id || state.cursor != publication.parent
-        })
-        || base.is_none() && publication.parent != ChangeCursor::Genesis
+    validate_publication_parts(
+        publication.operation,
+        publication.parent,
+        &publication.expected_nodes,
+        &publication.expected_directories,
+        &publication.target,
+        base,
+    )
+}
+
+pub(crate) fn validate_publication_parts(
+    operation: crate::filesystem::OperationId,
+    parent: ChangeCursor,
+    expected_nodes: &[NodePrecondition],
+    expected_directories: &[DirectoryPrecondition],
+    target: &NamespaceSnapshot,
+    base: Option<&NamespaceSnapshot>,
+) -> Result<bool, ManagedError> {
+    validate_snapshot(target)?;
+    if target.cursor.operation() != Some(operation)
+        || parent.sequence().checked_add(1) != Some(target.cursor.sequence())
+        || base.is_some_and(|state| state.volume_id != target.volume_id || state.cursor != parent)
+        || base.is_none() && parent != ChangeCursor::Genesis
     {
         return Err(invalid(
             "publish Managed namespace",
@@ -48,15 +63,21 @@ pub(crate) fn validate_publication(
     let empty_directories = BTreeMap::new();
     let nodes = base.map_or(&empty_nodes, |state| &state.nodes);
     let directories = base.map_or(&empty_directories, |state| &state.directories);
-    if !preconditions_match_nodes(nodes, &publication.expected_nodes)?
-        || !preconditions_match_directories(directories, &publication.expected_directories)?
+    if !preconditions_match_nodes(nodes, expected_nodes)?
+        || !preconditions_match_directories(directories, expected_directories)?
     {
         return Ok(false);
     }
-    validate_generations(publication, nodes, directories)?;
+    validate_generations(
+        target,
+        expected_nodes,
+        expected_directories,
+        nodes,
+        directories,
+    )?;
     if let Some(base) = base {
         for (id, version) in &base.file_versions {
-            if let Some(next) = publication.target.file_versions.get(id)
+            if let Some(next) = target.file_versions.get(id)
                 && next != version
             {
                 return Err(invalid(
@@ -139,20 +160,21 @@ fn preconditions_match_directories(
 }
 
 fn validate_generations(
-    publication: &NamespacePublication,
+    target: &NamespaceSnapshot,
+    expected_nodes: &[NodePrecondition],
+    expected_directories: &[DirectoryPrecondition],
     nodes: &BTreeMap<NodeId, NodeRecord>,
     directories: &BTreeMap<NodeId, DirectoryRecord>,
 ) -> Result<(), ManagedError> {
-    let node_conditions = publication
-        .expected_nodes
+    let node_conditions = expected_nodes
         .iter()
         .map(|condition| condition.node)
         .collect::<BTreeSet<_>>();
-    for id in nodes.keys().chain(publication.target.nodes.keys()) {
+    for id in nodes.keys().chain(target.nodes.keys()) {
         let current = nodes.get(id);
-        let target = publication.target.nodes.get(id);
-        let changed = current.map(node_body) != target.map(node_body);
-        let expected = match (current, target, changed) {
+        let next = target.nodes.get(id);
+        let changed = current.map(node_body) != next.map(node_body);
+        let expected = match (current, next, changed) {
             (None, Some(_), _) => managed_generation(1),
             (Some(node), Some(_), false) => node.generation.clone(),
             (Some(node), Some(_), true) => next_managed_generation(&node.generation)
@@ -168,7 +190,7 @@ fn validate_generations(
             }
             (None, None, _) => continue,
         };
-        if target.is_some_and(|node| node.generation != expected)
+        if next.is_some_and(|node| node.generation != expected)
             || changed && !node_conditions.contains(id)
         {
             return Err(invalid(
@@ -178,19 +200,15 @@ fn validate_generations(
         }
     }
 
-    let directory_conditions = publication
-        .expected_directories
+    let directory_conditions = expected_directories
         .iter()
         .map(|condition| condition.directory)
         .collect::<BTreeSet<_>>();
-    for id in directories
-        .keys()
-        .chain(publication.target.directories.keys())
-    {
+    for id in directories.keys().chain(target.directories.keys()) {
         let current = directories.get(id);
-        let target = publication.target.directories.get(id);
-        let changed = current.map(|item| &item.entries) != target.map(|item| &item.entries);
-        let expected = match (current, target, changed) {
+        let next = target.directories.get(id);
+        let changed = current.map(|item| &item.entries) != next.map(|item| &item.entries);
+        let expected = match (current, next, changed) {
             (None, Some(_), _) => managed_generation(1),
             (Some(directory), Some(_), false) => directory.generation.clone(),
             (Some(directory), Some(_), true) => next_managed_generation(&directory.generation)
@@ -208,7 +226,7 @@ fn validate_generations(
             }
             (None, None, _) => continue,
         };
-        if target.is_some_and(|directory| directory.generation != expected)
+        if next.is_some_and(|directory| directory.generation != expected)
             || changed && !directory_conditions.contains(id)
         {
             return Err(invalid(
