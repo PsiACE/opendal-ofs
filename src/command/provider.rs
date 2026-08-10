@@ -27,8 +27,7 @@ pub(super) fn open_operator(storage: &str, concurrency: NonZeroUsize) -> Result<
         .map(|operator| {
             operator
                 .layer(
-                    ConcurrentLimitLayer::new(concurrency)
-                        .with_http_concurrent_limit(concurrency),
+                    ConcurrentLimitLayer::new(concurrency).with_http_concurrent_limit(concurrency),
                 )
                 .layer(RetryLayer::new().with_jitter())
         })

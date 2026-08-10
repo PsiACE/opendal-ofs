@@ -52,7 +52,9 @@ pub(super) async fn prepare(
     previous: ChangeCursor,
     target: ChangeCursor,
 ) -> Result<(), VolumeError> {
-    let operation = target.operation().ok_or_else(|| invalid("history target is Genesis"))?;
+    let operation = target
+        .operation()
+        .ok_or_else(|| invalid("history target is Genesis"))?;
     let bytes = HISTORY_RECORD.encode(&HistoryRecord { previous, target })?;
     object::create_immutable(operator, &history_key(operation), Buffer::from(bytes)).await
 }
@@ -122,9 +124,15 @@ fn result_key(operation: OperationId) -> String {
 }
 
 fn invalid(message: &'static str) -> VolumeError {
-    VolumeError::new(VolumeErrorKind::Invalid, format!("publish Managed namespace: {message}"))
+    VolumeError::new(
+        VolumeErrorKind::Invalid,
+        format!("publish Managed namespace: {message}"),
+    )
 }
 
 fn corrupt(message: &'static str) -> VolumeError {
-    VolumeError::new(VolumeErrorKind::Corrupt, format!("read Managed history: {message}"))
+    VolumeError::new(
+        VolumeErrorKind::Corrupt,
+        format!("read Managed history: {message}"),
+    )
 }

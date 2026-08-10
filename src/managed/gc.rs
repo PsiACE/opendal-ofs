@@ -87,10 +87,7 @@ impl ManagedVolume {
         Ok((fence, head.snapshot))
     }
 
-    async fn sweep(
-        &self,
-        live: &BTreeMap<String, u64>,
-    ) -> Result<GcOutcome, VolumeError> {
+    async fn sweep(&self, live: &BTreeMap<String, u64>) -> Result<GcOutcome, VolumeError> {
         let mut outcome = GcOutcome::default();
         let mut lister = self
             .operator()
@@ -138,9 +135,7 @@ impl ManagedVolume {
 
     async fn finish_gc(&self, fence: GcFence) -> Result<(), VolumeError> {
         let (mut head, revision) = self.read_head().await?;
-        if head.maintenance != Some(fence)
-            || head.snapshot.cursor != fence.cursor
-        {
+        if head.maintenance != Some(fence) || head.snapshot.cursor != fence.cursor {
             return Err(conflict(
                 "finish Managed data collection: collection fence changed",
             ));

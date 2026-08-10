@@ -145,17 +145,13 @@ impl ManagedVolume {
             .cursor
             .operation()
             .expect("validated publication has an operation identity");
-        history::prepare(
-            &self.operator,
-            observed.snapshot.cursor,
-            target.cursor,
-        )
-        .await?;
+        history::prepare(&self.operator, observed.snapshot.cursor, target.cursor).await?;
         let bytes = HEAD_RECORD.encode(&Head {
             snapshot: target,
             maintenance: None,
         })?;
-        let committed = object::replace(&self.operator, HEAD_KEY, &observed.revision, bytes).await?;
+        let committed =
+            object::replace(&self.operator, HEAD_KEY, &observed.revision, bytes).await?;
         history::finish(&self.operator, operation, committed).await?;
         if committed {
             Ok(())

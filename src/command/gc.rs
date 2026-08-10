@@ -23,10 +23,8 @@ use crate::cli::GcArgs;
 use super::provider::open_operator;
 
 pub(super) async fn run(args: GcArgs) -> Result<()> {
-    let metadata = ManagedMetadata::object(open_operator(
-        &args.storage,
-        args.transfer_concurrency,
-    )?)?;
+    let metadata =
+        ManagedMetadata::object(open_operator(&args.storage, args.transfer_concurrency)?)?;
     let volume = metadata.open_for_gc().await?;
     let outcome = volume.collect_unreachable(args.resume).await?;
     println!(

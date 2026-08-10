@@ -33,10 +33,8 @@ pub(super) async fn run(args: SyncArgs) -> Result<()> {
         bail!("replica is not a directory: {}", args.replica.display());
     }
 
-    let metadata = ManagedMetadata::object(open_operator(
-        &args.storage,
-        args.transfer_concurrency,
-    )?)?;
+    let metadata =
+        ManagedMetadata::object(open_operator(&args.storage, args.transfer_concurrency)?)?;
     if args.init {
         let volume = metadata.initialize().await?;
         let observed = volume.observe().await?;
