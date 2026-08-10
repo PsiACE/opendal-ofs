@@ -535,7 +535,6 @@ mod tests {
             [7; 32],
             ExtentMap {
                 extents: vec![Extent {
-                    logical_offset: 0,
                     content: ContentRef {
                         digest: [7; 32],
                         length: 1,
@@ -583,7 +582,7 @@ mod tests {
 
         assert_eq!(
             hex::encode(change.request_sha256().unwrap()),
-            "78651ba748c448731e15bd8d36cc40a6e1ce845e3951877c531f54ef26b8bd16"
+            "f32678a3ccf8d7a2244302f43513ed667f396005a0b38584b0a53f0aa77edca9"
         );
     }
 }

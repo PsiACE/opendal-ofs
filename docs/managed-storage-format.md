@@ -107,11 +107,12 @@ A file version contains:
 - SHA-256 of the complete logical byte sequence;
 - an ordered extent map.
 
-Each extent contains the logical offset, a `ContentRef`, a `SegmentRef`, and
-the byte offset of the content in that segment. Extents MUST be non-empty,
-contiguous, ordered, and non-overlapping. They start at logical offset zero and
-cover the declared file length. Every occurrence of one segment digest MUST
-declare the same total segment length. An empty file has no extents.
+Each extent contains a `ContentRef`, a `SegmentRef`, and the byte offset of the
+content in that segment. Extents MUST be non-empty and ordered. Their logical
+offsets are the prefix sums of the preceding `ContentRef` lengths, so their
+concatenation MUST cover the declared file length. Every occurrence of one
+segment digest MUST declare the same total segment length. An empty file has no
+extents.
 
 `FileVersionId` is SHA-256 over this byte sequence:
 
@@ -121,7 +122,6 @@ logical length: u64
 whole-file digest: 32 bytes
 extent count: u64
 for each extent:
-  logical offset: u64
   content digest: 32 bytes
   content length: u64
   segment digest: 32 bytes

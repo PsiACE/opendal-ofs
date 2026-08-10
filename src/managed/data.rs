@@ -81,17 +81,11 @@ impl AuthorityKnownContent {
 struct PreparedFile {
     logical_size: u64,
     logical_digest: [u8; 32],
-    extents: Vec<PreparedExtent>,
-}
-
-#[derive(Debug)]
-struct PreparedExtent {
-    logical_offset: u64,
-    content: ContentRef,
+    contents: Vec<ContentRef>,
 }
 
 struct PreparedChunk {
-    extent: PreparedExtent,
+    content: ContentRef,
     bytes: Vec<u8>,
 }
 
@@ -223,17 +217,14 @@ impl ManagedData {
             let mut pending_bytes = 0_u64;
             let mut created = BTreeMap::new();
             for mut prepared in prepared_streams {
-                let mut extents = Vec::new();
-                while let Some(PreparedChunk { extent, bytes }) = prepared.chunks.recv().await {
-                    if known.get(&extent.content).is_none()
-                        && !created.contains_key(&extent.content)
-                    {
-                        match new_content.entry(extent.content) {
+                let mut contents = Vec::new();
+                while let Some(PreparedChunk { content, bytes }) = prepared.chunks.recv().await {
+                    if known.get(&content).is_none() && !created.contains_key(&content) {
+                        match new_content.entry(content) {
                             std::collections::btree_map::Entry::Vacant(entry) => {
                                 entry.insert(bytes);
-                                pending_bytes = pending_bytes
-                                    .checked_add(extent.content.length)
-                                    .ok_or_else(|| {
+                                pending_bytes =
+                                    pending_bytes.checked_add(content.length).ok_or_else(|| {
                                         invalid(
                                             "stage Managed files",
                                             "pending segment bytes overflow",
@@ -251,7 +242,7 @@ impl ManagedData {
                             std::collections::btree_map::Entry::Occupied(_) => {}
                         }
                     }
-                    extents.push(extent);
+                    contents.push(content);
 
                     while pending_bytes >= TARGET_SEGMENT_SIZE {
                         let contents = take_segment_contents(&mut new_content)?;
@@ -269,7 +260,7 @@ impl ManagedData {
                     PreparedFile {
                         logical_size,
                         logical_digest,
-                        extents,
+                        contents,
                     },
                 ));
             }
@@ -291,12 +282,12 @@ impl ManagedData {
                 .map(|(path, file)| {
                     let extent_map = ExtentMap {
                         extents: file
-                            .extents
+                            .contents
                             .into_iter()
-                            .map(|extent| {
+                            .map(|content| {
                                 let stored = known
-                                    .get(&extent.content)
-                                    .or_else(|| created.get(&extent.content).copied())
+                                    .get(&content)
+                                    .or_else(|| created.get(&content).copied())
                                     .ok_or_else(|| {
                                         corrupt(
                                             "stage Managed files",
@@ -304,8 +295,7 @@ impl ManagedData {
                                         )
                                     })?;
                                 Ok(Extent {
-                                    logical_offset: extent.logical_offset,
-                                    content: extent.content,
+                                    content,
                                     segment: stored.segment,
                                     segment_offset: stored.offset,
                                 })
@@ -937,13 +927,7 @@ async fn stream_file(
         }
         let content = content_ref(&bytes);
         sender
-            .send(PreparedChunk {
-                extent: PreparedExtent {
-                    logical_offset: 0,
-                    content,
-                },
-                bytes,
-            })
+            .send(PreparedChunk { content, bytes })
             .await
             .map_err(|_| unavailable("stage Managed files", "storage operation failed"))?;
         return Ok((size, content.digest));
@@ -992,10 +976,7 @@ async fn stream_fastcdc(
             .ok_or_else(|| invalid("read frozen file", "frozen input length overflows"))?;
         sender
             .send(PreparedChunk {
-                extent: PreparedExtent {
-                    logical_offset: chunk.offset,
-                    content,
-                },
+                content,
                 bytes: chunk.data,
             })
             .await
@@ -1228,13 +1209,11 @@ mod tests {
             ExtentMap {
                 extents: vec![
                     Extent {
-                        logical_offset: 0,
                         content,
                         segment: reference,
                         segment_offset: 0,
                     },
                     Extent {
-                        logical_offset: content.length,
                         content,
                         segment: reference,
                         segment_offset: 0,

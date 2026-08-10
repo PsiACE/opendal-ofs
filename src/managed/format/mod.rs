@@ -151,7 +151,6 @@ pub(crate) struct ExtentMap {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Extent {
-    pub(crate) logical_offset: u64,
     pub(crate) content: ContentRef,
     pub(crate) segment: SegmentRef,
     pub(crate) segment_offset: u64,

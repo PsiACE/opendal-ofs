@@ -58,17 +58,15 @@ fn extent_map_valid(size: u64, digest: &[u8; 32], extent_map: &ExtentMap) -> boo
         return *digest == empty && extent_map.extents.is_empty();
     }
     if let [extent] = extent_map.extents.as_slice()
-        && extent.logical_offset == 0
         && extent.content.length == size
         && extent.content.digest != *digest
     {
         return false;
     }
-    let mut next = 0;
+    let mut logical_size = 0_u64;
     let mut segment_lengths = BTreeMap::new();
     for extent in &extent_map.extents {
-        if extent.logical_offset != next
-            || extent.content.length == 0
+        if extent.content.length == 0
             || extent
                 .segment_offset
                 .checked_add(extent.content.length)
@@ -79,12 +77,12 @@ fn extent_map_valid(size: u64, digest: &[u8; 32], extent_map: &ExtentMap) -> boo
         {
             return false;
         }
-        let Some(end) = next.checked_add(extent.content.length) else {
+        let Some(end) = logical_size.checked_add(extent.content.length) else {
             return false;
         };
-        next = end;
+        logical_size = end;
     }
-    next == size
+    logical_size == size
 }
 
 fn canonical_file_version_id(
@@ -98,7 +96,6 @@ fn canonical_file_version_id(
     encoded.extend_from_slice(digest);
     encoded.extend_from_slice(&u64::try_from(extent_map.extents.len()).ok()?.to_be_bytes());
     for extent in &extent_map.extents {
-        encoded.extend_from_slice(&extent.logical_offset.to_be_bytes());
         encode_content(&mut encoded, &extent.content);
         encoded.extend_from_slice(&extent.segment.digest);
         encoded.extend_from_slice(&extent.segment.length.to_be_bytes());
@@ -220,7 +217,6 @@ mod tests {
                 content,
                 ExtentMap {
                     extents: vec![Extent {
-                        logical_offset: 0,
                         content: ContentRef {
                             digest: content,
                             length: 1,
