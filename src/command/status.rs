@@ -37,9 +37,21 @@ pub(super) fn run(args: StatusArgs) -> Result<()> {
                 "access_model": "sync",
                 "conflicts": state.conflicts().len(),
                 "common_sequence": state.common().cursor.sequence(),
+                "common_operation": state.common().cursor.operation().map(|operation| operation.to_string()),
                 "pending": state.has_pending(),
+                "remote_sequence": state.remote_cursor().sequence(),
+                "remote_operation": state.remote_cursor().operation().map(|operation| operation.to_string()),
                 "volume_id": state.volume_id().to_string(),
                 "volume_model": "managed",
+                "capabilities": {
+                    "executable": cfg!(unix),
+                    "hard_links": false,
+                    "namespace_publication": "generation_cas",
+                    "portable_names": true,
+                    "remote_durability": "explicit_sync",
+                    "stable_rename_identity": cfg!(unix),
+                    "symbolic_links": false,
+                },
             })
         );
     } else {

@@ -154,7 +154,7 @@ impl SyncEngine {
                 )?;
                 if !plan.conflicts.is_empty() {
                     let conflicts = plan.conflicts.len();
-                    state.retain_conflicts(plan.conflicts);
+                    state.retain_conflicts(plan.conflicts, observed.snapshot.cursor);
                     state.save(state_path)?;
                     return Ok(SyncOutcome {
                         conflicts,
@@ -207,8 +207,28 @@ impl SyncEngine {
             });
         }
         if observed.snapshot.cursor != expected.cursor {
+            let operation = target
+                .cursor
+                .operation()
+                .expect("pending target has an operation identity");
+            if self
+                .volume
+                .operation_committed(operation, &observed)
+                .await?
+            {
+                install(root, Some(state.common()), &target, &self.volume).await?;
+                state.advance(target, scan_native(root)?)?;
+                state.save(state_path)?;
+                return Ok(SyncOutcome {
+                    conflicts: 0,
+                    published: true,
+                    sequence: state.common().cursor.sequence(),
+                });
+            }
+            state.cancel_pending(observed.snapshot.cursor);
+            state.save(state_path)?;
             return Err(SyncError::new(
-                "pending publication outcome is unknown after the remote volume advanced",
+                "pending publication conflicted with a newer remote change; repeat sync to reconcile",
             ));
         }
         self.publish_target_files(root, &expected, &target).await?;

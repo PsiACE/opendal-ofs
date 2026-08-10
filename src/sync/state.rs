@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::filesystem::{NodeKind, OperationId, VolumeId, VolumeSnapshot};
+use crate::filesystem::{ChangeCursor, NodeKind, OperationId, VolumeId, VolumeSnapshot};
 
 use super::SyncError;
 
@@ -37,6 +37,7 @@ pub struct ReplicaState {
     format: String,
     root: PathBuf,
     common: VolumeSnapshot,
+    remote: ChangeCursor,
     native: BTreeMap<String, NativeIdentity>,
     pending: Option<PendingPublication>,
     conflicts: Vec<ConflictRecord>,
@@ -80,6 +81,7 @@ impl ReplicaState {
         Ok(Self {
             format: FORMAT.to_owned(),
             root,
+            remote: common.cursor,
             common,
             native,
             pending: None,
@@ -99,6 +101,11 @@ impl ReplicaState {
         }
         state.common.validate()?;
         validate_native(&state.common, &state.native)?;
+        if state.remote.sequence() < state.common.cursor.sequence() {
+            return Err(SyncError::new(
+                "replica remote cursor is behind its common namespace",
+            ));
+        }
         Ok(Some(state))
     }
 
@@ -148,6 +155,10 @@ impl ReplicaState {
         &self.common
     }
 
+    pub const fn remote_cursor(&self) -> ChangeCursor {
+        self.remote
+    }
+
     pub(crate) fn native(&self) -> &BTreeMap<String, NativeIdentity> {
         &self.native
     }
@@ -159,6 +170,7 @@ impl ReplicaState {
     ) -> Result<(), SyncError> {
         common.validate()?;
         validate_native(&common, &native)?;
+        self.remote = common.cursor;
         self.common = common;
         self.native = native;
         self.pending = None;
@@ -182,9 +194,19 @@ impl ReplicaState {
         &self.conflicts
     }
 
-    pub(crate) fn retain_conflicts(&mut self, conflicts: Vec<ConflictRecord>) {
+    pub(crate) fn retain_conflicts(
+        &mut self,
+        conflicts: Vec<ConflictRecord>,
+        remote: ChangeCursor,
+    ) {
         self.pending = None;
         self.conflicts = conflicts;
+        self.remote = remote;
+    }
+
+    pub(crate) fn cancel_pending(&mut self, remote: ChangeCursor) {
+        self.pending = None;
+        self.remote = remote;
     }
 
     pub(crate) fn begin(
@@ -201,6 +223,7 @@ impl ReplicaState {
         {
             return Err(SyncError::new("pending publication ancestry is invalid"));
         }
+        self.remote = expected.cursor;
         self.pending = Some(PendingPublication { expected, target });
         self.conflicts.clear();
         Ok(())

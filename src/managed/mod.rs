@@ -21,6 +21,7 @@ mod data;
 mod error;
 mod format;
 mod head;
+mod history;
 mod object;
 mod record;
 

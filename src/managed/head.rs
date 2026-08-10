@@ -26,6 +26,7 @@ use crate::filesystem::{
 };
 
 use super::format::ManagedFormat;
+use super::history;
 use super::object;
 use super::record::Record;
 
@@ -118,8 +119,20 @@ impl ManagedVolume {
                 "publish Managed namespace: publication ancestry is invalid",
             ));
         }
+        let operation = target
+            .cursor
+            .operation()
+            .expect("validated publication has an operation identity");
+        history::prepare(
+            &self.operator,
+            observed.snapshot.cursor,
+            target.cursor,
+        )
+        .await?;
         let bytes = HEAD_RECORD.encode(&Head { snapshot: target })?;
-        if object::replace(&self.operator, HEAD_KEY, &observed.revision, bytes).await? {
+        let committed = object::replace(&self.operator, HEAD_KEY, &observed.revision, bytes).await?;
+        history::finish(&self.operator, operation, committed).await?;
+        if committed {
             Ok(())
         } else {
             Err(VolumeError::new(
@@ -127,6 +140,14 @@ impl ManagedVolume {
                 "publish Managed namespace: observed generation changed",
             ))
         }
+    }
+
+    pub async fn operation_committed(
+        &self,
+        operation: crate::filesystem::OperationId,
+        observed: &ManagedObservation,
+    ) -> Result<bool, VolumeError> {
+        history::committed(&self.operator, operation, observed.snapshot.cursor).await
     }
 
     pub(crate) fn operator(&self) -> &Operator {
