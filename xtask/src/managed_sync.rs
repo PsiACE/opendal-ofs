@@ -41,14 +41,77 @@ pub(crate) fn run_fixture(keep: bool, case: Option<&str>) {
     fixture.create_bucket();
     match case {
         Some("admission") => admission(&fixture),
+        Some("growing") => growing(&fixture),
         Some("smoke") => smoke(&fixture),
         Some(name) => panic!("unknown Managed Sync behavior case: {name}"),
         None => {
             admission(&fixture);
             smoke(&fixture);
+            growing(&fixture);
         }
     }
     println!("Managed Sync behavior passed: {}", case.unwrap_or("all"));
+}
+
+fn growing(fixture: &Fixture) {
+    let root = CaseRoot::new();
+    let replica_a = root.path.join("replica-a");
+    let replica_b = root.path.join("replica-b");
+    let state_a = root.path.join("state-a");
+    let state_b = root.path.join("state-b");
+    fs::create_dir_all(&replica_a).expect("create growing replica A");
+    fs::create_dir_all(&replica_b).expect("create growing replica B");
+    let storage = fixture.storage_url("growing");
+
+    run_ofs_success(
+        ofs_sync(&replica_a, &state_a, &storage, true),
+        "initialize growing replica",
+    );
+    let initial = deterministic_bytes(2 * 1024 * 1024, 17);
+    fs::write(replica_a.join("session.tape"), initial).expect("write growing session");
+    run_ofs_success(
+        ofs_sync(&replica_a, &state_a, &storage, false),
+        "publish growing session",
+    );
+    run_ofs_success(
+        ofs_sync(&replica_b, &state_b, &storage, false),
+        "restore growing session",
+    );
+
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(replica_a.join("session.tape"))
+        .expect("open growing session");
+    file.write_all(&deterministic_bytes(128 * 1024, 91))
+        .expect("append growing session");
+    file.sync_all().expect("persist growing session");
+    run_ofs_success(
+        ofs_sync(&replica_a, &state_a, &storage, false),
+        "publish appended session",
+    );
+    run_ofs_success(
+        ofs_sync(&replica_b, &state_b, &storage, false),
+        "install appended session",
+    );
+    assert_eq!(
+        tree_fingerprint(&replica_a),
+        tree_fingerprint(&replica_b),
+        "an appended session converges without changing its bytes"
+    );
+    let no_op = run_ofs_success(
+        ofs_sync(&replica_b, &state_b, &storage, false),
+        "repeat appended session sync",
+    );
+    assert!(
+        !output_text(&no_op.stdout).contains("(published)"),
+        "an unchanged appended session is a no-op"
+    );
+}
+
+fn deterministic_bytes(length: usize, seed: u8) -> Vec<u8> {
+    (0..length)
+        .map(|offset| seed.wrapping_add((offset.wrapping_mul(31) % 251) as u8))
+        .collect()
 }
 
 struct Fixture {
