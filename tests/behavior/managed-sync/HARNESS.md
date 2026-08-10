@@ -55,12 +55,12 @@ The scenarios divide the public contract by user journey:
 They do not inspect object keys, metadata rows, state-file contents, private
 call order, or implementation-specific errors.
 
-`../managed-branch/workflow.sh` is the corresponding user-visible branched mode
-contract. It covers the default branch, current, historical, and genesis forks,
-independent publication, deletion and name reuse, stale replica fencing,
-historical branch materialization and a retained large-namespace parent. It uses
-the same provider inputs and likewise inspects only CLI output and ordinary
-replica files.
+`../managed-branch/workflow.sh` is the corresponding user-visible `branch/v1`
+extension contract. It covers the default branch, current, historical, and
+genesis forks, independent publication, deletion and name reuse, stale replica
+fencing, historical branch materialization and a retained large-namespace
+parent. It uses the same provider inputs and likewise inspects only CLI output
+and ordinary replica files.
 
 Run one scenario against either metadata authority with:
 

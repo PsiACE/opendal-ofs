@@ -33,7 +33,7 @@ pub enum ManagedExtension {
 }
 
 impl ManagedExtension {
-    pub const fn identifier(self) -> &'static str {
+    const fn identifier(self) -> &'static str {
         match self {
             Self::BranchV1 => "branch/v1",
         }
@@ -78,10 +78,6 @@ impl ManagedFormat {
 
     pub const fn volume_id(&self) -> VolumeId {
         self.volume_id
-    }
-
-    pub fn required_extensions(&self) -> &[ManagedExtension] {
-        &self.required_extensions
     }
 
     pub fn requires_extension(&self, extension: ManagedExtension) -> bool {

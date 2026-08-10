@@ -80,10 +80,10 @@ impl ManagedMetadata {
         format: ManagedFormat,
         data: Operator,
     ) -> Result<ManagedVolume, VolumeError> {
-        if !format.required_extensions().is_empty() {
+        if format.requires_extension(ManagedExtension::BranchV1) {
             return Err(invalid(
                 "open Managed volume",
-                "base namespace does not accept Managed extensions",
+                "base namespace does not accept the branch extension",
             ));
         }
         let volume_id = format.volume_id();

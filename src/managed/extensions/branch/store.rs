@@ -25,7 +25,7 @@ use crate::managed::ManagedVolume;
 use crate::managed::error::{conflict, corrupt, invalid, unavailable};
 use crate::managed::format::V1Record;
 use crate::managed::metadata::namespace::{
-    MAX_HEAD_ENCODED_BYTES, NamespaceStore, StoredHead, decode_head, encode_head,
+    NamespaceStore, StoredHead, encode_head, read_head_record,
 };
 use crate::managed::metadata::record::{RecordBackend, Revision};
 use futures::{StreamExt, TryStreamExt, stream};
@@ -75,10 +75,16 @@ impl BranchStore {
         let branch_id = BranchId::generate();
         let head = StoredHead::unborn(self.volume_id, Some(branch_id));
         let encoded_head = encode_head(&head)?;
-        let _ = self
+        if !self
             .backend
             .create(&head_key(branch_id), encoded_head, "create Managed branch")
-            .await?;
+            .await?
+        {
+            return Err(conflict(
+                "initialize Managed branches",
+                "default branch identity already exists",
+            ));
+        }
         let registry =
             StoredBranchRegistry::initial(self.volume_id, default_name.clone(), branch_id);
         let encoded_registry = REGISTRY_RECORD
@@ -411,20 +417,14 @@ impl BranchStore {
         &self,
         branch_id: BranchId,
     ) -> Result<Option<(StoredHead, Revision)>, VolumeError> {
-        let Some((bytes, revision)) = self
-            .backend
-            .read(
-                &head_key(branch_id),
-                MAX_HEAD_ENCODED_BYTES,
-                "read Managed branch",
-            )
-            .await?
-        else {
-            return Ok(None);
-        };
-        let head = decode_head(&bytes)?;
-        head.validate(self.volume_id, Some(branch_id))?;
-        Ok(Some((head, revision)))
+        read_head_record(
+            &self.backend,
+            &head_key(branch_id),
+            self.volume_id,
+            Some(branch_id),
+            "read Managed branch",
+        )
+        .await
     }
 }
 

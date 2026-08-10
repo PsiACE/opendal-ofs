@@ -682,20 +682,14 @@ impl NamespaceStore {
     pub(crate) async fn read_raw_head(
         &self,
     ) -> Result<Option<(StoredHead, Revision)>, VolumeError> {
-        let Some((bytes, revision)) = self
-            .backend
-            .read(
-                &self.head_key,
-                MAX_HEAD_ENCODED_BYTES,
-                "read Managed namespace",
-            )
-            .await?
-        else {
-            return Ok(None);
-        };
-        let head = decode_head(&bytes)?;
-        head.validate(self.volume_id, self.branch_id())?;
-        Ok(Some((head, revision)))
+        read_head_record(
+            &self.backend,
+            &self.head_key,
+            self.volume_id,
+            self.branch_id(),
+            "read Managed namespace",
+        )
+        .await
     }
 
     async fn read_bound_head(
@@ -713,6 +707,21 @@ impl NamespaceStore {
         }
         Ok(value)
     }
+}
+
+pub(crate) async fn read_head_record(
+    backend: &RecordBackend,
+    key: &str,
+    volume_id: VolumeId,
+    branch_id: Option<BranchId>,
+    action: &'static str,
+) -> Result<Option<(StoredHead, Revision)>, VolumeError> {
+    let Some((bytes, revision)) = backend.read(key, MAX_HEAD_ENCODED_BYTES, action).await? else {
+        return Ok(None);
+    };
+    let head = decode_head(&bytes)?;
+    head.validate(volume_id, branch_id)?;
+    Ok(Some((head, revision)))
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
