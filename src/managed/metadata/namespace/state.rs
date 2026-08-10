@@ -375,13 +375,6 @@ pub(crate) struct StoredChangeSegment {
 }
 
 impl StoredChangeSegment {
-    pub(crate) fn new(state: &StoredNamespaceState) -> Self {
-        Self {
-            checkpoint: state.checkpoint,
-            changes: state.tail.clone(),
-        }
-    }
-
     pub(crate) fn validate(&self, volume_id: VolumeId) -> Result<(), VolumeError> {
         if self.changes.is_empty() || self.changes.len() > MAX_TAIL_TRANSACTIONS {
             return Err(corrupt(
@@ -429,7 +422,8 @@ pub(crate) fn recover_namespace(
             "checkpoint identity disagrees with namespace HEAD",
         ));
     }
-    super::validate_snapshot(&snapshot)?;
+    super::validate_snapshot(&snapshot)
+        .map_err(|_| corrupt("read Managed namespace", "checkpoint namespace is invalid"))?;
     for change in &state.tail {
         snapshot = change.apply(Some(snapshot))?;
     }
@@ -440,7 +434,7 @@ pub(crate) fn recover_namespace(
         ));
     }
     if !state.tail.is_empty() {
-        super::validate_snapshot(&snapshot)
+        super::validate_snapshot_structure(&snapshot)
             .map_err(|_| corrupt("read Managed namespace", "recovered namespace is invalid"))?;
     }
     Ok(snapshot)
@@ -471,7 +465,7 @@ pub(crate) fn replay_tail_from(
             "transaction tail does not reach namespace HEAD",
         ));
     }
-    super::validate_snapshot(&snapshot)
+    super::validate_snapshot_structure(&snapshot)
         .map_err(|_| corrupt("read Managed namespace", "recovered namespace is invalid"))?;
     Ok(Some(snapshot))
 }

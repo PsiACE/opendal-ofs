@@ -19,29 +19,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::file_versions_have_consistent_segments;
 use super::records::{managed_generation, managed_generation_number, next_managed_generation};
-use super::{NamespaceChange, ValidatedChange};
 use crate::filesystem::{
     DirectoryRecord, FileVersionId, Generation, NodeAttributes, NodeId, NodeKind, NodeRecord,
     VolumeError, VolumeSnapshot,
 };
 use crate::managed::error::invalid;
 
-pub(crate) fn validate_publication(
-    change: &NamespaceChange,
-    base: Option<&VolumeSnapshot>,
-) -> Result<Option<ValidatedChange>, VolumeError> {
-    change.validate_against(base).map_err(|_| {
-        invalid(
-            "publish Managed namespace",
-            "publication mutation is invalid",
-        )
-    })
-}
-
 pub(crate) fn validate_snapshot(snapshot: &VolumeSnapshot) -> Result<(), VolumeError> {
-    snapshot
-        .validate_structure()
-        .map_err(|_| invalid("read Managed namespace", "namespace structure is invalid"))?;
+    validate_snapshot_structure(snapshot)?;
     for node in snapshot.nodes.values() {
         if managed_generation_number(&node.generation).is_none() {
             return Err(invalid("read Managed namespace", "node record is invalid"));
@@ -64,6 +49,12 @@ pub(crate) fn validate_snapshot(snapshot: &VolumeSnapshot) -> Result<(), VolumeE
         return Err(invalid("read Managed namespace", "file version is invalid"));
     }
     Ok(())
+}
+
+pub(crate) fn validate_snapshot_structure(snapshot: &VolumeSnapshot) -> Result<(), VolumeError> {
+    snapshot
+        .validate_structure()
+        .map_err(|_| invalid("read Managed namespace", "namespace structure is invalid"))
 }
 
 pub(super) fn match_preconditions<'a, K, V>(
@@ -152,6 +143,7 @@ mod tests {
 
     use super::*;
     use crate::filesystem::{ChangeCursor, OperationId, VolumeId};
+    use crate::managed::metadata::namespace::NamespaceChange;
 
     const ROOT: NodeId = NodeId::from_bytes([1; 16]);
 
@@ -205,10 +197,6 @@ mod tests {
             node: ROOT,
             expected_generation: Some(managed_generation(2)),
         }];
-        assert!(
-            validate_publication(&change, Some(&base))
-                .unwrap()
-                .is_none()
-        );
+        assert!(change.validate_against(Some(&base)).unwrap().is_none());
     }
 }

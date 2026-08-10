@@ -23,7 +23,7 @@ mod state;
 mod store;
 mod validation;
 
-pub(crate) use change::{NamespaceChange, ValidatedChange};
+pub(crate) use change::NamespaceChange;
 pub(crate) use records::{
     DecodedFileVersion, decode_file_version, encode_file_version,
     file_versions_have_consistent_segments, managed_generation, next_managed_generation,
@@ -34,4 +34,4 @@ pub(crate) use state::{
 };
 pub(crate) use store::{NamespaceStore, NamespaceWitness};
 pub(crate) use store::{StoredHead, encode_head, read_head_record};
-pub(crate) use validation::{validate_publication, validate_snapshot};
+pub(crate) use validation::{validate_snapshot, validate_snapshot_structure};

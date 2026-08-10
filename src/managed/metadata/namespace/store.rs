@@ -19,7 +19,6 @@ use sha2::{Digest as _, Sha256};
 use super::{
     ChangeSegmentRef, CheckpointRef, NamespaceChange, StoredChangeSegment, StoredCommittedResult,
     StoredNamespaceState, recover_namespace, replay_tail_from, require_request_digest,
-    validate_publication,
 };
 use crate::filesystem::{
     BranchBinding, BranchId, ChangeCursor, CommitOutcome, OperationId, VolumeError,
@@ -141,7 +140,7 @@ impl NamespaceStore {
         let cursor = change.cursor();
         let request_digest = change.request_sha256()?;
         let change_bytes = change.encoded_len()?;
-        let (head, revision, base) = match observed {
+        let (mut head, revision, base) = match observed {
             Some((witness, snapshot)) => {
                 if witness.head.volume_id != self.volume_id
                     || witness.head.branch_id != self.branch_id()
@@ -182,7 +181,12 @@ impl NamespaceStore {
             require_request_digest(Some(request_digest), result.request_sha256)?;
             return Ok(CommitOutcome::Committed(result.cursor));
         }
-        let mut validated = validate_publication(&change, base)?;
+        let mut validated = change.validate_against(base).map_err(|_| {
+            invalid(
+                "publish Managed namespace",
+                "publication mutation is invalid",
+            )
+        })?;
         if validated.is_none() {
             if matches!(
                 self.resolve_known(operation, Some(request_digest)).await?,
@@ -204,7 +208,12 @@ impl NamespaceStore {
             return Ok(CommitOutcome::Committed(cursor));
         }
 
-        let state = match &head.state {
+        let displaced_outcome = head
+            .state
+            .as_ref()
+            .filter(|state| !state.outcome_is_retained())
+            .and_then(|state| state.outcome.clone());
+        let state = match head.state.take() {
             None => {
                 let result = StoredCommittedResult::from_change(&change, request_digest);
                 let target = change.apply_validated(
@@ -222,7 +231,7 @@ impl NamespaceStore {
                 state.record_outcome(result);
                 state
             }
-            Some(current) => {
+            Some(mut current) => {
                 let tail_bytes = current.tail.iter().try_fold(0_usize, |total, change| {
                     change
                         .encoded_len()
@@ -231,10 +240,12 @@ impl NamespaceStore {
                 if current.tail.len() + 1 >= super::state::MAX_TAIL_TRANSACTIONS
                     || tail_bytes.saturating_add(change_bytes) > super::state::MAX_TAIL_BYTES
                 {
-                    let mut segments = current.segments.clone();
-                    let mut archived = current.clone();
-                    archived.tail.push(change.clone());
-                    let segment = StoredChangeSegment::new(&archived);
+                    let mut segments = std::mem::take(&mut current.segments);
+                    current.tail.push(change.clone());
+                    let segment = StoredChangeSegment {
+                        checkpoint: current.checkpoint,
+                        changes: current.tail,
+                    };
                     segments.push(self.write_change_segment(&segment).await?);
                     let excess = segments
                         .len()
@@ -264,8 +275,8 @@ impl NamespaceStore {
                         checkpoint_cursor: cursor,
                         tail: Vec::new(),
                         segments,
-                        operation_prefixes: current.operation_prefixes.clone(),
-                        outcome: current.outcome.clone(),
+                        operation_prefixes: current.operation_prefixes,
+                        outcome: current.outcome,
                     };
                     next.record_outcome(StoredCommittedResult::from_change(
                         &change,
@@ -273,27 +284,20 @@ impl NamespaceStore {
                     ));
                     next
                 } else {
-                    let mut next = current.clone();
-                    next.tail.push(change);
-                    next.record_outcome(StoredCommittedResult::from_change(
-                        next.tail.last().expect("change was appended above"),
+                    current.tail.push(change);
+                    current.record_outcome(StoredCommittedResult::from_change(
+                        current.tail.last().expect("change was appended above"),
                         request_digest,
                     ));
-                    next
+                    current
                 }
             }
         };
-        let mut next = head;
-        if let Some(result) = next
-            .state
-            .as_ref()
-            .filter(|state| !state.outcome_is_retained())
-            .and_then(|state| state.outcome.as_ref())
-        {
+        if let Some(result) = &displaced_outcome {
             self.write_operation(result).await?;
         }
-        next.state = Some(state);
-        let bytes = encode_head(&next)?;
+        head.state = Some(state);
+        let bytes = encode_head(&head)?;
         let replaced = match revision {
             Some(revision) => {
                 self.backend
@@ -693,7 +697,7 @@ impl NamespaceStore {
         for change in &state.tail {
             snapshot = change.apply(Some(snapshot))?;
         }
-        super::validate_snapshot(&snapshot).map_err(|_| {
+        super::validate_snapshot_structure(&snapshot).map_err(|_| {
             corrupt(
                 "read Managed change segment",
                 "replayed namespace is invalid",

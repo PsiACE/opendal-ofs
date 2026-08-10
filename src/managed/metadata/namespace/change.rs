@@ -36,7 +36,7 @@ pub(crate) struct NamespaceChange {
     pub(crate) mutation: VolumeMutation,
 }
 
-pub(crate) struct ValidatedChange {
+pub(super) struct ValidatedChange {
     put_directories: Vec<DirectoryRecord>,
 }
 
@@ -79,7 +79,7 @@ impl NamespaceChange {
         Ok(self.apply_validated(base, validated))
     }
 
-    pub(crate) fn apply_validated(
+    pub(super) fn apply_validated(
         &self,
         base: Option<VolumeSnapshot>,
         validated: ValidatedChange,
@@ -126,7 +126,7 @@ impl NamespaceChange {
         target
     }
 
-    pub(crate) fn validate_against(
+    pub(super) fn validate_against(
         &self,
         base: Option<&VolumeSnapshot>,
     ) -> Result<Option<ValidatedChange>, VolumeError> {
@@ -211,16 +211,20 @@ impl NamespaceChange {
                 }
             },
         )?;
-        let target_versions = versions
-            .iter()
-            .filter(|(id, _)| !self.mutation.remove_file_versions.contains(id))
-            .map(|(_, version)| version)
-            .chain(self.mutation.put_file_versions.iter());
-        if !file_versions_have_consistent_segments(target_versions) {
-            return Err(corrupt(
-                "read Managed transaction",
-                "file version delta is invalid",
-            ));
+        if !self.mutation.put_file_versions.is_empty()
+            || !self.mutation.remove_file_versions.is_empty()
+        {
+            let target_versions = versions
+                .iter()
+                .filter(|(id, _)| !self.mutation.remove_file_versions.contains(id))
+                .map(|(_, version)| version)
+                .chain(self.mutation.put_file_versions.iter());
+            if !file_versions_have_consistent_segments(target_versions) {
+                return Err(corrupt(
+                    "read Managed transaction",
+                    "file version delta is invalid",
+                ));
+            }
         }
         Ok(Some(ValidatedChange { put_directories }))
     }
