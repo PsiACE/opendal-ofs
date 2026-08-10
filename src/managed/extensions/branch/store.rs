@@ -18,9 +18,7 @@
 //! Branch authority over native revision-CAS records.
 
 use super::records::{BranchInfo, ForkPoint, StoredBranchRegistry, info};
-use crate::filesystem::{
-    BranchBinding, BranchId, BranchName, VolumeError, VolumeErrorKind, VolumeId,
-};
+use crate::filesystem::{BranchBinding, BranchId, BranchName, VolumeError, VolumeId};
 use crate::managed::ManagedVolume;
 use crate::managed::data::{RetainedDataRoots, SegmentGcMaintenance};
 use crate::managed::error::{conflict, corrupt, invalid, unavailable};
@@ -379,14 +377,17 @@ impl BranchStore {
                 ));
             }
             Err(error) => {
-                return match self.get(&target).await {
-                    Ok(current) if current.binding.id == target_id => Ok((current, source)),
-                    Ok(_) => Err(conflict(
+                let (current, _) = self.registry().await?;
+                return match current.branches.get(&target).copied() {
+                    Some(id) if id == target_id => Ok((
+                        info(target, target_id, &target_head, current.default_branch),
+                        source,
+                    )),
+                    Some(_) => Err(conflict(
                         "fork Managed branch",
                         "target branch was created concurrently",
                     )),
-                    Err(observed) if observed.kind() == VolumeErrorKind::Invalid => Err(error),
-                    Err(observed) => Err(observed),
+                    None => Err(error),
                 };
             }
         }
