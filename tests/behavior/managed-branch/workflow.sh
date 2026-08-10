@@ -72,15 +72,6 @@ mkdir -p "$(dirname "$config")" "$(dirname "$observed_config")" \
 
 volume_options=(--model managed --enable branch --storage "$OFS_STORAGE_URL")
 
-if [[ "$OFS_METADATA_MODE" == object ]]; then
-  if OFS_CONFIG="$OFS_CASE_ROOT/direct.json" "$OFS_BIN" volume create direct \
-    --model direct --enable branch --storage memory:///branch-rejection >/dev/null 2>&1; then
-    fail 'Direct volume enabled Managed branches'
-  fi
-  [[ ! -e "$OFS_CASE_ROOT/direct.json" ]] || \
-    fail 'Direct branch rejection changed the catalog'
-fi
-
 printf '%s\n' 'acceptance: create a branching volume with the default main branch'
 OFS_CONFIG="$config" "$OFS_BIN" volume create workspace "${volume_options[@]}"
 branches=$(OFS_CONFIG="$config" "$OFS_BIN" branch workspace list --json)

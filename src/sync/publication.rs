@@ -11,18 +11,19 @@ use std::num::NonZeroU64;
 
 use anyhow::{Context, Result, bail};
 
+use super::SyncVolume;
 use super::path::SnapshotTree;
 use super::staging::StagedTree;
 use crate::filesystem::{
     ChangeCursor, DirectoryEntry, DirectoryRecord, NodeAttributes, NodeId, NodeKind, NodeRecord,
-    OperationId, Volume, VolumePublication, VolumeSnapshot,
+    OperationId, VolumePublication, VolumeSnapshot,
 };
 
 /// Build one complete volume namespace target from a stable local observation.
 ///
 /// Rename identity belongs to reconciliation. This builder preserves identity
 /// at an unchanged path, but never treats equal content as proof of a rename.
-pub(crate) fn build_publication<V: Volume>(
+pub(crate) fn build_publication<V: SyncVolume>(
     volume_api: &V,
     operation: OperationId,
     authoritative: Option<&SnapshotTree<'_>>,
@@ -189,7 +190,7 @@ fn fresh_node(used: &mut BTreeSet<NodeId>, old: Option<&BTreeMap<NodeId, NodeRec
     }
 }
 
-fn next_node_generation<V: Volume>(
+fn next_node_generation<V: SyncVolume>(
     volume: &V,
     id: NodeId,
     body: (
@@ -211,7 +212,7 @@ fn next_node_generation<V: Volume>(
     }
 }
 
-fn next_directory_generation<V: Volume>(
+fn next_directory_generation<V: SyncVolume>(
     volume: &V,
     id: NodeId,
     entries: &BTreeMap<String, DirectoryEntry>,

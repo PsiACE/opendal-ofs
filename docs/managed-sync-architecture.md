@@ -6,21 +6,21 @@ its durable representation.
 
 ## Product boundary
 
-The volume model and access model are independent:
-
-| Volume | Mount | Sync |
-| --- | --- | --- |
-| Direct | Read-only | Not implemented |
-| Managed | Not implemented | Read-write |
-
-Mount and Sync are frontends over the shared filesystem model. Direct and
-Managed are volume implementations. An unavailable combination has no hidden
-fallback or alternate storage format.
+The current product surface is Managed Sync only. Volume creation still
+requires the explicit RFC 016 model selection, and the catalog records that
+choice, but this build accepts only `--model managed`. Direct remains an RFC
+model rather than an implemented storage path.
 
 ```text
-Sync -> filesystem model -> Managed volume -> Metadata (Object or D1)
-                                      `----> Data (OpenDAL)
+Sync -> SyncVolume port -> Managed volume -> Metadata (Object or D1)
+             |                         `----> Data (OpenDAL)
+             `-> filesystem model
 ```
+
+The filesystem module contains backend-neutral identities, snapshots,
+publications, and errors. The Sync-owned `SyncVolume` port adds the staging,
+materialization, recovery, and transfer operations needed by the Sync access
+model; those operations remain owned by Sync rather than the filesystem model.
 
 The catalog binds a client-local alias to a remote `VolumeId` and
 credential-free locators. Provider credentials and replica paths remain local.
@@ -45,9 +45,8 @@ namespace rules and checkpoint codec.
 
 One application composition root constructs every remote OpenDAL operator.
 Its concurrency layer bounds both logical operations and provider HTTP
-requests; its retry layer supplies the native temporary-error policy. Direct
-Mount and Managed Sync receive the resulting operator instead of assembling
-their own transport behavior.
+requests; its retry layer supplies the native temporary-error policy. Managed
+Sync receives the resulting operator instead of assembling transport behavior.
 
 Managed Data submits sparse reads through the OpenDAL reader and uses Foyer
 only for reusable, complete immutable segments. Publication CAS, operation
@@ -61,7 +60,7 @@ The integration shape follows the behavior it exposes:
 | Shape | Contract | OFS use |
 | --- | --- | --- |
 | OpenDAL Layer | The same storage operation with a transparent cross-cutting policy | Retry, concurrency limits, and complete immutable-segment Foyer caching |
-| OpenDAL Accessor or Service | A storage API backed by another data model | Direct storage today; a future Managed filesystem view for Mount or embedding |
+| OpenDAL Accessor or Service | A storage API backed by another data model | A future Managed filesystem view for embedding |
 | Built-in Managed extension | New durable volume behavior, identities, or commands | `branch/v1` namespace authorities and their lifecycle |
 | Domain operation | A visible multi-step state transition | Sync, publication recovery, staging, verification, and reachability collection |
 
@@ -70,8 +69,7 @@ they become configured runtime policies. Immutable-index and route layers do
 not replace namespace metadata: its authority is mutable, D1 requires revision
 CAS, and maintenance is the only path that lists data. Branch is therefore an
 extension over the one namespace implementation, not a Layer that rewrites
-arbitrary storage calls. Managed Mount, if added, should expose an Accessor
-instead of hiding namespace transactions inside a Layer.
+arbitrary storage calls.
 
 Object data and Object Metadata both use the composed OpenDAL operator. D1 is
 an explicit metadata-authority exception, not another data store: OpenDAL 0.57's
@@ -116,7 +114,7 @@ resolution as the base namespace.
 
 The extension provides named mutable branches, retained-position forks,
 deletion, Sync recovery, and explicit collection. It does not provide merge,
-tags, reset, unbounded history, automatic collection, Mount, or writer leases.
+tags, reset, unbounded history, automatic collection, or writer leases.
 Its records are specified in
 [Managed storage format](managed-storage-format.md#branchv1-authorities).
 

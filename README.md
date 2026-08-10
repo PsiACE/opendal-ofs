@@ -10,39 +10,19 @@
 [chat]: https://img.shields.io/discord/1081052318650339399
 [discord]: https://opendal.apache.org/discord
 
-`ofs` provides Mount and Sync access to named filesystems backed by OpenDAL.
+`ofs` synchronizes ordinary local directories with Managed volumes backed by
+OpenDAL.
 
 ## Status
 
-`ofs` is a work in progress. Its two independent choices are the volume model
-and the access model:
-
-| | Mount | Sync |
-| --- | --- | --- |
-| Direct volume | Available | Not yet available |
-| Managed volume | Not yet available | Available |
-
-A Direct volume exposes an existing object namespace. A Managed volume stores
-filesystem identity and namespace metadata. Mount provides an online filesystem,
-while Sync reconciles an ordinary local directory only when explicitly invoked.
+`ofs` is a work in progress. The current implementation provides Managed Sync:
+filesystem identity and namespace metadata are authoritative remotely, while
+an ordinary local directory is reconciled only when `ofs sync` is invoked.
 
 See the [Managed Sync documentation](docs/managed-sync.md) for its workflow,
 architecture, persistent format, and optional durable branches.
 
 ## How to use `ofs`
-
-### Install `FUSE` on Linux
-
-```shell
-sudo pacman -S fuse3 --noconfirm # archlinux
-sudo apt-get -y install fuse3    # debian/ubuntu
-```
-
-### Load `FUSE` kernel module on FreeBSD
-
-```shell
-kldload fuse
-```
 
 ### Install `ofs`
 
@@ -54,43 +34,10 @@ cargo install ofs
 
 > `cargo` is the Rust package manager. Follow the Rust [installation guide](https://www.rust-lang.org/tools/install) to install it.
 
-### Create and mount a Direct volume
-
-Choose a catalog path, then register a credential-free OpenDAL URL under a local
-volume name:
-
-```shell
-export OFS_CONFIG="$PWD/ofs-volumes.json"
-
-ofs volume create archive \
-  --model direct \
-  --storage 'fs://?root=/srv/archive'
-
-mkdir -p /mnt/archive
-ofs mount archive /mnt/archive
-```
-
-The mount runs in the foreground. Stop it with Ctrl-C.
-
-For S3, keep credentials in provider environment variables rather than the
-catalog URL:
-
-```shell
-export AWS_ACCESS_KEY_ID='<access-key-id>'
-export AWS_SECRET_ACCESS_KEY='<secret-access-key>'
-export AWS_REGION='<region>'
-
-ofs volume create archive \
-  --model direct \
-  --storage 's3://<bucket>/<path>?endpoint=<endpoint>&region=<region>'
-
-ofs mount archive /mnt/archive
-```
-
-Direct mounts are read-only. Writable Direct access remains unavailable until
-the selected backend and frontend can enforce generation-checked publication.
-
 ### Create and synchronize a Managed volume
+
+Volume creation requires the explicit `--model managed` selection. Managed is
+the only model accepted by the current build.
 
 See the [Managed Sync workflow](docs/managed-sync-workflow.md) for Object and
 D1 setup, synchronization, branches, conflict handling, and recovery.

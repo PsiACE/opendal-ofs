@@ -227,10 +227,10 @@ ofs sync workspace ./recovered \
   --state ./recovered.state
 ```
 
-If the catalog was also lost, first run `volume create` with the original
-storage and metadata locators. The replacement alias may differ from the lost
-one. The command reads the existing superblock and binds the new local alias to
-that volume identity.
+If the catalog was also lost, first run `volume create --model managed` with
+the original storage and metadata locators. The replacement alias may differ
+from the lost one. The command reads the existing superblock and binds the new
+local alias to that volume identity.
 
 ## Filesystem surface
 

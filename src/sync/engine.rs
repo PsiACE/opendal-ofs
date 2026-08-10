@@ -14,10 +14,11 @@ use std::path::Path;
 
 use super::install::{apply_target, fresh_sibling, install_staged_changes, remove_tree};
 use super::path::SnapshotTree;
-use super::{ConflictRecord, LocalTree, ReplicaState, StagedTree, build_publication, reconcile};
-use crate::filesystem::{
-    ChangeCursor, CommitOutcome, FileVersionId, NodeKind, OperationId, Volume, VolumeObservation,
+use super::{
+    ConflictRecord, LocalTree, ReplicaState, StagedTree, SyncObservation, SyncVolume,
+    build_publication, reconcile,
 };
+use crate::filesystem::{ChangeCursor, CommitOutcome, FileVersionId, NodeKind, OperationId};
 use anyhow::{Context, Result, bail};
 
 #[derive(Clone, Debug)]
@@ -34,7 +35,7 @@ pub struct SyncEngine<V> {
     transfer_concurrency: NonZeroUsize,
 }
 
-impl<V: Volume> SyncEngine<V> {
+impl<V: SyncVolume> SyncEngine<V> {
     pub fn new(volume: V, transfer_concurrency: NonZeroUsize) -> Self {
         Self {
             volume,

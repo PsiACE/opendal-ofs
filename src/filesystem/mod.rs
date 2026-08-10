@@ -21,19 +21,20 @@
 //! implementation, an access frontend, or a durable representation.
 
 mod branch;
+mod error;
 mod identity;
 mod model;
 mod namespace;
-mod volume;
+mod publication;
+mod snapshot;
 
 pub use branch::{AuthorityIdentity, BranchBinding, BranchName, InvalidBranchName};
+pub use error::{VolumeError, VolumeErrorKind};
 pub use identity::BranchId;
 pub use identity::{ChangeCursor, FileVersionId, Generation, NodeId, OperationId, VolumeId};
 pub use model::VolumeModel;
 pub use namespace::{DirectoryEntry, NodeAttributes, NodeKind};
-pub(crate) use volume::VolumeMutation;
-pub(crate) use volume::validate_portable_paths;
-pub use volume::{
-    CommitOutcome, DirectoryRecord, FileVersion, MaterializeRequest, NodeRecord, Volume,
-    VolumeError, VolumeErrorKind, VolumeObservation, VolumePublication, VolumeSnapshot,
-};
+pub(crate) use publication::VolumeMutation;
+pub use publication::{CommitOutcome, VolumePublication};
+pub(crate) use snapshot::validate_portable_paths;
+pub use snapshot::{DirectoryRecord, FileVersion, NodeRecord, VolumeSnapshot};

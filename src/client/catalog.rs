@@ -26,8 +26,8 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::durable::{JsonFormat, install_json};
 use crate::filesystem::{VolumeId, VolumeModel};
+use crate::local_store::{JsonFormat, install_json};
 
 const CATALOG_FORMAT: &str = "ofs-catalog/1";
 
@@ -42,20 +42,15 @@ pub struct VolumeDefinition {
 }
 
 impl VolumeDefinition {
-    pub fn direct(volume_id: VolumeId, storage: Url) -> Result<Self> {
+    pub fn new(
+        volume_id: VolumeId,
+        model: VolumeModel,
+        storage: Url,
+        metadata: Option<Url>,
+    ) -> Result<Self> {
         let definition = Self {
             volume_id,
-            model: VolumeModel::Direct,
-            storage,
-            metadata: None,
-        };
-        definition.validate()?;
-        Ok(definition)
-    }
-    pub fn managed(volume_id: VolumeId, storage: Url, metadata: Option<Url>) -> Result<Self> {
-        let definition = Self {
-            volume_id,
-            model: VolumeModel::Managed,
+            model,
             storage,
             metadata,
         };
@@ -67,9 +62,6 @@ impl VolumeDefinition {
         require_credential_free("storage", &self.storage)?;
         if let Some(metadata) = &self.metadata {
             require_credential_free("metadata", metadata)?;
-        }
-        if self.model == VolumeModel::Direct && self.metadata.is_some() {
-            bail!("Direct volume contains Managed-only catalog settings");
         }
         Ok(())
     }

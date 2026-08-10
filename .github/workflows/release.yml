@@ -65,8 +65,7 @@ jobs:
           CARGO_PROFILE_RELEASE_LTO: true
         run: '"${BUILD_COMMAND}" build --locked --release --target "${{ matrix.target }}"'
 
-      - name: Package artifact (Unix)
-        if: runner.os != 'Windows'
+      - name: Package artifact
         env:
           TARGET: ${{ matrix.target }}
         run: |

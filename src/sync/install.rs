@@ -18,9 +18,10 @@ use anyhow::{Context, Result, bail};
 use super::local::{entry_at, fs_operator, set_executable};
 use super::reconcile::{ReconcilePlan, TargetEdit};
 use super::staging::{StagedTree, TargetManifest};
-use crate::filesystem::{MaterializeRequest, NodeKind, Volume, VolumeSnapshot};
+use crate::filesystem::{NodeKind, VolumeSnapshot};
+use crate::sync::{MaterializeRequest, SyncVolume};
 
-pub(super) async fn apply_target<V: Volume>(
+pub(super) async fn apply_target<V: SyncVolume>(
     volume: &V,
     staged: &mut StagedTree,
     source_root: &Path,

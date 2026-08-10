@@ -14,11 +14,11 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::durable::{JsonFormat, install_json};
 use crate::filesystem::{
     AuthorityIdentity, BranchBinding, ChangeCursor, DirectoryRecord, FileVersion, NodeId,
     NodeRecord, OperationId, VolumeId, VolumeSnapshot,
 };
+use crate::local_store::{JsonFormat, install_json};
 use crate::sync::local::LocalEntry;
 use crate::sync::path::SnapshotTree;
 use crate::sync::staging::TargetManifest;

@@ -16,9 +16,11 @@ mod publication;
 mod reconcile;
 mod staging;
 mod state;
+mod volume;
 
 pub use engine::{SyncEngine, SyncResult};
 pub use state::{ConflictRecord, ReplicaState};
+pub use volume::{MaterializeRequest, SyncObservation, SyncVolume};
 
 pub(crate) use local::LocalTree;
 pub(crate) use publication::build_publication;

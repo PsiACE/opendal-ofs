@@ -13,8 +13,8 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
-use ofs::catalog::Catalog;
-use ofs::filesystem::{BranchName, VolumeModel};
+use ofs::client::catalog::Catalog;
+use ofs::filesystem::BranchName;
 use ofs::managed::{D1Config, ManagedExtension, ManagedFormat, ManagedMetadata, ManagedVolume};
 use opendal::Operator;
 use opendal::layers::{ConcurrentLimitLayer, RetryLayer};
@@ -60,9 +60,6 @@ pub(super) async fn open_managed_context(
     let definition = catalog
         .get(alias)
         .with_context(|| format!("volume alias {alias:?} is not in the catalog"))?;
-    if definition.model != VolumeModel::Managed {
-        bail!("this operation requires a Managed volume");
-    }
     let data = open_operator(&definition.storage, transfer_concurrency)?;
     let metadata = open_metadata(data.clone(), definition.metadata.as_ref())?;
     let format = metadata.read_format().await?;

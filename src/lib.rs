@@ -15,14 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Shared filesystem semantics used by ofs access and volume implementations.
+//! Filesystem semantics, volume implementations, and access models for ofs.
 
-pub mod catalog;
+pub mod client;
 pub mod filesystem;
 pub mod managed;
 pub mod sync;
 
-mod durable {
+mod local_store {
     use std::fs::{self, OpenOptions};
     use std::io::Write as _;
     use std::path::Path;

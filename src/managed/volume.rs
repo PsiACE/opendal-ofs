@@ -27,12 +27,12 @@ use super::metadata::namespace::{
     NamespaceChange, NamespaceStore, NamespaceWitness, decode_file_version, encode_file_version,
 };
 use super::{AuthorityKnownContent, ManagedData};
-use crate::filesystem::{AuthorityIdentity, CommitOutcome, OperationId, VolumeId};
 use crate::filesystem::{
-    FileVersion, MaterializeRequest, Volume, VolumeError, VolumeObservation, VolumePublication,
-    VolumeSnapshot,
+    AuthorityIdentity, CommitOutcome, FileVersion, OperationId, VolumeError, VolumeId,
+    VolumePublication, VolumeSnapshot,
 };
 use crate::managed::error::{corrupt, invalid};
+use crate::sync::{MaterializeRequest, SyncObservation, SyncVolume};
 
 #[derive(Clone)]
 pub struct ManagedVolume {
@@ -70,13 +70,13 @@ impl ManagedVolume {
     }
 }
 
-impl VolumeObservation for ManagedObservation {
+impl SyncObservation for ManagedObservation {
     fn snapshot(&self) -> &VolumeSnapshot {
         &self.snapshot
     }
 }
 
-impl Volume for ManagedVolume {
+impl SyncVolume for ManagedVolume {
     type Observation = ManagedObservation;
 
     fn id(&self) -> VolumeId {

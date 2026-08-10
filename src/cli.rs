@@ -33,24 +33,10 @@ pub(crate) enum Command {
     },
     /// Manage durable branches of a Managed volume.
     Branch(BranchArgs),
-    /// Mount a named Direct volume as a read-only online filesystem.
-    Mount(MountArgs),
     /// Reconcile and publish a local Managed Sync replica.
     Sync(SyncArgs),
     /// Report the durable state of a local replica.
     Status(StatusArgs),
-}
-
-#[derive(Debug, Args)]
-pub(crate) struct MountArgs {
-    /// Named Direct volume from the local catalog.
-    pub alias: String,
-
-    /// Local path where the volume will be mounted.
-    pub mount_path: PathBuf,
-
-    #[command(flatten)]
-    pub runtime: StorageOptions,
 }
 
 #[derive(Debug, Subcommand)]
@@ -127,7 +113,7 @@ pub(crate) struct BranchArgs {
 pub(crate) struct VolumeCreateArgs {
     pub alias: String,
 
-    /// Namespace authority model.
+    /// Namespace authority model. This build currently accepts only managed.
     #[arg(long, value_parser = parse_volume_model, value_name = "MODEL")]
     pub model: VolumeModel,
 
@@ -202,8 +188,7 @@ pub(crate) struct StatusArgs {
 
 fn parse_volume_model(value: &str) -> Result<VolumeModel, String> {
     match value {
-        "direct" => Ok(VolumeModel::Direct),
         "managed" => Ok(VolumeModel::Managed),
-        _ => Err("expected direct or managed".into()),
+        _ => Err("expected managed".into()),
     }
 }

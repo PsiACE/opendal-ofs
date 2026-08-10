@@ -19,8 +19,7 @@ ofs_access_key=ofs-managed-sync
 ofs_secret_key=ofs-managed-sync-password
 binary="$workspace/target/debug/ofs"
 fixtures_started=false
-audit_root=${OFS_MANAGED_SYNC_AUDIT_DIR:-$workspace/.local/managed-sync-audit}
-audit_owned=false
+audit_root=
 declare -a compose
 
 usage() {
@@ -75,9 +74,8 @@ wait_for_http() {
 }
 
 fixtures_up() {
-  local with_d1=${1:-true}
+  local with_d1=$1
   local -a services=(minio)
-  select_compose
   mkdir -p "$audit_root"
   [[ $with_d1 == true ]] && services+=(d1)
   compose_run up --detach "${services[@]}" >/dev/null
@@ -98,7 +96,6 @@ fixtures_up() {
 }
 
 fixtures_down() {
-  select_compose
   compose_run down --volumes --remove-orphans >/dev/null 2>&1
 }
 
@@ -108,7 +105,7 @@ cleanup() {
   if [[ $fixtures_started == true ]] && ! fixtures_down; then
     ((status == 0)) && status=1
   fi
-  if [[ $audit_owned == true ]]; then
+  if [[ -n $audit_root ]]; then
     rm -rf -- "$audit_root"
   fi
   exit "$status"
@@ -202,8 +199,8 @@ run_tests() {
       ;;
   esac
   cargo build --locked
+  select_compose
   audit_root=$(mktemp -d "${TMPDIR:-/tmp}/ofs-managed-audit.XXXXXX")
-  audit_owned=true
   fixtures_started=true
   trap cleanup EXIT
   local needs_d1=false item

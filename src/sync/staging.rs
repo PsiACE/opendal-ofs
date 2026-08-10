@@ -21,9 +21,9 @@ use super::local::{
 use super::path::descendants;
 use super::state::PendingIntent;
 use crate::filesystem::{
-    FileVersion, FileVersionId, NodeKind, OperationId, Volume, VolumeSnapshot,
-    validate_portable_paths,
+    FileVersion, FileVersionId, NodeKind, OperationId, VolumeSnapshot, validate_portable_paths,
 };
+use crate::sync::SyncVolume;
 
 const TREE_DIR: &str = "tree";
 const SEGMENTS_DIR: &str = "segments";
@@ -153,7 +153,7 @@ pub(crate) struct StagedTree {
 }
 
 impl StagedTree {
-    pub(crate) async fn prepare_for_publish<V: Volume>(
+    pub(crate) async fn prepare_for_publish<V: SyncVolume>(
         tree: &LocalTree,
         root: impl AsRef<Path>,
         known_versions: &BTreeMap<&str, FileVersionId>,

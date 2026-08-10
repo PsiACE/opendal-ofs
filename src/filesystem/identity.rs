@@ -81,8 +81,7 @@ fixed_identity!(
 fixed_identity!(
     /// Identity of one filesystem node.
     ///
-    /// Managed volumes preserve it across rename. Direct volumes may derive it
-    /// from a path and report that it is not stable across namespace changes.
+    /// The identity is preserved across rename within one authority.
     NodeId,
     16
 );
@@ -103,8 +102,7 @@ display_identity!(VolumeId, BranchId, OperationId);
 /// An opaque optimistic-concurrency token owned by a volume implementation.
 ///
 /// Callers may retain and compare the token, but must not infer ordering from
-/// its bytes. A Managed volume may encode a local counter while a Direct
-/// volume may use a storage version or ETag.
+/// its bytes. A volume may encode a local counter or another authority token.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct Generation(Box<[u8]>);

@@ -53,7 +53,6 @@ esac
 config="$OFS_CASE_ROOT/client/config.json"
 peer_config="$OFS_CASE_ROOT/peer-client/config.json"
 cold_config="$OFS_CASE_ROOT/cold-client/config.json"
-direct_config="$OFS_CASE_ROOT/direct-client/config.json"
 extension_mismatch_config="$OFS_CASE_ROOT/extension-mismatch-client/config.json"
 peer_alias=restored-workspace
 cold_alias=recovered-workspace
@@ -69,7 +68,7 @@ if [[ "$OFS_METADATA_MODE" == d1 ]]; then
 fi
 
 mkdir -p "$(dirname "$config")" "$(dirname "$peer_config")" \
-  "$(dirname "$cold_config")" "$(dirname "$direct_config")" \
+  "$(dirname "$cold_config")" \
   "$(dirname "$extension_mismatch_config")" \
   "$replica_a" "$replica_b" "$cold_replica" "$(dirname "$state_a")"
 
