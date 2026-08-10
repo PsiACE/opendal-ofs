@@ -260,9 +260,16 @@ impl StagedTree {
     pub(crate) fn recover(intent: &PendingIntent) -> Result<Self> {
         let staging = &intent.staging;
         let root = staging.join(TREE_DIR);
-        if !root.is_dir() || !staging.join(SEGMENTS_DIR).is_dir() {
-            bail!("staging cache is missing");
+        if !staging.is_dir() || !staging.join(SEGMENTS_DIR).is_dir() {
+            bail!("segment staging is missing");
         }
+        match fs::symlink_metadata(&root) {
+            Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(&root)?,
+            Ok(_) => fs::remove_file(&root)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("inspect staged tree"),
+        }
+        fs::create_dir(&root).context("rebuild staged tree")?;
         let prepared = intent
             .prepared
             .iter()
@@ -272,24 +279,13 @@ impl StagedTree {
         if prepared.len() != intent.prepared.len() {
             bail!("pending staging repeats a prepared file version");
         }
-        let target = intent.manifest.as_ref().unwrap_or(&intent.source);
-        let cache = intent
-            .cached_paths
-            .iter()
-            .map(|path| {
-                target
-                    .file(path)
-                    .map(|file| (path.clone(), file.id))
-                    .with_context(|| format!("cached path {path:?} is not a target file"))
-            })
-            .collect::<Result<_>>()?;
         let staged = Self {
             staging: staging.to_owned(),
             root,
             source: intent.source.clone(),
-            manifest: intent.manifest.clone(),
+            manifest: None,
             prepared,
-            cache,
+            cache: BTreeMap::new(),
         };
         staged.validate()?;
         Ok(staged)
@@ -298,18 +294,14 @@ impl StagedTree {
     pub(crate) fn pending(
         &self,
         operation: OperationId,
-        data_finalized: bool,
         renames: BTreeMap<String, String>,
     ) -> PendingIntent {
         PendingIntent {
             operation,
             staging: self.staging.clone(),
-            data_finalized,
             renames,
             source: self.source.clone(),
-            manifest: self.manifest.clone(),
             prepared: self.prepared.values().cloned().collect(),
-            cached_paths: self.cache.keys().cloned().collect(),
         }
     }
 

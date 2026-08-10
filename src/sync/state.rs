@@ -6,7 +6,7 @@
 // "License"); you may not use this file except in compliance
 // with the License.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
@@ -30,12 +30,9 @@ const STATE_FORMAT: &str = "ofs-sync-replica/1";
 pub struct PendingIntent {
     pub operation: OperationId,
     pub staging: PathBuf,
-    pub data_finalized: bool,
     pub renames: BTreeMap<String, String>,
     pub(crate) source: TargetManifest,
-    pub(crate) manifest: Option<TargetManifest>,
     pub(crate) prepared: Vec<FileVersion>,
-    pub(crate) cached_paths: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

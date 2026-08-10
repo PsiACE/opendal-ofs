@@ -86,7 +86,7 @@ impl<V: Volume> SyncEngine<V> {
                                 &LocalTree::scan(replica_path).await?,
                             ) =>
                         {
-                            Some((staged, pending.operation, pending.data_finalized))
+                            Some((staged, pending.operation))
                         }
                         _ => {
                             let _ = remove_tree(&pending.staging);
@@ -102,7 +102,7 @@ impl<V: Volume> SyncEngine<V> {
                 }
                 CommitOutcome::Absent | CommitOutcome::Conflict { .. } => {
                     match StagedTree::recover(&pending) {
-                        Ok(staged) => Some((staged, pending.operation, pending.data_finalized)),
+                        Ok(staged) => Some((staged, pending.operation)),
                         Err(_) => {
                             state.pending = None;
                             state.install(state_path)?;
@@ -135,13 +135,12 @@ impl<V: Volume> SyncEngine<V> {
             .transpose()?;
         let remote_tree = remote.map(SnapshotTree::new).transpose()?;
 
-        let (local, staging_path, mut staged, operation, mut data_finalized) = match prior_staging {
-            Some((staged, operation, data_finalized)) => (
+        let (local, staging_path, mut staged, operation) = match prior_staging {
+            Some((staged, operation)) => (
                 staged.local_tree(),
                 staged.staging.clone(),
                 staged,
                 operation,
-                data_finalized,
             ),
             None => {
                 let local = LocalTree::scan(replica_path).await?;
@@ -165,7 +164,7 @@ impl<V: Volume> SyncEngine<V> {
                 )
                 .await?;
                 let operation = OperationId::generate();
-                (local, staging_path, staged, operation, false)
+                (local, staging_path, staged, operation)
             }
         };
         let source_manifest = staged.source.clone();
@@ -202,7 +201,7 @@ impl<V: Volume> SyncEngine<V> {
         }
 
         if target_update.is_some() || publish {
-            let pending = staged.pending(operation, data_finalized, local_renames.clone());
+            let pending = staged.pending(operation, local_renames.clone());
             let changed = state.pending.as_ref() != Some(&pending) || !state.conflicts.is_empty();
             state.pending = Some(pending);
             state.conflicts.clear();
@@ -211,14 +210,11 @@ impl<V: Volume> SyncEngine<V> {
             }
         }
 
-        if publish && !data_finalized {
+        if publish {
             let segment_staging = staged.segment_operator()?;
             self.volume
                 .finalize_staged_files(&segment_staging, self.transfer_concurrency)
                 .await?;
-            data_finalized = true;
-            state.pending = Some(staged.pending(operation, true, local_renames.clone()));
-            state.install(state_path)?;
         }
 
         if let Some(plan) = target_update {
@@ -265,13 +261,6 @@ impl<V: Volume> SyncEngine<V> {
             &staged,
             &local_renames,
         )?;
-        let pending = staged.pending(operation, data_finalized, local_renames);
-        let changed = state.pending.as_ref() != Some(&pending) || !state.conflicts.is_empty();
-        state.pending = Some(pending);
-        state.conflicts.clear();
-        if changed {
-            state.install(state_path)?;
-        }
         match self.volume.publish(observed.as_ref(), &publication).await? {
             CommitOutcome::Committed(committed) if committed == publication.target.cursor => {
                 let Some(observed_local) = matching_local(replica_path, &local).await? else {
