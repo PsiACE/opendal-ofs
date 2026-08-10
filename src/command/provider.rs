@@ -15,19 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod gc;
-mod provider;
-mod status;
-mod sync;
+use std::num::NonZeroUsize;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
+use opendal::Operator;
+use opendal::layers::{ConcurrentLimitLayer, RetryLayer};
 
-use crate::cli::{Cli, Command};
-
-pub(crate) async fn run(cli: Cli) -> Result<()> {
-    match cli.command {
-        Command::Gc(args) => gc::run(args).await,
-        Command::Sync(args) => sync::run(args).await,
-        Command::Status(args) => status::run(args),
-    }
+pub(super) fn open_operator(storage: &str, concurrency: NonZeroUsize) -> Result<Operator> {
+    let concurrency = concurrency.get();
+    Operator::from_uri(storage)
+        .map(|operator| {
+            operator
+                .layer(
+                    ConcurrentLimitLayer::new(concurrency)
+                        .with_http_concurrent_limit(concurrency),
+                )
+                .layer(RetryLayer::new().with_jitter())
+        })
+        .map_err(|_| {
+            anyhow!("cannot configure --storage; check its scheme, endpoint, bucket, and root")
+        })
 }

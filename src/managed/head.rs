@@ -44,10 +44,18 @@ pub struct ManagedObservation {
     revision: String,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct Head {
-    snapshot: VolumeSnapshot,
+pub(super) struct Head {
+    pub(super) snapshot: VolumeSnapshot,
+    pub(super) maintenance: Option<GcFence>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct GcFence {
+    pub(super) owner: crate::filesystem::OperationId,
+    pub(super) cursor: ChangeCursor,
 }
 
 impl ManagedVolume {
@@ -70,7 +78,10 @@ impl ManagedVolume {
 
     pub(super) async fn initialize(&self) -> Result<(), VolumeError> {
         let snapshot = empty_snapshot(self.id());
-        let bytes = HEAD_RECORD.encode(&Head { snapshot })?;
+        let bytes = HEAD_RECORD.encode(&Head {
+            snapshot,
+            maintenance: None,
+        })?;
         if object::create(&self.operator, HEAD_KEY, bytes).await? {
             return Ok(());
         }
@@ -78,6 +89,20 @@ impl ManagedVolume {
     }
 
     pub async fn observe(&self) -> Result<ManagedObservation, VolumeError> {
+        let (head, revision) = self.read_head().await?;
+        if head.maintenance.is_some() {
+            return Err(VolumeError::new(
+                VolumeErrorKind::Conflict,
+                "open Managed volume: data collection is active",
+            ));
+        }
+        Ok(ManagedObservation {
+            snapshot: head.snapshot,
+            revision,
+        })
+    }
+
+    pub(super) async fn read_head(&self) -> Result<(Head, String), VolumeError> {
         let (bytes, revision) = object::read_with_revision(
             &self.operator,
             HEAD_KEY,
@@ -98,10 +123,7 @@ impl ManagedVolume {
                 "open Managed volume: namespace head belongs to a different volume",
             ));
         }
-        Ok(ManagedObservation {
-            snapshot: head.snapshot,
-            revision,
-        })
+        Ok((head, revision))
     }
 
     pub async fn publish(
@@ -129,7 +151,10 @@ impl ManagedVolume {
             target.cursor,
         )
         .await?;
-        let bytes = HEAD_RECORD.encode(&Head { snapshot: target })?;
+        let bytes = HEAD_RECORD.encode(&Head {
+            snapshot: target,
+            maintenance: None,
+        })?;
         let committed = object::replace(&self.operator, HEAD_KEY, &observed.revision, bytes).await?;
         history::finish(&self.operator, operation, committed).await?;
         if committed {
@@ -152,6 +177,20 @@ impl ManagedVolume {
 
     pub(crate) fn operator(&self) -> &Operator {
         &self.operator
+    }
+
+    pub(super) async fn replace_head(
+        &self,
+        expected_revision: &str,
+        head: &Head,
+    ) -> Result<bool, VolumeError> {
+        object::replace(
+            &self.operator,
+            HEAD_KEY,
+            expected_revision,
+            HEAD_RECORD.encode(head)?,
+        )
+        .await
     }
 }
 

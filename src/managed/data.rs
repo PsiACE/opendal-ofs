@@ -32,15 +32,15 @@ const SEGMENT_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct Segment {
-    digest: [u8; 32],
-    length: u64,
+pub(super) struct Segment {
+    pub(super) digest: [u8; 32],
+    pub(super) length: u64,
 }
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct Descriptor {
-    segments: Vec<Segment>,
+pub(super) struct Descriptor {
+    pub(super) segments: Vec<Segment>,
 }
 
 impl ManagedVolume {
@@ -199,7 +199,7 @@ impl ManagedVolume {
     }
 }
 
-fn decode_descriptor(version: &FileVersion) -> Result<Descriptor, VolumeError> {
+pub(super) fn decode_descriptor(version: &FileVersion) -> Result<Descriptor, VolumeError> {
     let descriptor: Descriptor = serde_json::from_slice(version.descriptor())
         .map_err(|_| corrupt("read Managed file", "file descriptor is invalid"))?;
     let expected_size = descriptor
@@ -221,7 +221,7 @@ fn decode_descriptor(version: &FileVersion) -> Result<Descriptor, VolumeError> {
     Ok(descriptor)
 }
 
-fn segment_key(digest: [u8; 32]) -> String {
+pub(super) fn segment_key(digest: [u8; 32]) -> String {
     format!(
         ".ofs/managed/data/{}",
         blake3::Hash::from_bytes(digest).to_hex()

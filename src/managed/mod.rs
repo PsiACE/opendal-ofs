@@ -20,12 +20,14 @@
 mod data;
 mod error;
 mod format;
+mod gc;
 mod head;
 mod history;
 mod object;
 mod record;
 
 pub use format::ManagedFormat;
+pub use gc::GcOutcome;
 pub use head::{ManagedObservation, ManagedVolume};
 
 use opendal::Operator;
@@ -92,5 +94,10 @@ impl ManagedMetadata {
     pub async fn open_unbound(&self) -> Result<ManagedVolume, VolumeError> {
         let format = self.read_format().await?;
         ManagedVolume::open(format, self.operator.clone()).await
+    }
+
+    pub async fn open_for_gc(&self) -> Result<ManagedVolume, VolumeError> {
+        let format = self.read_format().await?;
+        Ok(ManagedVolume::new(format, self.operator.clone()))
     }
 }

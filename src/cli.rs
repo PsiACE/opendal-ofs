@@ -29,10 +29,32 @@ pub(crate) struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
+    /// Collect immutable data no longer reachable from the Managed namespace.
+    Gc(GcArgs),
     /// Reconcile and publish a local Managed Sync replica.
     Sync(SyncArgs),
     /// Report the durable state of a local Managed Sync replica.
     Status(StatusArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct GcArgs {
+    /// OpenDAL storage URL. Provider credentials come from the environment.
+    #[arg(long, env = "OFS_STORAGE_URL", value_name = "URL")]
+    pub(crate) storage: String,
+
+    /// Resume an interrupted collection fence.
+    #[arg(long)]
+    pub(crate) resume: bool,
+
+    /// Maximum concurrency for storage operations.
+    #[arg(
+        long,
+        env = "OFS_TRANSFER_CONCURRENCY",
+        default_value = "4",
+        value_name = "N"
+    )]
+    pub(crate) transfer_concurrency: NonZeroUsize,
 }
 
 #[derive(Debug, Args)]

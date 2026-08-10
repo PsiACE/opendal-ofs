@@ -17,13 +17,13 @@
 
 use std::fs;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use ofs::managed::ManagedMetadata;
 use ofs::sync::{ReplicaState, SyncEngine};
-use opendal::Operator;
-use opendal::layers::{ConcurrentLimitLayer, RetryLayer};
 
 use crate::cli::SyncArgs;
+
+use super::provider::open_operator;
 
 pub(super) async fn run(args: SyncArgs) -> Result<()> {
     validate_options(&args)?;
@@ -33,7 +33,10 @@ pub(super) async fn run(args: SyncArgs) -> Result<()> {
         bail!("replica is not a directory: {}", args.replica.display());
     }
 
-    let metadata = ManagedMetadata::object(open_operator(&args)?)?;
+    let metadata = ManagedMetadata::object(open_operator(
+        &args.storage,
+        args.transfer_concurrency,
+    )?)?;
     if args.init {
         let volume = metadata.initialize().await?;
         let observed = volume.observe().await?;
@@ -73,19 +76,4 @@ fn validate_options(args: &SyncArgs) -> Result<()> {
         (true, _) => bail!("--init requires --model managed"),
         (false, Some(_)) => bail!("--model requires --init"),
     }
-}
-
-fn open_operator(args: &SyncArgs) -> Result<Operator> {
-    let concurrency = args.transfer_concurrency.get();
-    Operator::from_uri(args.storage.as_str())
-        .map(|operator| {
-            operator
-                .layer(
-                    ConcurrentLimitLayer::new(concurrency).with_http_concurrent_limit(concurrency),
-                )
-                .layer(RetryLayer::new().with_jitter())
-        })
-        .map_err(|_| {
-            anyhow!("cannot configure --storage; check its scheme, endpoint, bucket, and root")
-        })
 }

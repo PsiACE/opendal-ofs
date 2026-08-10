@@ -15,19 +15,26 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod gc;
-mod provider;
-mod status;
-mod sync;
-
 use anyhow::Result;
+use ofs::managed::ManagedMetadata;
 
-use crate::cli::{Cli, Command};
+use crate::cli::GcArgs;
 
-pub(crate) async fn run(cli: Cli) -> Result<()> {
-    match cli.command {
-        Command::Gc(args) => gc::run(args).await,
-        Command::Sync(args) => sync::run(args).await,
-        Command::Status(args) => status::run(args),
-    }
+use super::provider::open_operator;
+
+pub(super) async fn run(args: GcArgs) -> Result<()> {
+    let metadata = ManagedMetadata::object(open_operator(
+        &args.storage,
+        args.transfer_concurrency,
+    )?)?;
+    let volume = metadata.open_for_gc().await?;
+    let outcome = volume.collect_unreachable(args.resume).await?;
+    println!(
+        "collected managed volume {}: scanned {}, deleted {} segment(s), {} byte(s)",
+        volume.id(),
+        outcome.scanned,
+        outcome.deleted,
+        outcome.deleted_bytes
+    );
+    Ok(())
 }
