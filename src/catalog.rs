@@ -29,7 +29,7 @@ use url::Url;
 use crate::durable::{JsonFormat, install_json};
 use crate::filesystem::{VolumeId, VolumeModel};
 
-const SCHEMA_MAJOR: u16 = 1;
+const CATALOG_FORMAT: &str = "ofs-catalog/1";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -96,11 +96,8 @@ impl Catalog {
         };
         let stored: StoredCatalog =
             serde_json::from_slice(&bytes).context("parse volume catalog JSON")?;
-        if stored.schema_major != SCHEMA_MAJOR {
-            bail!(
-                "unsupported volume catalog schema major {}",
-                stored.schema_major
-            );
+        if stored.format != CATALOG_FORMAT {
+            bail!("volume catalog format is unsupported");
         }
         let mut volumes: BTreeMap<String, VolumeDefinition> = BTreeMap::new();
         for (alias, definition) in stored.volumes {
@@ -153,7 +150,7 @@ impl Catalog {
 
     pub fn save(&self) -> Result<()> {
         let stored = StoredCatalog {
-            schema_major: SCHEMA_MAJOR,
+            format: CATALOG_FORMAT.into(),
             volumes: self.volumes.clone(),
         };
         install_json(&self.path, "catalog", &stored, JsonFormat::Pretty)
@@ -164,7 +161,7 @@ impl Catalog {
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct StoredCatalog {
-    schema_major: u16,
+    format: String,
     volumes: BTreeMap<String, VolumeDefinition>,
 }
 

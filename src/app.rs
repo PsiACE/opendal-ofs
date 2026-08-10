@@ -233,7 +233,7 @@ async fn create_volume(config: &Path, mut args: VolumeCreateArgs) -> Result<()> 
             args.alias
         );
     }
-    let data = open_operator(&args.storage, NonZeroUsize::MIN)?;
+    let data = open_operator(&args.storage, args.runtime.transfer_concurrency)?;
     let metadata = open_metadata(data.clone(), args.metadata.as_ref())?;
     let desired = ManagedFormat::v1(provisional_id);
     let desired = if branch_enabled {
@@ -290,7 +290,7 @@ fn create_direct_volume(
     let volume_id = configured
         .map(|definition| definition.volume_id)
         .unwrap_or_else(VolumeId::generate);
-    open_operator(&args.storage, NonZeroUsize::MIN)
+    open_operator(&args.storage, args.runtime.transfer_concurrency)
         .context("cannot configure the Direct volume storage")?;
     let definition = VolumeDefinition::direct(volume_id, args.storage)
         .context("volume URLs must be credential-free; supply credentials through provider environment variables")?;

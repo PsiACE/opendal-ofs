@@ -23,8 +23,7 @@ use crate::sync::local::{LocalEntry, LocalKind};
 use crate::sync::path::SnapshotTree;
 use crate::sync::staging::TargetManifest;
 
-const STATE_FORMAT: &str = "ofs-sync-replica";
-const STATE_MAJOR: u16 = 1;
+const STATE_FORMAT: &str = "ofs-sync-replica/1";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -146,7 +145,6 @@ impl ReplicaState {
 #[serde(deny_unknown_fields)]
 struct StoredState {
     format: String,
-    major: u16,
     volume: VolumeId,
     branch: Option<BranchBinding>,
     authority: Option<StoredSnapshot>,
@@ -169,7 +167,6 @@ impl From<&ReplicaState> for StoredState {
     fn from(state: &ReplicaState) -> Self {
         Self {
             format: STATE_FORMAT.into(),
-            major: STATE_MAJOR,
             volume: state.volume,
             branch: state.branch.clone(),
             authority: state.authority.as_ref().map(StoredSnapshot::from),
@@ -191,7 +188,7 @@ impl TryFrom<StoredState> for ReplicaState {
     type Error = anyhow::Error;
 
     fn try_from(stored: StoredState) -> Result<Self> {
-        if stored.format != STATE_FORMAT || stored.major != STATE_MAJOR {
+        if stored.format != STATE_FORMAT {
             bail!("replica state format is unsupported");
         }
         let authority = stored

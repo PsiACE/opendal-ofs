@@ -154,6 +154,9 @@ pub(crate) struct VolumeCreateArgs {
     /// Credential-free D1 metadata URL. Managed volumes also read OFS_METADATA_URL.
     #[arg(long, value_name = "URL")]
     pub metadata: Option<Url>,
+
+    #[command(flatten)]
+    pub runtime: StorageOptions,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
