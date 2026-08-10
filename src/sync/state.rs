@@ -19,7 +19,7 @@ use crate::filesystem::{
     AuthorityIdentity, BranchBinding, ChangeCursor, DirectoryRecord, FileVersion, NodeId,
     NodeRecord, OperationId, VolumeId, VolumeSnapshot,
 };
-use crate::sync::local::{LocalEntry, LocalKind};
+use crate::sync::local::LocalEntry;
 use crate::sync::path::SnapshotTree;
 use crate::sync::staging::TargetManifest;
 
@@ -274,11 +274,7 @@ fn validate_installed(
         let version = record
             .file_version
             .map(|id| &tree.snapshot.file_versions[&id]);
-        let kind = match record.kind {
-            crate::filesystem::NodeKind::Directory => LocalKind::Directory,
-            crate::filesystem::NodeKind::RegularFile => LocalKind::File,
-        };
-        if saved.kind != kind
+        if saved.kind != record.kind
             || saved.executable != record.attributes.executable
             || version.is_some_and(|version| saved.size != version.logical_size)
         {

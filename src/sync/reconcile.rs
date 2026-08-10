@@ -101,13 +101,13 @@ pub(crate) fn reconcile(
         let local_digest = local.source.file(&path).map(|file| file.logical_digest);
         let remote_entry = remote.get(&path);
         let remote_digest = remote_entry.and_then(digest);
-        let base_kind = base_entry.map(kind);
+        let base_kind = base_entry.map(|entry| entry.node.kind);
         let local_kind = local
             .source
             .entries
             .get(&path)
             .map(|entry| entry.local.kind);
-        let remote_kind = remote_entry.map(kind);
+        let remote_kind = remote_entry.map(|entry| entry.node.kind);
         if local_kind != remote_kind {
             if local_kind != base_kind && remote_kind != base_kind {
                 bail!(
@@ -115,7 +115,7 @@ pub(crate) fn reconcile(
                 );
             } else if local_kind == base_kind {
                 match remote_entry {
-                    Some(entry) if kind(entry) == super::LocalKind::File => {
+                    Some(entry) if entry.node.kind == NodeKind::RegularFile => {
                         plan.select_file(path, entry, TargetEdit::Materialize);
                     }
                     Some(_) => plan.select_directory(path),
@@ -126,7 +126,7 @@ pub(crate) fn reconcile(
             }
             continue;
         }
-        if local_kind != Some(super::LocalKind::File) {
+        if local_kind != Some(NodeKind::RegularFile) {
             continue;
         }
         let local_executable = local
@@ -201,7 +201,7 @@ fn validate_directory_deletions(
     for path in base.paths.keys() {
         if base
             .get(path)
-            .is_none_or(|entry| kind(entry) != super::LocalKind::Directory)
+            .is_none_or(|entry| entry.node.kind != NodeKind::Directory)
         {
             continue;
         }
@@ -209,10 +209,10 @@ fn validate_directory_deletions(
             .source
             .entries
             .get(path)
-            .is_some_and(|entry| entry.local.kind == super::LocalKind::Directory);
+            .is_some_and(|entry| entry.local.kind == NodeKind::Directory);
         let remote_kept = remote
             .get(path)
-            .is_some_and(|entry| kind(entry) == super::LocalKind::Directory);
+            .is_some_and(|entry| entry.node.kind == NodeKind::Directory);
         if !remote_kept && local_kept && local_subtree_changed(replica, local, base, path) {
             bail!("cannot reconcile {path:?}: remote directory deletion overlaps local changes");
         }
@@ -237,8 +237,13 @@ fn local_subtree_changed(
     paths.into_iter().any(|path| {
         match (replica.installed.get(path), local.source.entries.get(path)) {
             (Some(installed), Some(current)) => {
-                current.local.kind != kind(base.get(path).expect("installed path is in the base"))
-                    || current.local.kind == super::LocalKind::File && installed != &current.local
+                current.local.kind
+                    != base
+                        .get(path)
+                        .expect("installed path is in the base")
+                        .node
+                        .kind
+                    || current.local.kind == NodeKind::RegularFile && installed != &current.local
             }
             (None, None) => false,
             _ => true,
@@ -515,7 +520,7 @@ fn local_matches_remote(local: &StagedTree, path: &str, remote: SnapshotEntry<'_
 fn local_file(local: &StagedTree, path: &str) -> Option<([u8; 32], bool)> {
     let file = local.source.file(path)?;
     let entry = local.source.entries.get(path)?;
-    (entry.local.kind == super::LocalKind::File)
+    (entry.local.kind == NodeKind::RegularFile)
         .then_some((file.logical_digest, entry.local.executable))
 }
 
@@ -560,7 +565,7 @@ fn reject_unidentified_moves(
     });
     let crosses_devices = deleted.iter().any(|from| {
         base.and_then(|tree| tree.get(from))
-            .is_some_and(|entry| kind(entry) == super::LocalKind::Directory)
+            .is_some_and(|entry| entry.node.kind == NodeKind::Directory)
             && added.iter().any(|path| {
                 local.source.file(path).is_none()
                     && replica.installed[from]
@@ -593,13 +598,6 @@ fn unique_remote_nodes(remote: &SnapshotTree<'_>) -> BTreeMap<NodeId, Option<Str
             .or_insert_with(|| Some(path.clone()));
     }
     nodes
-}
-
-fn kind(entry: SnapshotEntry<'_>) -> super::LocalKind {
-    match entry.node.kind {
-        NodeKind::Directory => super::LocalKind::Directory,
-        NodeKind::RegularFile => super::LocalKind::File,
-    }
 }
 
 fn digest(entry: SnapshotEntry<'_>) -> Option<[u8; 32]> {

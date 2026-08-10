@@ -15,14 +15,7 @@ use futures::TryStreamExt as _;
 use opendal::{EntryMode, Operator, services};
 use serde::{Deserialize, Serialize};
 
-use crate::filesystem::validate_portable_paths;
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum LocalKind {
-    Directory,
-    File,
-}
+use crate::filesystem::{NodeKind, validate_portable_paths};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -34,7 +27,7 @@ pub(crate) struct NativeIdentity {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LocalEntry {
-    pub kind: LocalKind,
+    pub kind: NodeKind,
     pub size: u64,
     pub modified: String,
     pub executable: bool,
@@ -70,8 +63,8 @@ impl LocalTree {
             }
             let metadata = entry.metadata();
             let kind = match metadata.mode() {
-                EntryMode::DIR => LocalKind::Directory,
-                EntryMode::FILE => LocalKind::File,
+                EntryMode::DIR => NodeKind::Directory,
+                EntryMode::FILE => NodeKind::RegularFile,
                 _ => bail!(
                     "local path {path:?} is a symbolic link or special file; remove it before sync"
                 ),
@@ -81,7 +74,7 @@ impl LocalTree {
                 .context("local filesystem did not report modification time")?
                 .to_string();
             let (native_identity, executable, link_count) = native_attributes_at(root, path, kind)?;
-            if kind == LocalKind::File {
+            if kind == NodeKind::RegularFile {
                 if link_count > 1 {
                     bail!(
                         "local path {path:?} is a hard link; Sync does not publish hard-linked files"
@@ -122,8 +115,8 @@ pub(crate) async fn entry_at(root: &Path, path: &str) -> Result<LocalEntry> {
         .await
         .with_context(|| format!("inspect materialized path {path:?}"))?;
     let kind = match metadata.mode() {
-        EntryMode::DIR => LocalKind::Directory,
-        EntryMode::FILE => LocalKind::File,
+        EntryMode::DIR => NodeKind::Directory,
+        EntryMode::FILE => NodeKind::RegularFile,
         _ => bail!("materialized path {path:?} is a symbolic link or special file"),
     };
     let (native_identity, executable, _) = native_attributes_at(root, path, kind)?;
@@ -142,7 +135,7 @@ pub(crate) async fn entry_at(root: &Path, path: &str) -> Result<LocalEntry> {
 pub(crate) fn native_identity_at(
     root: &Path,
     path: &str,
-    kind: LocalKind,
+    kind: NodeKind,
 ) -> Result<Option<NativeIdentity>> {
     native_attributes_at(root, path, kind).map(|(identity, _, _)| identity)
 }
@@ -150,7 +143,7 @@ pub(crate) fn native_identity_at(
 fn native_attributes_at(
     root: &Path,
     path: &str,
-    kind: LocalKind,
+    kind: NodeKind,
 ) -> Result<(Option<NativeIdentity>, bool, u64)> {
     #[cfg(unix)]
     {
@@ -158,8 +151,8 @@ fn native_attributes_at(
         let metadata = fs::symlink_metadata(root.join(path))
             .with_context(|| format!("inspect local attributes for {path:?}"))?;
         let expected = match kind {
-            LocalKind::Directory => metadata.file_type().is_dir(),
-            LocalKind::File => metadata.file_type().is_file(),
+            NodeKind::Directory => metadata.file_type().is_dir(),
+            NodeKind::RegularFile => metadata.file_type().is_file(),
         };
         if !expected {
             bail!("local path {path:?} changed kind while it was being inspected; retry sync");
@@ -169,7 +162,7 @@ fn native_attributes_at(
                 device: metadata.dev(),
                 inode: metadata.ino(),
             }),
-            kind == LocalKind::File && metadata.permissions().mode() & 0o111 != 0,
+            kind == NodeKind::RegularFile && metadata.permissions().mode() & 0o111 != 0,
             metadata.nlink(),
         ))
     }

@@ -11,7 +11,6 @@ use std::num::NonZeroU64;
 
 use anyhow::{Context, Result, bail};
 
-use super::LocalKind;
 use super::path::SnapshotTree;
 use super::staging::{StagedTree, TargetManifest};
 use crate::filesystem::{
@@ -50,7 +49,7 @@ pub(crate) fn build_publication<V: Volume>(
     let mut identities = BTreeMap::from([(String::new(), root)]);
     let mut used = BTreeSet::from([root]);
     for (path, entry) in &target_manifest.entries {
-        let kind = node_kind(entry.local.kind);
+        let kind = entry.local.kind;
         let identity = old_paths
             .get(path)
             .or_else(|| rename_source(&rename_sources, path).and_then(|from| old_paths.get(&from)))
@@ -68,7 +67,7 @@ pub(crate) fn build_publication<V: Volume>(
         target_manifest
             .entries
             .iter()
-            .map(|(path, entry)| (path.as_str(), node_kind(entry.local.kind))),
+            .map(|(path, entry)| (path.as_str(), entry.local.kind)),
     ) {
         let id = identities[path];
         let file_version = if kind == NodeKind::RegularFile {
@@ -120,7 +119,7 @@ pub(crate) fn build_publication<V: Volume>(
         target_manifest
             .entries
             .iter()
-            .map(|(path, entry)| (path.as_str(), node_kind(entry.local.kind))),
+            .map(|(path, entry)| (path.as_str(), entry.local.kind)),
     ) {
         if kind != NodeKind::Directory {
             continue;
@@ -188,11 +187,11 @@ fn directory_entries(
             && !target
                 .entries
                 .get(parent)
-                .is_some_and(|entry| entry.local.kind == LocalKind::Directory)
+                .is_some_and(|entry| entry.local.kind == NodeKind::Directory)
         {
             bail!("local path {path:?} has no directory parent");
         }
-        let kind = node_kind(entry.local.kind);
+        let kind = entry.local.kind;
         directories.entry(parent.to_owned()).or_default().insert(
             name.to_owned(),
             DirectoryEntry {
@@ -205,13 +204,6 @@ fn directory_entries(
         }
     }
     Ok(directories)
-}
-
-fn node_kind(kind: LocalKind) -> NodeKind {
-    match kind {
-        LocalKind::Directory => NodeKind::Directory,
-        LocalKind::File => NodeKind::RegularFile,
-    }
 }
 
 fn split_path(path: &str) -> Result<(&str, &str)> {

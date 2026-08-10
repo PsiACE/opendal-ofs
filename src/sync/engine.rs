@@ -17,11 +17,11 @@ use super::local::{entry_at, fs_operator, set_executable};
 use super::path::SnapshotTree;
 use super::reconcile::{ReconcilePlan, TargetEdit};
 use super::{
-    ConflictRecord, LocalKind, LocalTree, ReplicaState, StagedTree, TargetManifest,
-    build_publication, reconcile,
+    ConflictRecord, LocalTree, ReplicaState, StagedTree, TargetManifest, build_publication,
+    reconcile,
 };
 use crate::filesystem::{
-    ChangeCursor, CommitOutcome, FileVersion, MaterializeRequest, OperationId, Volume,
+    ChangeCursor, CommitOutcome, FileVersion, MaterializeRequest, NodeKind, OperationId, Volume,
     VolumeObservation,
 };
 use anyhow::{Context, Result, bail};
@@ -344,8 +344,8 @@ async fn apply_target<V: Volume>(
         .collect::<Vec<_>>();
     for (path, kind) in removed {
         let target_path = match kind {
-            LocalKind::Directory => format!("{path}/"),
-            LocalKind::File => path,
+            NodeKind::Directory => format!("{path}/"),
+            NodeKind::RegularFile => path,
         };
         target.delete(&target_path).await?;
     }
@@ -492,7 +492,7 @@ fn known_local_versions(
         .iter()
         .filter_map(|(path, entry)| {
             let base = state.installed.get(path)?;
-            if entry.kind == LocalKind::File && base == entry {
+            if entry.kind == NodeKind::RegularFile && base == entry {
                 let version = tree.get(path)?.file?;
                 Some((path.clone(), version.clone()))
             } else {
@@ -532,16 +532,16 @@ fn install_staged_changes(
     }
 
     for (path, entry) in &staged.manifest().entries {
-        if entry.local.kind == LocalKind::Directory {
+        if entry.local.kind == NodeKind::Directory {
             fs::create_dir_all(replica.join(path))?;
         }
     }
     for (path, entry) in &staged.manifest().entries {
-        if entry.local.kind != LocalKind::File {
+        if entry.local.kind != NodeKind::RegularFile {
             continue;
         }
         let same_content = before.entries.get(path).is_some_and(|existing| {
-            existing.local.kind == LocalKind::File
+            existing.local.kind == NodeKind::RegularFile
                 && existing.local.size == entry.local.size
                 && before.file(path).map(|file| file.logical_digest)
                     == staged.manifest().file(path).map(|file| file.logical_digest)

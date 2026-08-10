@@ -16,11 +16,13 @@ use opendal::Operator;
 use serde::{Deserialize, Serialize};
 
 use super::local::{
-    LocalEntry, LocalKind, LocalTree, NativeIdentity, entry_at, fs_operator, native_identity_at,
+    LocalEntry, LocalTree, NativeIdentity, entry_at, fs_operator, native_identity_at,
 };
 use super::path::descendants;
 use super::state::PendingIntent;
-use crate::filesystem::{FileVersion, FileVersionId, OperationId, Volume, VolumeSnapshot};
+use crate::filesystem::{
+    FileVersion, FileVersionId, NodeKind, OperationId, Volume, VolumeSnapshot,
+};
 
 const TREE_DIR: &str = "tree";
 const SEGMENTS_DIR: &str = "segments";
@@ -67,7 +69,7 @@ impl TargetManifest {
             path,
             TargetEntry {
                 local: LocalEntry {
-                    kind: LocalKind::File,
+                    kind: NodeKind::RegularFile,
                     size: file.logical_size,
                     modified: String::new(),
                     executable,
@@ -84,7 +86,7 @@ impl TargetManifest {
             path,
             TargetEntry {
                 local: LocalEntry {
-                    kind: LocalKind::Directory,
+                    kind: NodeKind::Directory,
                     size: 0,
                     modified: String::new(),
                     executable: false,
@@ -174,7 +176,7 @@ impl StagedTree {
             .entries
             .iter()
             .filter(|(path, entry)| {
-                entry.kind == LocalKind::File && !known_versions.contains_key(*path)
+                entry.kind == NodeKind::RegularFile && !known_versions.contains_key(*path)
             })
             .map(|(path, _)| path.clone())
             .collect::<Vec<_>>();
@@ -193,7 +195,7 @@ impl StagedTree {
         let cache = BTreeMap::new();
         for (path, expected) in &tree.entries {
             let file = match expected.kind {
-                LocalKind::Directory => {
+                NodeKind::Directory => {
                     staged
                         .create_dir(&format!("{path}/"))
                         .await
@@ -206,7 +208,7 @@ impl StagedTree {
                     )?;
                     None
                 }
-                LocalKind::File => {
+                NodeKind::RegularFile => {
                     let version = match prepared.get(path) {
                         Some(version) => {
                             if version.logical_size != expected.size {
@@ -421,7 +423,7 @@ impl StagedTree {
 
 fn validate_manifest(manifest: &TargetManifest) -> Result<()> {
     for (path, entry) in &manifest.entries {
-        if (entry.local.kind == LocalKind::File) != entry.file.is_some() {
+        if (entry.local.kind == NodeKind::RegularFile) != entry.file.is_some() {
             bail!("staged path {path:?} has inconsistent kind and file state");
         }
         let Some(file) = &entry.file else {
@@ -437,7 +439,7 @@ fn validate_manifest(manifest: &TargetManifest) -> Result<()> {
 fn require_same_identity(
     root: &Path,
     path: &str,
-    kind: LocalKind,
+    kind: NodeKind,
     expected: Option<NativeIdentity>,
 ) -> Result<()> {
     if native_identity_at(root, path, kind)? != expected {
