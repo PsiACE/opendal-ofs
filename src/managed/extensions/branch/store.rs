@@ -437,18 +437,19 @@ impl BranchStore {
         let mut reads = RetainedMetadataReads::default();
         let mut sweeps = Vec::with_capacity(registry.branches.len());
         for (name, id) in &registry.branches {
+            let namespace = self.namespace(BranchBinding {
+                name: name.clone(),
+                id: *id,
+            });
             let (sweep, state) = self
                 .lock_head(*id, registry.maintenance_epoch, owner)
                 .await?;
             if let Some(state) = &state {
-                self.namespace(BranchBinding {
-                    name: name.clone(),
-                    id: *id,
-                })
-                .retain_state_data(state, &mut roots, &mut reads)
-                .await?;
+                namespace
+                    .retain_state_data(state, &mut roots, &mut reads)
+                    .await?;
             }
-            sweeps.push((*id, sweep));
+            sweeps.push((namespace, sweep));
         }
         let (mut current, revision) = self.registry().await?;
         if current.maintenance_owner != Some(owner)
@@ -464,8 +465,8 @@ impl BranchStore {
         let result = crate::managed::ManagedData::new(self.data.clone())?
             .collect_unreachable_segments(&roots)
             .await?;
-        for (id, sweep) in sweeps {
-            self.unlock_head(id, sweep).await?;
+        for (namespace, sweep) in sweeps {
+            namespace.finish_gc(sweep).await?;
         }
         current.maintenance_owner = None;
         if !self
@@ -521,33 +522,6 @@ impl BranchStore {
             "begin Managed data collection",
             "branch HEAD kept changing",
         ))
-    }
-
-    async fn unlock_head(&self, id: BranchId, sweep: NamespaceGcSweep) -> Result<(), VolumeError> {
-        let (mut head, revision) = self.read_head(id).await?.ok_or_else(|| {
-            corrupt(
-                "finish Managed data collection",
-                "registered branch HEAD is missing",
-            )
-        })?;
-        if head.maintenance != Some(sweep) {
-            return Err(conflict(
-                "finish Managed data collection",
-                "branch collection fence changed",
-            ));
-        }
-        head.maintenance = None;
-        if self
-            .replace_head(id, &revision, &head, "finish Managed data collection")
-            .await?
-        {
-            Ok(())
-        } else {
-            Err(conflict(
-                "finish Managed data collection",
-                "branch HEAD changed",
-            ))
-        }
     }
 
     async fn replace_registry(

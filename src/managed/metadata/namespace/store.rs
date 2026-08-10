@@ -502,14 +502,24 @@ impl NamespaceStore {
     }
 
     pub(crate) async fn finish_gc(&self, sweep: NamespaceGcSweep) -> Result<(), VolumeError> {
-        let (mut head, revision) = self
-            .read_raw_head()
-            .await?
-            .ok_or_else(|| conflict("finish Managed data collection", "namespace disappeared"))?;
+        let (mut head, revision) = self.read_raw_head().await?.ok_or_else(|| {
+            if self.branch_id().is_some() {
+                corrupt(
+                    "finish Managed data collection",
+                    "registered branch HEAD is missing",
+                )
+            } else {
+                conflict("finish Managed data collection", "namespace disappeared")
+            }
+        })?;
         if head.maintenance != Some(sweep) {
             return Err(conflict(
                 "finish Managed data collection",
-                "collection fence changed",
+                if self.branch_id().is_some() {
+                    "branch collection fence changed"
+                } else {
+                    "collection fence changed"
+                },
             ));
         }
         head.maintenance = None;
@@ -527,7 +537,11 @@ impl NamespaceStore {
         } else {
             Err(conflict(
                 "finish Managed data collection",
-                "namespace authority changed",
+                if self.branch_id().is_some() {
+                    "branch HEAD changed"
+                } else {
+                    "namespace authority changed"
+                },
             ))
         }
     }
