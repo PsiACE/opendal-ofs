@@ -15,10 +15,10 @@ set -euo pipefail
 command -v b3sum >/dev/null || { printf '%s\n' 'b3sum is required' >&2; exit 2; }
 
 rounds=$OFS_PERF_ROUNDS
-volume=performance-volume
-catalog="$OFS_RUN_ROOT/catalog.json"
 evidence="$OFS_RUN_ROOT/evidence"
 mkdir -p "$evidence"
+target_options=(--model managed --storage "$OFS_STORAGE_URL")
+unset OFS_STORAGE_URL
 
 record_command() {
   {
@@ -34,7 +34,7 @@ measure() {
   local started_ns ended_ns elapsed_ms
   started_ns=$(date +%s%N)
   record_command "$@"
-  OFS_CONFIG="$catalog" "$@" >"$output"
+  "$@" >"$output"
   ended_ns=$(date +%s%N)
   elapsed_ms=$(((ended_ns - started_ns) / 1000000))
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
@@ -72,14 +72,13 @@ with path.open("r+b") as output:
 PY
 }
 
-measure init create "$evidence/create.txt" \
-  "$OFS_BIN" volume create "$volume" --model managed --storage "$OFS_STORAGE_URL"
-
 source_tree="$OFS_RUN_ROOT/replica-source"
 source_state="$OFS_RUN_ROOT/state-source.json"
 lagging_tree="$OFS_RUN_ROOT/replica-lagging"
 lagging_state="$OFS_RUN_ROOT/state-lagging.json"
 mkdir -p "$source_tree/memory" "$source_tree/skills" "$lagging_tree"
+measure init create "$evidence/create.txt" \
+  "$OFS_BIN" sync "$source_tree" --state "$source_state" --init "${target_options[@]}"
 write_deterministic "$source_tree/memory/seed.bin" $((16 * 1024 * 1024)) seed
 truncate -s $((80 * 1024 * 1024)) "$source_tree/memory/repeated.bin"
 for group in $(seq 0 7); do
@@ -92,9 +91,9 @@ for group in $(seq 0 7); do
 done
 
 measure init initial-publication "$evidence/initial-publication.txt" \
-  "$OFS_BIN" sync "$volume" "$source_tree" --state "$source_state"
+  "$OFS_BIN" sync "$source_tree" --state "$source_state"
 measure cold_restore initial "$evidence/initial-catchup.txt" \
-  "$OFS_BIN" sync "$volume" "$lagging_tree" --state "$lagging_state"
+  "$OFS_BIN" sync "$lagging_tree" --state "$lagging_state" "${target_options[@]}"
 diff -qr "$source_tree" "$lagging_tree" >/dev/null
 
 lifecycle_started_ns=$(date +%s%N)
@@ -105,7 +104,7 @@ for round in $(seq 1 "$rounds"); do
   next_state="$OFS_RUN_ROOT/state-$round.json"
   mkdir "$next_tree"
   measure cold_restore "$round" "$evidence/catchup-$round.txt" \
-    "$OFS_BIN" sync "$volume" "$next_tree" --state "$next_state"
+    "$OFS_BIN" sync "$next_tree" --state "$next_state" "${target_options[@]}"
   diff -qr "$current_tree" "$next_tree" >/dev/null
   rewrite_window \
     "$next_tree/memory/seed.bin" \
@@ -120,7 +119,7 @@ for round in $(seq 1 "$rounds"); do
     "$next_tree/memory/generation-$round.bin" \
     $((256 * 1024)) "generation-$round"
   measure publication "$round" "$evidence/publication-$round.txt" \
-    "$OFS_BIN" sync "$volume" "$next_tree" --state "$next_state"
+    "$OFS_BIN" sync "$next_tree" --state "$next_state"
   rm -rf "$current_tree"
   rm -rf "$current_state"
   current_tree=$next_tree
@@ -128,7 +127,7 @@ for round in $(seq 1 "$rounds"); do
 done
 
 measure incremental_catchup lagging "$evidence/catchup-lagging.txt" \
-  "$OFS_BIN" sync "$volume" "$lagging_tree" --state "$lagging_state"
+  "$OFS_BIN" sync "$lagging_tree" --state "$lagging_state"
 diff -qr "$current_tree" "$lagging_tree" >/dev/null
 lifecycle_ended_ns=$(date +%s%N)
 printf '%s\t%s\tlifecycle\t1\t%s\t%s\t%s\n' \
@@ -137,7 +136,7 @@ printf '%s\t%s\tlifecycle\t1\t%s\t%s\t%s\n' \
   "$lifecycle_started_ns" "$lifecycle_ended_ns" >>"$OFS_METRICS"
 
 measure noop 1 "$evidence/noop.txt" \
-  "$OFS_BIN" sync "$volume" "$current_tree" --state "$current_state"
+  "$OFS_BIN" sync "$current_tree" --state "$current_state"
 
 read -r logical_files logical_bytes < <(
   find "$current_tree" -type f -printf '%s\n' |

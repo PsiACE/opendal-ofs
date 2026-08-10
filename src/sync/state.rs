@@ -13,12 +13,13 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 use crate::filesystem::{
     AuthorityIdentity, BranchBinding, ChangeCursor, DirectoryRecord, FileVersion, NodeId,
-    NodeRecord, OperationId, VolumeId, VolumeSnapshot,
+    NodeRecord, OperationId, VolumeId, VolumeModel, VolumeSnapshot,
 };
-use crate::local_store::{JsonFormat, install_json};
+use crate::local_store::install_json;
 use crate::sync::local::LocalEntry;
 use crate::sync::path::SnapshotTree;
 use crate::sync::staging::TargetManifest;
@@ -43,8 +44,51 @@ pub struct ConflictRecord {
     pub remote_digest: Option<[u8; 32]>,
 }
 
+/// Credential-free information needed to reopen the volume for one replica.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicaTarget {
+    model: VolumeModel,
+    storage: Url,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<Url>,
+}
+
+impl ReplicaTarget {
+    pub fn new(model: VolumeModel, storage: Url, metadata: Option<Url>) -> Result<Self> {
+        let target = Self {
+            model,
+            storage,
+            metadata,
+        };
+        target.validate()?;
+        Ok(target)
+    }
+
+    pub const fn model(&self) -> VolumeModel {
+        self.model
+    }
+
+    pub const fn storage(&self) -> &Url {
+        &self.storage
+    }
+
+    pub const fn metadata(&self) -> Option<&Url> {
+        self.metadata.as_ref()
+    }
+
+    fn validate(&self) -> Result<()> {
+        require_credential_free("storage", &self.storage)?;
+        if let Some(metadata) = &self.metadata {
+            require_credential_free("metadata", metadata)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReplicaState {
+    target: ReplicaTarget,
     pub volume: VolumeId,
     pub branch: Option<BranchBinding>,
     pub(crate) authority: Option<VolumeSnapshot>,
@@ -54,8 +98,9 @@ pub struct ReplicaState {
 }
 
 impl ReplicaState {
-    pub(crate) fn empty_for(authority: AuthorityIdentity) -> Self {
+    pub(crate) fn empty_for(target: ReplicaTarget, authority: AuthorityIdentity) -> Self {
         Self {
+            target,
             volume: authority.volume,
             branch: authority.branch,
             authority: None,
@@ -63,6 +108,10 @@ impl ReplicaState {
             pending: None,
             conflicts: Vec::new(),
         }
+    }
+
+    pub const fn target(&self) -> &ReplicaTarget {
+        &self.target
     }
 
     pub fn authority_identity(&self) -> AuthorityIdentity {
@@ -84,12 +133,14 @@ impl ReplicaState {
     }
 
     pub(crate) fn at_common(
+        target: ReplicaTarget,
         identity: AuthorityIdentity,
         authority: &SnapshotTree<'_>,
         installed: BTreeMap<String, LocalEntry>,
     ) -> Result<Self> {
         validate_installed(authority, &installed)?;
         Ok(Self {
+            target,
             volume: identity.volume,
             branch: identity.branch,
             authority: Some(authority.snapshot.clone()),
@@ -132,13 +183,7 @@ impl ReplicaState {
 
     pub fn install(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
-        install_json(
-            path,
-            "ofs-state",
-            &StoredState::from(self),
-            JsonFormat::Compact,
-        )
-        .context("install replica state")
+        install_json(path, "ofs-state", &StoredState::from(self)).context("install replica state")
     }
 }
 
@@ -146,6 +191,7 @@ impl ReplicaState {
 #[serde(deny_unknown_fields)]
 struct StoredState {
     format: String,
+    target: ReplicaTarget,
     volume: VolumeId,
     branch: Option<BranchBinding>,
     authority: Option<StoredSnapshot>,
@@ -168,6 +214,7 @@ impl From<&ReplicaState> for StoredState {
     fn from(state: &ReplicaState) -> Self {
         Self {
             format: STATE_FORMAT.into(),
+            target: state.target.clone(),
             volume: state.volume,
             branch: state.branch.clone(),
             authority: state.authority.as_ref().map(StoredSnapshot::from),
@@ -192,6 +239,7 @@ impl TryFrom<StoredState> for ReplicaState {
         if stored.format != STATE_FORMAT {
             bail!("replica state format is unsupported");
         }
+        stored.target.validate()?;
         let authority = stored
             .authority
             .map(|snapshot| snapshot.into_snapshot(stored.volume))
@@ -200,6 +248,7 @@ impl TryFrom<StoredState> for ReplicaState {
             validate_installed(&SnapshotTree::new(snapshot)?, &stored.installed)?;
         }
         Ok(Self {
+            target: stored.target,
             volume: stored.volume,
             branch: stored.branch,
             authority,
@@ -208,6 +257,23 @@ impl TryFrom<StoredState> for ReplicaState {
             conflicts: stored.conflicts,
         })
     }
+}
+
+fn require_credential_free(kind: &str, url: &Url) -> Result<()> {
+    let has_query_secret = url.query_pairs().any(|(key, _)| {
+        let key = key.to_ascii_lowercase();
+        key.contains("secret")
+            || key.contains("password")
+            || key.contains("credential")
+            || key == "token"
+            || key.ends_with("_token")
+            || key == "access_key"
+            || key == "access_key_id"
+    });
+    if !url.username().is_empty() || url.password().is_some() || has_query_secret {
+        bail!("{kind} URL must not contain credentials");
+    }
+    Ok(())
 }
 
 impl From<&VolumeSnapshot> for StoredSnapshot {

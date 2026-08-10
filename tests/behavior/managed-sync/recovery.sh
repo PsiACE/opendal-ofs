@@ -19,11 +19,9 @@ chmod u+x "$replica_a/tools/run.sh"
 sync_a >/dev/null
 sync_b >/dev/null
 
-printf '%s\n' 'recovery: rebuild a cold client under another local alias'
-OFS_CONFIG="$cold_config" "$OFS_BIN" volume create "$cold_alias" \
-  "${volume_options[@]}" >/dev/null
+printf '%s\n' 'recovery: rebuild a cold client from the remote Managed format'
 cold_root_identity=$(ls -di -- "$cold_replica")
-sync_cold >/dev/null
+attach_cold >/dev/null
 diff -ru "$replica_a" "$cold_replica" || fail 'cold replica does not match the published tree'
 [[ "$(ls -di -- "$cold_replica")" == "$cold_root_identity" ]] || \
   fail 'cold rebuild replaced the replica root'
@@ -43,21 +41,19 @@ diff -ru "$replica_a" "$cold_replica" || \
   fail 'the original client did not converge after the recovered client published'
 
 printf '%s\n' 'recovery: status exposes durable replica state without secrets'
-status_json=$(OFS_CONFIG="$cold_config" "$OFS_BIN" status --state "$cold_state" --json)
+status_json=$("$OFS_BIN" status --state "$cold_state" --json)
 grep -Eq '"volume_model"[[:space:]]*:[[:space:]]*"managed"' <<<"$status_json" || \
   fail 'status did not report volume_model=managed'
 grep -Eq '"access_model"[[:space:]]*:[[:space:]]*"sync"' <<<"$status_json" || \
   fail 'status did not report access_model=sync'
 grep -Eq '"stable_rename_identity"[[:space:]]*:[[:space:]]*true' <<<"$status_json" || \
   fail 'status did not report the admitted native rename capability'
-grep -Eq '"volume_alias"[[:space:]]*:[[:space:]]*"recovered-workspace"' <<<"$status_json" || \
-  fail 'status did not report the current client local alias'
 grep -Eq '"volume_id"[[:space:]]*:[[:space:]]*"[0-9a-f]{32}"' <<<"$status_json" || \
   fail 'status did not report the durable remote volume identity'
 common_sequence=$(json_field "$status_json" common_sequence)
 [[ "$common_sequence" =~ ^[1-9][0-9]*$ ]] || \
   fail 'status did not report a durable non-genesis common sequence'
-original_status=$(OFS_CONFIG="$config" "$OFS_BIN" status --state "$state_a" --json)
+original_status=$("$OFS_BIN" status --state "$state_a" --json)
 [[ "$(json_field "$original_status" common_sequence)" == "$common_sequence" ]] || \
   fail 'converged replicas reported different common sequences'
 grep -Eq '"conflicts"[[:space:]]*:[[:space:]]*0' <<<"$status_json" || \

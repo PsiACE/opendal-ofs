@@ -15,8 +15,8 @@ use std::path::Path;
 use super::install::{apply_target, fresh_sibling, install_staged_changes, remove_tree};
 use super::path::SnapshotTree;
 use super::{
-    ConflictRecord, LocalTree, ReplicaState, StagedTree, SyncObservation, SyncVolume,
-    build_publication, reconcile,
+    ConflictRecord, LocalTree, ReplicaState, ReplicaTarget, StagedTree, SyncObservation,
+    SyncVolume, build_publication, reconcile,
 };
 use crate::filesystem::{ChangeCursor, CommitOutcome, FileVersionId, NodeKind, OperationId};
 use anyhow::{Context, Result, bail};
@@ -47,6 +47,7 @@ impl<V: SyncVolume> SyncEngine<V> {
         &self,
         replica_path: impl AsRef<Path>,
         state_path: impl AsRef<Path>,
+        target: ReplicaTarget,
         resolve_paths: &[String],
     ) -> Result<SyncResult> {
         super::local::require_native_capabilities()?;
@@ -59,7 +60,10 @@ impl<V: SyncVolume> SyncEngine<V> {
         let volume_id = self.volume.id();
         let authority_identity = self.volume.authority();
         let mut state = ReplicaState::load(state_path)?
-            .unwrap_or_else(|| ReplicaState::empty_for(authority_identity.clone()));
+            .unwrap_or_else(|| ReplicaState::empty_for(target.clone(), authority_identity.clone()));
+        if state.target() != &target {
+            bail!("replica state points to another Managed volume target");
+        }
         if state.volume != volume_id {
             bail!("replica state belongs to another volume");
         }
@@ -224,6 +228,7 @@ impl<V: SyncVolume> SyncEngine<V> {
                 }
                 let installed = LocalTree::scan(replica_path).await?;
                 state = ReplicaState::at_common(
+                    state.target().clone(),
                     state.authority_identity(),
                     remote_tree,
                     installed.entries,
@@ -260,6 +265,7 @@ impl<V: SyncVolume> SyncEngine<V> {
                     observed_local
                 };
                 state = ReplicaState::at_common(
+                    state.target().clone(),
                     state.authority_identity(),
                     &committed,
                     installed.entries,

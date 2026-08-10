@@ -139,10 +139,10 @@ grep -Fxq 'second candidate from replica a' "$replica_a/shared-two.txt" || \
   fail 'second remote conflict candidate was lost'
 grep -Fxq 'second candidate from replica b' "$replica_b/shared-two.txt" || \
   fail 'second local conflict candidate was lost'
-conflict_status=$(OFS_CONFIG="$peer_config" "$OFS_BIN" status --state "$state_b" --json)
+conflict_status=$("$OFS_BIN" status --state "$state_b" --json)
 grep -Eq '"conflicts"[[:space:]]*:[[:space:]]*2' <<<"$conflict_status" || \
   fail 'status did not report both unresolved conflicts'
-OFS_CONFIG="$peer_config" "$OFS_BIN" sync "$peer_alias" "$replica_b" --state "$state_b" \
+"$OFS_BIN" sync "$replica_b" --state "$state_b" \
   --resolve shared.txt --resolve shared-two.txt >/dev/null
 sync_a >/dev/null
 grep -Fxq 'candidate from replica b' "$replica_a/shared.txt" || fail 'resolved content was not published'

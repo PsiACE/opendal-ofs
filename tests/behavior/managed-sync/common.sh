@@ -50,51 +50,48 @@ case "$OFS_METADATA_MODE" in
   *) fail "OFS_METADATA_MODE must be object or d1, got: $OFS_METADATA_MODE" ;;
 esac
 
-config="$OFS_CASE_ROOT/client/config.json"
-peer_config="$OFS_CASE_ROOT/peer-client/config.json"
-cold_config="$OFS_CASE_ROOT/cold-client/config.json"
-extension_mismatch_config="$OFS_CASE_ROOT/extension-mismatch-client/config.json"
-peer_alias=restored-workspace
-cold_alias=recovered-workspace
 replica_a="$OFS_CASE_ROOT/replica-a"
 replica_b="$OFS_CASE_ROOT/replica-b"
 cold_replica="$OFS_CASE_ROOT/cold-replica"
 state_a="$OFS_CASE_ROOT/state/replica-a.json"
 state_b="$OFS_CASE_ROOT/state/replica-b.json"
 cold_state="$OFS_CASE_ROOT/state/cold-replica.json"
-volume_options=(--model managed --storage "$OFS_STORAGE_URL")
+target_options=(--model managed --storage "$OFS_STORAGE_URL")
 if [[ "$OFS_METADATA_MODE" == d1 ]]; then
-  volume_options+=(--metadata "$OFS_METADATA_URL")
+  target_options+=(--metadata "$OFS_METADATA_URL")
 fi
+unset OFS_STORAGE_URL OFS_METADATA_URL
 
-mkdir -p "$(dirname "$config")" "$(dirname "$peer_config")" \
-  "$(dirname "$cold_config")" \
-  "$(dirname "$extension_mismatch_config")" \
-  "$replica_a" "$replica_b" "$cold_replica" "$(dirname "$state_a")"
+mkdir -p "$replica_a" "$replica_b" "$cold_replica" "$(dirname "$state_a")"
 
 sync_a() {
-  OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a"
+  "$OFS_BIN" sync "$replica_a" --state "$state_a"
 }
 
 sync_b() {
-  OFS_CONFIG="$peer_config" "$OFS_BIN" sync "$peer_alias" "$replica_b" --state "$state_b"
+  "$OFS_BIN" sync "$replica_b" --state "$state_b"
 }
 
 sync_cold() {
-  OFS_CONFIG="$cold_config" "$OFS_BIN" sync "$cold_alias" "$cold_replica" \
-    --state "$cold_state"
+  "$OFS_BIN" sync "$cold_replica" --state "$cold_state"
 }
 
-register_pair() {
-  OFS_CONFIG="$config" "$OFS_BIN" volume create workspace "${volume_options[@]}" >/dev/null
-  OFS_CONFIG="$peer_config" "$OFS_BIN" volume create "$peer_alias" \
-    "${volume_options[@]}" >/dev/null
+init_a() {
+  "$OFS_BIN" sync "$replica_a" --state "$state_a" --init "${target_options[@]}"
+}
+
+attach_b() {
+  "$OFS_BIN" sync "$replica_b" --state "$state_b" "${target_options[@]}"
+}
+
+attach_cold() {
+  "$OFS_BIN" sync "$cold_replica" --state "$cold_state" "${target_options[@]}"
 }
 
 establish_pair() {
-  register_pair
+  init_a >/dev/null
   printf '%s\n' 'private before sync' >"$replica_a/first.txt"
-  sync_b >/dev/null
+  attach_b >/dev/null
   [[ ! -e "$replica_b/first.txt" ]] || fail 'volume creation published a local file without sync'
   sync_a >/dev/null
   sync_b >/dev/null

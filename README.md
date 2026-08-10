@@ -34,10 +34,11 @@ cargo install ofs
 
 > `cargo` is the Rust package manager. Follow the Rust [installation guide](https://www.rust-lang.org/tools/install) to install it.
 
-### Create and synchronize a Managed volume
+### Initialize and synchronize a Managed volume
 
-Volume creation requires the explicit `--model managed` selection. Managed is
-the only model accepted by the current build.
+Initializing a volume or attaching a new replica requires the explicit
+`--model managed` selection. Managed is the only model accepted by the current
+build. Later syncs recover the credential-free target from replica state.
 
 See the [Managed Sync workflow](docs/managed-sync-workflow.md) for Object and
 D1 setup, synchronization, branches, conflict handling, and recovery.

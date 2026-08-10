@@ -38,18 +38,16 @@ policy and are not stored in the superblock.
 
 `VolumeId` is the only durable identity of a Managed volume. It is created once
 with the superblock and remains stable for the volume lifetime. Metadata
-records, file versions, data references, and replica bindings use that identity
+records, file versions, data references, and replica states use that identity
 where the containing format requires a volume scope.
 
-A name passed to `ofs volume create` or `ofs sync` is a client-local catalog
-alias. An alias MUST NOT be written to the superblock, namespace metadata, data
-segments, or replica state. Different clients MAY register the same `VolumeId`
-under different aliases. Readers MUST determine the remote identity from the
-superblock and MUST reject an expected `VolumeId` that does not match it.
+Readers MUST determine the remote identity from the superblock and MUST reject
+a replica state whose expected `VolumeId` does not match it.
 
 Storage and metadata locators select the physical stores; they are not volume
-identities and are not persisted in this format. Moving a format-preserving
-copy to equivalent storage does not change its `VolumeId`.
+identities and are not persisted in the remote format. A Sync replica MAY store
+credential-free locators in its local state. Moving a format-preserving copy to
+equivalent storage does not change its `VolumeId`.
 
 ## Superblock
 
@@ -81,8 +79,8 @@ instead of creating another superblock under a version-specific key.
 The built-in `branch/v1` extension replaces the single namespace authority with
 durable named authorities. Its records are specified below.
 
-The superblock does not contain credentials, endpoints, local paths,
-client-local aliases, index inventory, or policy settings.
+The superblock does not contain credentials, endpoints, local paths, index
+inventory, or policy settings.
 
 ## Identities and references
 

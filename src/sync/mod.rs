@@ -19,7 +19,7 @@ mod state;
 mod volume;
 
 pub use engine::{SyncEngine, SyncResult};
-pub use state::{ConflictRecord, ReplicaState};
+pub use state::{ConflictRecord, ReplicaState, ReplicaTarget};
 pub use volume::{MaterializeRequest, SyncObservation, SyncVolume};
 
 pub(crate) use local::LocalTree;

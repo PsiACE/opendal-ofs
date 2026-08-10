@@ -6,7 +6,7 @@ architecture, and persistent format.
 
 The documentation is split by purpose:
 
-- [Managed Sync workflow](managed-sync-workflow.md) explains how to create a
+- [Managed Sync workflow](managed-sync-workflow.md) explains how to initialize a
   volume, synchronize a replica, resolve conflicts, and recover local state.
 - [Managed Sync architecture](managed-sync-architecture.md) explains the
   component boundaries, metadata authorities, publication path, and OpenDAL

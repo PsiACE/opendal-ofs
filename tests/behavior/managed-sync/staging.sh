@@ -17,9 +17,9 @@ fail() {
 }
 
 pause_when_pending() {
-  local catalog=$1 state=$2 pid=$3 status deadline=$((SECONDS + 10))
+  local state=$1 pid=$2 status deadline=$((SECONDS + 10))
   while ((SECONDS < deadline)) && kill -0 "$pid" 2>/dev/null; do
-    status=$(OFS_CONFIG="$catalog" "$OFS_BIN" status --state "$state" --json 2>/dev/null || true)
+    status=$("$OFS_BIN" status --state "$state" --json 2>/dev/null || true)
     if grep -Eq '"pending"[[:space:]]*:[[:space:]]*true' <<<"$status"; then
       kill -STOP "$pid" 2>/dev/null || return 1
       return
@@ -29,8 +29,6 @@ pause_when_pending() {
   return 1
 }
 
-catalog="$OFS_CASE_ROOT/catalog.json"
-peer_catalog="$OFS_CASE_ROOT/peer-catalog.json"
 replica="$OFS_CASE_ROOT/replica"
 peer="$OFS_CASE_ROOT/peer"
 state="$OFS_CASE_ROOT/state/replica.json"
@@ -39,16 +37,17 @@ cold="$OFS_CASE_ROOT/cold"
 cold_state="$OFS_CASE_ROOT/state/cold.json"
 mkdir -p "$replica" "$peer" "$(dirname "$state")" "$cold"
 
-OFS_CONFIG="$catalog" "$OFS_BIN" volume create staging \
-  --model managed --storage "$OFS_STORAGE_URL" >/dev/null
-OFS_CONFIG="$peer_catalog" "$OFS_BIN" volume create staging \
-  --model managed --storage "$OFS_STORAGE_URL" >/dev/null
+target_options=(--model managed --storage "$OFS_STORAGE_URL")
+if [[ -n ${OFS_METADATA_URL:-} ]]; then
+  target_options+=(--metadata "$OFS_METADATA_URL")
+fi
+unset OFS_STORAGE_URL OFS_METADATA_URL
 printf '%s\n' 'common conflict content' >"$replica/conflict.txt"
-OFS_CONFIG="$catalog" "$OFS_BIN" sync staging "$replica" --state "$state" >/dev/null
-OFS_CONFIG="$peer_catalog" "$OFS_BIN" sync staging "$peer" --state "$peer_state" >/dev/null
+"$OFS_BIN" sync "$replica" --state "$state" --init "${target_options[@]}" >/dev/null
+"$OFS_BIN" sync "$peer" --state "$peer_state" "${target_options[@]}" >/dev/null
 
 printf '%s\n' 'remote conflict candidate' >"$replica/conflict.txt"
-OFS_CONFIG="$catalog" "$OFS_BIN" sync staging "$replica" --state "$state" >/dev/null
+"$OFS_BIN" sync "$replica" --state "$state" >/dev/null
 printf '%s\n' 'resolved local candidate' >"$peer/conflict.txt"
 mkdir "$peer/changed"
 for index in $(seq -w 1 128); do
@@ -58,26 +57,26 @@ for index in $(seq -w 1 128); do
   } >"$peer/changed/$index.bin"
 done
 
-if OFS_CONFIG="$peer_catalog" "$OFS_BIN" sync staging "$peer" --state "$peer_state" \
+if "$OFS_BIN" sync "$peer" --state "$peer_state" \
   >/dev/null 2>&1; then
   fail 'same-path conflict succeeded without explicit resolution'
 fi
-conflict_status=$(OFS_CONFIG="$peer_catalog" "$OFS_BIN" status --state "$peer_state" --json)
+conflict_status=$("$OFS_BIN" status --state "$peer_state" --json)
 grep -Eq '"conflicts"[[:space:]]*:[[:space:]]*1' <<<"$conflict_status" || \
   fail 'unresolved conflict was not retained'
 
-OFS_CONFIG="$peer_catalog" "$OFS_BIN" sync staging "$peer" --state "$peer_state" \
+"$OFS_BIN" sync "$peer" --state "$peer_state" \
   --resolve conflict.txt >/dev/null &
 sync_pid=$!
-pause_when_pending "$peer_catalog" "$peer_state" "$sync_pid" || \
+pause_when_pending "$peer_state" "$sync_pid" || \
   fail 'could not pause resolved sync before deferred finalization'
 
 kill -KILL "$sync_pid" 2>/dev/null || true
 wait "$sync_pid" 2>/dev/null || true
 printf '%s\n' 'edited after the interrupted sync' >"$peer/after-crash.txt"
-OFS_CONFIG="$peer_catalog" "$OFS_BIN" sync staging "$peer" --state "$peer_state" \
+"$OFS_BIN" sync "$peer" --state "$peer_state" \
   --resolve conflict.txt >/dev/null || fail 'pending resolved sync did not recover'
-OFS_CONFIG="$catalog" "$OFS_BIN" sync staging "$replica" --state "$state" >/dev/null
+"$OFS_BIN" sync "$replica" --state "$state" >/dev/null
 grep -Fxq 'resolved local candidate' "$replica/conflict.txt" || \
   fail 'explicit conflict resolution did not converge on the retained local candidate'
 grep -Fxq 'edited after the interrupted sync' "$replica/after-crash.txt" || \
@@ -91,9 +90,9 @@ for index in $(seq -w 1 128); do
     printf 'committed publication %s\n' "$index"
   } >"$replica/committed-cache-loss/$index.bin"
 done
-OFS_CONFIG="$catalog" "$OFS_BIN" sync staging "$replica" --state "$state" >/dev/null &
+"$OFS_BIN" sync "$replica" --state "$state" >/dev/null &
 sync_pid=$!
-pause_when_pending "$catalog" "$state" "$sync_pid" || \
+pause_when_pending "$state" "$sync_pid" || \
   fail 'could not preserve a pending state before commit'
 pending_state="$OFS_CASE_ROOT/pending-before-commit.json"
 cp "$state" "$pending_state"
@@ -105,12 +104,12 @@ for round in $(seq 1 40); do
   else
     chmod u-x "$replica/conflict.txt"
   fi
-  OFS_CONFIG="$catalog" "$OFS_BIN" sync staging "$replica" --state "$state" >/dev/null
+  "$OFS_BIN" sync "$replica" --state "$state" >/dev/null
 done
 cp "$pending_state" "$state"
-OFS_CONFIG="$catalog" "$OFS_BIN" sync staging "$replica" --state "$state" >/dev/null || \
+"$OFS_BIN" sync "$replica" --state "$state" >/dev/null || \
   fail 'committed publication could not recover from retained history without its pending cache'
-OFS_CONFIG="$catalog" "$OFS_BIN" sync staging "$cold" --state "$cold_state" >/dev/null
+"$OFS_BIN" sync "$cold" --state "$cold_state" "${target_options[@]}" >/dev/null
 diff -qr "$replica" "$cold" >/dev/null || fail 'cold replica differs after staging recovery'
 
 printf '%s\n' 'managed-sync staging recovery passed'

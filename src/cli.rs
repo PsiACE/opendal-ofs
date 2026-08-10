@@ -16,17 +16,13 @@ use url::Url;
 #[derive(Debug, Parser)]
 #[command(version, about = "OpenDAL filesystem")]
 pub(crate) struct Cli {
-    /// Volume catalog. OFS_CONFIG provides the same setting.
-    #[arg(long, env = "OFS_CONFIG", value_name = "PATH")]
-    pub config: PathBuf,
-
     #[command(subcommand)]
     pub command: Command,
 }
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
-    /// Register a local alias, creating the remote volume format when absent.
+    /// Maintain data belonging to a Managed volume.
     Volume {
         #[command(subcommand)]
         command: VolumeCommand,
@@ -41,16 +37,15 @@ pub(crate) enum Command {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum VolumeCommand {
-    /// Register an alias and save its credential-free volume binding.
-    Create(VolumeCreateArgs),
     /// Explicitly collect unreachable Managed data segments.
     Gc(VolumeGcArgs),
 }
 
 #[derive(Debug, Args)]
 pub(crate) struct VolumeGcArgs {
-    /// Named Managed volume from the local catalog.
-    pub alias: String,
+    /// State of any replica attached to the Managed volume.
+    #[arg(long, value_name = "PATH")]
+    pub state: PathBuf,
 
     /// Resume an interrupted collection after its previous process stopped.
     #[arg(long)]
@@ -99,38 +94,15 @@ pub(crate) enum BranchCommand {
 
 #[derive(Debug, Args)]
 pub(crate) struct BranchArgs {
-    /// Named Managed volume from the local catalog.
-    pub alias: String,
+    /// State of any replica attached to the Managed volume.
+    #[arg(long, value_name = "PATH")]
+    pub state: PathBuf,
 
     #[command(flatten)]
     pub runtime: StorageOptions,
 
     #[command(subcommand)]
     pub command: BranchCommand,
-}
-
-#[derive(Debug, Args)]
-pub(crate) struct VolumeCreateArgs {
-    pub alias: String,
-
-    /// Namespace authority model. This build currently accepts only managed.
-    #[arg(long, value_parser = parse_volume_model, value_name = "MODEL")]
-    pub model: VolumeModel,
-
-    /// Managed volume feature to require.
-    #[arg(long, value_enum, value_name = "FEATURE")]
-    pub enable: Option<EnableFeature>,
-
-    /// OpenDAL data URL. Credentials are not stored in the catalog.
-    #[arg(long, env = "OFS_STORAGE_URL", value_name = "URL")]
-    pub storage: Url,
-
-    /// Credential-free D1 metadata URL. OFS_METADATA_URL provides the same setting.
-    #[arg(long, env = "OFS_METADATA_URL", value_name = "URL")]
-    pub metadata: Option<Url>,
-
-    #[command(flatten)]
-    pub runtime: StorageOptions,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -141,9 +113,6 @@ pub(crate) enum EnableFeature {
 
 #[derive(Debug, Args)]
 pub(crate) struct SyncArgs {
-    /// Named Managed volume from the local catalog.
-    pub alias: String,
-
     /// Local directory used as the Sync replica.
     pub replica: PathBuf,
 
@@ -155,12 +124,38 @@ pub(crate) struct SyncArgs {
     #[arg(long, value_name = "PATH")]
     pub state: PathBuf,
 
+    /// Create the Managed format if it does not exist.
+    #[arg(long)]
+    pub init: bool,
+
+    /// Managed volume feature to require while initializing.
+    #[arg(long, value_enum, value_name = "FEATURE")]
+    pub enable: Option<EnableFeature>,
+
+    #[command(flatten)]
+    pub target: TargetOptions,
+
     /// Resolve a retained conflict with the current local candidate. May be repeated.
     #[arg(long, value_name = "RELATIVE_PATH")]
     pub resolve: Vec<String>,
 
     #[command(flatten)]
     pub runtime: StorageOptions,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct TargetOptions {
+    /// Namespace authority model. Required when attaching a new replica.
+    #[arg(long, value_parser = parse_volume_model, value_name = "MODEL")]
+    pub model: Option<VolumeModel>,
+
+    /// Credential-free OpenDAL data URL. Required when attaching a new replica.
+    #[arg(long, env = "OFS_STORAGE_URL", value_name = "URL")]
+    pub storage: Option<Url>,
+
+    /// Credential-free D1 metadata URL. OFS_METADATA_URL provides the same setting.
+    #[arg(long, env = "OFS_METADATA_URL", value_name = "URL")]
+    pub metadata: Option<Url>,
 }
 
 #[derive(Debug, Args)]

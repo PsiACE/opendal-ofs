@@ -6,10 +6,10 @@ its durable representation.
 
 ## Product boundary
 
-The current product surface is Managed Sync only. Volume creation still
-requires the explicit RFC 016 model selection, and the catalog records that
-choice, but this build accepts only `--model managed`. Direct remains an RFC
-model rather than an implemented storage path.
+The current product surface is Managed Sync only. Initializing or attaching a
+replica requires the explicit RFC 016 model selection, but this build accepts
+only `--model managed`. Direct remains an RFC model rather than an implemented
+storage path.
 
 ```text
 Sync -> SyncVolume port -> Managed volume -> Metadata (Object or D1)
@@ -22,14 +22,15 @@ publications, and errors. The Sync-owned `SyncVolume` port adds the staging,
 materialization, recovery, and transfer operations needed by the Sync access
 model; those operations remain owned by Sync rather than the filesystem model.
 
-The catalog binds a client-local alias to a remote `VolumeId` and
-credential-free locators. Provider credentials and replica paths remain local.
+Each replica state binds one remote `VolumeId` to credential-free storage and
+metadata locators. There is no client-wide volume registry. Provider
+credentials and replica paths remain local.
 
 ## Ownership
 
 | Component | Responsibility |
 | --- | --- |
-| Application | Catalog lookup, credentials, operator construction, runtime limits |
+| Application | Replica target admission, credentials, operator construction, runtime limits |
 | Filesystem | Nodes, directories, snapshots, mutations, preconditions |
 | Managed Metadata | Namespace authority, cursors, publication and operation results |
 | Managed Data | Immutable segments, file-version descriptors, verified reads and writes |
@@ -169,9 +170,10 @@ overlapping subtree changes remain conflicts until explicitly resolved. The
 common base advances only after the merged tree is installed and verified.
 
 Replica state is local authority for recovery, not remote namespace state. It
-stores the remote volume and branch identities, verified common snapshot,
-pending operation, staged descriptors, and conflicts. The saved operation is
-resolved before a missing or malformed staging cache is discarded and rebuilt.
+stores credential-free remote locators, volume and branch identities, the
+verified common snapshot, pending operation, staged descriptors, and conflicts.
+The saved operation is resolved before a missing or malformed staging cache is
+discarded and rebuilt.
 
 ## Filesystem admission
 

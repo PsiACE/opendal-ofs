@@ -17,7 +17,6 @@
 
 //! Filesystem semantics, volume implementations, and access models for ofs.
 
-pub mod client;
 pub mod filesystem;
 pub mod managed;
 pub mod sync;
@@ -33,16 +32,10 @@ mod local_store {
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-    pub(crate) enum JsonFormat {
-        Compact,
-        Pretty,
-    }
-
     pub(crate) fn install_json(
         path: &Path,
         temporary_tag: &str,
         value: &impl Serialize,
-        format: JsonFormat,
     ) -> Result<()> {
         let parent = path
             .parent()
@@ -63,10 +56,7 @@ mod local_store {
         }
         let mut file = options.open(&temporary)?;
         let result = (|| -> Result<()> {
-            match format {
-                JsonFormat::Compact => serde_json::to_writer(&mut file, value),
-                JsonFormat::Pretty => serde_json::to_writer_pretty(&mut file, value),
-            }?;
+            serde_json::to_writer(&mut file, value)?;
             file.write_all(b"\n")?;
             file.sync_all()?;
             drop(file);

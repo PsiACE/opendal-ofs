@@ -12,7 +12,9 @@ tests/performance/managed-sync/run.sh \
 A baseline is required through `--baseline`, `OFS_PERF_BASELINE`, or
 `OFS_PERF_BASELINE_BIN`. The candidate defaults to a fresh release build of the
 current `HEAD` commit. Pass `--candidate PATH_OR_REF` to compare two supplied
-binaries or refs. The harness requires the standard BLAKE3 `b3sum` command.
+binaries or refs. Both binaries must support the current Managed Sync CLI; use
+a commit containing that CLI as the earliest baseline instead of adding a
+compatibility adapter. The harness requires the standard BLAKE3 `b3sum` command.
 
 Both binaries use the same host, one long-running local MinIO, and separate
 object roots. Samples run in the fixed order baseline, candidate, candidate,
@@ -43,8 +45,8 @@ not assign arbitrary relative thresholds to them.
 
 `results.json` is the canonical report. Raw recomputable evidence remains in
 `audit.jsonl`, `commands.tsv`, `samples.tsv`, `inputs.tsv`, and each run's
-command output, logical manifest, and object inventory. Replica trees,
-catalogs, and states are removed. A final native S3 audit event acts as the
+command output, logical manifest, and object inventory. Replica trees and
+states are removed. A final native S3 audit event acts as the
 drain barrier before analysis.
 
 Provider startup and fixture construction are outside measured phases.

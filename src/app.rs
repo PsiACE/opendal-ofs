@@ -17,19 +17,15 @@ mod volume;
 
 use branch::branch_command;
 use sync::{status, sync_volume};
-use volume::{create_volume, gc_volume};
+use volume::gc_volume;
 
 pub(crate) async fn run(cli: Cli) -> Result<()> {
-    let config = cli.config;
     match cli.command {
         Command::Volume {
-            command: VolumeCommand::Create(args),
-        } => create_volume(&config, args).await,
-        Command::Volume {
             command: VolumeCommand::Gc(args),
-        } => gc_volume(&config, args).await,
-        Command::Branch(args) => branch_command(&config, args).await,
-        Command::Sync(args) => sync_volume(&config, args).await,
-        Command::Status(args) => status(&config, args),
+        } => gc_volume(args).await,
+        Command::Branch(args) => branch_command(args).await,
+        Command::Sync(args) => sync_volume(args).await,
+        Command::Status(args) => status(args),
     }
 }

@@ -12,8 +12,9 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 printf '%s\n' 'smoke: first publication and empty-replica materialization'
-register_pair
-empty_collection=$(OFS_CONFIG="$config" "$OFS_BIN" volume gc workspace)
+init_a >/dev/null
+attach_b >/dev/null
+empty_collection=$("$OFS_BIN" volume gc --state "$state_a")
 grep -Fq 'scanned=0 deleted=0 bytes=0' <<<"$empty_collection" || \
   fail 'an unpublished volume was not an empty collection'
 printf '%s\n' 'private before sync' >"$replica_a/first.txt"
@@ -26,12 +27,12 @@ cmp "$replica_a/first.txt" "$replica_b/first.txt" || \
 printf '%s\n' 'smoke: reject hard links before publication'
 printf '%s\n' 'must remain local' >"$replica_a/hard-link-source.txt"
 if ln "$replica_a/hard-link-source.txt" "$replica_a/hard-link-alias.txt" 2>/dev/null; then
-  before_hard_link=$(OFS_CONFIG="$config" "$OFS_BIN" status --state "$state_a" --json)
+  before_hard_link=$("$OFS_BIN" status --state "$state_a" --json)
   if sync_a >"$OFS_CASE_ROOT/hard-link.err" 2>&1; then
     fail 'hard-linked files were published'
   fi
   grep -Fq 'hard link' "$OFS_CASE_ROOT/hard-link.err" || fail 'hard-link rejection was not explicit'
-  after_hard_link=$(OFS_CONFIG="$config" "$OFS_BIN" status --state "$state_a" --json)
+  after_hard_link=$("$OFS_BIN" status --state "$state_a" --json)
   [[ "$before_hard_link" == "$after_hard_link" ]] || fail 'hard-link rejection changed replica state'
   rm "$replica_a/hard-link-alias.txt"
 fi

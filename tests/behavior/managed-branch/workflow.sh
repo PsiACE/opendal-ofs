@@ -49,9 +49,8 @@ case "$OFS_METADATA_MODE" in
     ;;
 esac
 
-config="$OFS_CASE_ROOT/client/config.json"
-observed_config="$OFS_CASE_ROOT/observed-client/config.json"
 main_replica="$OFS_CASE_ROOT/main"
+observed_replica="$OFS_CASE_ROOT/observed"
 experiment_replica="$OFS_CASE_ROOT/experiment"
 main_cold="$OFS_CASE_ROOT/main-cold"
 experiment_cold="$OFS_CASE_ROOT/experiment-cold"
@@ -63,19 +62,38 @@ large_replica="$OFS_CASE_ROOT/large"
 large_parent="$OFS_CASE_ROOT/large-parent"
 state_root="$OFS_CASE_ROOT/state"
 main_state="$state_root/main.json"
+observed_state="$state_root/observed.json"
 experiment_state="$state_root/experiment.json"
 
-mkdir -p "$(dirname "$config")" "$(dirname "$observed_config")" \
-  "$main_replica" "$experiment_replica" \
+mkdir -p "$main_replica" "$observed_replica" "$experiment_replica" \
   "$main_cold" "$experiment_cold" "$rewind_replica" "$new_experiment" \
   "$empty_replica" "$rewind_cold" "$large_replica" "$large_parent" \
   "$state_root"
 
-volume_options=(--model managed --enable branch --storage "$OFS_STORAGE_URL")
+target_options=(--model managed --storage "$OFS_STORAGE_URL")
+if [[ "$OFS_METADATA_MODE" == d1 ]]; then
+  target_options+=(--metadata "$OFS_METADATA_URL")
+fi
+unset OFS_STORAGE_URL OFS_METADATA_URL
 
-printf '%s\n' 'acceptance: create a branching volume with the default main branch'
-OFS_CONFIG="$config" "$OFS_BIN" volume create workspace "${volume_options[@]}"
-branches=$(OFS_CONFIG="$config" "$OFS_BIN" branch workspace list --json)
+attach() {
+  local replica=$1 state=$2
+  shift 2
+  "$OFS_BIN" sync "$replica" --state "$state" "${target_options[@]}" "$@"
+}
+
+branch_cmd() {
+  "$OFS_BIN" branch --state "$main_state" "$@"
+}
+
+gc_cmd() {
+  "$OFS_BIN" volume gc --state "$main_state" "$@"
+}
+
+printf '%s\n' 'acceptance: initialize a branching volume with the default main branch'
+"$OFS_BIN" sync "$main_replica" --state "$main_state" --init --enable branch \
+  "${target_options[@]}" >/dev/null
+branches=$(branch_cmd list --json)
 python3 -c '
 import json, sys
 value = json.load(sys.stdin)
@@ -84,9 +102,8 @@ assert [branch["name"] for branch in value["branches"]] == ["main"]
 ' <<<"$branches" || fail 'new branching volume did not expose only default branch main'
 
 if [[ "$OFS_METADATA_MODE" == object ]]; then
-  OFS_CONFIG="$observed_config" "$OFS_BIN" volume create observed-workspace \
-    --model managed --storage "$OFS_STORAGE_URL" >/dev/null
-  observed_branches=$(OFS_CONFIG="$observed_config" "$OFS_BIN" branch observed-workspace list --json)
+  attach "$observed_replica" "$observed_state" >/dev/null
+  observed_branches=$("$OFS_BIN" branch --state "$observed_state" list --json)
   python3 -c '
 import json, sys
 value = json.load(sys.stdin)
@@ -97,95 +114,85 @@ assert [branch["name"] for branch in value["branches"]] == ["main"]
 fi
 
 printf '%s\n' 'anchor state' >"$main_replica/shared.txt"
-OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$main_replica" --state "$main_state"
-main_status=$(OFS_CONFIG="$config" "$OFS_BIN" status --state "$main_state" --json)
+"$OFS_BIN" sync "$main_replica" --state "$main_state"
+main_status=$("$OFS_BIN" status --state "$main_state" --json)
 anchor_sequence=$(json_field "$main_status" common_sequence)
 [[ "$(json_field "$main_status" branch_name)" == main ]] || fail 'default sync did not bind main'
-main_branch=$(OFS_CONFIG="$config" "$OFS_BIN" branch workspace show main --json)
+main_branch=$(branch_cmd show main --json)
 [[ "$(json_field "$main_branch" name)" == main ]] || fail 'branch show returned another branch'
 [[ "$(json_field "$main_branch" sequence)" == "$anchor_sequence" ]] || \
   fail 'branch show did not report the durable Sync position'
 
 printf '%s\n' 'acceptance: fork current state and publish independently'
-OFS_CONFIG="$config" "$OFS_BIN" branch workspace create experiment
-OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$experiment_replica" \
-  --branch experiment --state "$experiment_state"
+branch_cmd create experiment
+attach "$experiment_replica" "$experiment_state" --branch experiment
 cmp "$main_replica/shared.txt" "$experiment_replica/shared.txt" || fail 'fork did not retain source state'
 
 printf '%s\n' 'main state' >"$main_replica/shared.txt"
 printf '%s\n' 'experiment state' >"$experiment_replica/shared.txt"
-OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$main_replica" --state "$main_state"
-OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$experiment_replica" \
-  --branch experiment --state "$experiment_state"
-OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$main_cold" \
-  --state "$state_root/main-cold.json"
-OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$experiment_cold" \
-  --branch experiment --state "$state_root/experiment-cold.json"
+"$OFS_BIN" sync "$main_replica" --state "$main_state"
+"$OFS_BIN" sync "$experiment_replica" --state "$experiment_state"
+attach "$main_cold" "$state_root/main-cold.json"
+attach "$experiment_cold" "$state_root/experiment-cold.json" --branch experiment
 grep -Fxq 'main state' "$main_cold/shared.txt" || fail 'main observed another branch publication'
 grep -Fxq 'experiment state' "$experiment_cold/shared.txt" || fail 'experiment observed main publication'
 
 printf '%s\n' 'acceptance: fork an old published position after a long branch history'
 for generation in $(seq 1 66); do
   printf 'main generation %s\n' "$generation" >"$main_replica/history.txt"
-  OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$main_replica" \
-    --state "$main_state" >/dev/null
+  "$OFS_BIN" sync "$main_replica" --state "$main_state" >/dev/null
 done
-OFS_CONFIG="$config" "$OFS_BIN" branch workspace create rewind --from main --at "$anchor_sequence"
-OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$rewind_replica" \
-  --branch rewind --state "$state_root/rewind.json"
+branch_cmd create rewind --from main --at "$anchor_sequence"
+attach "$rewind_replica" "$state_root/rewind.json" --branch rewind
 grep -Fxq 'anchor state' "$rewind_replica/shared.txt" || fail 'historical fork lost its source content'
 [[ ! -e "$rewind_replica/history.txt" ]] || fail 'historical fork included later content'
 
-OFS_CONFIG="$config" "$OFS_BIN" branch workspace create empty --from main --at 0
-OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$empty_replica" \
-  --branch empty --state "$state_root/empty.json"
+branch_cmd create empty --from main --at 0
+attach "$empty_replica" "$state_root/empty.json" --branch empty
 [[ -z "$(find "$empty_replica" -mindepth 1 -print -quit)" ]] || \
   fail 'fork at change zero was not empty'
 
 printf '%s\n' 'acceptance: reject stale replica state after delete and name reuse'
-old_experiment_status=$(OFS_CONFIG="$config" "$OFS_BIN" status --state "$experiment_state" --json)
+old_experiment_status=$("$OFS_BIN" status --state "$experiment_state" --json)
 old_experiment_tree=$(tree_digest "$experiment_replica")
 old_experiment_id=$(json_field "$old_experiment_status" branch_id)
-OFS_CONFIG="$config" "$OFS_BIN" branch workspace delete experiment
-OFS_CONFIG="$config" "$OFS_BIN" branch workspace create experiment --from main
-if OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$experiment_replica" \
-  --branch experiment --state "$experiment_state" 2>"$OFS_CASE_ROOT/stale.err"; then
+branch_cmd delete experiment
+branch_cmd create experiment --from main
+if "$OFS_BIN" sync "$experiment_replica" --state "$experiment_state" \
+  2>"$OFS_CASE_ROOT/stale.err"; then
   fail 'old replica attached to a recreated branch name'
 fi
 grep -Fq 'branch incarnation' "$OFS_CASE_ROOT/stale.err" || fail 'stale replica rejection was not actionable'
 [[ "$(tree_digest "$experiment_replica")" == "$old_experiment_tree" ]] || \
   fail 'stale replica rejection changed user files'
-[[ "$(OFS_CONFIG="$config" "$OFS_BIN" status --state "$experiment_state" --json)" == \
+[[ "$("$OFS_BIN" status --state "$experiment_state" --json)" == \
   "$old_experiment_status" ]] || fail 'stale replica rejection changed durable replica status'
 
-OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$new_experiment" --branch experiment \
-  --state "$state_root/new-experiment.json"
-new_status=$(OFS_CONFIG="$config" "$OFS_BIN" status --state "$state_root/new-experiment.json" --json)
+attach "$new_experiment" "$state_root/new-experiment.json" --branch experiment
+new_status=$("$OFS_BIN" status --state "$state_root/new-experiment.json" --json)
 [[ "$(json_field "$new_status" branch_id)" != "$old_experiment_id" ]] || \
   fail 'recreated branch reused its deleted incarnation'
 grep -Fxq 'main state' "$new_experiment/shared.txt" || fail 'recreated branch did not fork current main'
 
 printf '%s\n' 'acceptance: collection preserves every active and historical branch root'
 if [[ "$OFS_METADATA_MODE" == d1 ]]; then
-  if AWS_SECRET_ACCESS_KEY=invalid OFS_CONFIG="$config" \
-    "$OFS_BIN" volume gc workspace >/dev/null 2>&1; then
+  if AWS_SECRET_ACCESS_KEY=invalid gc_cmd >/dev/null 2>&1; then
     fail 'collection unexpectedly completed with unavailable data storage'
   fi
-  if OFS_CONFIG="$config" "$OFS_BIN" volume gc workspace >/dev/null 2>&1; then
+  if gc_cmd >/dev/null 2>&1; then
     fail 'a new collector replaced an interrupted collection'
   fi
-  collection=$(OFS_CONFIG="$config" "$OFS_BIN" volume gc workspace --resume)
+  collection=$(gc_cmd --resume)
 else
-  collection=$(OFS_CONFIG="$config" "$OFS_BIN" volume gc workspace)
+  collection=$(gc_cmd)
 fi
 grep -Eq 'deleted=[1-9][0-9]*' <<<"$collection" || \
   fail 'branch reachability collection removed no orphaned segment'
-OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$rewind_cold" --branch rewind \
-  --state "$state_root/rewind-cold.json"
+attach "$rewind_cold" "$state_root/rewind-cold.json" --branch rewind
 diff -ru "$rewind_replica" "$rewind_cold" || fail 'collection removed historical branch content'
 
 printf '%s\n' 'acceptance: branch status is complete and does not expose secrets'
-status_json=$(OFS_CONFIG="$config" "$OFS_BIN" status --state "$state_root/rewind-cold.json" --json)
+status_json=$("$OFS_BIN" status --state "$state_root/rewind-cold.json" --json)
 [[ "$(json_field "$status_json" branch_name)" == rewind ]] || fail 'status omitted branch name'
 grep -Eq '"branch_id"[[:space:]]*:[[:space:]]*"[0-9a-f]{32}"' <<<"$status_json" || \
   fail 'status omitted the complete branch identity'
@@ -197,23 +204,19 @@ for name in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN OFS_D1_TOK
 done
 
 printf '%s\n' 'scale regression: publish a large namespace change and retain its parent'
-OFS_CONFIG="$config" "$OFS_BIN" branch workspace create large --from main --at 0
+branch_cmd create large --from main --at 0
 printf '%s\n' seed >"$large_replica/seed.txt"
-OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$large_replica" \
-  --branch large --state "$state_root/large.json" >/dev/null
+attach "$large_replica" "$state_root/large.json" --branch large >/dev/null
 large_parent_sequence=$(json_field \
-  "$(OFS_CONFIG="$config" "$OFS_BIN" status --state "$state_root/large.json" --json)" \
+  "$("$OFS_BIN" status --state "$state_root/large.json" --json)" \
   common_sequence)
 bulk_suffix=$(printf '%0180d' 0 | tr '0' x)
 for number in $(seq -w 1 2200); do
   : >"$large_replica/bulk-$number-$bulk_suffix"
 done
-OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$large_replica" \
-  --branch large --state "$state_root/large.json" >/dev/null
-OFS_CONFIG="$config" "$OFS_BIN" branch workspace create large-parent \
-  --from large --at "$large_parent_sequence" >/dev/null
-OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$large_parent" \
-  --branch large-parent --state "$state_root/large-parent.json" >/dev/null
+"$OFS_BIN" sync "$large_replica" --state "$state_root/large.json" >/dev/null
+branch_cmd create large-parent --from large --at "$large_parent_sequence" >/dev/null
+attach "$large_parent" "$state_root/large-parent.json" --branch large-parent >/dev/null
 grep -Fxq seed "$large_parent/seed.txt" || fail 'large publication parent lost its seed state'
 if find "$large_parent" -maxdepth 1 -name 'bulk-*' -print -quit | grep -q .; then
   fail 'large publication was copied into its retained parent'

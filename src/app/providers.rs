@@ -10,12 +10,11 @@
 
 use std::env;
 use std::num::NonZeroUsize;
-use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
-use ofs::client::catalog::Catalog;
-use ofs::filesystem::BranchName;
+use ofs::filesystem::{BranchName, VolumeId};
 use ofs::managed::{D1Config, ManagedExtension, ManagedFormat, ManagedMetadata, ManagedVolume};
+use ofs::sync::ReplicaTarget;
 use opendal::Operator;
 use opendal::layers::{ConcurrentLimitLayer, RetryLayer};
 use url::Url;
@@ -27,8 +26,8 @@ pub(super) struct ManagedContext {
 }
 
 pub(super) async fn open_managed_volume(
-    config: &Path,
-    alias: &str,
+    target: &ReplicaTarget,
+    expected_volume: Option<VolumeId>,
     branch: Option<&BranchName>,
     transfer_concurrency: NonZeroUsize,
 ) -> Result<ManagedVolume> {
@@ -36,7 +35,46 @@ pub(super) async fn open_managed_volume(
         format,
         data,
         metadata,
-    } = open_managed_context(config, alias, transfer_concurrency).await?;
+    } = open_managed_context(target, expected_volume, transfer_concurrency).await?;
+    volume_from_context(format, data, metadata, branch).await
+}
+
+pub(super) async fn initialize_managed_volume(
+    target: &ReplicaTarget,
+    expected_volume: Option<VolumeId>,
+    branch: Option<&BranchName>,
+    branch_enabled: bool,
+    transfer_concurrency: NonZeroUsize,
+) -> Result<ManagedVolume> {
+    let data = open_operator(target.storage(), transfer_concurrency)?;
+    let metadata = open_metadata(data.clone(), target.metadata())?;
+    let provisional_id = expected_volume.unwrap_or_else(VolumeId::generate);
+    let desired = ManagedFormat::v1(provisional_id);
+    let desired = if branch_enabled {
+        desired.with_extension(ManagedExtension::BranchV1)
+    } else {
+        desired
+    };
+    let format = metadata.create_format(&desired).await?;
+    validate_volume(expected_volume, &format)?;
+    if branch_enabled && !format.requires_extension(ManagedExtension::BranchV1) {
+        bail!("existing Managed volume does not enable requested extension branch/v1");
+    }
+    if format.requires_extension(ManagedExtension::BranchV1) {
+        metadata
+            .branches(&format, data.clone())?
+            .initialize(BranchName::parse("main").expect("main is a valid branch name"))
+            .await?;
+    }
+    volume_from_context(format, data, metadata, branch).await
+}
+
+async fn volume_from_context(
+    format: ManagedFormat,
+    data: Operator,
+    metadata: ManagedMetadata,
+    branch: Option<&BranchName>,
+) -> Result<ManagedVolume> {
     if format.requires_extension(ManagedExtension::BranchV1) {
         let branches = metadata.branches(&format, data)?;
         let volume = match branch {
@@ -52,25 +90,26 @@ pub(super) async fn open_managed_volume(
 }
 
 pub(super) async fn open_managed_context(
-    config: &Path,
-    alias: &str,
+    target: &ReplicaTarget,
+    expected_volume: Option<VolumeId>,
     transfer_concurrency: NonZeroUsize,
 ) -> Result<ManagedContext> {
-    let catalog = Catalog::load(config).context("cannot open the volume catalog")?;
-    let definition = catalog
-        .get(alias)
-        .with_context(|| format!("volume alias {alias:?} is not in the catalog"))?;
-    let data = open_operator(&definition.storage, transfer_concurrency)?;
-    let metadata = open_metadata(data.clone(), definition.metadata.as_ref())?;
+    let data = open_operator(target.storage(), transfer_concurrency)?;
+    let metadata = open_metadata(data.clone(), target.metadata())?;
     let format = metadata.read_format().await?;
-    if format.volume_id() != definition.volume_id {
-        bail!("volume catalog and Managed format v1 binding disagree");
-    }
+    validate_volume(expected_volume, &format)?;
     Ok(ManagedContext {
         format,
         data,
         metadata,
     })
+}
+
+fn validate_volume(expected: Option<VolumeId>, format: &ManagedFormat) -> Result<()> {
+    if expected.is_some_and(|volume| volume != format.volume_id()) {
+        bail!("replica state and Managed format belong to different volumes");
+    }
+    Ok(())
 }
 
 pub(super) fn open_metadata(data: Operator, metadata: Option<&Url>) -> Result<ManagedMetadata> {

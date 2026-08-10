@@ -43,8 +43,8 @@ directory intact on failure so the caller can inspect the user-visible state.
 
 The scenarios divide the public contract by user journey:
 
-- `admission` validates volume registration, client-local aliases, and
-  built-in extension admission.
+- `admission` validates explicit initialization, remote identity discovery,
+  state-only reconnection, and built-in extension admission.
 - `smoke` publishes and materializes representative files and validates the
   portable namespace contract.
 - `reconcile` merges independent changes, applies replacements and moves, and
