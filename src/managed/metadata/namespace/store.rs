@@ -245,8 +245,13 @@ impl NamespaceStore {
                             .iter()
                             .map(committed_result)
                             .collect::<Result<Vec<_>, _>>()?;
-                        try_join_all(results.iter().map(|result| self.write_operation(result)))
-                            .await?;
+                        try_join_all(
+                            results
+                                .iter()
+                                .filter(|result| result.origin_branch == self.branch_id())
+                                .map(|result| self.write_operation(result)),
+                        )
+                        .await?;
                     }
                     segments.drain(..excess);
                     let target = change.apply_validated(
@@ -463,13 +468,7 @@ impl NamespaceStore {
             ));
         }
         let key = checkpoint_key(reference.digest);
-        let bytes = match self
-            .data
-            .read_with(&key)
-            .range(0..reference.length)
-            .content_length_hint(reference.length)
-            .await
-        {
+        let bytes = match self.data.read_with(&key).range(0..reference.length).await {
             Ok(bytes) => bytes.to_bytes(),
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 return Err(corrupt("read Managed namespace", "checkpoint is missing"));
@@ -523,7 +522,6 @@ impl NamespaceStore {
             .data
             .read_with(&change_segment_key(reference.digest))
             .range(0..reference.length)
-            .content_length_hint(reference.length)
             .await
             .map_err(|error| {
                 if error.kind() == ErrorKind::NotFound {
@@ -763,6 +761,16 @@ impl StoredHead {
         }
         if let Some(state) = &self.state {
             state.validate(volume_id)?;
+            if state
+                .outcome
+                .as_ref()
+                .is_some_and(|result| result.origin_branch != branch_id)
+            {
+                return Err(corrupt(
+                    "read Managed namespace",
+                    "HEAD outcome authority is invalid",
+                ));
+            }
         }
         Ok(())
     }

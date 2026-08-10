@@ -535,7 +535,6 @@ impl ManagedData {
                     .operator
                     .reader_with(&segment_key(segment))
                     .concurrent(concurrency.get())
-                    .content_length_hint(segment.length)
                     .await
                     .map_err(|error| referenced_segment_error("read data segment", error))?;
                 let fetched = reader

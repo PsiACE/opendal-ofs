@@ -110,7 +110,8 @@ A file version contains:
 Each extent contains the logical offset, a `ContentRef`, a `SegmentRef`, and
 the byte offset of the content in that segment. Extents MUST be non-empty,
 contiguous, ordered, and non-overlapping. They start at logical offset zero and
-cover the declared file length. An empty file has no extents.
+cover the declared file length. Every occurrence of one segment digest MUST
+declare the same total segment length. An empty file has no extents.
 
 `FileVersionId` is SHA-256 over this byte sequence:
 
@@ -187,7 +188,9 @@ Transactions in the tail contain the operation identity, parent and committed
 cursors, resulting root, generation preconditions, and ordered node,
 directory, directory-entry, and file-version effects. The chain MUST be
 consecutive from the checkpoint cursor to the current cursor. The tail has at
-most 32 transactions and at most 128 KiB of encoded change bodies.
+most 32 transactions. Writers checkpoint before appending a change would make
+the encoded transaction bodies exceed 128 KiB; this byte threshold is
+checkpoint policy rather than a second HEAD decoding limit.
 
 ### Checkpoint
 

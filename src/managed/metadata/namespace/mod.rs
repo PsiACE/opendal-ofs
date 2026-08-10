@@ -25,8 +25,8 @@ mod validation;
 
 pub(crate) use change::{NamespaceChange, ValidatedChange};
 pub(crate) use records::{
-    DecodedFileVersion, decode_file_version, encode_file_version, managed_generation,
-    next_managed_generation,
+    DecodedFileVersion, decode_file_version, encode_file_version,
+    file_versions_have_consistent_segments, managed_generation, next_managed_generation,
 };
 pub(crate) use state::{
     ChangeSegmentRef, CheckpointRef, StoredChangeSegment, StoredCommittedResult,

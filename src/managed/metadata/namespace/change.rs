@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use super::decode_file_version;
+use super::file_versions_have_consistent_segments;
 use super::validation::{
     match_preconditions, validate_directory_generation, validate_node_generation,
 };
@@ -200,8 +200,7 @@ impl NamespaceChange {
             |record| record.id,
             |_, current, next| {
                 if next.is_some_and(|next| {
-                    decode_file_version(next).is_err()
-                        || current.is_some_and(|current: &FileVersion| current != next)
+                    current.is_some_and(|current: &FileVersion| current != next)
                 }) {
                     Err(corrupt(
                         "read Managed transaction",
@@ -212,6 +211,17 @@ impl NamespaceChange {
                 }
             },
         )?;
+        let target_versions = versions
+            .iter()
+            .filter(|(id, _)| !self.mutation.remove_file_versions.contains(id))
+            .map(|(_, version)| version)
+            .chain(self.mutation.put_file_versions.iter());
+        if !file_versions_have_consistent_segments(target_versions) {
+            return Err(corrupt(
+                "read Managed transaction",
+                "file version delta is invalid",
+            ));
+        }
         Ok(Some(ValidatedChange { put_directories }))
     }
 

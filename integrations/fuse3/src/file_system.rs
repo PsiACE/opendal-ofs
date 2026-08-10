@@ -440,9 +440,7 @@ impl PathFilesystem for Filesystem {
         if size == 0 || offset >= content_length {
             return Ok(ReplyData { data: Bytes::new() });
         }
-        let end = offset
-            .saturating_add(u64::from(size))
-            .min(content_length);
+        let end = offset.saturating_add(u64::from(size)).min(content_length);
 
         let data = self
             .op

@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::BTreeMap;
+use std::io::Cursor;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -61,29 +64,22 @@ fn extent_map_valid(size: u64, digest: &[u8; 32], extent_map: &ExtentMap) -> boo
     {
         return false;
     }
-    contiguous(
-        size,
-        extent_map.extents.iter().map(|extent| {
-            (extent.content.length != 0
-                && extent
-                    .segment_offset
-                    .checked_add(extent.content.length)
-                    .is_some_and(|end| end <= extent.segment.length))
-            .then_some((extent.logical_offset, extent.content.length))
-        }),
-    )
-}
-
-fn contiguous(size: u64, spans: impl Iterator<Item = Option<(u64, u64)>>) -> bool {
     let mut next = 0;
-    for span in spans {
-        let Some((offset, length)) = span else {
-            return false;
-        };
-        if offset != next || length == 0 {
+    let mut segment_lengths = BTreeMap::new();
+    for extent in &extent_map.extents {
+        if extent.logical_offset != next
+            || extent.content.length == 0
+            || extent
+                .segment_offset
+                .checked_add(extent.content.length)
+                .is_none_or(|end| end > extent.segment.length)
+            || segment_lengths
+                .insert(extent.segment.digest, extent.segment.length)
+                .is_some_and(|length| length != extent.segment.length)
+        {
             return false;
         }
-        let Some(end) = next.checked_add(length) else {
+        let Some(end) = next.checked_add(extent.content.length) else {
             return false;
         };
         next = end;
@@ -133,8 +129,16 @@ pub(crate) fn encode_file_version(
 pub(crate) fn decode_file_version(
     version: &FileVersion,
 ) -> Result<DecodedFileVersion, VolumeError> {
-    let extent_map: ExtentMap = ciborium::from_reader(version.descriptor())
+    let descriptor = version.descriptor();
+    let mut input = Cursor::new(descriptor);
+    let extent_map: ExtentMap = ciborium::from_reader(&mut input)
         .map_err(|error| corrupt("decode Managed file version", error.to_string()))?;
+    if input.position() != descriptor.len() as u64 {
+        return Err(corrupt(
+            "decode Managed file version",
+            "descriptor has trailing bytes",
+        ));
+    }
     DecodedFileVersion::from_extents(version.logical_size, version.logical_digest, extent_map)
         .filter(|decoded| decoded.id == version.id)
         .ok_or_else(|| {
@@ -143,6 +147,21 @@ pub(crate) fn decode_file_version(
                 "descriptor does not match its filesystem identity",
             )
         })
+}
+
+pub(crate) fn file_versions_have_consistent_segments<'a>(
+    versions: impl IntoIterator<Item = &'a FileVersion>,
+) -> bool {
+    let mut segment_lengths = BTreeMap::new();
+    versions.into_iter().all(|version| {
+        decode_file_version(version).is_ok_and(|decoded| {
+            decoded.extent_map.extents.iter().all(|extent| {
+                segment_lengths
+                    .insert(extent.segment.digest, extent.segment.length)
+                    .is_none_or(|length| length == extent.segment.length)
+            })
+        })
+    })
 }
 
 pub(crate) fn managed_generation(value: u64) -> Generation {
@@ -162,4 +181,63 @@ pub(crate) fn next_managed_generation(generation: &Generation) -> Option<Generat
     managed_generation_number(generation)
         .and_then(|value| value.checked_add(1))
         .map(managed_generation)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::filesystem::VolumeErrorKind;
+    use crate::managed::format::{Extent, SegmentRef};
+
+    #[test]
+    fn file_version_descriptors_have_one_identity() {
+        let empty_digest = Sha256::digest([]).into();
+        let empty = DecodedFileVersion::from_extents(
+            0,
+            empty_digest,
+            ExtentMap {
+                extents: Vec::new(),
+            },
+        )
+        .unwrap();
+        let encoded = encode_file_version(&empty).unwrap();
+        let mut descriptor = encoded.descriptor().to_vec();
+        descriptor.push(0);
+        let trailing = FileVersion::from_parts(
+            encoded.id,
+            encoded.logical_size,
+            encoded.logical_digest,
+            descriptor,
+        );
+        assert_eq!(
+            decode_file_version(&trailing).unwrap_err().kind(),
+            VolumeErrorKind::Corrupt
+        );
+
+        let version = |content, segment_length| {
+            let decoded = DecodedFileVersion::from_extents(
+                1,
+                content,
+                ExtentMap {
+                    extents: vec![Extent {
+                        logical_offset: 0,
+                        content: ContentRef {
+                            digest: content,
+                            length: 1,
+                        },
+                        segment: SegmentRef {
+                            digest: [1; 32],
+                            length: segment_length,
+                        },
+                        segment_offset: 0,
+                    }],
+                },
+            )
+            .unwrap();
+            encode_file_version(&decoded).unwrap()
+        };
+        let first = version([2; 32], 1);
+        let second = version([3; 32], 2);
+        assert!(!file_versions_have_consistent_segments([&first, &second]));
+    }
 }

@@ -17,7 +17,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::decode_file_version;
+use super::file_versions_have_consistent_segments;
 use super::records::{managed_generation, managed_generation_number, next_managed_generation};
 use super::{NamespaceChange, ValidatedChange};
 use crate::filesystem::{
@@ -55,10 +55,13 @@ pub(crate) fn validate_snapshot(snapshot: &VolumeSnapshot) -> Result<(), VolumeE
             ));
         }
     }
-    for (id, version) in &snapshot.file_versions {
-        if *id != version.id || decode_file_version(version).is_err() {
-            return Err(invalid("read Managed namespace", "file version is invalid"));
-        }
+    if snapshot
+        .file_versions
+        .iter()
+        .any(|(id, version)| *id != version.id)
+        || !file_versions_have_consistent_segments(snapshot.file_versions.values())
+    {
+        return Err(invalid("read Managed namespace", "file version is invalid"));
     }
     Ok(())
 }
