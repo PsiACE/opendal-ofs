@@ -143,7 +143,9 @@ struct CommandManagedSyncBehavior {
             "gc",
             "growing",
             "history",
+            "install-recovery",
             "reconcile",
+            "recovery-gc",
             "rename",
             "smoke"
         ],

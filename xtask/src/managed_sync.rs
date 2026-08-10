@@ -44,7 +44,9 @@ pub(crate) fn run_fixture(keep: bool, case: Option<&str>) {
         Some("gc") => gc(&fixture),
         Some("growing") => growing(&fixture),
         Some("history") => history(&fixture),
+        Some("install-recovery") => install_recovery(&fixture),
         Some("reconcile") => reconcile(&fixture),
+        Some("recovery-gc") => recovery_gc(&fixture),
         Some("rename") => rename(&fixture),
         Some("smoke") => smoke(&fixture),
         Some(name) => panic!("unknown Managed Sync behavior case: {name}"),
@@ -54,6 +56,8 @@ pub(crate) fn run_fixture(keep: bool, case: Option<&str>) {
             reconcile(&fixture);
             rename(&fixture);
             history(&fixture);
+            install_recovery(&fixture);
+            recovery_gc(&fixture);
             growing(&fixture);
             gc(&fixture);
         }
@@ -125,31 +129,19 @@ pub(crate) fn run_bub_e2e(keep: bool) {
     );
 
     for (replica, state, storage) in [
-        ("/sync/sessions/tapes", "/var/lib/ofs/sessions.state", &sessions),
+        (
+            "/sync/sessions/tapes",
+            "/var/lib/ofs/sessions.state",
+            &sessions,
+        ),
         (
             "/workspace/.agents/skills",
             "/var/lib/ofs/skills.state",
             &skills,
         ),
     ] {
-        container_sync(
-            &fixture,
-            "bub-a",
-            replica,
-            state,
-            storage,
-            true,
-            &[],
-        );
-        container_sync(
-            &fixture,
-            "bub-b",
-            replica,
-            state,
-            storage,
-            false,
-            &[],
-        );
+        container_sync(&fixture, "bub-a", replica, state, storage, true, &[]);
+        container_sync(&fixture, "bub-b", replica, state, storage, false, &[]);
     }
 
     let fact_a = format!("HARBOR-A-{}", std::process::id());
@@ -257,7 +249,11 @@ pub(crate) fn run_bub_e2e(keep: bool) {
     converge(&fixture, "bub-a", "bub-b", &sessions, &skills);
     let before_noop = bub_statuses(&fixture);
     for (replica, state, storage) in [
-        ("/sync/sessions/tapes", "/var/lib/ofs/sessions.state", &sessions),
+        (
+            "/sync/sessions/tapes",
+            "/var/lib/ofs/sessions.state",
+            &sessions,
+        ),
         (
             "/workspace/.agents/skills",
             "/var/lib/ofs/skills.state",
@@ -265,15 +261,7 @@ pub(crate) fn run_bub_e2e(keep: bool) {
         ),
     ] {
         for service in ["bub-a", "bub-b"] {
-            let output = container_sync(
-                &fixture,
-                service,
-                replica,
-                state,
-                storage,
-                false,
-                &[],
-            );
+            let output = container_sync(&fixture, service, replica, state, storage, false, &[]);
             assert!(
                 !output.contains("(published)"),
                 "final Bub convergence is not a no-op"
@@ -395,7 +383,11 @@ fn skill_creation_prompt(name: &str, marker: &str) -> String {
 
 fn converge(fixture: &Fixture, source: &str, target: &str, sessions: &str, skills: &str) {
     for (replica, state, storage) in [
-        ("/sync/sessions/tapes", "/var/lib/ofs/sessions.state", sessions),
+        (
+            "/sync/sessions/tapes",
+            "/var/lib/ofs/sessions.state",
+            sessions,
+        ),
         (
             "/workspace/.agents/skills",
             "/var/lib/ofs/skills.state",
@@ -431,9 +423,7 @@ fn container_sync(
     for path in resolve {
         arguments.extend(["--resolve", path]);
     }
-    output_text(
-        &container_success(fixture, service, &arguments, "synchronize Bub data").stdout,
-    )
+    output_text(&container_success(fixture, service, &arguments, "synchronize Bub data").stdout)
 }
 
 fn container_status(fixture: &Fixture, service: &str, replica: &str, state: &str) -> String {
@@ -457,14 +447,7 @@ fn container_bub(fixture: &Fixture, service: &str, session: &str, prompt: &str) 
         command
             .env("BUB_API_KEY", &api_key)
             .env("BUB_MODEL", &model)
-            .args([
-                "exec",
-                "-T",
-                "-e",
-                "BUB_API_KEY",
-                "-e",
-                "BUB_MODEL",
-            ]);
+            .args(["exec", "-T", "-e", "BUB_API_KEY", "-e", "BUB_MODEL"]);
         if let Some(proxy) = &proxy {
             command
                 .env("HTTP_PROXY", proxy)
@@ -517,12 +500,7 @@ fn container_bub(fixture: &Fixture, service: &str, session: &str, prompt: &str) 
     unreachable!()
 }
 
-fn container_success(
-    fixture: &Fixture,
-    service: &str,
-    arguments: &[&str],
-    action: &str,
-) -> Output {
+fn container_success(fixture: &Fixture, service: &str, arguments: &[&str], action: &str) -> Output {
     let mut command = fixture.compose();
     command.args(["exec", "-T", service]).args(arguments);
     let output = command.output().expect("execute container command");
@@ -630,6 +608,134 @@ fn gc(fixture: &Fixture) {
     );
 }
 
+fn recovery_gc(fixture: &Fixture) {
+    let root = CaseRoot::new();
+    let replica_a = root.path.join("replica-a");
+    let replica_b = root.path.join("replica-b");
+    let state_a = root.path.join("state-a");
+    let state_b = root.path.join("state-b");
+    fs::create_dir_all(&replica_a).expect("create recovery replica A");
+    fs::create_dir_all(&replica_b).expect("create recovery replica B");
+    let storage = fixture.storage_url("recovery-gc");
+
+    run_ofs_success(
+        ofs_sync(&replica_a, &state_a, &storage, true),
+        "initialize recovery replica",
+    );
+    run_ofs_success(
+        ofs_sync(&replica_b, &state_b, &storage, false),
+        "attach recovery peer",
+    );
+    fs::write(
+        replica_a.join("generation.bin"),
+        deterministic_bytes(512 * 1024, 19),
+    )
+    .expect("write interrupted publication");
+    let mut interrupted = ofs_sync(&replica_a, &state_a, &storage, false);
+    interrupted.env("OFS_INTERNAL_TEST_INTERRUPT", "after-publish");
+    run_ofs_failure(interrupted, "interrupt committed publication");
+
+    run_ofs_success(
+        ofs_sync(&replica_b, &state_b, &storage, false),
+        "install interrupted publication in peer",
+    );
+    fs::write(
+        replica_b.join("generation.bin"),
+        deterministic_bytes(512 * 1024, 113),
+    )
+    .expect("replace interrupted publication");
+    run_ofs_success(
+        ofs_sync(&replica_b, &state_b, &storage, false),
+        "advance beyond interrupted publication",
+    );
+    let collected = run_ofs_success(
+        ofs_gc(&storage, false),
+        "collect superseded interrupted publication",
+    );
+    assert!(
+        !output_text(&collected.stdout).contains("deleted 0 segment"),
+        "collection reclaims the superseded target before its origin recovers"
+    );
+
+    run_ofs_success(
+        ofs_sync(&replica_a, &state_a, &storage, false),
+        "recover committed publication from current head",
+    );
+    assert_eq!(
+        tree_fingerprint(&replica_a),
+        tree_fingerprint(&replica_b),
+        "a committed operation recovers to the current namespace after collection"
+    );
+    let status = run_ofs_success(
+        ofs_status(&replica_a, &state_a),
+        "read recovered publication status",
+    );
+    assert!(
+        output_text(&status.stdout).contains("\"pending\":false"),
+        "recovery clears the committed pending publication"
+    );
+}
+
+fn install_recovery(fixture: &Fixture) {
+    let root = CaseRoot::new();
+    let replica_a = root.path.join("replica-a");
+    let replica_b = root.path.join("replica-b");
+    let state_a = root.path.join("state-a");
+    let state_b = root.path.join("state-b");
+    fs::create_dir_all(&replica_a).expect("create install recovery replica A");
+    fs::create_dir_all(&replica_b).expect("create install recovery replica B");
+    let storage = fixture.storage_url("install-recovery");
+
+    run_ofs_success(
+        ofs_sync(&replica_a, &state_a, &storage, true),
+        "initialize install recovery replica",
+    );
+    fs::write(replica_a.join("removed.txt"), b"old generation\n")
+        .expect("write install recovery base");
+    run_ofs_success(
+        ofs_sync(&replica_a, &state_a, &storage, false),
+        "publish install recovery base",
+    );
+    run_ofs_success(
+        ofs_sync(&replica_b, &state_b, &storage, false),
+        "attach install recovery peer",
+    );
+
+    fs::remove_file(replica_a.join("removed.txt")).expect("remove install recovery base");
+    fs::write(replica_a.join("current.txt"), b"current generation\n")
+        .expect("write install recovery target");
+    run_ofs_success(
+        ofs_sync(&replica_a, &state_a, &storage, false),
+        "publish install recovery target",
+    );
+    let mut interrupted = ofs_sync(&replica_b, &state_b, &storage, false);
+    interrupted.env("OFS_INTERNAL_TEST_INTERRUPT", "during-install");
+    run_ofs_failure(interrupted, "interrupt remote installation");
+
+    let recovered = run_ofs_success(
+        ofs_sync(&replica_b, &state_b, &storage, false),
+        "resume interrupted remote installation",
+    );
+    assert!(
+        !output_text(&recovered.stdout).contains("(published)"),
+        "install recovery does not publish its partial local tree"
+    );
+    assert_eq!(
+        tree_fingerprint(&replica_a),
+        tree_fingerprint(&replica_b),
+        "an interrupted installation is safely rerunnable"
+    );
+    let status = run_ofs_success(
+        ofs_status(&replica_b, &state_b),
+        "read recovered installation status",
+    );
+    assert!(
+        output_text(&status.stdout).contains("\"pending\":false")
+            && output_text(&status.stdout).contains("\"conflicts\":0"),
+        "install recovery leaves no pending work or conflicts"
+    );
+}
+
 fn history(fixture: &Fixture) {
     let root = CaseRoot::new();
     let replica_a = root.path.join("replica-a");
@@ -658,11 +764,8 @@ fn history(fixture: &Fixture) {
     );
 
     for generation in 1..=32 {
-        fs::write(
-            replica_a.join("cursor.txt"),
-            format!("{generation}\n"),
-        )
-        .expect("advance history file");
+        fs::write(replica_a.join("cursor.txt"), format!("{generation}\n"))
+            .expect("advance history file");
         run_ofs_success(
             ofs_sync(&replica_a, &state_a, &storage, false),
             "publish history generation",
@@ -687,7 +790,11 @@ fn history(fixture: &Fixture) {
         tree_fingerprint(&replica_c),
         "the current checkpoint is sufficient for a cold restore"
     );
-    for (replica, state) in [(&replica_a, &state_a), (&replica_b, &state_b), (&replica_c, &state_c)] {
+    for (replica, state) in [
+        (&replica_a, &state_a),
+        (&replica_b, &state_b),
+        (&replica_c, &state_c),
+    ] {
         let status = run_ofs_success(ofs_status(replica, state), "read converged history status");
         let status = output_text(&status.stdout);
         assert!(
@@ -727,13 +834,9 @@ fn rename(fixture: &Fixture) {
         "attach rename replica B",
     );
 
-    fs::rename(replica_a.join("file-before"), replica_a.join("file-after"))
-        .expect("rename file");
-    fs::rename(
-        replica_a.join("tree-before"),
-        replica_a.join("tree-after"),
-    )
-    .expect("move directory tree");
+    fs::rename(replica_a.join("file-before"), replica_a.join("file-after")).expect("rename file");
+    fs::rename(replica_a.join("tree-before"), replica_a.join("tree-after"))
+        .expect("move directory tree");
     make_executable(&replica_a.join("file-after"));
     run_ofs_success(
         ofs_sync(&replica_a, &state_a, &storage, false),
