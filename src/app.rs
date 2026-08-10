@@ -21,7 +21,7 @@ use opendal::Operator;
 use opendal::layers::{ConcurrentLimitLayer, RetryLayer};
 use url::Url;
 
-use crate::cli::BranchCommand;
+use crate::cli::{BranchArgs, BranchCommand};
 use crate::cli::{
     Cli, Command, MountArgs, StatusArgs, SyncArgs, VolumeCommand, VolumeCreateArgs, VolumeGcArgs,
 };
@@ -41,7 +41,7 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
         Command::Volume {
             command: VolumeCommand::Gc(args),
         } => gc_volume(&config, args).await,
-        Command::Branch { command } => branch_command(&config, command).await,
+        Command::Branch(args) => branch_command(&config, args).await,
         Command::Mount(args) => mount_volume(&config, args).await,
         Command::Sync(args) => sync_volume(&config, args).await,
         Command::Status(args) => status(&config, args),
@@ -72,23 +72,18 @@ async fn gc_volume(config: &Path, args: VolumeGcArgs) -> Result<()> {
     Ok(())
 }
 
-async fn branch_command(config: &Path, command: BranchCommand) -> Result<()> {
-    let (alias, concurrency) = match &command {
-        BranchCommand::List(args) => (&args.alias, args.runtime.transfer_concurrency),
-        BranchCommand::Show(args) => (&args.alias, args.runtime.transfer_concurrency),
-        BranchCommand::Create(args) => (&args.alias, args.runtime.transfer_concurrency),
-        BranchCommand::Delete(args) => (&args.alias, args.runtime.transfer_concurrency),
-    };
+async fn branch_command(config: &Path, args: BranchArgs) -> Result<()> {
+    let concurrency = args.runtime.transfer_concurrency;
     let ManagedContext {
         format,
         data,
         metadata,
-    } = open_managed_context(config, alias, concurrency).await?;
+    } = open_managed_context(config, &args.alias, concurrency).await?;
     let branches = metadata.branches(&format, data)?;
-    match command {
-        BranchCommand::List(args) => {
+    match args.command {
+        BranchCommand::List { json } => {
             let listed = branches.list(concurrency).await?;
-            if args.json {
+            if json {
                 let default = listed
                     .iter()
                     .find(|branch| branch.is_default)
@@ -114,9 +109,9 @@ async fn branch_command(config: &Path, command: BranchCommand) -> Result<()> {
             }
             Ok(())
         }
-        BranchCommand::Show(args) => {
-            let branch = branches.get(&args.branch).await?;
-            if args.json {
+        BranchCommand::Show { branch, json } => {
+            let branch = branches.get(&branch).await?;
+            if json {
                 println!("{}", serde_json::to_string(&branch_json(&branch))?);
             } else {
                 println!(
@@ -129,9 +124,9 @@ async fn branch_command(config: &Path, command: BranchCommand) -> Result<()> {
             }
             Ok(())
         }
-        BranchCommand::Create(args) => {
-            let point = args.at.map_or(ForkPoint::Head, ForkPoint::Sequence);
-            let (created, source) = branches.fork(args.from, point, args.branch).await?;
+        BranchCommand::Create { branch, from, at } => {
+            let point = at.map_or(ForkPoint::Head, ForkPoint::Sequence);
+            let (created, source) = branches.fork(from, point, branch).await?;
             println!(
                 "created branch {:?} {} from {:?} at change {}",
                 created.binding.name.as_str(),
@@ -141,9 +136,9 @@ async fn branch_command(config: &Path, command: BranchCommand) -> Result<()> {
             );
             Ok(())
         }
-        BranchCommand::Delete(args) => {
-            branches.delete(&args.branch).await?;
-            println!("deleted branch {:?}", args.branch.as_str());
+        BranchCommand::Delete { branch } => {
+            branches.delete(&branch).await?;
+            println!("deleted branch {:?}", branch.as_str());
             Ok(())
         }
     }
@@ -212,23 +207,10 @@ async fn open_managed_context(
     })
 }
 
-async fn create_volume(config: &Path, mut args: VolumeCreateArgs) -> Result<()> {
+async fn create_volume(config: &Path, args: VolumeCreateArgs) -> Result<()> {
     let branch_enabled = args.enable.is_some();
     if args.model == VolumeModel::Direct && branch_enabled {
         bail!("--enable branch requires --model managed");
-    }
-    if args.model == VolumeModel::Managed && args.metadata.is_none() {
-        args.metadata = env::var_os("OFS_METADATA_URL")
-            .filter(|value| !value.is_empty())
-            .map(|value| {
-                value
-                    .into_string()
-                    .map_err(|_| anyhow!("OFS_METADATA_URL is not valid UTF-8"))
-                    .and_then(|value| {
-                        Url::parse(&value).context("OFS_METADATA_URL is not a valid URL")
-                    })
-            })
-            .transpose()?;
     }
     let mut catalog = Catalog::load(config).context("cannot open the writable volume catalog")?;
     let configured = catalog.get(&args.alias).cloned();

@@ -27,14 +27,14 @@ ofs sync workspace ./experiment --branch experiment --state ./experiment.state
 Create from the current default head, another branch, or a retained sequence:
 
 ```shell
-ofs branch create workspace experiment
-ofs branch create workspace retry --from experiment
-ofs branch create workspace rewind --from main --at 42
+ofs branch workspace create experiment
+ofs branch workspace create retry --from experiment
+ofs branch workspace create rewind --from main --at 42
 ```
 
-Inspect and delete branches with `branch list`, `branch show`, and `branch
-delete`. The default branch cannot be deleted. Both inspection commands accept
-`--json`.
+Inspect and delete branches with `branch workspace list`, `branch workspace
+show`, and `branch workspace delete`. The default branch cannot be deleted.
+Both inspection commands accept `--json`.
 
 Run destructive reachability maintenance explicitly:
 

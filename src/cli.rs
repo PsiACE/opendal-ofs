@@ -32,10 +32,7 @@ pub(crate) enum Command {
         command: VolumeCommand,
     },
     /// Manage durable branches of a Managed volume.
-    Branch {
-        #[command(subcommand)]
-        command: BranchCommand,
-    },
+    Branch(BranchArgs),
     /// Mount a named Direct volume as a read-only online filesystem.
     Mount(MountArgs),
     /// Reconcile and publish a local Managed Sync replica.
@@ -80,74 +77,50 @@ pub(crate) struct VolumeGcArgs {
 #[derive(Debug, Subcommand)]
 pub(crate) enum BranchCommand {
     /// List the branches of a Managed volume.
-    List(BranchListArgs),
+    List {
+        /// Emit a machine-readable branch list.
+        #[arg(long)]
+        json: bool,
+    },
     /// Show one branch and its current durable position.
-    Show(BranchShowArgs),
+    Show {
+        /// Branch to show.
+        branch: BranchName,
+
+        /// Emit a machine-readable branch description.
+        #[arg(long)]
+        json: bool,
+    },
     /// Fork a new branch from a current or retained position.
-    Create(BranchCreateArgs),
+    Create {
+        /// Name of the new branch.
+        branch: BranchName,
+
+        /// Source branch. Defaults to the volume's default branch.
+        #[arg(long, value_name = "BRANCH")]
+        from: Option<BranchName>,
+
+        /// Retained source sequence. Defaults to the current source position.
+        #[arg(long, value_name = "SEQUENCE")]
+        at: Option<u64>,
+    },
     /// Delete a branch without immediately deleting shared data.
-    Delete(BranchDeleteArgs),
+    Delete {
+        /// Branch to delete.
+        branch: BranchName,
+    },
 }
 
 #[derive(Debug, Args)]
-pub(crate) struct BranchListArgs {
+pub(crate) struct BranchArgs {
     /// Named Managed volume from the local catalog.
     pub alias: String,
 
-    /// Emit a machine-readable branch list.
-    #[arg(long)]
-    pub json: bool,
-
     #[command(flatten)]
     pub runtime: StorageOptions,
-}
 
-#[derive(Debug, Args)]
-pub(crate) struct BranchShowArgs {
-    /// Named Managed volume from the local catalog.
-    pub alias: String,
-
-    /// Branch to show.
-    pub branch: BranchName,
-
-    /// Emit a machine-readable branch description.
-    #[arg(long)]
-    pub json: bool,
-
-    #[command(flatten)]
-    pub runtime: StorageOptions,
-}
-
-#[derive(Debug, Args)]
-pub(crate) struct BranchCreateArgs {
-    /// Named Managed volume from the local catalog.
-    pub alias: String,
-
-    /// Name of the new branch.
-    pub branch: BranchName,
-
-    /// Source branch. Defaults to the volume's default branch.
-    #[arg(long, value_name = "BRANCH")]
-    pub from: Option<BranchName>,
-
-    /// Retained source sequence. Defaults to the current source position.
-    #[arg(long, value_name = "SEQUENCE")]
-    pub at: Option<u64>,
-
-    #[command(flatten)]
-    pub runtime: StorageOptions,
-}
-
-#[derive(Debug, Args)]
-pub(crate) struct BranchDeleteArgs {
-    /// Named Managed volume from the local catalog.
-    pub alias: String,
-
-    /// Branch to delete.
-    pub branch: BranchName,
-
-    #[command(flatten)]
-    pub runtime: StorageOptions,
+    #[command(subcommand)]
+    pub command: BranchCommand,
 }
 
 #[derive(Debug, Args)]
@@ -166,8 +139,8 @@ pub(crate) struct VolumeCreateArgs {
     #[arg(long, env = "OFS_STORAGE_URL", value_name = "URL")]
     pub storage: Url,
 
-    /// Credential-free D1 metadata URL. Managed volumes also read OFS_METADATA_URL.
-    #[arg(long, value_name = "URL")]
+    /// Credential-free D1 metadata URL. OFS_METADATA_URL provides the same setting.
+    #[arg(long, env = "OFS_METADATA_URL", value_name = "URL")]
     pub metadata: Option<Url>,
 
     #[command(flatten)]

@@ -71,9 +71,6 @@ mkdir -p "$(dirname "$config")" "$(dirname "$observed_config")" \
   "$state_root"
 
 volume_options=(--model managed --enable branch --storage "$OFS_STORAGE_URL")
-if [[ "$OFS_METADATA_MODE" == d1 ]]; then
-  volume_options+=(--metadata "$OFS_METADATA_URL")
-fi
 
 if [[ "$OFS_METADATA_MODE" == object ]]; then
   if OFS_CONFIG="$OFS_CASE_ROOT/direct.json" "$OFS_BIN" volume create direct \
@@ -86,7 +83,7 @@ fi
 
 printf '%s\n' 'acceptance: create a branching volume with the default main branch'
 OFS_CONFIG="$config" "$OFS_BIN" volume create workspace "${volume_options[@]}"
-branches=$(OFS_CONFIG="$config" "$OFS_BIN" branch list workspace --json)
+branches=$(OFS_CONFIG="$config" "$OFS_BIN" branch workspace list --json)
 python3 -c '
 import json, sys
 value = json.load(sys.stdin)
@@ -97,7 +94,7 @@ assert [branch["name"] for branch in value["branches"]] == ["main"]
 if [[ "$OFS_METADATA_MODE" == object ]]; then
   OFS_CONFIG="$observed_config" "$OFS_BIN" volume create observed-workspace \
     --model managed --storage "$OFS_STORAGE_URL" >/dev/null
-  observed_branches=$(OFS_CONFIG="$observed_config" "$OFS_BIN" branch list observed-workspace --json)
+  observed_branches=$(OFS_CONFIG="$observed_config" "$OFS_BIN" branch observed-workspace list --json)
   python3 -c '
 import json, sys
 value = json.load(sys.stdin)
@@ -112,13 +109,13 @@ OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$main_replica" --state "$main_st
 main_status=$(OFS_CONFIG="$config" "$OFS_BIN" status --state "$main_state" --json)
 anchor_sequence=$(json_field "$main_status" common_sequence)
 [[ "$(json_field "$main_status" branch_name)" == main ]] || fail 'default sync did not bind main'
-main_branch=$(OFS_CONFIG="$config" "$OFS_BIN" branch show workspace main --json)
+main_branch=$(OFS_CONFIG="$config" "$OFS_BIN" branch workspace show main --json)
 [[ "$(json_field "$main_branch" name)" == main ]] || fail 'branch show returned another branch'
 [[ "$(json_field "$main_branch" sequence)" == "$anchor_sequence" ]] || \
   fail 'branch show did not report the durable Sync position'
 
 printf '%s\n' 'acceptance: fork current state and publish independently'
-OFS_CONFIG="$config" "$OFS_BIN" branch create workspace experiment
+OFS_CONFIG="$config" "$OFS_BIN" branch workspace create experiment
 OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$experiment_replica" \
   --branch experiment --state "$experiment_state"
 cmp "$main_replica/shared.txt" "$experiment_replica/shared.txt" || fail 'fork did not retain source state'
@@ -141,13 +138,13 @@ for generation in $(seq 1 66); do
   OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$main_replica" \
     --state "$main_state" >/dev/null
 done
-OFS_CONFIG="$config" "$OFS_BIN" branch create workspace rewind --from main --at "$anchor_sequence"
+OFS_CONFIG="$config" "$OFS_BIN" branch workspace create rewind --from main --at "$anchor_sequence"
 OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$rewind_replica" \
   --branch rewind --state "$state_root/rewind.json"
 grep -Fxq 'anchor state' "$rewind_replica/shared.txt" || fail 'historical fork lost its source content'
 [[ ! -e "$rewind_replica/history.txt" ]] || fail 'historical fork included later content'
 
-OFS_CONFIG="$config" "$OFS_BIN" branch create workspace empty --from main --at 0
+OFS_CONFIG="$config" "$OFS_BIN" branch workspace create empty --from main --at 0
 OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$empty_replica" \
   --branch empty --state "$state_root/empty.json"
 [[ -z "$(find "$empty_replica" -mindepth 1 -print -quit)" ]] || \
@@ -157,8 +154,8 @@ printf '%s\n' 'acceptance: reject stale replica state after delete and name reus
 old_experiment_status=$(OFS_CONFIG="$config" "$OFS_BIN" status --state "$experiment_state" --json)
 old_experiment_tree=$(tree_digest "$experiment_replica")
 old_experiment_id=$(json_field "$old_experiment_status" branch_id)
-OFS_CONFIG="$config" "$OFS_BIN" branch delete workspace experiment
-OFS_CONFIG="$config" "$OFS_BIN" branch create workspace experiment --from main
+OFS_CONFIG="$config" "$OFS_BIN" branch workspace delete experiment
+OFS_CONFIG="$config" "$OFS_BIN" branch workspace create experiment --from main
 if OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$experiment_replica" \
   --branch experiment --state "$experiment_state" 2>"$OFS_CASE_ROOT/stale.err"; then
   fail 'old replica attached to a recreated branch name'
@@ -208,7 +205,7 @@ for name in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN OFS_D1_TOK
 done
 
 printf '%s\n' 'scale regression: publish a large namespace change and retain its parent'
-OFS_CONFIG="$config" "$OFS_BIN" branch create workspace large --from main --at 0
+OFS_CONFIG="$config" "$OFS_BIN" branch workspace create large --from main --at 0
 printf '%s\n' seed >"$large_replica/seed.txt"
 OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$large_replica" \
   --branch large --state "$state_root/large.json" >/dev/null
@@ -221,7 +218,7 @@ for number in $(seq -w 1 2200); do
 done
 OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$large_replica" \
   --branch large --state "$state_root/large.json" >/dev/null
-OFS_CONFIG="$config" "$OFS_BIN" branch create workspace large-parent \
+OFS_CONFIG="$config" "$OFS_BIN" branch workspace create large-parent \
   --from large --at "$large_parent_sequence" >/dev/null
 OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$large_parent" \
   --branch large-parent --state "$state_root/large-parent.json" >/dev/null
