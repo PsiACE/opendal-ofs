@@ -42,6 +42,7 @@ pub(crate) fn run_fixture(keep: bool, case: Option<&str>) {
     match case {
         Some("admission") => admission(&fixture),
         Some("growing") => growing(&fixture),
+        Some("history") => history(&fixture),
         Some("reconcile") => reconcile(&fixture),
         Some("rename") => rename(&fixture),
         Some("smoke") => smoke(&fixture),
@@ -51,10 +52,78 @@ pub(crate) fn run_fixture(keep: bool, case: Option<&str>) {
             smoke(&fixture);
             reconcile(&fixture);
             rename(&fixture);
+            history(&fixture);
             growing(&fixture);
         }
     }
     println!("Managed Sync behavior passed: {}", case.unwrap_or("all"));
+}
+
+fn history(fixture: &Fixture) {
+    let root = CaseRoot::new();
+    let replica_a = root.path.join("replica-a");
+    let replica_b = root.path.join("replica-b");
+    let replica_c = root.path.join("replica-c");
+    let state_a = root.path.join("state-a");
+    let state_b = root.path.join("state-b");
+    let state_c = root.path.join("state-c");
+    fs::create_dir_all(&replica_a).expect("create history replica A");
+    fs::create_dir_all(&replica_b).expect("create history replica B");
+    fs::create_dir_all(&replica_c).expect("create history replica C");
+    let storage = fixture.storage_url("history");
+
+    run_ofs_success(
+        ofs_sync(&replica_a, &state_a, &storage, true),
+        "initialize history replica",
+    );
+    fs::write(replica_a.join("cursor.txt"), b"0\n").expect("write history base");
+    run_ofs_success(
+        ofs_sync(&replica_a, &state_a, &storage, false),
+        "publish history base",
+    );
+    run_ofs_success(
+        ofs_sync(&replica_b, &state_b, &storage, false),
+        "attach lagging history replica",
+    );
+
+    for generation in 1..=32 {
+        fs::write(
+            replica_a.join("cursor.txt"),
+            format!("{generation}\n"),
+        )
+        .expect("advance history file");
+        run_ofs_success(
+            ofs_sync(&replica_a, &state_a, &storage, false),
+            "publish history generation",
+        );
+    }
+
+    run_ofs_success(
+        ofs_sync(&replica_b, &state_b, &storage, false),
+        "catch up lagging history replica",
+    );
+    run_ofs_success(
+        ofs_sync(&replica_c, &state_c, &storage, false),
+        "restore cold history replica",
+    );
+    assert_eq!(
+        tree_fingerprint(&replica_a),
+        tree_fingerprint(&replica_b),
+        "a lagging replica catches up across retained publication history"
+    );
+    assert_eq!(
+        tree_fingerprint(&replica_a),
+        tree_fingerprint(&replica_c),
+        "the current checkpoint is sufficient for a cold restore"
+    );
+    for (replica, state) in [(&replica_a, &state_a), (&replica_b, &state_b), (&replica_c, &state_c)] {
+        let status = run_ofs_success(ofs_status(replica, state), "read converged history status");
+        let status = output_text(&status.stdout);
+        assert!(
+            status.contains("\"pending\":false") && status.contains("\"conflicts\":0"),
+            "history convergence leaves no pending work or conflicts"
+        );
+    }
 }
 
 fn rename(fixture: &Fixture) {

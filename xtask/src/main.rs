@@ -101,7 +101,14 @@ enum BehaviorTarget {
 struct CommandManagedSyncBehavior {
     #[arg(
         long,
-        value_parser = ["admission", "growing", "reconcile", "rename", "smoke"],
+        value_parser = [
+            "admission",
+            "growing",
+            "history",
+            "reconcile",
+            "rename",
+            "smoke"
+        ],
         value_name = "NAME"
     )]
     case: Option<String>,
