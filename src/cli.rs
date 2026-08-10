@@ -56,6 +56,10 @@ pub(crate) struct SyncArgs {
     #[arg(long, value_parser = ["managed"], value_name = "MODEL")]
     pub(crate) model: Option<String>,
 
+    /// Resolve an existing conflict by publishing the current local path.
+    #[arg(long, value_name = "RELATIVE-PATH")]
+    pub(crate) resolve: Vec<String>,
+
     /// Maximum concurrency for storage operations.
     #[arg(
         long,

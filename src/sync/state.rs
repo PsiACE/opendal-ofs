@@ -37,12 +37,22 @@ pub struct ReplicaState {
     root: PathBuf,
     common: VolumeSnapshot,
     pending: Option<PendingPublication>,
+    conflicts: Vec<ConflictRecord>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PendingPublication {
+    expected: VolumeSnapshot,
     target: VolumeSnapshot,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConflictRecord {
+    pub path: String,
+    pub local_digest: Option<[u8; 32]>,
+    pub remote_digest: Option<[u8; 32]>,
 }
 
 impl ReplicaState {
@@ -53,6 +63,7 @@ impl ReplicaState {
             root,
             common,
             pending: None,
+            conflicts: Vec::new(),
         })
     }
 
@@ -119,6 +130,7 @@ impl ReplicaState {
     pub(crate) fn advance(&mut self, common: VolumeSnapshot) {
         self.common = common;
         self.pending = None;
+        self.conflicts.clear();
     }
 
     pub const fn has_pending(&self) -> bool {
@@ -129,14 +141,35 @@ impl ReplicaState {
         self.pending.as_ref().map(|pending| &pending.target)
     }
 
-    pub(crate) fn begin(&mut self, target: VolumeSnapshot) -> Result<(), SyncError> {
+    pub(crate) fn pending_expected(&self) -> Option<&VolumeSnapshot> {
+        self.pending.as_ref().map(|pending| &pending.expected)
+    }
+
+    pub fn conflicts(&self) -> &[ConflictRecord] {
+        &self.conflicts
+    }
+
+    pub(crate) fn retain_conflicts(&mut self, conflicts: Vec<ConflictRecord>) {
+        self.pending = None;
+        self.conflicts = conflicts;
+    }
+
+    pub(crate) fn begin(
+        &mut self,
+        expected: VolumeSnapshot,
+        target: VolumeSnapshot,
+    ) -> Result<(), SyncError> {
+        expected.validate()?;
         target.validate()?;
-        if target.volume_id != self.volume_id()
-            || target.cursor.sequence() != self.common.cursor.sequence() + 1
+        if expected.volume_id != self.volume_id()
+            || target.volume_id != self.volume_id()
+            || expected.cursor.sequence() < self.common.cursor.sequence()
+            || target.cursor.sequence() != expected.cursor.sequence() + 1
         {
             return Err(SyncError::new("pending publication ancestry is invalid"));
         }
-        self.pending = Some(PendingPublication { target });
+        self.pending = Some(PendingPublication { expected, target });
+        self.conflicts.clear();
         Ok(())
     }
 }

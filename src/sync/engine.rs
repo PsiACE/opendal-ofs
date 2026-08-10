@@ -15,17 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use crate::filesystem::{NodeKind, VolumeSnapshot};
 use crate::managed::ManagedVolume;
 
 use super::install::install;
+use super::reconcile::reconcile;
 use super::scan::scan;
 use super::{ReplicaState, SyncError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SyncOutcome {
+    pub conflicts: usize,
     pub published: bool,
     pub sequence: u64,
 }
@@ -39,7 +42,18 @@ impl SyncEngine {
         Self { volume }
     }
 
-    pub async fn sync(&self, root: &Path, state_path: &Path) -> Result<SyncOutcome, SyncError> {
+    pub async fn sync(
+        &self,
+        root: &Path,
+        state_path: &Path,
+        resolve_paths: &[String],
+    ) -> Result<SyncOutcome, SyncError> {
+        let resolved = resolve_paths.iter().cloned().collect::<BTreeSet<_>>();
+        if resolved.len() != resolve_paths.len() {
+            return Err(SyncError::new(
+                "a conflict resolution path was provided more than once",
+            ));
+        }
         let root = std::fs::canonicalize(root)
             .map_err(|error| SyncError::io("open replica directory", error))?;
         if !root.is_dir() {
@@ -47,10 +61,16 @@ impl SyncEngine {
         }
         let observed = self.volume.observe().await?;
         let Some(mut state) = ReplicaState::load(state_path)? else {
+            if !resolved.is_empty() {
+                return Err(SyncError::new(
+                    "--resolve requires an unresolved conflict in replica state",
+                ));
+            }
             require_empty(&root)?;
             install(&root, None, &observed.snapshot, &self.volume).await?;
             ReplicaState::new(root, observed.snapshot.clone())?.save_new(state_path)?;
             return Ok(SyncOutcome {
+                conflicts: 0,
                 published: false,
                 sequence: observed.snapshot.cursor.sequence(),
             });
@@ -77,13 +97,19 @@ impl SyncEngine {
         let remote_changed = observed.snapshot.cursor != state.common().cursor;
         match (local_changed, remote_changed) {
             (false, false) => Ok(SyncOutcome {
+                conflicts: 0,
                 published: false,
                 sequence: state.common().cursor.sequence(),
             }),
             (true, false) => {
-                state.begin(local.snapshot.clone())?;
+                if !resolved.is_empty() {
+                    return Err(SyncError::new(
+                        "--resolve requires a current local and remote conflict",
+                    ));
+                }
+                state.begin(observed.snapshot.clone(), local.snapshot.clone())?;
                 state.save(state_path)?;
-                self.publish_target_files(&root, state.common(), &local.snapshot)
+                self.publish_target_files(&root, &observed.snapshot, &local.snapshot)
                     .await?;
                 self.volume
                     .publish(&observed, local.snapshot.clone())
@@ -91,11 +117,17 @@ impl SyncEngine {
                 state.advance(local.snapshot);
                 state.save(state_path)?;
                 Ok(SyncOutcome {
+                    conflicts: 0,
                     published: true,
                     sequence: state.common().cursor.sequence(),
                 })
             }
             (false, true) => {
+                if !resolved.is_empty() {
+                    return Err(SyncError::new(
+                        "--resolve requires a current local and remote conflict",
+                    ));
+                }
                 install(
                     &root,
                     Some(state.common()),
@@ -106,13 +138,44 @@ impl SyncEngine {
                 state.advance(observed.snapshot);
                 state.save(state_path)?;
                 Ok(SyncOutcome {
+                    conflicts: 0,
                     published: false,
                     sequence: state.common().cursor.sequence(),
                 })
             }
-            (true, true) => Err(SyncError::new(
-                "local and remote changes require reconciliation",
-            )),
+            (true, true) => {
+                let plan = reconcile(
+                    state.common(),
+                    &local.snapshot,
+                    &observed.snapshot,
+                    &resolved,
+                )?;
+                if !plan.conflicts.is_empty() {
+                    let conflicts = plan.conflicts.len();
+                    state.retain_conflicts(plan.conflicts);
+                    state.save(state_path)?;
+                    return Ok(SyncOutcome {
+                        conflicts,
+                        published: false,
+                        sequence: state.common().cursor.sequence(),
+                    });
+                }
+                if plan.publish {
+                    state.begin(observed.snapshot.clone(), plan.target.clone())?;
+                    state.save(state_path)?;
+                    self.publish_target_files(&root, &observed.snapshot, &plan.target)
+                        .await?;
+                    self.volume.publish(&observed, plan.target.clone()).await?;
+                }
+                install(&root, Some(&local.snapshot), &plan.target, &self.volume).await?;
+                state.advance(plan.target);
+                state.save(state_path)?;
+                Ok(SyncOutcome {
+                    conflicts: 0,
+                    published: plan.publish,
+                    sequence: state.common().cursor.sequence(),
+                })
+            }
         }
     }
 
@@ -127,25 +190,32 @@ impl SyncEngine {
             .pending_target()
             .expect("pending state has a target")
             .clone();
+        let expected = state
+            .pending_expected()
+            .expect("pending state has an expected snapshot")
+            .clone();
         if observed.snapshot.cursor == target.cursor {
+            install(root, Some(state.common()), &target, &self.volume).await?;
             state.advance(target);
             state.save(state_path)?;
             return Ok(SyncOutcome {
+                conflicts: 0,
                 published: true,
                 sequence: state.common().cursor.sequence(),
             });
         }
-        if observed.snapshot.cursor != state.common().cursor {
+        if observed.snapshot.cursor != expected.cursor {
             return Err(SyncError::new(
                 "pending publication outcome is unknown after the remote volume advanced",
             ));
         }
-        self.publish_target_files(root, state.common(), &target)
-            .await?;
+        self.publish_target_files(root, &expected, &target).await?;
         self.volume.publish(&observed, target.clone()).await?;
+        install(root, Some(state.common()), &target, &self.volume).await?;
         state.advance(target);
         state.save(state_path)?;
         Ok(SyncOutcome {
+            conflicts: 0,
             published: true,
             sequence: state.common().cursor.sequence(),
         })

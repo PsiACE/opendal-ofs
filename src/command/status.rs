@@ -35,7 +35,7 @@ pub(super) fn run(args: StatusArgs) -> Result<()> {
             "{}",
             serde_json::json!({
                 "access_model": "sync",
-                "conflicts": 0,
+                "conflicts": state.conflicts().len(),
                 "common_sequence": state.common().cursor.sequence(),
                 "pending": state.has_pending(),
                 "volume_id": state.volume_id().to_string(),
@@ -44,10 +44,11 @@ pub(super) fn run(args: StatusArgs) -> Result<()> {
         );
     } else {
         println!(
-            "managed sync volume {} at change {}, {} pending, 0 conflict(s)",
+            "managed sync volume {} at change {}, {} pending, {} conflict(s)",
             state.volume_id(),
             state.common().cursor.sequence(),
-            usize::from(state.has_pending())
+            usize::from(state.has_pending()),
+            state.conflicts().len()
         );
     }
     Ok(())

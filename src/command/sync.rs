@@ -48,8 +48,14 @@ pub(super) async fn run(args: SyncArgs) -> Result<()> {
         None => metadata.open_unbound().await?,
     };
     let result = SyncEngine::new(volume.clone())
-        .sync(&root, &args.state)
+        .sync(&root, &args.state, &args.resolve)
         .await?;
+    if result.conflicts != 0 {
+        bail!(
+            "sync retained {} conflict(s); inspect `ofs status` and resolve explicitly",
+            result.conflicts
+        );
+    }
     println!(
         "synced managed volume {} at change {}{}",
         volume.id(),
@@ -61,7 +67,9 @@ pub(super) async fn run(args: SyncArgs) -> Result<()> {
 
 fn validate_options(args: &SyncArgs) -> Result<()> {
     match (args.init, args.model.as_deref()) {
-        (true, Some("managed")) | (false, None) => Ok(()),
+        (true, Some("managed")) if args.resolve.is_empty() => Ok(()),
+        (false, None) => Ok(()),
+        (true, Some("managed")) => bail!("--resolve cannot be used with --init"),
         (true, _) => bail!("--init requires --model managed"),
         (false, Some(_)) => bail!("--model requires --init"),
     }
