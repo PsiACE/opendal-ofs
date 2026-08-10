@@ -40,6 +40,7 @@ impl Command {
     fn run(self) {
         match self.sub {
             SubCommand::Behavior(cmd) => cmd.run(),
+            SubCommand::Build(cmd) => cmd.run(),
             SubCommand::Check(cmd) => cmd.run(),
             SubCommand::Licenses(cmd) => cmd.run(),
             SubCommand::Lint(cmd) => cmd.run(),
@@ -52,6 +53,8 @@ impl Command {
 enum SubCommand {
     #[clap(about = "Run user-visible behavior scenarios.")]
     Behavior(CommandBehavior),
+    #[clap(about = "Build workspace binaries.")]
+    Build(CommandBuild),
     #[clap(about = "Check all workspace targets.")]
     Check(CommandCheck),
     #[clap(about = "Check source headers and dependency licenses.")]
@@ -60,6 +63,16 @@ enum SubCommand {
     Lint(CommandLint),
     #[clap(about = "Run all workspace tests.")]
     Test(CommandTest),
+}
+
+#[derive(Parser)]
+#[clap(name = "build")]
+struct CommandBuild {}
+
+impl CommandBuild {
+    fn run(self) {
+        run_command(make_build_cmd());
+    }
 }
 
 #[derive(Parser)]
@@ -86,13 +99,16 @@ enum BehaviorTarget {
 #[derive(Parser)]
 #[clap(name = "managed-sync")]
 struct CommandManagedSyncBehavior {
+    #[arg(long, value_parser = ["admission"], value_name = "NAME")]
+    case: Option<String>,
+
     #[arg(long, help = "Leave the fixture running after the command exits.")]
     keep: bool,
 }
 
 impl CommandManagedSyncBehavior {
     fn run(self) {
-        managed_sync::run_fixture(self.keep);
+        managed_sync::run_fixture(self.keep, self.case.as_deref());
     }
 }
 
@@ -178,6 +194,12 @@ fn make_check_cmd() -> StdCommand {
     let mut cmd = find_command("cargo");
     cmd.env("RUSTFLAGS", "-Dwarnings");
     cmd.args(["check", "--workspace", "--all-targets"]);
+    cmd
+}
+
+fn make_build_cmd() -> StdCommand {
+    let mut cmd = find_command("cargo");
+    cmd.args(["build", "--workspace"]);
     cmd
 }
 
