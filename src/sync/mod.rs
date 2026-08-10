@@ -9,6 +9,7 @@
 //! Local replica foundations owned by the Sync access model.
 
 mod engine;
+mod install;
 mod local;
 mod path;
 mod publication;
