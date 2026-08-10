@@ -76,7 +76,7 @@ impl<V: Volume> SyncEngine<V> {
             .context("create local replica")?;
 
         let mut resolved_commit = None;
-        let prior_staging = if let Some(pending) = state.pending.clone() {
+        let prior_staging = if let Some(pending) = state.pending.as_ref() {
             let committed = match self.volume.resolve(pending.operation).await? {
                 CommitOutcome::Committed(committed) => Some(committed),
                 CommitOutcome::Unknown => {
@@ -84,7 +84,7 @@ impl<V: Volume> SyncEngine<V> {
                 }
                 CommitOutcome::Absent | CommitOutcome::Conflict { .. } => None,
             };
-            let staged = match StagedTree::recover(&pending) {
+            let staged = match StagedTree::recover(pending) {
                 Ok(staged)
                     if staged.matches_source_observation(&LocalTree::scan(replica_path).await?) =>
                 {
@@ -92,8 +92,9 @@ impl<V: Volume> SyncEngine<V> {
                 }
                 _ => None,
             };
+            let staging_path = pending.staging.clone();
             if staged.is_none() {
-                let _ = remove_tree(&pending.staging);
+                let _ = remove_tree(&staging_path);
                 if committed.is_none() {
                     state.pending = None;
                     state.install(state_path)?;
@@ -154,7 +155,6 @@ impl<V: Volume> SyncEngine<V> {
             }
         };
         let operation = OperationId::generate();
-        let source_manifest = staged.source.clone();
         let mut publish = remote.is_none() && !local.entries.is_empty();
         let mut conflicts = Vec::new();
         let mut local_renames = BTreeMap::new();
@@ -227,7 +227,7 @@ impl<V: Volume> SyncEngine<V> {
                     if state.installed.is_empty() && local.entries.is_empty() {
                         install_staged_tree(replica_path, &staged.root)?;
                     } else {
-                        install_staged_changes(replica_path, &staged, &source_manifest)?;
+                        install_staged_changes(replica_path, &staged, &staged.source)?;
                     }
                 }
                 let installed = LocalTree::scan(replica_path).await?;
@@ -244,7 +244,7 @@ impl<V: Volume> SyncEngine<V> {
             return Ok(result(&state, resolved_commit.is_some()));
         }
 
-        let requires_materialization = !source_manifest.same_content(staged.manifest());
+        let requires_materialization = !staged.source.same_content(staged.manifest());
 
         let publication = build_publication(
             &self.volume,
@@ -259,7 +259,7 @@ impl<V: Volume> SyncEngine<V> {
                     return Ok(result(&state, false));
                 };
                 if requires_materialization {
-                    install_staged_changes(replica_path, &staged, &source_manifest)?;
+                    install_staged_changes(replica_path, &staged, &staged.source)?;
                 }
                 let committed = SnapshotTree::new(&publication.target)?;
                 let installed = if requires_materialization {
