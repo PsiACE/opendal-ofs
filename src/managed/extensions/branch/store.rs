@@ -128,18 +128,16 @@ impl BranchStore {
     pub async fn list(&self, concurrency: NonZeroUsize) -> Result<Vec<BranchInfo>, VolumeError> {
         let (registry, _) = self.registry().await?;
         let default = registry.default_branch;
-        let mut branches = stream::iter(registry.branches)
+        stream::iter(registry.branches)
             .map(|(name, id)| async move {
                 let (head, _) = self.read_head(id).await?.ok_or_else(|| {
                     corrupt("list Managed branches", "registered branch HEAD is missing")
                 })?;
                 Ok(info(name, id, &head, default))
             })
-            .buffer_unordered(concurrency.get())
+            .buffered(concurrency.get())
             .try_collect::<Vec<_>>()
-            .await?;
-        branches.sort_by(|left, right| left.binding.name.cmp(&right.binding.name));
-        Ok(branches)
+            .await
     }
 
     pub async fn get(&self, name: &BranchName) -> Result<BranchInfo, VolumeError> {

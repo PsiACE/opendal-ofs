@@ -341,9 +341,18 @@ impl NamespaceStore {
         let Some((head, _)) = self.read_bound_head("resolve Managed publication").await? else {
             return Ok(CommitOutcome::Absent);
         };
-        let Some(state) = head.state else {
+        let Some(state) = &head.state else {
             return Ok(CommitOutcome::Absent);
         };
+        self.resolve_from_state(state, operation, expected).await
+    }
+
+    async fn resolve_from_state(
+        &self,
+        state: &StoredNamespaceState,
+        operation: OperationId,
+        expected: Option<[u8; 32]>,
+    ) -> Result<CommitOutcome, VolumeError> {
         if let Some(result) = state.resolve(self.branch_id(), operation) {
             require_request_digest(expected, result.request_sha256)?;
             return Ok(CommitOutcome::Committed(result.cursor));
@@ -443,18 +452,32 @@ impl NamespaceStore {
         operation: OperationId,
         request_digest: [u8; 32],
     ) -> Result<CommitOutcome, VolumeError> {
-        let resolved = match self.resolve_known(operation, Some(request_digest)).await {
-            Err(error) if error.kind() == VolumeErrorKind::Unavailable => CommitOutcome::Unknown,
+        let head = match self.read_bound_head("resolve Managed publication").await {
+            Err(error) if error.kind() == VolumeErrorKind::Unavailable => {
+                return Ok(CommitOutcome::Unknown);
+            }
             result => result?,
         };
+        let Some((head, _)) = head else {
+            return Ok(CommitOutcome::Conflict {
+                observed: ChangeCursor::Genesis,
+            });
+        };
+        let observed = head.cursor();
+        let resolved = match &head.state {
+            Some(state) => {
+                self.resolve_from_state(state, operation, Some(request_digest))
+                    .await
+            }
+            None => Ok(CommitOutcome::Absent),
+        };
         match resolved {
-            result @ (CommitOutcome::Committed(_) | CommitOutcome::Unknown) => Ok(result),
-            _ => Ok(CommitOutcome::Conflict {
-                observed: self
-                    .observe(None)
-                    .await?
-                    .map_or(ChangeCursor::Genesis, |(snapshot, _)| snapshot.cursor),
-            }),
+            Err(error) if error.kind() == VolumeErrorKind::Unavailable => {
+                Ok(CommitOutcome::Unknown)
+            }
+            Err(error) => Err(error),
+            Ok(result @ (CommitOutcome::Committed(_) | CommitOutcome::Unknown)) => Ok(result),
+            Ok(_) => Ok(CommitOutcome::Conflict { observed }),
         }
     }
 
