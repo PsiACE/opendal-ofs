@@ -1021,10 +1021,13 @@ dependencies = [
 name = "ofs"
 version = "0.0.24"
 dependencies = [
+ "anyhow",
+ "clap",
  "futures",
  "opendal",
  "serde",
  "serde_json",
+ "tokio",
  "unicode-casefold",
  "unicode-normalization",
  "uuid",
