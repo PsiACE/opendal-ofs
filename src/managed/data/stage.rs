@@ -22,7 +22,7 @@ use std::num::NonZeroUsize;
 
 use fastcdc::v2020::AsyncStreamCDC;
 use futures::{StreamExt as _, TryStreamExt as _, stream};
-use opendal::{ErrorKind, Operator};
+use opendal::{Buffer, ErrorKind, Operator};
 use sha2::{Digest as _, Sha256};
 use tokio::sync::{mpsc, oneshot};
 
@@ -91,7 +91,7 @@ struct PreparedStream {
 #[derive(Debug)]
 struct SealedSegment {
     reference: SegmentRef,
-    bytes: Vec<u8>,
+    bytes: Buffer,
     locations: BTreeMap<ContentRef, StoredContent>,
 }
 
@@ -392,7 +392,9 @@ fn take_segment_contents(
 fn seal_segment(contents: BTreeMap<ContentRef, Vec<u8>>) -> Result<SealedSegment, VolumeError> {
     // Segment v1 is the stable ContentRef ordering of its raw contents. The
     // descriptor owns offsets; SegmentRef authenticates the complete object.
-    let mut encoded = Vec::new();
+    let mut chunks = Vec::with_capacity(contents.len());
+    let mut digest = Sha256::new();
+    let mut length = 0_u64;
     let mut offsets = BTreeMap::new();
     for (content, bytes) in contents {
         if content.length == 0 || content.length != bytes.len() as u64 {
@@ -401,9 +403,12 @@ fn seal_segment(contents: BTreeMap<ContentRef, Vec<u8>>) -> Result<SealedSegment
                 "segment entry does not match its content reference",
             ));
         }
-        let offset = encoded.len() as u64;
-        encoded.extend_from_slice(&bytes);
-        offsets.insert(content, offset);
+        offsets.insert(content, length);
+        length = length
+            .checked_add(content.length)
+            .ok_or_else(|| invalid("seal data segment", "segment content length overflows"))?;
+        digest.update(&bytes);
+        chunks.extend(Buffer::from(bytes));
     }
     if offsets.is_empty() {
         return Err(invalid(
@@ -411,10 +416,9 @@ fn seal_segment(contents: BTreeMap<ContentRef, Vec<u8>>) -> Result<SealedSegment
             "a segment must contain non-empty content",
         ));
     }
-    let digest: [u8; 32] = Sha256::digest(&encoded).into();
     let reference = SegmentRef {
-        digest,
-        length: encoded.len() as u64,
+        digest: digest.finalize().into(),
+        length,
     };
     let locations = offsets
         .into_iter()
@@ -430,7 +434,7 @@ fn seal_segment(contents: BTreeMap<ContentRef, Vec<u8>>) -> Result<SealedSegment
         .collect();
     Ok(SealedSegment {
         reference,
-        bytes: encoded,
+        bytes: chunks.into_iter().collect(),
         locations,
     })
 }
