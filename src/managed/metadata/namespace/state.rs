@@ -33,6 +33,15 @@ pub(crate) struct CheckpointRef {
     pub(crate) length: u64,
 }
 
+impl CheckpointRef {
+    pub(crate) fn from_encoded(bytes: &[u8]) -> Self {
+        Self {
+            digest: Sha256::digest(bytes).into(),
+            length: bytes.len() as u64,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ChangeSegmentRef {
@@ -234,21 +243,12 @@ impl StoredNamespaceState {
                 "namespace change segments do not reach the checkpoint",
             ));
         }
-        let mut parent = self.checkpoint_cursor;
-        for change in &self.tail {
-            change.validate(volume_id)?;
-            if change.parent() != parent {
-                return Err(corrupt(
-                    "read Managed namespace",
-                    "namespace transaction tail is not consecutive",
-                ));
-            }
-            parent = change.cursor();
-        }
-        let cursor = self.cursor();
+        let cursor = validate_change_chain(&self.tail, volume_id, self.checkpoint_cursor)?;
         if let Some(result) = &self.outcome {
-            result.validate()?;
-            if result.cursor != cursor || !self.maybe_contains(result.operation) {
+            if result.cursor.operation() != Some(result.operation)
+                || result.cursor != cursor
+                || !self.maybe_contains(result.operation)
+            {
                 return Err(corrupt(
                     "read Managed namespace",
                     "namespace outcome does not describe HEAD",
@@ -295,15 +295,14 @@ impl StoredNamespaceState {
     }
 
     pub(crate) fn outcome_is_retained(&self) -> bool {
-        self.outcome.as_ref().is_none_or(|result| {
-            self.tail
-                .iter()
-                .any(|change| change.operation() == result.operation)
-                || self
-                    .segments
-                    .iter()
-                    .any(|segment| segment.end == result.cursor)
-        })
+        let Some(result) = &self.outcome else {
+            return true;
+        };
+        !self.tail.is_empty()
+            || self
+                .segments
+                .last()
+                .is_some_and(|segment| segment.end == result.cursor)
     }
 
     fn remember(&mut self, operation: OperationId) {
@@ -348,16 +347,24 @@ impl StoredCommittedResult {
             request_sha256,
         }
     }
+}
 
-    pub(crate) fn validate(&self) -> Result<(), VolumeError> {
-        if self.cursor.operation() != Some(self.operation) {
+fn validate_change_chain(
+    changes: &[NamespaceChange],
+    volume_id: VolumeId,
+    mut cursor: ChangeCursor,
+) -> Result<ChangeCursor, VolumeError> {
+    for change in changes {
+        change.validate(volume_id)?;
+        if change.parent() != cursor {
             return Err(corrupt(
                 "read Managed namespace",
-                "committed result cursor is invalid",
+                "change chain is not consecutive",
             ));
         }
-        Ok(())
+        cursor = change.cursor();
     }
+    Ok(cursor)
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -375,32 +382,17 @@ impl StoredChangeSegment {
                 "change segment size is invalid",
             ));
         }
-        let mut parent = self.start();
-        for change in &self.changes {
-            change.validate(volume_id)?;
-            if change.parent() != parent {
-                return Err(corrupt(
-                    "read Managed change segment",
-                    "change segment is not consecutive",
-                ));
-            }
-            parent = change.cursor();
-        }
+        validate_change_chain(&self.changes, volume_id, self.changes[0].parent())?;
         Ok(())
     }
 
-    pub(crate) fn cursor(&self) -> ChangeCursor {
-        self.changes
-            .last()
-            .expect("validated change segments are non-empty")
-            .cursor()
-    }
-
-    pub(crate) fn start(&self) -> ChangeCursor {
-        self.changes
-            .first()
-            .expect("validated change segments are non-empty")
-            .parent()
+    pub(crate) fn reference(&self, digest: [u8; 32], length: u64) -> ChangeSegmentRef {
+        ChangeSegmentRef {
+            digest,
+            length,
+            start: self.changes[0].parent(),
+            end: self.changes.last().expect("non-empty segment").cursor(),
+        }
     }
 }
 
@@ -417,15 +409,7 @@ pub(crate) fn recover_namespace(
     }
     super::validate_snapshot(&snapshot)
         .map_err(|_| corrupt("read Managed namespace", "checkpoint namespace is invalid"))?;
-    for change in &state.tail {
-        snapshot = change.apply(Some(snapshot))?;
-    }
-    if snapshot.cursor != state.cursor() {
-        return Err(corrupt(
-            "read Managed namespace",
-            "transaction tail does not reach namespace HEAD",
-        ));
-    }
+    snapshot = apply_changes(snapshot, &state.tail)?;
     if !state.tail.is_empty() {
         super::validate_snapshot_structure(&snapshot)
             .map_err(|_| corrupt("read Managed namespace", "recovered namespace is invalid"))?;
@@ -448,19 +432,20 @@ pub(crate) fn replay_tail_from(
     else {
         return Ok(None);
     };
-    let mut snapshot = base.clone();
-    for change in &state.tail[start..] {
-        snapshot = change.apply(Some(snapshot))?;
-    }
-    if snapshot.cursor != state.cursor() {
-        return Err(corrupt(
-            "read Managed namespace",
-            "transaction tail does not reach namespace HEAD",
-        ));
-    }
+    let snapshot = apply_changes(base.clone(), &state.tail[start..])?;
     super::validate_snapshot_structure(&snapshot)
         .map_err(|_| corrupt("read Managed namespace", "recovered namespace is invalid"))?;
     Ok(Some(snapshot))
+}
+
+pub(super) fn apply_changes(
+    mut snapshot: VolumeSnapshot,
+    changes: &[NamespaceChange],
+) -> Result<VolumeSnapshot, VolumeError> {
+    for change in changes {
+        snapshot = change.apply(Some(snapshot))?;
+    }
+    Ok(snapshot)
 }
 
 pub(crate) fn require_request_digest(

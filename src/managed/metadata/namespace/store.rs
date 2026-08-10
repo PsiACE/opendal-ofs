@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 
+use super::state::apply_changes;
 use super::{
     ChangeSegmentRef, CheckpointRef, NamespaceChange, StoredChangeSegment, StoredCommittedResult,
     StoredNamespaceState, recover_namespace, replay_tail_from, require_request_digest,
@@ -128,17 +129,13 @@ impl NamespaceStore {
         let Some(state) = &head.state else {
             return Ok(None);
         };
-        if let Some(base) = base
-            && base.volume_id == self.volume_id
-            && let Some(snapshot) = replay_tail_from(base, state)?
-        {
-            return Ok(Some((snapshot, NamespaceWitness { revision, head })));
-        }
-        if let Some(base) = base
-            && base.volume_id == self.volume_id
-            && let Some(snapshot) = self.replay_retained_from(base, state).await?
-        {
-            return Ok(Some((snapshot, NamespaceWitness { revision, head })));
+        if let Some(base) = base.filter(|base| base.volume_id == self.volume_id) {
+            if let Some(snapshot) = replay_tail_from(base, state)? {
+                return Ok(Some((snapshot, NamespaceWitness { revision, head })));
+            }
+            if let Some(snapshot) = self.replay_retained_from(base, state).await? {
+                return Ok(Some((snapshot, NamespaceWitness { revision, head })));
+            }
         }
         let checkpoint = self.read_checkpoint(state.checkpoint).await?;
         let snapshot = recover_namespace(checkpoint, state, self.volume_id)?;
@@ -237,9 +234,9 @@ impl NamespaceStore {
             .as_ref()
             .filter(|state| !state.outcome_is_retained())
             .and_then(|state| state.outcome.clone());
+        let result = StoredCommittedResult::from_change(&change, request_digest);
         let state = match head.state.take() {
             None => {
-                let result = StoredCommittedResult::from_change(&change, request_digest);
                 let target = change.apply_validated(
                     base.cloned(),
                     validated.take().expect("publication was validated above"),
@@ -268,7 +265,7 @@ impl NamespaceStore {
                     current.tail.push(change.clone());
                     let segment = StoredChangeSegment {
                         checkpoint: current.checkpoint,
-                        changes: current.tail,
+                        changes: std::mem::take(&mut current.tail),
                     };
                     segments.push(self.write_change_segment(&segment).await?);
                     let excess = segments
@@ -294,25 +291,14 @@ impl NamespaceStore {
                         base.cloned(),
                         validated.take().expect("publication was validated above"),
                     );
-                    let mut next = StoredNamespaceState {
-                        checkpoint: self.write_checkpoint(&target).await?,
-                        checkpoint_cursor: cursor,
-                        tail: Vec::new(),
-                        segments,
-                        operation_prefixes: current.operation_prefixes,
-                        outcome: current.outcome,
-                    };
-                    next.record_outcome(StoredCommittedResult::from_change(
-                        &change,
-                        request_digest,
-                    ));
-                    next
+                    current.checkpoint = self.write_checkpoint(&target).await?;
+                    current.checkpoint_cursor = cursor;
+                    current.segments = segments;
+                    current.record_outcome(result);
+                    current
                 } else {
                     current.tail.push(change);
-                    current.record_outcome(StoredCommittedResult::from_change(
-                        current.tail.last().expect("change was appended above"),
-                        request_digest,
-                    ));
+                    current.record_outcome(result);
                     current
                 }
             }
@@ -565,31 +551,15 @@ impl NamespaceStore {
         if !state.maybe_contains(operation) {
             return Ok(CommitOutcome::Absent);
         }
-        if let Some(result) = state
-            .tail
-            .iter()
-            .rev()
-            .find(|change| {
-                change.origin_branch == self.branch_id() && change.operation() == operation
-            })
-            .map(committed_result)
-            .transpose()?
-        {
+        if let Some(result) = find_committed_result(&state.tail, self.branch_id(), operation)? {
             require_request_digest(expected, result.request_sha256)?;
             return Ok(CommitOutcome::Committed(result.cursor));
         }
         let Some(result) = self.read_operation(operation).await? else {
             for reference in state.segments.iter().rev() {
                 let segment = self.read_change_segment(*reference).await?;
-                if let Some(result) = segment
-                    .changes
-                    .iter()
-                    .rev()
-                    .find(|change| {
-                        change.origin_branch == self.branch_id() && change.operation() == operation
-                    })
-                    .map(committed_result)
-                    .transpose()?
+                if let Some(result) =
+                    find_committed_result(&segment.changes, self.branch_id(), operation)?
                 {
                     require_request_digest(expected, result.request_sha256)?;
                     return Ok(CommitOutcome::Committed(result.cursor));
@@ -618,8 +588,10 @@ impl NamespaceStore {
         let result: StoredCommittedResult = OPERATION_RECORD
             .decode(&bytes)
             .map_err(|error| corrupt("resolve Managed publication", error.message()))?;
-        result.validate()?;
-        if result.origin_branch != self.branch_id() || result.operation != operation {
+        if result.origin_branch != self.branch_id()
+            || result.operation != operation
+            || result.cursor.operation() != Some(operation)
+        {
             return Err(corrupt(
                 "resolve Managed publication",
                 "operation receipt identity is invalid",
@@ -723,10 +695,7 @@ impl NamespaceStore {
         checkpoint: &VolumeSnapshot,
     ) -> Result<CheckpointRef, VolumeError> {
         let bytes = encode_checkpoint(checkpoint)?;
-        let reference = CheckpointRef {
-            digest: Sha256::digest(&bytes).into(),
-            length: bytes.len() as u64,
-        };
+        let reference = CheckpointRef::from_encoded(&bytes);
         ensure_immutable(
             &self.data,
             &checkpoint_key(reference.digest),
@@ -773,7 +742,7 @@ impl NamespaceStore {
             .decode(&bytes)
             .map_err(|error| corrupt("read Managed change segment", error.message()))?;
         segment.validate(self.volume_id)?;
-        if segment.start() != reference.start || segment.cursor() != reference.end {
+        if segment.reference(reference.digest, reference.length) != reference {
             return Err(corrupt(
                 "read Managed change segment",
                 "change segment disagrees with its index",
@@ -798,12 +767,7 @@ impl NamespaceStore {
             "archive Managed changes",
         )
         .await?;
-        Ok(ChangeSegmentRef {
-            digest,
-            length,
-            start: segment.start(),
-            end: segment.cursor(),
-        })
+        Ok(segment.reference(digest, length))
     }
 
     pub(crate) async fn state_at_sequence(
@@ -822,22 +786,14 @@ impl NamespaceStore {
             return Ok(None);
         };
         let segment = self.read_change_segment(*reference).await?;
-        let length = usize::try_from(sequence - segment.start().sequence())
-            .ok()
-            .filter(|length| *length <= segment.changes.len())
-            .ok_or_else(|| {
-                corrupt(
-                    "read Managed change segment",
-                    "requested sequence is not in the change segment",
-                )
-            })?;
+        let length = (sequence - reference.start.sequence()) as usize;
         let outcome = current
             .outcome
             .clone()
             .filter(|result| result.cursor.sequence() <= sequence);
         Ok(Some(StoredNamespaceState {
             checkpoint: segment.checkpoint,
-            checkpoint_cursor: segment.start(),
+            checkpoint_cursor: reference.start,
             tail: segment.changes[..length].to_vec(),
             segments: current.segments[..position].to_vec(),
             operation_prefixes: current.operation_prefixes.clone(),
@@ -859,9 +815,9 @@ impl NamespaceStore {
         let mut snapshot = base.clone();
         for (offset, reference) in state.segments[position..].iter().enumerate() {
             let segment = self.read_change_segment(*reference).await?;
-            let start = if snapshot.cursor == segment.start() {
+            let start = if snapshot.cursor == reference.start {
                 Some(0)
-            } else if snapshot.cursor == segment.cursor() {
+            } else if snapshot.cursor == reference.end {
                 Some(segment.changes.len())
             } else {
                 segment
@@ -879,25 +835,9 @@ impl NamespaceStore {
                     ))
                 };
             };
-            for change in &segment.changes[start..] {
-                snapshot = change.apply(Some(snapshot))?;
-            }
-            if snapshot.cursor != reference.end {
-                return Err(corrupt(
-                    "read Managed change segment",
-                    "change segment does not reach its indexed cursor",
-                ));
-            }
+            snapshot = apply_changes(snapshot, &segment.changes[start..])?;
         }
-        if snapshot.cursor != state.checkpoint_cursor {
-            return Err(corrupt(
-                "read Managed change segment",
-                "retained changes do not reach the current checkpoint",
-            ));
-        }
-        for change in &state.tail {
-            snapshot = change.apply(Some(snapshot))?;
-        }
+        snapshot = apply_changes(snapshot, &state.tail)?;
         super::validate_snapshot_structure(&snapshot).map_err(|_| {
             corrupt(
                 "read Managed change segment",
@@ -1048,6 +988,19 @@ fn committed_result(change: &NamespaceChange) -> Result<StoredCommittedResult, V
         change,
         change.request_sha256()?,
     ))
+}
+
+fn find_committed_result(
+    changes: &[NamespaceChange],
+    branch: Option<BranchId>,
+    operation: OperationId,
+) -> Result<Option<StoredCommittedResult>, VolumeError> {
+    changes
+        .iter()
+        .rev()
+        .find(|change| change.origin_branch == branch && change.operation() == operation)
+        .map(committed_result)
+        .transpose()
 }
 
 pub(crate) fn checkpoint_key(id: [u8; 32]) -> String {
@@ -1214,7 +1167,7 @@ mod tests {
         let outcome = StoredCommittedResult::from_change(latest, request_digest);
         let mut state = StoredNamespaceState {
             checkpoint,
-            checkpoint_cursor: segment.cursor(),
+            checkpoint_cursor: reference.end,
             tail: Vec::new(),
             segments: vec![reference],
             operation_prefixes: StoredNamespaceState::empty_operation_index(),
