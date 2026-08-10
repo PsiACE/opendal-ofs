@@ -86,8 +86,7 @@ async fn branch_command(config: &Path, command: BranchCommand) -> Result<()> {
             Ok(())
         }
         BranchCommand::Show(args) => {
-            let name = parse_branch_name(&args.branch)?;
-            let branch = branches.get(&name).await?;
+            let branch = branches.get(&args.branch).await?;
             if args.json {
                 println!("{}", serde_json::to_string(&branch_json(&branch))?);
             } else {
@@ -102,10 +101,8 @@ async fn branch_command(config: &Path, command: BranchCommand) -> Result<()> {
             Ok(())
         }
         BranchCommand::Create(args) => {
-            let target = parse_branch_name(&args.branch)?;
-            let source = args.from.as_deref().map(parse_branch_name).transpose()?;
             let point = args.at.map_or(ForkPoint::Head, ForkPoint::Sequence);
-            let (created, source) = branches.fork(source, point, target).await?;
+            let (created, source) = branches.fork(args.from, point, args.branch).await?;
             println!(
                 "created branch {:?} {} from {:?} at change {}",
                 created.binding.name.as_str(),
@@ -116,18 +113,11 @@ async fn branch_command(config: &Path, command: BranchCommand) -> Result<()> {
             Ok(())
         }
         BranchCommand::Delete(args) => {
-            let name = parse_branch_name(&args.branch)?;
-            branches.delete(&name).await?;
-            println!("deleted branch {:?}", name.as_str());
+            branches.delete(&args.branch).await?;
+            println!("deleted branch {:?}", args.branch.as_str());
             Ok(())
         }
     }
-}
-
-fn parse_branch_name(value: &str) -> Result<BranchName> {
-    value
-        .parse()
-        .map_err(|error| anyhow!("invalid branch name {value:?}: {error}"))
 }
 
 fn branch_json(branch: &BranchInfo) -> serde_json::Value {
@@ -146,7 +136,7 @@ fn branch_json(branch: &BranchInfo) -> serde_json::Value {
 async fn open_managed_volume(
     config: &Path,
     alias: &str,
-    branch: Option<&str>,
+    branch: Option<&BranchName>,
     transfer_concurrency: NonZeroUsize,
 ) -> Result<ManagedVolume> {
     let ManagedContext {
@@ -157,7 +147,7 @@ async fn open_managed_volume(
     if format.requires_extension(ManagedExtension::BranchV1) {
         let branches = metadata.branches(&format, data)?;
         let volume = match branch {
-            Some(name) => branches.open(&parse_branch_name(name)?).await?,
+            Some(name) => branches.open(name).await?,
             None => branches.open_default().await?,
         };
         return Ok(volume);
@@ -322,7 +312,7 @@ async fn sync_volume(config: &Path, args: SyncArgs) -> Result<()> {
     let volume = open_managed_volume(
         config,
         &args.alias,
-        args.branch.as_deref(),
+        args.branch.as_ref(),
         transfer_concurrency,
     )
     .await?;

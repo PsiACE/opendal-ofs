@@ -99,23 +99,22 @@ impl Catalog {
         if stored.format != CATALOG_FORMAT {
             bail!("volume catalog format is unsupported");
         }
-        let mut volumes: BTreeMap<String, VolumeDefinition> = BTreeMap::new();
-        for (alias, definition) in stored.volumes {
+        let mut identities = BTreeMap::new();
+        for (alias, definition) in &stored.volumes {
             if alias.is_empty() {
                 bail!("volume alias is empty");
             }
             definition.validate()?;
-            if let Some((existing, _)) = volumes
-                .iter()
-                .find(|(_, current)| current.volume_id == definition.volume_id)
-            {
+            if let Some(existing) = identities.insert(definition.volume_id, alias) {
                 bail!(
                     "volume aliases {existing:?} and {alias:?} refer to the same volume identity"
                 );
             }
-            volumes.insert(alias, definition);
         }
-        Ok(Self { path, volumes })
+        Ok(Self {
+            path,
+            volumes: stored.volumes,
+        })
     }
 
     pub fn get(&self, alias: &str) -> Option<&VolumeDefinition> {

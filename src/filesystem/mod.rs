@@ -24,7 +24,6 @@ mod branch;
 mod identity;
 mod model;
 mod namespace;
-mod publication;
 mod volume;
 
 pub use branch::{AuthorityIdentity, BranchBinding, BranchName, InvalidBranchName};
@@ -32,12 +31,11 @@ pub use identity::BranchId;
 pub use identity::{ChangeCursor, FileVersionId, Generation, NodeId, OperationId, VolumeId};
 pub use model::VolumeModel;
 pub use namespace::{DirectoryEntry, NodeAttributes, NodeKind};
-pub use publication::CommitOutcome;
 #[cfg(test)]
 pub(crate) use volume::NodePrecondition;
 pub(crate) use volume::VolumeMutation;
 pub(crate) use volume::validate_portable_paths;
 pub use volume::{
-    DirectoryRecord, FileVersion, MaterializeRequest, NodeRecord, Volume, VolumeError,
-    VolumeErrorKind, VolumeObservation, VolumePublication, VolumeSnapshot,
+    CommitOutcome, DirectoryRecord, FileVersion, MaterializeRequest, NodeRecord, Volume,
+    VolumeError, VolumeErrorKind, VolumeObservation, VolumePublication, VolumeSnapshot,
 };

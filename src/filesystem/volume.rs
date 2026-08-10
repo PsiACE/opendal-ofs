@@ -29,8 +29,8 @@ use unicode_normalization::UnicodeNormalization as _;
 
 use super::AuthorityIdentity;
 use super::{
-    ChangeCursor, CommitOutcome, DirectoryEntry, FileVersionId, Generation, NodeAttributes, NodeId,
-    NodeKind, OperationId, VolumeId,
+    ChangeCursor, DirectoryEntry, FileVersionId, Generation, NodeAttributes, NodeId, NodeKind,
+    OperationId, VolumeId,
 };
 
 /// An immutable file version whose durable descriptor is owned by its volume.
@@ -487,6 +487,19 @@ impl VolumePublication {
     pub(crate) fn mutation(&self) -> &VolumeMutation {
         &self.mutation
     }
+}
+
+/// The authoritative result of a generation-checked publication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommitOutcome {
+    /// The mutation is visible at this change-stream position.
+    Committed(ChangeCursor),
+    /// Recovery proved that the operation did not commit.
+    Absent,
+    /// An observed precondition no longer matches authoritative state.
+    Conflict { observed: ChangeCursor },
+    /// The caller must retain its intent and resolve the original operation.
+    Unknown,
 }
 
 #[derive(Clone, Debug)]

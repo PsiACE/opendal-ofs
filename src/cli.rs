@@ -10,7 +10,7 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use ofs::filesystem::VolumeModel;
+use ofs::filesystem::{BranchName, VolumeModel};
 use url::Url;
 
 #[derive(Debug, Parser)]
@@ -93,7 +93,7 @@ pub(crate) struct BranchShowArgs {
     pub alias: String,
 
     /// Branch to show.
-    pub branch: String,
+    pub branch: BranchName,
 
     /// Emit a machine-readable branch description.
     #[arg(long)]
@@ -109,11 +109,11 @@ pub(crate) struct BranchCreateArgs {
     pub alias: String,
 
     /// Name of the new branch.
-    pub branch: String,
+    pub branch: BranchName,
 
     /// Source branch. Defaults to the volume's default branch.
     #[arg(long, value_name = "BRANCH")]
-    pub from: Option<String>,
+    pub from: Option<BranchName>,
 
     /// Retained source sequence. Defaults to the current source position.
     #[arg(long, value_name = "SEQUENCE")]
@@ -129,7 +129,7 @@ pub(crate) struct BranchDeleteArgs {
     pub alias: String,
 
     /// Branch to delete.
-    pub branch: String,
+    pub branch: BranchName,
 
     #[command(flatten)]
     pub runtime: StorageOptions,
@@ -175,7 +175,7 @@ pub(crate) struct SyncArgs {
 
     /// Branch to synchronize. Defaults to the volume's default branch.
     #[arg(long, value_name = "BRANCH")]
-    pub branch: Option<String>,
+    pub branch: Option<BranchName>,
 
     /// Durable replica state stored outside the replica directory.
     #[arg(long, value_name = "PATH")]
