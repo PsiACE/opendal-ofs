@@ -19,12 +19,11 @@ use std::fs;
 
 use anyhow::{Context, Result, anyhow, bail};
 use ofs::managed::ManagedMetadata;
+use ofs::sync::{ReplicaState, SyncEngine};
 use opendal::Operator;
 use opendal::layers::{ConcurrentLimitLayer, RetryLayer};
 
 use crate::cli::SyncArgs;
-
-use super::state::ReplicaState;
 
 pub(super) async fn run(args: SyncArgs) -> Result<()> {
     validate_options(&args)?;
@@ -37,20 +36,25 @@ pub(super) async fn run(args: SyncArgs) -> Result<()> {
     let metadata = ManagedMetadata::object(open_operator(&args)?)?;
     if args.init {
         let volume = metadata.initialize().await?;
-        ReplicaState::new(root, volume.id()).save_new(&args.state)?;
+        let observed = volume.observe().await?;
+        ReplicaState::new(root, observed.snapshot)?.save_new(&args.state)?;
         println!("initialized managed sync volume {}", volume.id());
         return Ok(());
     }
 
-    let state = ReplicaState::load(&args.state)?;
-    if state.root != root {
-        bail!("replica state belongs to a different local directory");
-    }
-    let volume = metadata.open(state.volume_id).await?;
+    let stored = ReplicaState::load(&args.state)?;
+    let volume = match &stored {
+        Some(state) => metadata.open(state.volume_id()).await?,
+        None => metadata.open_unbound().await?,
+    };
+    let result = SyncEngine::new(volume.clone())
+        .sync(&root, &args.state)
+        .await?;
     println!(
-        "opened managed sync volume {} at change {}",
+        "synced managed volume {} at change {}{}",
         volume.id(),
-        state.cursor.sequence()
+        result.sequence,
+        if result.published { " (published)" } else { "" }
     );
     Ok(())
 }

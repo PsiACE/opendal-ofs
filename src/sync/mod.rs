@@ -15,10 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Apache OpenDAL™ File System.
-//!
-//! Managed Sync follows the volume and access boundaries defined by RFC 016.
+mod engine;
+mod error;
+mod install;
+mod scan;
+mod state;
 
-pub mod filesystem;
-pub mod managed;
-pub mod sync;
+pub use engine::{SyncEngine, SyncOutcome};
+pub use error::SyncError;
+pub use state::ReplicaState;

@@ -18,16 +18,16 @@
 use std::fs;
 
 use anyhow::{Context, Result, bail};
+use ofs::sync::ReplicaState;
 
 use crate::cli::StatusArgs;
-
-use super::state::ReplicaState;
 
 pub(super) fn run(args: StatusArgs) -> Result<()> {
     let root = fs::canonicalize(&args.replica)
         .with_context(|| format!("cannot open replica directory: {}", args.replica.display()))?;
-    let state = ReplicaState::load(&args.state)?;
-    if state.root != root {
+    let state = ReplicaState::load(&args.state)?
+        .ok_or_else(|| anyhow::anyhow!("replica state does not exist: {}", args.state.display()))?;
+    if state.root() != root {
         bail!("replica state belongs to a different local directory");
     }
     if args.json {
@@ -36,17 +36,17 @@ pub(super) fn run(args: StatusArgs) -> Result<()> {
             serde_json::json!({
                 "access_model": "sync",
                 "conflicts": 0,
-                "common_sequence": state.cursor.sequence(),
+                "common_sequence": state.common().cursor.sequence(),
                 "pending": false,
-                "volume_id": state.volume_id.to_string(),
+                "volume_id": state.volume_id().to_string(),
                 "volume_model": "managed",
             })
         );
     } else {
         println!(
             "managed sync volume {} at change {}, 0 pending, 0 conflict(s)",
-            state.volume_id,
-            state.cursor.sequence()
+            state.volume_id(),
+            state.common().cursor.sequence()
         );
     }
     Ok(())

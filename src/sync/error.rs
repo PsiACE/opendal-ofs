@@ -15,10 +15,34 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Apache OpenDAL™ File System.
-//!
-//! Managed Sync follows the volume and access boundaries defined by RFC 016.
+use std::error::Error;
+use std::fmt;
 
-pub mod filesystem;
-pub mod managed;
-pub mod sync;
+use crate::filesystem::VolumeError;
+
+#[derive(Debug)]
+pub struct SyncError(String);
+
+impl SyncError {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+
+    pub(crate) fn io(action: &'static str, error: std::io::Error) -> Self {
+        Self(format!("{action}: {error}"))
+    }
+}
+
+impl fmt::Display for SyncError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl Error for SyncError {}
+
+impl From<VolumeError> for SyncError {
+    fn from(error: VolumeError) -> Self {
+        Self(error.to_string())
+    }
+}

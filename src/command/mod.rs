@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod state;
 mod status;
 mod sync;
 
