@@ -106,6 +106,13 @@ A file version contains:
 - SHA-256 of the complete logical byte sequence;
 - an ordered extent map.
 
+The ordinary filesystem `FileVersion` record stores `id`, `logical_size`,
+`logical_digest`, and an opaque `descriptor`. For Managed v1, `descriptor` is
+the strict CBOR encoding of an object with one `extents` field. Each extent has
+exactly `content`, `segment`, and `segment_offset`; content and segment
+references each have exactly `digest` and `length`. Unknown fields and trailing
+descriptor bytes are invalid.
+
 Each extent contains a `ContentRef`, a `SegmentRef`, and the byte offset of the
 content in that segment. Extents MUST be non-empty and ordered. Their logical
 offsets are the prefix sums of the preceding `ContentRef` lengths, so their
@@ -187,6 +194,13 @@ base HEAD envelope, namespace state machine, checkpoint and change formats,
 operation receipts, validation rules, and data layout. Operation identities
 are scoped to their originating authority and are not copied by a fork.
 
+The registry uses the `OFS1BRG1` strict CBOR envelope with a 4 MiB body limit.
+Its exact fields are `volume_id`, `default_branch`, `branches`,
+`maintenance_epoch`, and `maintenance_owner`. `branches` maps validated names
+to unique branch identities, and `default_branch` MUST occur in that map. The
+owner is present only while its non-zero epoch fences registry mutation and
+all registered HEADs for collection.
+
 ### HEAD
 
 HEAD has this envelope:
@@ -215,6 +229,24 @@ consecutive from the checkpoint cursor to the current cursor. The tail has at
 most 32 transactions. Writers checkpoint before appending a change would make
 the encoded transaction bodies exceed 128 KiB; this byte threshold is
 checkpoint policy rather than a second HEAD decoding limit.
+
+The exact Managed v1 HEAD fields are:
+
+| Record | Fields |
+| --- | --- |
+| `StoredHead` | `volume_id`, `branch_id`, `sealed`, `state`, `maintenance_epoch`, `maintenance` |
+| collection fence | `epoch`, `owner`, `fixed_cursor` |
+| namespace state | `checkpoint`, `checkpoint_cursor`, `tail`, `segments`, `operation_prefixes`, `outcome` |
+| checkpoint reference | `digest`, `length` |
+| change-segment reference | `digest`, `length`, `start`, `end` |
+| namespace change | `origin_branch`, `mutation` |
+| committed result | `origin_branch`, `cursor`, `request_sha256` |
+
+`operation_prefixes` is exactly 1024 unsigned 64-bit words. Bit `n` records
+that some committed `OperationId` began with the big-endian 16-bit value `n`.
+It is a bounded negative lookup filter: a set bit does not prove commitment,
+while a clear bit proves that the authority has never committed that prefix.
+It is not a second history or result store.
 
 ### Checkpoint
 
@@ -258,6 +290,11 @@ contains the volume identity and must continue the preceding cursor. HEAD
 records the digest, encoded length, start cursor, and end cursor. Recovery uses
 one bounded range GET, verifies the referenced bytes, then checks the derived
 start and end against HEAD. The encoded body is limited to 16 MiB.
+
+The exact body fields are `checkpoint` and `changes`. `start` and `end` are
+stored only in the HEAD reference and MUST equal the cursors derived from the
+decoded changes; they are deliberately repeated there so a reader can locate
+a retained position without first fetching every change object.
 
 ### Operation receipt
 
@@ -307,6 +344,10 @@ An operation receipt uses magic `OFS1OPR1` with the same strict
 authority scope, committed cursor, and publication request digest. The
 committed cursor contains the `OperationId`; the deterministic key is scoped
 by `base` or the lowercase branch id.
+
+The exact receipt fields are `origin_branch`, `cursor`, and
+`request_sha256`. There is no separate operation field: it is derived from the
+non-genesis committed cursor.
 
 HEAD stores the most recent committed result and a fixed operation-prefix
 filter. Recent results remain reconstructable from the transaction tail and
