@@ -17,11 +17,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::filesystem::{
-    ChangeCursor, DirectoryEntry, DirectoryRecord, FileVersion, FileVersionId, Generation,
-    NodeAttributes, NodeId, NodeKind, NodeRecord, OperationId, VolumeSnapshot,
+    ChangeCursor, DirectoryEntry, DirectoryRecord, FileVersionId, Generation, NodeAttributes,
+    NodeId, NodeKind, NodeRecord, OperationId, VolumeSnapshot,
 };
 use crate::managed::ManagedVolume;
 
@@ -29,7 +29,6 @@ use super::SyncError;
 
 pub(crate) struct ScannedTree {
     pub(crate) snapshot: VolumeSnapshot,
-    pub(crate) changed_files: Vec<(PathBuf, FileVersion)>,
 }
 
 #[derive(Clone, Copy)]
@@ -66,7 +65,6 @@ pub(crate) async fn scan(
 
     let mut file_versions = BTreeMap::new();
     let mut file_by_path = BTreeMap::<String, FileVersionId>::new();
-    let mut prepared = BTreeMap::<String, FileVersion>::new();
     for (path, entry) in &local {
         if entry.kind != NodeKind::RegularFile {
             continue;
@@ -76,7 +74,6 @@ pub(crate) async fn scan(
         file_versions
             .entry(version.id)
             .or_insert_with(|| version.clone());
-        prepared.insert(path.clone(), version);
     }
 
     let mut directories = BTreeMap::new();
@@ -170,21 +167,12 @@ pub(crate) async fn scan(
     if same_namespace(&snapshot, base) {
         return Ok(ScannedTree {
             snapshot: base.clone(),
-            changed_files: Vec::new(),
         });
     }
 
     let operation = OperationId::generate();
     snapshot.cursor = ChangeCursor::at(next_sequence, operation);
-    let changed_files = prepared
-        .into_iter()
-        .filter(|(_, version)| base.file_versions.get(&version.id) != Some(version))
-        .map(|(path, version)| (root.join(path), version))
-        .collect();
-    Ok(ScannedTree {
-        snapshot,
-        changed_files,
-    })
+    Ok(ScannedTree { snapshot })
 }
 
 fn same_namespace(left: &VolumeSnapshot, right: &VolumeSnapshot) -> bool {

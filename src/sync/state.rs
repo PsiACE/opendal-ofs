@@ -36,6 +36,13 @@ pub struct ReplicaState {
     format: String,
     root: PathBuf,
     common: VolumeSnapshot,
+    pending: Option<PendingPublication>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PendingPublication {
+    target: VolumeSnapshot,
 }
 
 impl ReplicaState {
@@ -45,6 +52,7 @@ impl ReplicaState {
             format: FORMAT.to_owned(),
             root,
             common,
+            pending: None,
         })
     }
 
@@ -110,6 +118,26 @@ impl ReplicaState {
 
     pub(crate) fn advance(&mut self, common: VolumeSnapshot) {
         self.common = common;
+        self.pending = None;
+    }
+
+    pub const fn has_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    pub(crate) fn pending_target(&self) -> Option<&VolumeSnapshot> {
+        self.pending.as_ref().map(|pending| &pending.target)
+    }
+
+    pub(crate) fn begin(&mut self, target: VolumeSnapshot) -> Result<(), SyncError> {
+        target.validate()?;
+        if target.volume_id != self.volume_id()
+            || target.cursor.sequence() != self.common.cursor.sequence() + 1
+        {
+            return Err(SyncError::new("pending publication ancestry is invalid"));
+        }
+        self.pending = Some(PendingPublication { target });
+        Ok(())
     }
 }
 

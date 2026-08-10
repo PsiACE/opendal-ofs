@@ -37,16 +37,17 @@ pub(super) fn run(args: StatusArgs) -> Result<()> {
                 "access_model": "sync",
                 "conflicts": 0,
                 "common_sequence": state.common().cursor.sequence(),
-                "pending": false,
+                "pending": state.has_pending(),
                 "volume_id": state.volume_id().to_string(),
                 "volume_model": "managed",
             })
         );
     } else {
         println!(
-            "managed sync volume {} at change {}, 0 pending, 0 conflict(s)",
+            "managed sync volume {} at change {}, {} pending, 0 conflict(s)",
             state.volume_id(),
-            state.common().cursor.sequence()
+            state.common().cursor.sequence(),
+            usize::from(state.has_pending())
         );
     }
     Ok(())

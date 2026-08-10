@@ -17,6 +17,7 @@
 
 use std::path::Path;
 
+use crate::filesystem::{NodeKind, VolumeSnapshot};
 use crate::managed::ManagedVolume;
 
 use super::install::install;
@@ -65,6 +66,12 @@ impl SyncEngine {
             ));
         }
 
+        if state.has_pending() {
+            return self
+                .recover_pending(&root, state_path, state, observed)
+                .await;
+        }
+
         let local = scan(&root, state.common(), &self.volume).await?;
         let local_changed = local.snapshot.cursor != state.common().cursor;
         let remote_changed = observed.snapshot.cursor != state.common().cursor;
@@ -74,9 +81,10 @@ impl SyncEngine {
                 sequence: state.common().cursor.sequence(),
             }),
             (true, false) => {
-                for (path, version) in &local.changed_files {
-                    self.volume.publish_file(path, version).await?;
-                }
+                state.begin(local.snapshot.clone())?;
+                state.save(state_path)?;
+                self.publish_target_files(&root, state.common(), &local.snapshot)
+                    .await?;
                 self.volume
                     .publish(&observed, local.snapshot.clone())
                     .await?;
@@ -106,6 +114,70 @@ impl SyncEngine {
                 "local and remote changes require reconciliation",
             )),
         }
+    }
+
+    async fn recover_pending(
+        &self,
+        root: &Path,
+        state_path: &Path,
+        mut state: ReplicaState,
+        observed: crate::managed::ManagedObservation,
+    ) -> Result<SyncOutcome, SyncError> {
+        let target = state
+            .pending_target()
+            .expect("pending state has a target")
+            .clone();
+        if observed.snapshot.cursor == target.cursor {
+            state.advance(target);
+            state.save(state_path)?;
+            return Ok(SyncOutcome {
+                published: true,
+                sequence: state.common().cursor.sequence(),
+            });
+        }
+        if observed.snapshot.cursor != state.common().cursor {
+            return Err(SyncError::new(
+                "pending publication outcome is unknown after the remote volume advanced",
+            ));
+        }
+        self.publish_target_files(root, state.common(), &target)
+            .await?;
+        self.volume.publish(&observed, target.clone()).await?;
+        state.advance(target);
+        state.save(state_path)?;
+        Ok(SyncOutcome {
+            published: true,
+            sequence: state.common().cursor.sequence(),
+        })
+    }
+
+    async fn publish_target_files(
+        &self,
+        root: &Path,
+        common: &VolumeSnapshot,
+        target: &VolumeSnapshot,
+    ) -> Result<(), SyncError> {
+        for (path, node_id) in target.paths()? {
+            let node = &target.nodes[&node_id];
+            if node.kind != NodeKind::RegularFile {
+                continue;
+            }
+            let version = node
+                .file_version
+                .and_then(|id| target.file_versions.get(&id))
+                .ok_or_else(|| SyncError::new("pending file has no file version"))?;
+            if common.file_versions.get(&version.id) == Some(version) {
+                continue;
+            }
+            let observed = self.volume.inspect_file(&root.join(&path)).await?;
+            if observed != *version {
+                return Err(SyncError::new(
+                    "local file changed after its publication was prepared",
+                ));
+            }
+            self.volume.publish_file(&root.join(path), version).await?;
+        }
+        Ok(())
     }
 }
 
