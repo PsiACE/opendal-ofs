@@ -189,17 +189,12 @@ impl StagedTree {
         {
             bail!("volume did not prepare every changed file exactly once");
         }
-        let staged = fs_operator(&root)?;
         let mut entries = BTreeMap::new();
         let mut versions = BTreeMap::new();
         let cache = BTreeMap::new();
         for (path, expected) in &tree.entries {
             let file = match expected.kind {
                 NodeKind::Directory => {
-                    staged
-                        .create_dir(&format!("{path}/"))
-                        .await
-                        .with_context(|| format!("create staging directory {path:?}"))?;
                     require_same_identity(
                         &tree.root,
                         path,

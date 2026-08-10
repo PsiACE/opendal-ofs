@@ -11,8 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use futures::TryStreamExt as _;
-use opendal::{EntryMode, Operator, services};
+use opendal::{Operator, services};
 use serde::{Deserialize, Serialize};
 
 use crate::filesystem::{NodeKind, validate_portable_paths};
@@ -44,60 +43,52 @@ pub(crate) struct LocalTree {
 impl LocalTree {
     pub(crate) async fn scan(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
-        let operator = fs_operator(root)?;
-        let mut listed = operator
-            .lister_with("")
-            .recursive(true)
-            .await
-            .context("scan local replica through OpenDAL fs")?;
+        root.to_str()
+            .context("local replica path is not valid Unicode")?;
+        let mut pending = vec![(root.to_owned(), String::new())];
         let mut entries = BTreeMap::new();
         let mut file_identities = BTreeMap::new();
-        while let Some(entry) = listed
-            .try_next()
-            .await
-            .context("scan local replica through OpenDAL fs")?
-        {
-            let path = entry.path().trim_end_matches('/');
-            if path.is_empty() {
-                continue;
-            }
-            let metadata = entry.metadata();
-            let kind = match metadata.mode() {
-                EntryMode::DIR => NodeKind::Directory,
-                EntryMode::FILE => NodeKind::RegularFile,
-                _ => bail!(
-                    "local path {path:?} is a symbolic link or special file; remove it before sync"
-                ),
-            };
-            let modified = metadata
-                .last_modified()
-                .context("local filesystem did not report modification time")?
-                .to_string();
-            let (native_identity, executable, link_count) = native_attributes_at(root, path, kind)?;
-            if kind == NodeKind::RegularFile {
-                if link_count > 1 {
-                    bail!(
-                        "local path {path:?} is a hard link; Sync does not publish hard-linked files"
-                    );
+        while let Some((directory, parent)) = pending.pop() {
+            let mut children = tokio::fs::read_dir(&directory)
+                .await
+                .with_context(|| format!("scan local directory {parent:?}"))?;
+            while let Some(child) = children
+                .next_entry()
+                .await
+                .with_context(|| format!("scan local directory {parent:?}"))?
+            {
+                let name = child.file_name().into_string().map_err(|_| {
+                    anyhow::anyhow!("local directory {parent:?} contains a non-Unicode name")
+                })?;
+                let path = if parent.is_empty() {
+                    name
+                } else {
+                    format!("{parent}/{name}")
+                };
+                let (entry, link_count) = local_entry(
+                    &path,
+                    tokio::fs::symlink_metadata(child.path())
+                        .await
+                        .with_context(|| format!("inspect local path {path:?}"))?,
+                )?;
+                if entry.kind == NodeKind::Directory {
+                    pending.push((child.path(), path.clone()));
+                } else {
+                    if link_count > 1 {
+                        bail!(
+                            "local path {path:?} is a hard link; Sync does not publish hard-linked files"
+                        );
+                    }
+                    if let Some(identity) = entry.native_identity
+                        && let Some(other) = file_identities.insert(identity, path.clone())
+                    {
+                        bail!(
+                            "local paths {other:?} and {path:?} are hard links; Sync does not publish hard-linked files"
+                        );
+                    }
                 }
-                if let Some(identity) = native_identity
-                    && let Some(other) = file_identities.insert(identity, path.to_owned())
-                {
-                    bail!(
-                        "local paths {other:?} and {path:?} are hard links; Sync does not publish hard-linked files"
-                    );
-                }
+                entries.insert(path, entry);
             }
-            entries.insert(
-                path.to_owned(),
-                LocalEntry {
-                    kind,
-                    size: metadata.content_length(),
-                    modified,
-                    executable,
-                    native_identity,
-                },
-            );
         }
         validate_portable_paths(entries.keys().map(String::as_str))
             .map_err(anyhow::Error::new)
@@ -110,26 +101,13 @@ impl LocalTree {
 }
 
 pub(crate) async fn entry_at(root: &Path, path: &str) -> Result<LocalEntry> {
-    let metadata = fs_operator(root)?
-        .stat(path)
-        .await
-        .with_context(|| format!("inspect materialized path {path:?}"))?;
-    let kind = match metadata.mode() {
-        EntryMode::DIR => NodeKind::Directory,
-        EntryMode::FILE => NodeKind::RegularFile,
-        _ => bail!("materialized path {path:?} is a symbolic link or special file"),
-    };
-    let (native_identity, executable, _) = native_attributes_at(root, path, kind)?;
-    Ok(LocalEntry {
-        kind,
-        size: metadata.content_length(),
-        modified: metadata
-            .last_modified()
-            .context("local filesystem did not report modification time")?
-            .to_string(),
-        executable,
-        native_identity,
-    })
+    local_entry(
+        path,
+        tokio::fs::symlink_metadata(root.join(path))
+            .await
+            .with_context(|| format!("inspect materialized path {path:?}"))?,
+    )
+    .map(|(entry, _)| entry)
 }
 
 pub(crate) fn native_identity_at(
@@ -137,38 +115,46 @@ pub(crate) fn native_identity_at(
     path: &str,
     kind: NodeKind,
 ) -> Result<Option<NativeIdentity>> {
-    native_attributes_at(root, path, kind).map(|(identity, _, _)| identity)
+    let (entry, _) = local_entry(
+        path,
+        fs::symlink_metadata(root.join(path))
+            .with_context(|| format!("inspect local attributes for {path:?}"))?,
+    )?;
+    if entry.kind != kind {
+        bail!("local path {path:?} changed kind while it was being inspected; retry sync");
+    }
+    Ok(entry.native_identity)
 }
 
-fn native_attributes_at(
-    root: &Path,
-    path: &str,
-    kind: NodeKind,
-) -> Result<(Option<NativeIdentity>, bool, u64)> {
+fn local_entry(path: &str, metadata: fs::Metadata) -> Result<(LocalEntry, u64)> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-        let metadata = fs::symlink_metadata(root.join(path))
-            .with_context(|| format!("inspect local attributes for {path:?}"))?;
-        let expected = match kind {
-            NodeKind::Directory => metadata.file_type().is_dir(),
-            NodeKind::RegularFile => metadata.file_type().is_file(),
+        let kind = match metadata.file_type() {
+            kind if kind.is_dir() => NodeKind::Directory,
+            kind if kind.is_file() => NodeKind::RegularFile,
+            _ => bail!(
+                "local path {path:?} is a symbolic link or special file; remove it before sync"
+            ),
         };
-        if !expected {
-            bail!("local path {path:?} changed kind while it was being inspected; retry sync");
-        }
         Ok((
-            Some(NativeIdentity {
-                device: metadata.dev(),
-                inode: metadata.ino(),
-            }),
-            kind == NodeKind::RegularFile && metadata.permissions().mode() & 0o111 != 0,
+            LocalEntry {
+                kind,
+                size: metadata.len(),
+                modified: format!("{}.{:09}", metadata.mtime(), metadata.mtime_nsec()),
+                executable: kind == NodeKind::RegularFile
+                    && metadata.permissions().mode() & 0o111 != 0,
+                native_identity: Some(NativeIdentity {
+                    device: metadata.dev(),
+                    inode: metadata.ino(),
+                }),
+            },
             metadata.nlink(),
         ))
     }
     #[cfg(not(unix))]
     {
-        let _ = (root, path, kind);
+        let _ = (path, metadata);
         bail!(
             "Managed Sync requires native file identity and executable attributes on this platform"
         )
