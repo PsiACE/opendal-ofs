@@ -21,11 +21,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::records::managed_generation_number;
-use super::validation::{validate_directory_generation, validate_node_generation};
+use super::validation::{validate_generation, validate_node_generation};
 use super::{decode_file_version, file_versions_have_consistent_segments};
 use crate::filesystem::{
-    BranchId, ChangeCursor, DirectoryRecord, Generation, NodeKind, OperationId, VolumeError,
-    VolumeId, VolumeMutation, VolumeSnapshot,
+    BranchId, ChangeCursor, Generation, NodeKind, OperationId, VolumeError, VolumeId,
+    VolumeMutation, VolumeSnapshot,
 };
 use crate::managed::error::corrupt;
 
@@ -36,9 +36,7 @@ pub(crate) struct NamespaceChange {
     pub(crate) mutation: VolumeMutation,
 }
 
-pub(super) struct ValidatedChange {
-    directories: Vec<Option<DirectoryRecord>>,
-}
+pub(super) struct ValidatedChange(());
 
 impl NamespaceChange {
     pub(crate) fn new(mutation: VolumeMutation, origin_branch: Option<BranchId>) -> Self {
@@ -161,7 +159,7 @@ impl NamespaceChange {
     pub(super) fn apply_validated(
         &self,
         base: Option<VolumeSnapshot>,
-        validated: ValidatedChange,
+        _validated: ValidatedChange,
     ) -> VolumeSnapshot {
         let mut target = base.unwrap_or_else(|| VolumeSnapshot {
             volume_id: self.mutation.volume_id,
@@ -177,10 +175,17 @@ impl NamespaceChange {
                 None => target.nodes.remove(&change.node),
             };
         }
-        for (change, record) in self.mutation.directories.iter().zip(validated.directories) {
-            match record {
-                Some(record) => target.directories.insert(change.directory, record),
-                None => target.directories.remove(&change.directory),
+        for change in &self.mutation.directories {
+            match &change.target {
+                Some(delta) => {
+                    let current = target.directories.remove(&change.directory);
+                    target
+                        .directories
+                        .insert(change.directory, delta.apply(change.directory, current));
+                }
+                None => {
+                    target.directories.remove(&change.directory);
+                }
             };
         }
         for change in &self.mutation.file_versions {
@@ -226,25 +231,26 @@ impl NamespaceChange {
             }
             validate_node_generation(current, change.target.as_ref())?;
         }
-        let mut validated_directories = Vec::with_capacity(self.mutation.directories.len());
         for change in &self.mutation.directories {
             let current = directories.get(&change.directory);
             if current.map(|record| &record.generation) != change.expected_generation.as_ref() {
                 return Ok(None);
             }
-            let target = change
-                .target
-                .as_ref()
-                .map(|delta| delta.apply(change.directory, current))
-                .transpose()?;
-            if current.is_none() && target.is_none() {
+            if current.is_none() && change.target.is_none() {
                 return Err(corrupt(
                     "read Managed transaction",
                     "directory removal is invalid",
                 ));
             }
-            validate_directory_generation(current, target.as_ref())?;
-            validated_directories.push(target);
+            let (generation, changed) = match &change.target {
+                Some(delta) => (Some(&delta.generation), delta.validate_against(current)?),
+                None => (None, true),
+            };
+            validate_generation(
+                current.map(|directory| &directory.generation),
+                generation,
+                changed,
+            )?;
         }
         for change in &self.mutation.file_versions {
             match (&change.target, versions.get(&change.version)) {
@@ -285,9 +291,7 @@ impl NamespaceChange {
                 ));
             }
         }
-        Ok(Some(ValidatedChange {
-            directories: validated_directories,
-        }))
+        Ok(Some(ValidatedChange(())))
     }
 
     pub(crate) fn validate(&self, volume_id: VolumeId) -> Result<(), VolumeError> {

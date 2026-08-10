@@ -18,8 +18,8 @@
 use super::file_versions_have_consistent_segments;
 use super::records::{managed_generation, managed_generation_number, next_managed_generation};
 use crate::filesystem::{
-    DirectoryRecord, FileVersionId, Generation, NodeAttributes, NodeId, NodeKind, NodeRecord,
-    VolumeError, VolumeSnapshot,
+    FileVersionId, Generation, NodeAttributes, NodeId, NodeKind, NodeRecord, VolumeError,
+    VolumeSnapshot,
 };
 use crate::managed::error::invalid;
 
@@ -38,12 +38,7 @@ pub(crate) fn validate_snapshot(snapshot: &VolumeSnapshot) -> Result<(), VolumeE
             ));
         }
     }
-    if snapshot
-        .file_versions
-        .iter()
-        .any(|(id, version)| *id != version.id)
-        || !file_versions_have_consistent_segments(snapshot.file_versions.values())
-    {
+    if !file_versions_have_consistent_segments(snapshot.file_versions.values()) {
         return Err(invalid("read Managed namespace", "file version is invalid"));
     }
     Ok(())
@@ -66,18 +61,7 @@ pub(super) fn validate_node_generation(
     )
 }
 
-pub(super) fn validate_directory_generation(
-    current: Option<&DirectoryRecord>,
-    next: Option<&DirectoryRecord>,
-) -> Result<(), VolumeError> {
-    validate_generation(
-        current.map(|record| &record.generation),
-        next.map(|record| &record.generation),
-        current.map(|record| &record.entries) != next.map(|record| &record.entries),
-    )
-}
-
-fn validate_generation(
+pub(super) fn validate_generation(
     current: Option<&Generation>,
     next: Option<&Generation>,
     changed: bool,
@@ -109,7 +93,7 @@ mod tests {
     use std::num::NonZeroU64;
 
     use super::*;
-    use crate::filesystem::{ChangeCursor, OperationId, VolumeId};
+    use crate::filesystem::{ChangeCursor, DirectoryRecord, OperationId, VolumeId};
     use crate::managed::metadata::namespace::NamespaceChange;
 
     const ROOT: NodeId = NodeId::from_bytes([1; 16]);

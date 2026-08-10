@@ -105,24 +105,22 @@ impl VolumeSnapshot {
         let mut pending = vec![(String::new(), self.root)];
         let mut expanded = BTreeSet::new();
         while let Some((path, node)) = pending.pop() {
-            if !path.is_empty() && paths.insert(path.clone(), node).is_some() {
-                return Err(invalid_snapshot("namespace contains a duplicate path"));
-            }
             let record = &self.nodes[&node];
-            if record.kind != NodeKind::Directory {
-                continue;
+            if record.kind == NodeKind::Directory {
+                if !expanded.insert(node) {
+                    return Err(invalid_snapshot("namespace directories do not form a tree"));
+                }
+                for (name, entry) in self.directories[&node].entries.iter().rev() {
+                    let child = if path.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{path}/{name}")
+                    };
+                    pending.push((child, entry.node));
+                }
             }
-            if !expanded.insert(node) {
-                return Err(invalid_snapshot("namespace directories do not form a tree"));
-            }
-            let directory = &self.directories[&node];
-            for (name, entry) in directory.entries.iter().rev() {
-                let child = if path.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{path}/{name}")
-                };
-                pending.push((child, entry.node));
+            if !path.is_empty() {
+                paths.insert(path, node);
             }
         }
         Ok(paths)
@@ -192,6 +190,16 @@ impl VolumeSnapshot {
                     ));
                 }
             }
+        }
+
+        if self
+            .file_versions
+            .iter()
+            .any(|(id, version)| *id != version.id)
+        {
+            return Err(invalid_snapshot(
+                "file-version map key does not match its record identity",
+            ));
         }
 
         let paths = self.paths()?;
@@ -319,30 +327,37 @@ impl DirectoryMutation {
         }
     }
 
-    pub(crate) fn apply(
+    pub(crate) fn validate_against(
         &self,
-        node: NodeId,
         base: Option<&DirectoryRecord>,
-    ) -> Result<DirectoryRecord, VolumeError> {
-        let mut directory = base.cloned().unwrap_or(DirectoryRecord {
+    ) -> Result<bool, VolumeError> {
+        if self.remove_entries.iter().any(|name| {
+            self.put_entries.contains_key(name)
+                || base.is_none_or(|directory| !directory.entries.contains_key(name))
+        }) {
+            return Err(invalid_mutation("directory entry removal is invalid"));
+        }
+        Ok(base.is_none()
+            || !self.remove_entries.is_empty()
+            || self.put_entries.iter().any(|(name, entry)| {
+                base.and_then(|directory| directory.entries.get(name)) != Some(entry)
+            }))
+    }
+
+    pub(crate) fn apply(&self, node: NodeId, base: Option<DirectoryRecord>) -> DirectoryRecord {
+        let mut directory = base.unwrap_or(DirectoryRecord {
             node,
             generation: self.generation.clone(),
             entries: BTreeMap::new(),
         });
         directory.generation = self.generation.clone();
-        let mut changed = BTreeSet::new();
         for name in &self.remove_entries {
-            if !changed.insert(name.clone()) || directory.entries.remove(name).is_none() {
-                return Err(invalid_mutation("directory entry removal is invalid"));
-            }
+            directory.entries.remove(name);
         }
         for (name, entry) in &self.put_entries {
-            if !changed.insert(name.clone()) {
-                return Err(invalid_mutation("directory entry update is invalid"));
-            }
             directory.entries.insert(name.clone(), *entry);
         }
-        Ok(directory)
+        directory
     }
 }
 
