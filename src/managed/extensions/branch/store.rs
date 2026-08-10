@@ -89,7 +89,7 @@ impl BranchStore {
             StoredBranchRegistry::initial(self.volume_id, default_name.clone(), branch_id);
         let encoded_registry = REGISTRY_RECORD
             .encode(&registry)
-            .map_err(|error| invalid("initialize Managed branches", error.message()))?;
+            .map_err(|error| invalid("initialize Managed branches", error))?;
         if !self
             .backend
             .create(
@@ -404,7 +404,7 @@ impl BranchStore {
     ) -> Result<bool, VolumeError> {
         let bytes = REGISTRY_RECORD
             .encode(registry)
-            .map_err(|error| invalid(action, error.message()))?;
+            .map_err(|error| invalid(action, error))?;
         self.backend
             .replace(REGISTRY_KEY, revision, bytes, action)
             .await
@@ -442,7 +442,7 @@ impl BranchStore {
         };
         let registry: StoredBranchRegistry = REGISTRY_RECORD
             .decode(&bytes)
-            .map_err(|error| corrupt("read Managed branches", error.message()))?;
+            .map_err(|error| corrupt("read Managed branches", error))?;
         registry.validate(self.volume_id)?;
         Ok(Some((registry, revision)))
     }

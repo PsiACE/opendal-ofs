@@ -453,13 +453,13 @@ impl StoredHead {
 pub(crate) fn encode_head(value: &StoredHead) -> Result<Vec<u8>, VolumeError> {
     HEAD_RECORD
         .encode(value)
-        .map_err(|error| invalid("write Managed namespace", error.message()))
+        .map_err(|error| invalid("write Managed namespace", error))
 }
 
 pub(crate) fn decode_head(bytes: &[u8]) -> Result<StoredHead, VolumeError> {
     HEAD_RECORD
         .decode(bytes)
-        .map_err(|error| corrupt("read Managed namespace", error.message()))
+        .map_err(|error| corrupt("read Managed namespace", error))
 }
 
 fn committed_result(change: &NamespaceChange) -> Result<StoredCommittedResult, VolumeError> {

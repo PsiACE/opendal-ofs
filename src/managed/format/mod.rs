@@ -23,37 +23,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-pub(crate) enum RecordEncodeError {
-    Encode,
-    TooLarge,
-}
-
-pub(crate) enum RecordDecodeError {
-    Envelope,
-    Checksum,
-    Decode,
-    TrailingBytes,
-}
-
-impl RecordEncodeError {
-    pub(crate) const fn message(&self) -> &'static str {
-        match self {
-            Self::Encode => "record cannot be encoded",
-            Self::TooLarge => "record exceeds its size limit",
-        }
-    }
-}
-
-impl RecordDecodeError {
-    pub(crate) const fn message(&self) -> &'static str {
-        match self {
-            Self::Envelope => "record format is invalid",
-            Self::Checksum => "record checksum is invalid",
-            Self::Decode => "record cannot be decoded",
-            Self::TrailingBytes => "record has trailing bytes",
-        }
-    }
-}
+type RecordError = &'static str;
 
 /// The stable `magic || CBOR || SHA-256` envelope used by Managed v1 records.
 pub(crate) struct V1Record {
@@ -108,11 +78,11 @@ impl CompressedRecord {
         }
     }
 
-    pub(crate) fn encode<T: Serialize>(&self, value: &T) -> Result<Vec<u8>, RecordEncodeError> {
+    pub(crate) fn encode<T: Serialize>(&self, value: &T) -> Result<Vec<u8>, RecordError> {
         let mut body = Vec::new();
-        ciborium::into_writer(value, &mut body).map_err(|_| RecordEncodeError::Encode)?;
+        ciborium::into_writer(value, &mut body).map_err(|_| "record cannot be encoded")?;
         if body.len() > self.maximum_decoded_bytes {
-            return Err(RecordEncodeError::TooLarge);
+            return Err("record exceeds its size limit");
         }
         let length = match self.length {
             LengthEncoding::U32 => u32::try_from(body.len())
@@ -122,8 +92,8 @@ impl CompressedRecord {
                 .map(u64::to_be_bytes)
                 .map(Vec::from),
         }
-        .map_err(|_| RecordEncodeError::TooLarge)?;
-        let compressed = zstd::bulk::compress(&body, 3).map_err(|_| RecordEncodeError::Encode)?;
+        .map_err(|_| "record exceeds its size limit")?;
+        let compressed = zstd::bulk::compress(&body, 3).map_err(|_| "record cannot be encoded")?;
         let encoded_length = self
             .magic
             .len()
@@ -131,7 +101,7 @@ impl CompressedRecord {
             .saturating_add(compressed.len())
             .saturating_add(if self.checksum { 32 } else { 0 });
         if encoded_length > self.maximum_encoded_bytes {
-            return Err(RecordEncodeError::TooLarge);
+            return Err("record exceeds its size limit");
         }
         let mut bytes = Vec::with_capacity(encoded_length);
         bytes.extend_from_slice(&self.magic);
@@ -143,24 +113,24 @@ impl CompressedRecord {
         Ok(bytes)
     }
 
-    pub(crate) fn decode<T: DeserializeOwned>(&self, bytes: &[u8]) -> Result<T, RecordDecodeError> {
+    pub(crate) fn decode<T: DeserializeOwned>(&self, bytes: &[u8]) -> Result<T, RecordError> {
         if bytes.len() > self.maximum_encoded_bytes {
-            return Err(RecordDecodeError::Envelope);
+            return Err("record format is invalid");
         }
         let payload = bytes
             .strip_prefix(&self.magic)
-            .ok_or(RecordDecodeError::Envelope)?;
+            .ok_or("record format is invalid")?;
         let encoded = if self.checksum {
             let body = payload
                 .get(
                     ..payload
                         .len()
                         .checked_sub(32)
-                        .ok_or(RecordDecodeError::Envelope)?,
+                        .ok_or("record format is invalid")?,
                 )
-                .ok_or(RecordDecodeError::Envelope)?;
+                .ok_or("record format is invalid")?;
             if Sha256::digest(&bytes[..bytes.len() - 32]).as_slice() != &bytes[bytes.len() - 32..] {
-                return Err(RecordDecodeError::Checksum);
+                return Err("record checksum is invalid");
             }
             body
         } else {
@@ -170,30 +140,30 @@ impl CompressedRecord {
             LengthEncoding::U32 => {
                 let (length, compressed) = encoded
                     .split_first_chunk::<4>()
-                    .ok_or(RecordDecodeError::Envelope)?;
+                    .ok_or("record format is invalid")?;
                 (u32::from_be_bytes(*length) as usize, compressed)
             }
             LengthEncoding::U64 => {
                 let (length, compressed) = encoded
                     .split_first_chunk::<8>()
-                    .ok_or(RecordDecodeError::Envelope)?;
+                    .ok_or("record format is invalid")?;
                 let length = usize::try_from(u64::from_be_bytes(*length))
-                    .map_err(|_| RecordDecodeError::Envelope)?;
+                    .map_err(|_| "record format is invalid")?;
                 (length, compressed)
             }
         };
         if decoded_length > self.maximum_decoded_bytes {
-            return Err(RecordDecodeError::Envelope);
+            return Err("record format is invalid");
         }
         let body = zstd::bulk::decompress(compressed, decoded_length)
-            .map_err(|_| RecordDecodeError::Decode)?;
+            .map_err(|_| "record cannot be decoded")?;
         if body.len() != decoded_length {
-            return Err(RecordDecodeError::Envelope);
+            return Err("record format is invalid");
         }
         let mut input = Cursor::new(body);
-        let value = ciborium::from_reader(&mut input).map_err(|_| RecordDecodeError::Decode)?;
+        let value = ciborium::from_reader(&mut input).map_err(|_| "record cannot be decoded")?;
         if input.position() != decoded_length as u64 {
-            return Err(RecordDecodeError::TrailingBytes);
+            return Err("record has trailing bytes");
         }
         Ok(value)
     }
@@ -214,11 +184,11 @@ impl V1Record {
             .saturating_add(32)
     }
 
-    pub(crate) fn encode<T: Serialize>(&self, value: &T) -> Result<Vec<u8>, RecordEncodeError> {
+    pub(crate) fn encode<T: Serialize>(&self, value: &T) -> Result<Vec<u8>, RecordError> {
         let mut body = Vec::new();
-        ciborium::into_writer(value, &mut body).map_err(|_| RecordEncodeError::Encode)?;
+        ciborium::into_writer(value, &mut body).map_err(|_| "record cannot be encoded")?;
         if body.len() > self.maximum_body_bytes {
-            return Err(RecordEncodeError::TooLarge);
+            return Err("record exceeds its size limit");
         }
         let mut bytes = Vec::with_capacity(self.magic.len() + body.len() + 32);
         bytes.extend_from_slice(&self.magic);
@@ -227,20 +197,20 @@ impl V1Record {
         Ok(bytes)
     }
 
-    pub(crate) fn decode<T: DeserializeOwned>(&self, bytes: &[u8]) -> Result<T, RecordDecodeError> {
+    pub(crate) fn decode<T: DeserializeOwned>(&self, bytes: &[u8]) -> Result<T, RecordError> {
         let body = bytes
             .strip_prefix(&self.magic)
             .and_then(|bytes| bytes.get(..bytes.len().checked_sub(32)?))
-            .ok_or(RecordDecodeError::Envelope)?;
+            .ok_or("record format is invalid")?;
         if body.len() > self.maximum_body_bytes
             || Sha256::digest(&bytes[..bytes.len() - 32]).as_slice() != &bytes[bytes.len() - 32..]
         {
-            return Err(RecordDecodeError::Checksum);
+            return Err("record checksum is invalid");
         }
         let mut input = Cursor::new(body);
-        let value = ciborium::from_reader(&mut input).map_err(|_| RecordDecodeError::Decode)?;
+        let value = ciborium::from_reader(&mut input).map_err(|_| "record cannot be decoded")?;
         if input.position() != body.len() as u64 {
-            return Err(RecordDecodeError::TrailingBytes);
+            return Err("record has trailing bytes");
         }
         Ok(value)
     }

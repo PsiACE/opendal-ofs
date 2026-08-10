@@ -106,7 +106,7 @@ impl NamespaceStore {
         }
         let segment: StoredChangeSegment = CHANGE_SEGMENT_RECORD
             .decode(&bytes)
-            .map_err(|error| corrupt("read Managed change segment", error.message()))?;
+            .map_err(|error| corrupt("read Managed change segment", error))?;
         segment.validate(self.volume_id)?;
         if segment.reference(reference.digest, reference.length) != reference {
             return Err(corrupt(
@@ -123,7 +123,7 @@ impl NamespaceStore {
     ) -> Result<ChangeSegmentRef, VolumeError> {
         let bytes = CHANGE_SEGMENT_RECORD
             .encode(segment)
-            .map_err(|error| invalid("write Managed change segment", error.message()))?;
+            .map_err(|error| invalid("write Managed change segment", error))?;
         let digest: [u8; 32] = Sha256::digest(&bytes).into();
         let length = bytes.len() as u64;
         ensure_immutable(
@@ -217,13 +217,13 @@ impl NamespaceStore {
 pub(super) fn encode_checkpoint(checkpoint: &VolumeSnapshot) -> Result<Vec<u8>, VolumeError> {
     CHECKPOINT_RECORD
         .encode(checkpoint)
-        .map_err(|error| invalid("checkpoint Managed namespace", error.message()))
+        .map_err(|error| invalid("checkpoint Managed namespace", error))
 }
 
 pub(super) fn decode_checkpoint(bytes: &[u8]) -> Result<VolumeSnapshot, VolumeError> {
     CHECKPOINT_RECORD
         .decode(bytes)
-        .map_err(|error| corrupt("read Managed namespace", error.message()))
+        .map_err(|error| corrupt("read Managed namespace", error))
 }
 
 fn checkpoint_key(id: [u8; 32]) -> String {

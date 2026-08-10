@@ -83,7 +83,7 @@ impl NamespaceStore {
         };
         let result: StoredCommittedResult = OPERATION_RECORD
             .decode(&bytes)
-            .map_err(|error| corrupt("resolve Managed publication", error.message()))?;
+            .map_err(|error| corrupt("resolve Managed publication", error))?;
         if result.origin_branch != self.branch_id() || result.operation() != Some(operation) {
             return Err(corrupt(
                 "resolve Managed publication",
@@ -102,7 +102,7 @@ impl NamespaceStore {
             .expect("a committed result has a publication operation");
         let bytes = OPERATION_RECORD
             .encode(result)
-            .map_err(|error| invalid("record Managed publication", error.message()))?;
+            .map_err(|error| invalid("record Managed publication", error))?;
         ensure_immutable(
             &self.data,
             &self.operation_key(operation),
