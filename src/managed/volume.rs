@@ -26,12 +26,13 @@ use super::format::ExtentMap;
 use super::metadata::namespace::{
     FileVersionRecord, NamespacePublication, NamespaceSnapshot, NamespaceStore, NamespaceWitness,
 };
-use super::{AuthorityKnownContent, ManagedData, ManagedError, ManagedErrorKind};
+use super::{AuthorityKnownContent, ManagedData};
 use crate::filesystem::{AuthorityIdentity, CommitOutcome, OperationId, VolumeId};
 use crate::filesystem::{
-    FileVersion, MaterializeRequest, Volume, VolumeError, VolumeErrorKind, VolumeObservation,
-    VolumePublication, VolumeSnapshot,
+    FileVersion, MaterializeRequest, Volume, VolumeError, VolumeObservation, VolumePublication,
+    VolumeSnapshot,
 };
+use crate::managed::error::{corrupt, invalid};
 
 #[derive(Clone)]
 pub struct ManagedVolume {
@@ -49,7 +50,7 @@ impl ManagedVolume {
     pub(crate) fn new(
         namespace: NamespaceStore,
         data_operator: Operator,
-    ) -> Result<Self, ManagedError> {
+    ) -> Result<Self, VolumeError> {
         Ok(Self {
             namespace,
             data: ManagedData::new(data_operator)?,
@@ -60,7 +61,7 @@ impl ManagedVolume {
     async fn observe_from(
         &self,
         base: Option<&NamespaceSnapshot>,
-    ) -> Result<Option<ManagedObservation>, ManagedError> {
+    ) -> Result<Option<ManagedObservation>, VolumeError> {
         match base {
             Some(base) => self.namespace.observe_from(base).await?,
             None => self.namespace.observe().await?,
@@ -76,7 +77,7 @@ impl ManagedVolume {
         &self,
         observed: Option<&ManagedObservation>,
         publication: &NamespacePublication,
-    ) -> Result<CommitOutcome, ManagedError> {
+    ) -> Result<CommitOutcome, VolumeError> {
         let base = observed
             .map(|observed| to_managed_snapshot(&observed.filesystem_snapshot))
             .transpose()?;
@@ -119,9 +120,9 @@ impl Volume for ManagedVolume {
         generation: &crate::filesystem::Generation,
     ) -> Result<crate::filesystem::Generation, VolumeError> {
         super::metadata::namespace::next_managed_generation(generation).ok_or_else(|| {
-            VolumeError::new(
-                VolumeErrorKind::Invalid,
-                "advance filesystem generation: generation is invalid or exhausted",
+            invalid(
+                "advance filesystem generation",
+                "generation is invalid or exhausted",
             )
         })
     }
@@ -131,9 +132,7 @@ impl Volume for ManagedVolume {
         base: Option<&VolumeSnapshot>,
     ) -> Result<Option<Self::Observation>, VolumeError> {
         let base = base.map(to_managed_snapshot).transpose()?;
-        ManagedVolume::observe_from(self, base.as_ref())
-            .await
-            .map_err(Into::into)
+        ManagedVolume::observe_from(self, base.as_ref()).await
     }
 
     async fn stage_files(
@@ -173,7 +172,6 @@ impl Volume for ManagedVolume {
         self.data
             .finalize_staged_files(staging, files, &known)
             .await
-            .map_err(Into::into)
     }
 
     async fn publish(
@@ -182,13 +180,11 @@ impl Volume for ManagedVolume {
         publication: &VolumePublication,
     ) -> Result<CommitOutcome, VolumeError> {
         let publication = to_managed_publication(publication)?;
-        ManagedVolume::publish(self, observed, &publication)
-            .await
-            .map_err(Into::into)
+        ManagedVolume::publish(self, observed, &publication).await
     }
 
     async fn resolve(&self, operation: OperationId) -> Result<CommitOutcome, VolumeError> {
-        self.namespace.resolve(operation).await.map_err(Into::into)
+        self.namespace.resolve(operation).await
     }
 
     async fn materialize(
@@ -205,13 +201,12 @@ impl Volume for ManagedVolume {
         self.data
             .materialize(target, decoded, full_tree, concurrency)
             .await
-            .map_err(Into::into)
     }
 }
 
 fn authority_known_content(
     snapshot: &VolumeSnapshot,
-) -> Result<AuthorityKnownContent, ManagedError> {
+) -> Result<AuthorityKnownContent, VolumeError> {
     let mut known = AuthorityKnownContent::default();
     let mut visited = BTreeSet::new();
     for id in snapshot.nodes.values().filter_map(|node| node.file_version) {
@@ -219,8 +214,7 @@ fn authority_known_content(
             continue;
         }
         let version = snapshot.file_versions.get(&id).ok_or_else(|| {
-            ManagedError::new(
-                ManagedErrorKind::Corrupt,
+            corrupt(
                 "derive authority-known content",
                 "live node references a missing file version",
             )
@@ -233,7 +227,7 @@ fn authority_known_content(
 fn managed_observation(
     snapshot: NamespaceSnapshot,
     witness: NamespaceWitness,
-) -> Result<ManagedObservation, ManagedError> {
+) -> Result<ManagedObservation, VolumeError> {
     let filesystem_snapshot = to_volume_snapshot(snapshot)?;
     Ok(ManagedObservation {
         witness,
@@ -241,15 +235,10 @@ fn managed_observation(
     })
 }
 
-fn encode_file_version(version: &FileVersionRecord) -> Result<FileVersion, ManagedError> {
+fn encode_file_version(version: &FileVersionRecord) -> Result<FileVersion, VolumeError> {
     let mut descriptor = Vec::new();
-    ciborium::into_writer(&version.extent_map, &mut descriptor).map_err(|error| {
-        ManagedError::new(
-            ManagedErrorKind::Invalid,
-            "encode Managed file version",
-            error.to_string(),
-        )
-    })?;
+    ciborium::into_writer(&version.extent_map, &mut descriptor)
+        .map_err(|error| invalid("encode Managed file version", error.to_string()))?;
     Ok(FileVersion::from_parts(
         version.id,
         version.logical_size,
@@ -258,20 +247,14 @@ fn encode_file_version(version: &FileVersionRecord) -> Result<FileVersion, Manag
     ))
 }
 
-fn decode_file_version(version: &FileVersion) -> Result<FileVersionRecord, ManagedError> {
-    let extent_map: ExtentMap = ciborium::from_reader(version.descriptor()).map_err(|error| {
-        ManagedError::new(
-            ManagedErrorKind::Corrupt,
-            "decode Managed file version",
-            error.to_string(),
-        )
-    })?;
+fn decode_file_version(version: &FileVersion) -> Result<FileVersionRecord, VolumeError> {
+    let extent_map: ExtentMap = ciborium::from_reader(version.descriptor())
+        .map_err(|error| corrupt("decode Managed file version", error.to_string()))?;
     let decoded =
         FileVersionRecord::from_extents(version.logical_size, version.logical_digest, extent_map)
             .filter(|decoded| decoded.id == version.id)
             .ok_or_else(|| {
-                ManagedError::new(
-                    ManagedErrorKind::Corrupt,
+                corrupt(
                     "decode Managed file version",
                     "descriptor does not match its filesystem identity",
                 )
@@ -279,7 +262,7 @@ fn decode_file_version(version: &FileVersion) -> Result<FileVersionRecord, Manag
     Ok(decoded)
 }
 
-fn to_volume_snapshot(snapshot: NamespaceSnapshot) -> Result<VolumeSnapshot, ManagedError> {
+fn to_volume_snapshot(snapshot: NamespaceSnapshot) -> Result<VolumeSnapshot, VolumeError> {
     Ok(VolumeSnapshot {
         volume_id: snapshot.volume_id,
         cursor: snapshot.cursor,
@@ -290,11 +273,11 @@ fn to_volume_snapshot(snapshot: NamespaceSnapshot) -> Result<VolumeSnapshot, Man
             .file_versions
             .into_iter()
             .map(|(id, version)| Ok((id, encode_file_version(&version)?)))
-            .collect::<Result<_, ManagedError>>()?,
+            .collect::<Result<_, VolumeError>>()?,
     })
 }
 
-fn to_managed_snapshot(snapshot: &VolumeSnapshot) -> Result<NamespaceSnapshot, ManagedError> {
+fn to_managed_snapshot(snapshot: &VolumeSnapshot) -> Result<NamespaceSnapshot, VolumeError> {
     Ok(NamespaceSnapshot {
         volume_id: snapshot.volume_id,
         cursor: snapshot.cursor,
@@ -305,13 +288,13 @@ fn to_managed_snapshot(snapshot: &VolumeSnapshot) -> Result<NamespaceSnapshot, M
             .file_versions
             .iter()
             .map(|(id, version)| Ok((*id, decode_file_version(version)?)))
-            .collect::<Result<_, ManagedError>>()?,
+            .collect::<Result<_, VolumeError>>()?,
     })
 }
 
 fn to_managed_publication(
     publication: &VolumePublication,
-) -> Result<NamespacePublication, ManagedError> {
+) -> Result<NamespacePublication, VolumeError> {
     Ok(NamespacePublication {
         operation: publication.operation,
         parent: publication.parent,

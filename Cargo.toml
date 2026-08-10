@@ -36,6 +36,7 @@ ciborium = "0.2"
 fastcdc = { version = "3", features = ["futures"] }
 foyer = "0.22.3"
 futures = "0.3"
+hex = "0.4"
 log = { version = "0.4.22" }
 logforth = { version = "0.28.1", features = ["starter-log"] }
 opendal = { version = "0.57.0", features = ["layers-foyer", "services-fs"] }

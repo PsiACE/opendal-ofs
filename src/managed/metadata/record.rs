@@ -20,9 +20,12 @@
 use opendal::Operator;
 use serde_json::Value;
 
+use crate::filesystem::VolumeError;
+use crate::managed::error::{corrupt, invalid, unavailable};
+use crate::managed::format::LowerHex;
 use crate::managed::metadata::d1::{D1Result, D1Session, D1Statement};
 use crate::managed::metadata::object;
-use crate::managed::{D1Config, ManagedError, ManagedErrorKind};
+use crate::managed::{D1Config, MetadataFormat};
 
 const RECORDS: &str = "ofs_managed_v1_authority_records";
 
@@ -44,30 +47,27 @@ pub(crate) struct D1Backend {
 }
 
 impl D1Backend {
-    fn new(config: D1Config) -> Result<Self, ManagedError> {
+    fn new(config: D1Config) -> Result<Self, VolumeError> {
         D1Session::new(config).map(|session| Self { session })
     }
     async fn read(
         &self,
         key: &str,
         action: &'static str,
-    ) -> Result<Option<(Vec<u8>, u64)>, ManagedError> {
+    ) -> Result<Option<(Vec<u8>, u64)>, VolumeError> {
         let results = self
             .session
             .query(
-                vec![
-                    schema(),
-                    D1Statement {
-                        sql: format!(
-                            "SELECT value_hex, revision FROM {RECORDS} WHERE store_key = ? AND record_key = ?"
-                        ),
-                        params: self.params(key),
-                    },
-                ],
+                vec![D1Statement {
+                    sql: format!(
+                        "SELECT value_hex, revision FROM {RECORDS} WHERE store_key = ? AND record_key = ?"
+                    ),
+                    params: self.params(key),
+                }],
                 action,
             )
             .await?;
-        match results[1].results.as_slice() {
+        match results[0].results.as_slice() {
             [] => Ok(None),
             [row] => {
                 let value = row
@@ -88,25 +88,22 @@ impl D1Backend {
         key: &str,
         bytes: Vec<u8>,
         action: &'static str,
-    ) -> Result<bool, ManagedError> {
+    ) -> Result<bool, VolumeError> {
         let mut params = self.params(key);
-        params.push(hex(&bytes).into());
+        params.push(LowerHex::encode(&bytes).into());
         let results = self
             .session
             .query(
-                vec![
-                    schema(),
-                    D1Statement {
-                        sql: format!(
-                            "INSERT OR IGNORE INTO {RECORDS} (store_key, record_key, revision, value_hex) VALUES (?, ?, 1, ?) RETURNING revision"
-                        ),
-                        params,
-                    },
-                ],
+                vec![D1Statement {
+                    sql: format!(
+                        "INSERT OR IGNORE INTO {RECORDS} (store_key, record_key, revision, value_hex) VALUES (?, ?, 1, ?) RETURNING revision"
+                    ),
+                    params,
+                }],
                 action,
             )
             .await?;
-        changed(&results[1], action)
+        changed(&results[0], action)
     }
 
     async fn create_or_read(
@@ -114,9 +111,9 @@ impl D1Backend {
         key: &str,
         bytes: Vec<u8>,
         action: &'static str,
-    ) -> Result<Vec<u8>, ManagedError> {
+    ) -> Result<Vec<u8>, VolumeError> {
         let mut params = self.params(key);
-        params.push(hex(&bytes).into());
+        params.push(LowerHex::encode(&bytes).into());
         let results = self
             .session
             .query(
@@ -160,28 +157,25 @@ impl D1Backend {
         revision: &u64,
         bytes: Vec<u8>,
         action: &'static str,
-    ) -> Result<bool, ManagedError> {
+    ) -> Result<bool, VolumeError> {
         let revision = i64::try_from(*revision)
             .map_err(|_| corrupt(action, "D1 record revision is invalid"))?;
-        let mut params = vec![hex(&bytes).into()];
+        let mut params = vec![LowerHex::encode(&bytes).into()];
         params.extend(self.params(key));
         params.push(revision.into());
         let results = self
             .session
             .query(
-                vec![
-                    schema(),
-                    D1Statement {
-                        sql: format!(
-                            "UPDATE {RECORDS} SET revision = revision + 1, value_hex = ? WHERE store_key = ? AND record_key = ? AND revision = ? RETURNING revision"
-                        ),
-                        params,
-                    },
-                ],
+                vec![D1Statement {
+                    sql: format!(
+                        "UPDATE {RECORDS} SET revision = revision + 1, value_hex = ? WHERE store_key = ? AND record_key = ? AND revision = ? RETURNING revision"
+                    ),
+                    params,
+                }],
                 action,
             )
             .await?;
-        changed(&results[1], action)
+        changed(&results[0], action)
     }
     fn params(&self, key: &str) -> Vec<Value> {
         vec![
@@ -192,15 +186,14 @@ impl D1Backend {
 }
 
 impl RecordBackend {
-    pub(crate) fn object(operator: Operator, action: &'static str) -> Result<Self, ManagedError> {
+    pub(crate) fn object(operator: Operator, action: &'static str) -> Result<Self, VolumeError> {
         let capability = operator.info().full_capability();
         let supported = capability.read
             && capability.write
             && capability.write_with_if_not_exists
             && capability.write_with_if_match;
         if !supported {
-            return Err(ManagedError::new(
-                ManagedErrorKind::Invalid,
+            return Err(invalid(
                 action,
                 "object metadata lacks required record capabilities",
             ));
@@ -208,15 +201,22 @@ impl RecordBackend {
         Ok(Self::Object(operator))
     }
 
-    pub(crate) fn d1(config: D1Config) -> Result<Self, ManagedError> {
+    pub(crate) fn d1(config: D1Config) -> Result<Self, VolumeError> {
         D1Backend::new(config).map(Self::D1)
+    }
+
+    pub(crate) const fn metadata_format(&self) -> MetadataFormat {
+        match self {
+            Self::Object(_) => MetadataFormat::ObjectV1,
+            Self::D1(_) => MetadataFormat::TransactionalV1,
+        }
     }
 
     pub(crate) async fn read(
         &self,
         key: &str,
         action: &'static str,
-    ) -> Result<Option<(Vec<u8>, Revision)>, ManagedError> {
+    ) -> Result<Option<(Vec<u8>, Revision)>, VolumeError> {
         match self {
             Self::Object(operator) => object::read_with_revision(operator, key, action)
                 .await
@@ -233,7 +233,7 @@ impl RecordBackend {
         key: &str,
         bytes: Vec<u8>,
         action: &'static str,
-    ) -> Result<bool, ManagedError> {
+    ) -> Result<bool, VolumeError> {
         match self {
             Self::Object(operator) => object::create(operator, key, bytes, action).await,
             Self::D1(backend) => backend.create(key, bytes, action).await,
@@ -245,7 +245,7 @@ impl RecordBackend {
         key: &str,
         bytes: Vec<u8>,
         action: &'static str,
-    ) -> Result<Vec<u8>, ManagedError> {
+    ) -> Result<Vec<u8>, VolumeError> {
         match self {
             Self::Object(operator) => {
                 if object::create(operator, key, bytes.clone(), action).await? {
@@ -254,7 +254,7 @@ impl RecordBackend {
                 object::read_with_revision(operator, key, action)
                     .await?
                     .map(|(bytes, _)| bytes)
-                    .ok_or_else(|| unavailable(action))
+                    .ok_or_else(|| unavailable(action, "Managed record storage is unavailable"))
             }
             Self::D1(backend) => backend.create_or_read(key, bytes, action).await,
         }
@@ -266,7 +266,7 @@ impl RecordBackend {
         revision: &Revision,
         bytes: Vec<u8>,
         action: &'static str,
-    ) -> Result<bool, ManagedError> {
+    ) -> Result<bool, VolumeError> {
         match (self, revision) {
             (Self::Object(operator), Revision::Object(revision)) => {
                 object::replace(operator, key, revision, bytes, action).await
@@ -291,7 +291,7 @@ fn schema() -> D1Statement {
     }
 }
 
-fn changed(result: &D1Result, action: &'static str) -> Result<bool, ManagedError> {
+fn changed(result: &D1Result, action: &'static str) -> Result<bool, VolumeError> {
     match result.results.as_slice() {
         [] => Ok(false),
         [row] if row.revision.is_some() => Ok(true),
@@ -300,48 +300,6 @@ fn changed(result: &D1Result, action: &'static str) -> Result<bool, ManagedError
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        encoded.push(DIGITS[(byte >> 4) as usize] as char);
-        encoded.push(DIGITS[(byte & 0x0f) as usize] as char);
-    }
-    encoded
-}
-
-fn decode_hex(value: &str, action: &'static str) -> Result<Vec<u8>, ManagedError> {
-    if value.len() % 2 != 0 {
-        return Err(corrupt(action, "D1 returned an invalid Managed value"));
-    }
-    value
-        .as_bytes()
-        .chunks_exact(2)
-        .map(|pair| {
-            let high = digit(pair[0])?;
-            let low = digit(pair[1])?;
-            Some((high << 4) | low)
-        })
-        .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| corrupt(action, "D1 returned an invalid Managed value"))
-}
-
-fn digit(value: u8) -> Option<u8> {
-    match value {
-        b'0'..=b'9' => Some(value - b'0'),
-        b'a'..=b'f' => Some(value - b'a' + 10),
-        _ => None,
-    }
-}
-
-fn corrupt(action: &'static str, message: &'static str) -> ManagedError {
-    ManagedError::new(ManagedErrorKind::Corrupt, action, message)
-}
-
-fn unavailable(action: &'static str) -> ManagedError {
-    ManagedError::new(
-        ManagedErrorKind::Unavailable,
-        action,
-        "Managed record storage is unavailable",
-    )
+fn decode_hex(value: &str, action: &'static str) -> Result<Vec<u8>, VolumeError> {
+    LowerHex::decode(value).ok_or_else(|| corrupt(action, "D1 returned an invalid Managed value"))
 }

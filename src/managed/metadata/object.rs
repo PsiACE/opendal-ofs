@@ -18,17 +18,18 @@
 use opendal::{ErrorKind, Operator};
 use sha2::{Digest as _, Sha256};
 
-use crate::managed::{ManagedError, ManagedErrorKind};
+use crate::filesystem::{VolumeError, VolumeErrorKind};
+use crate::managed::error::{corrupt, error, unavailable};
 
 pub(crate) async fn read(
     operator: &Operator,
     key: &str,
     action: &'static str,
-) -> Result<Option<Vec<u8>>, ManagedError> {
+) -> Result<Option<Vec<u8>>, VolumeError> {
     match operator.read(key).await {
         Ok(bytes) => Ok(Some(bytes.to_bytes().to_vec())),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-        Err(_) => Err(unavailable(action)),
+        Err(_) => Err(unavailable(action, "object metadata is unavailable")),
     }
 }
 
@@ -36,21 +37,21 @@ pub(crate) async fn read_with_revision(
     operator: &Operator,
     key: &str,
     action: &'static str,
-) -> Result<Option<(Vec<u8>, String)>, ManagedError> {
+) -> Result<Option<(Vec<u8>, String)>, VolumeError> {
     let reader = match operator.reader(key).await {
         Ok(reader) => reader,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err(unavailable(action)),
+        Err(_) => return Err(unavailable(action, "object metadata is unavailable")),
     };
     let bytes = match reader.read(..).await {
         Ok(bytes) => bytes.to_bytes().to_vec(),
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err(unavailable(action)),
+        Err(_) => return Err(unavailable(action, "object metadata is unavailable")),
     };
     let revision = reader
         .metadata()
         .and_then(|metadata| metadata.etag())
-        .ok_or_else(|| unavailable(action))?
+        .ok_or_else(|| unavailable(action, "object metadata is unavailable"))?
         .to_owned();
     Ok(Some((bytes, revision)))
 }
@@ -62,16 +63,12 @@ pub(crate) async fn read_content_addressed(
     action: &'static str,
     missing: &'static str,
     invalid: &'static str,
-) -> Result<Vec<u8>, ManagedError> {
+) -> Result<Vec<u8>, VolumeError> {
     let bytes = read(operator, key, action)
         .await?
-        .ok_or_else(|| ManagedError::new(ManagedErrorKind::Corrupt, action, missing))?;
+        .ok_or_else(|| corrupt(action, missing))?;
     if Sha256::digest(&bytes).as_slice() != expected {
-        return Err(ManagedError::new(
-            ManagedErrorKind::Corrupt,
-            action,
-            invalid,
-        ));
+        return Err(corrupt(action, invalid));
     }
     Ok(bytes)
 }
@@ -81,7 +78,7 @@ pub(crate) async fn create(
     key: &str,
     bytes: Vec<u8>,
     action: &'static str,
-) -> Result<bool, ManagedError> {
+) -> Result<bool, VolumeError> {
     match operator.write_with(key, bytes).if_not_exists(true).await {
         Ok(_) => Ok(true),
         Err(error)
@@ -92,7 +89,7 @@ pub(crate) async fn create(
         {
             Ok(false)
         }
-        Err(_) => Err(unavailable(action)),
+        Err(_) => Err(unavailable(action, "object metadata is unavailable")),
     }
 }
 
@@ -102,7 +99,7 @@ pub(crate) async fn replace(
     expected_revision: &str,
     bytes: Vec<u8>,
     action: &'static str,
-) -> Result<bool, ManagedError> {
+) -> Result<bool, VolumeError> {
     match operator
         .write_with(key, bytes)
         .if_match(expected_revision)
@@ -110,7 +107,7 @@ pub(crate) async fn replace(
     {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == ErrorKind::ConditionNotMatch => Ok(false),
-        Err(_) => Err(unavailable(action)),
+        Err(_) => Err(unavailable(action, "object metadata is unavailable")),
     }
 }
 
@@ -119,9 +116,9 @@ pub(crate) async fn ensure_immutable(
     key: &str,
     expected: &[u8],
     action: &'static str,
-    mismatch_kind: ManagedErrorKind,
+    mismatch_kind: VolumeErrorKind,
     mismatch_message: &'static str,
-) -> Result<(), ManagedError> {
+) -> Result<(), VolumeError> {
     if operator
         .write_with(key, expected.to_vec())
         .if_not_exists(true)
@@ -132,18 +129,10 @@ pub(crate) async fn ensure_immutable(
     }
     let observed = read(operator, key, action)
         .await?
-        .ok_or_else(|| unavailable(action))?;
+        .ok_or_else(|| unavailable(action, "object metadata is unavailable"))?;
     if observed == expected {
         Ok(())
     } else {
-        Err(ManagedError::new(mismatch_kind, action, mismatch_message))
+        Err(error(mismatch_kind, action, mismatch_message))
     }
-}
-
-fn unavailable(action: &'static str) -> ManagedError {
-    ManagedError::new(
-        ManagedErrorKind::Unavailable,
-        action,
-        "object metadata is unavailable",
-    )
 }

@@ -331,14 +331,6 @@ impl StagedTree {
         &self.source
     }
 
-    pub(crate) fn entries(&self) -> &BTreeMap<String, TargetEntry> {
-        self.source.entries()
-    }
-
-    pub(crate) fn file(&self, path: &str) -> Option<&TargetFile> {
-        self.source.file(path)
-    }
-
     pub(crate) fn local_tree(&self) -> LocalTree {
         LocalTree::from_entries(
             &self.root,
@@ -398,10 +390,10 @@ impl StagedTree {
         Ok(version)
     }
 
-    pub(crate) async fn replace_manifest(
+    pub(crate) async fn replace_manifest<'a>(
         &mut self,
         mut manifest: TargetManifest,
-        refreshed: &std::collections::BTreeSet<String>,
+        refreshed: impl IntoIterator<Item = &'a String>,
     ) -> Result<()> {
         for path in refreshed {
             let local = entry_at(&self.root, path).await?;

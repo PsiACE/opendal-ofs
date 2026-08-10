@@ -12,9 +12,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::filesystem::{BranchBinding, BranchId, BranchName, ChangeCursor, VolumeId};
+use crate::filesystem::{BranchBinding, BranchId, BranchName, ChangeCursor, VolumeError, VolumeId};
+use crate::managed::error::corrupt;
 use crate::managed::metadata::namespace::StoredHead;
-use crate::managed::{ManagedError, ManagedErrorKind};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -58,13 +58,13 @@ impl StoredBranchRegistry {
         }
     }
 
-    pub(crate) fn validate(&self, volume_id: VolumeId) -> Result<(), ManagedError> {
+    pub(crate) fn validate(&self, volume_id: VolumeId) -> Result<(), VolumeError> {
         let unique_ids = self.branches.values().copied().collect::<BTreeSet<_>>();
         if self.volume_id != volume_id
             || unique_ids.len() != self.branches.len()
             || !self.branches.values().any(|id| *id == self.default_branch)
         {
-            return Err(corrupt("branch registry is invalid"));
+            return Err(corrupt("read Managed branch", "branch registry is invalid"));
         }
         Ok(())
     }
@@ -100,8 +100,4 @@ pub(crate) fn info(
         cursor: head.cursor(),
         is_default: id == default,
     }
-}
-
-fn corrupt(message: &'static str) -> ManagedError {
-    ManagedError::new(ManagedErrorKind::Corrupt, "read Managed branch", message)
 }

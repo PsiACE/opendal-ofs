@@ -28,9 +28,9 @@ use super::{
 };
 use crate::filesystem::{
     BranchId, ChangeCursor, DirectoryEntry, FileVersionId, Generation, NodeId, OperationId,
-    VolumeId,
+    VolumeError, VolumeId,
 };
-use crate::managed::{ManagedError, ManagedErrorKind};
+use crate::managed::error::corrupt;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -85,25 +85,34 @@ impl DirectoryDelta {
         }
     }
 
-    fn apply(&self, base: Option<&DirectoryRecord>) -> Result<DirectoryRecord, ManagedError> {
+    fn apply(&self, base: Option<&DirectoryRecord>) -> Result<DirectoryRecord, VolumeError> {
         let mut directory = base.cloned().unwrap_or(DirectoryRecord {
             node: self.node,
             generation: self.generation.clone(),
             entries: BTreeMap::new(),
         });
         if directory.node != self.node {
-            return Err(corrupt("directory delta identity is invalid"));
+            return Err(corrupt(
+                "read Managed transaction",
+                "directory delta identity is invalid",
+            ));
         }
         directory.generation = self.generation.clone();
         let mut changed = BTreeSet::new();
         for name in &self.remove_entries {
             if !changed.insert(name.clone()) || directory.entries.remove(name).is_none() {
-                return Err(corrupt("directory entry removal is invalid"));
+                return Err(corrupt(
+                    "read Managed transaction",
+                    "directory entry removal is invalid",
+                ));
             }
         }
         for (name, entry) in &self.put_entries {
             if !changed.insert(name.clone()) {
-                return Err(corrupt("directory entry update is invalid"));
+                return Err(corrupt(
+                    "read Managed transaction",
+                    "directory entry update is invalid",
+                ));
             }
             directory.entries.insert(name.clone(), *entry);
         }
@@ -177,13 +186,18 @@ impl NamespaceChange {
     pub(crate) fn apply(
         &self,
         base: Option<NamespaceSnapshot>,
-    ) -> Result<NamespaceSnapshot, ManagedError> {
+    ) -> Result<NamespaceSnapshot, VolumeError> {
         self.validate(self.volume_id)?;
-        if !self
-            .validate_against(base.as_ref())
-            .map_err(|_| corrupt("transaction transition is invalid"))?
-        {
-            return Err(corrupt("transaction preconditions are stale"));
+        if !self.validate_against(base.as_ref()).map_err(|_| {
+            corrupt(
+                "read Managed transaction",
+                "transaction transition is invalid",
+            )
+        })? {
+            return Err(corrupt(
+                "read Managed transaction",
+                "transaction preconditions are stale",
+            ));
         }
         let mut target = base.unwrap_or_else(|| NamespaceSnapshot {
             volume_id: self.volume_id,
@@ -232,11 +246,14 @@ impl NamespaceChange {
     pub(crate) fn validate_against(
         &self,
         base: Option<&NamespaceSnapshot>,
-    ) -> Result<bool, ManagedError> {
+    ) -> Result<bool, VolumeError> {
         if base.is_some_and(|base| base.volume_id != self.volume_id || base.cursor != self.parent)
             || base.is_none() && self.parent != ChangeCursor::Genesis
         {
-            return Err(corrupt("transaction base is invalid"));
+            return Err(corrupt(
+                "read Managed transaction",
+                "transaction base is invalid",
+            ));
         }
         let empty_nodes = BTreeMap::new();
         let empty_directories = BTreeMap::new();
@@ -298,7 +315,10 @@ impl NamespaceChange {
                 if next.is_some_and(|next| {
                     !next.is_valid() || current.is_some_and(|current| current != next)
                 }) {
-                    Err(corrupt("file version delta is invalid"))
+                    Err(corrupt(
+                        "read Managed transaction",
+                        "file version delta is invalid",
+                    ))
                 } else {
                     Ok(())
                 }
@@ -307,12 +327,15 @@ impl NamespaceChange {
         Ok(true)
     }
 
-    pub(crate) fn validate(&self, volume_id: VolumeId) -> Result<(), ManagedError> {
+    pub(crate) fn validate(&self, volume_id: VolumeId) -> Result<(), VolumeError> {
         if self.volume_id != volume_id
             || self.cursor.operation() != Some(self.operation)
             || self.parent.sequence().checked_add(1) != Some(self.cursor.sequence())
         {
-            return Err(corrupt("transaction ancestry is invalid"));
+            return Err(corrupt(
+                "read Managed transaction",
+                "transaction ancestry is invalid",
+            ));
         }
         Ok(())
     }
@@ -323,32 +346,30 @@ fn validate_records<'a, K, V: 'a>(
     removed: impl IntoIterator<Item = K>,
     put: impl IntoIterator<Item = &'a V>,
     key: impl Fn(&V) -> K,
-    validate: impl Fn(K, Option<&V>, Option<&V>) -> Result<(), ManagedError>,
-) -> Result<(), ManagedError>
+    validate: impl Fn(K, Option<&V>, Option<&V>) -> Result<(), VolumeError>,
+) -> Result<(), VolumeError>
 where
     K: Copy + Ord,
 {
     let mut changed = BTreeSet::new();
     for id in removed {
         if !changed.insert(id) || !current.contains_key(&id) {
-            return Err(corrupt("transaction delta is invalid"));
+            return Err(corrupt(
+                "read Managed transaction",
+                "transaction delta is invalid",
+            ));
         }
         validate(id, current.get(&id), None)?;
     }
     for record in put {
         let id = key(record);
         if !changed.insert(id) {
-            return Err(corrupt("transaction delta is invalid"));
+            return Err(corrupt(
+                "read Managed transaction",
+                "transaction delta is invalid",
+            ));
         }
         validate(id, current.get(&id), Some(record))?;
     }
     Ok(())
-}
-
-fn corrupt(message: &'static str) -> ManagedError {
-    ManagedError::new(
-        ManagedErrorKind::Corrupt,
-        "read Managed transaction",
-        message,
-    )
 }

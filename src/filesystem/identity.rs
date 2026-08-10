@@ -39,6 +39,33 @@ macro_rules! fixed_identity {
     };
 }
 
+macro_rules! random_identity {
+    ($($name:ident),+ $(,)?) => {
+        $(
+            impl $name {
+                pub fn generate() -> Self {
+                    Self::from_bytes(*uuid::Uuid::new_v4().as_bytes())
+                }
+            }
+        )+
+    };
+}
+
+macro_rules! display_identity {
+    ($($name:ident),+ $(,)?) => {
+        $(
+            impl fmt::Display for $name {
+                fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    for byte in self.as_bytes() {
+                        write!(formatter, "{byte:02x}")?;
+                    }
+                    Ok(())
+                }
+            }
+        )+
+    };
+}
+
 fixed_identity!(
     /// Stable identity of one configured volume.
     VolumeId,
@@ -51,47 +78,6 @@ fixed_identity!(
     16
 );
 
-impl VolumeId {
-    pub fn generate() -> Self {
-        Self::from_bytes(*uuid::Uuid::new_v4().as_bytes())
-    }
-}
-
-impl BranchId {
-    pub fn generate() -> Self {
-        Self::from_bytes(*uuid::Uuid::new_v4().as_bytes())
-    }
-}
-
-impl fmt::Display for VolumeId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for byte in self.as_bytes() {
-            write!(formatter, "{byte:02x}")?;
-        }
-        Ok(())
-    }
-}
-
-impl fmt::Display for BranchId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for byte in self.as_bytes() {
-            write!(formatter, "{byte:02x}")?;
-        }
-        Ok(())
-    }
-}
-
-impl NodeId {
-    pub fn generate() -> Self {
-        Self::from_bytes(*uuid::Uuid::new_v4().as_bytes())
-    }
-}
-
-impl OperationId {
-    pub fn generate() -> Self {
-        Self::from_bytes(*uuid::Uuid::new_v4().as_bytes())
-    }
-}
 fixed_identity!(
     /// Identity of one filesystem node.
     ///
@@ -110,6 +96,9 @@ fixed_identity!(
     OperationId,
     16
 );
+
+random_identity!(VolumeId, BranchId, NodeId, OperationId);
+display_identity!(VolumeId, BranchId);
 
 /// An opaque optimistic-concurrency token owned by a volume implementation.
 ///

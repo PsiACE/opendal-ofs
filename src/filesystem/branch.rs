@@ -61,22 +61,6 @@ impl FromStr for BranchName {
     }
 }
 
-impl TryFrom<String> for BranchName {
-    type Error = InvalidBranchName;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        Self::parse(value)
-    }
-}
-
-impl TryFrom<&str> for BranchName {
-    type Error = InvalidBranchName;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        Self::parse(value)
-    }
-}
-
 impl Serialize for BranchName {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where

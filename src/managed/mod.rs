@@ -25,6 +25,5 @@ mod metadata;
 mod volume;
 
 pub(crate) use data::{AuthorityKnownContent, ManagedData};
-pub use error::{ManagedError, ManagedErrorKind};
 pub use metadata::{D1Config, ManagedExtension, ManagedFormat, ManagedMetadata, MetadataFormat};
 pub use volume::{ManagedObservation, ManagedVolume};

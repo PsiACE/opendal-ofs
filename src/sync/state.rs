@@ -7,14 +7,14 @@
 // with the License.
 
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Write as _};
+use std::fs;
+use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::durable::{JsonFormat, install_json};
 use crate::filesystem::{
     AuthorityIdentity, BranchBinding, ChangeCursor, DirectoryRecord, FileVersion, NodeId,
     NodeRecord, OperationId, VolumeId, VolumeSnapshot,
@@ -24,7 +24,6 @@ use crate::sync::staging::TargetManifest;
 
 const STATE_FORMAT: &str = "ofs-sync-replica";
 const STATE_MAJOR: u16 = 1;
-static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -132,35 +131,13 @@ impl ReplicaState {
 
     pub fn install(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
-        let parent = path
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        fs::create_dir_all(parent).context("create replica state directory")?;
-        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let temporary =
-            path.with_extension(format!("ofs-state.{}.{}.tmp", std::process::id(), sequence));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        let result = (|| -> Result<()> {
-            let mut file = options.open(&temporary)?;
-            serde_json::to_writer(&mut file, &StoredState::from(self))?;
-            file.write_all(b"\n")?;
-            file.sync_all()?;
-            drop(file);
-            fs::rename(&temporary, path)?;
-            sync_directory(parent)?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
-        result.context("install replica state")
+        install_json(
+            path,
+            "ofs-state",
+            &StoredState::from(self),
+            JsonFormat::Compact,
+        )
+        .context("install replica state")
     }
 }
 
@@ -312,15 +289,5 @@ fn validate_installed(
             bail!("replica base disagrees with authority snapshot at {path:?}");
         }
     }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn sync_directory(path: &Path) -> Result<()> {
-    File::open(path)?.sync_all().map_err(Into::into)
-}
-
-#[cfg(not(unix))]
-fn sync_directory(_: &Path) -> Result<()> {
     Ok(())
 }

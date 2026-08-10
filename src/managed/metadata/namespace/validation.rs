@@ -24,14 +24,15 @@ use super::records::{
 };
 use crate::filesystem::{
     BranchId, ChangeCursor, FileVersionId, Generation, NodeAttributes, NodeId, NodeKind,
+    VolumeError,
 };
-use crate::managed::{ManagedError, ManagedErrorKind};
+use crate::managed::error::invalid;
 
 pub(crate) fn validate_publication(
     publication: &NamespacePublication,
     base: Option<&NamespaceSnapshot>,
     origin_branch: Option<BranchId>,
-) -> Result<(bool, StoredChange), ManagedError> {
+) -> Result<(bool, StoredChange), VolumeError> {
     if publication.target.cursor.operation() != Some(publication.operation)
         || publication.parent.sequence().checked_add(1)
             != Some(publication.target.cursor.sequence())
@@ -50,7 +51,7 @@ pub(crate) fn validate_publication(
     Ok((change.validate_against(base)?, change))
 }
 
-pub(crate) fn validate_snapshot(snapshot: &NamespaceSnapshot) -> Result<(), ManagedError> {
+pub(crate) fn validate_snapshot(snapshot: &NamespaceSnapshot) -> Result<(), VolumeError> {
     snapshot
         .validate_structure()
         .map_err(|_| invalid("read Managed namespace", "namespace structure is invalid"))?;
@@ -80,7 +81,7 @@ pub(super) fn match_preconditions<'a, K, V>(
     expected: impl IntoIterator<Item = (K, Option<&'a Generation>)>,
     generation: impl Fn(&V) -> &Generation,
     duplicate: &'static str,
-) -> Result<Option<BTreeSet<K>>, ManagedError>
+) -> Result<Option<BTreeSet<K>>, VolumeError>
 where
     K: Copy + Ord,
 {
@@ -100,7 +101,7 @@ pub(super) fn validate_node_generation(
     current: Option<&NodeRecord>,
     next: Option<&NodeRecord>,
     has_precondition: bool,
-) -> Result<(), ManagedError> {
+) -> Result<(), VolumeError> {
     validate_generation(
         current.map(|record| &record.generation),
         next.map(|record| &record.generation),
@@ -113,7 +114,7 @@ pub(super) fn validate_directory_generation(
     current: Option<&DirectoryRecord>,
     next: Option<&DirectoryRecord>,
     has_precondition: bool,
-) -> Result<(), ManagedError> {
+) -> Result<(), VolumeError> {
     validate_generation(
         current.map(|record| &record.generation),
         next.map(|record| &record.generation),
@@ -127,7 +128,7 @@ fn validate_generation(
     next: Option<&Generation>,
     changed: bool,
     has_precondition: bool,
-) -> Result<(), ManagedError> {
+) -> Result<(), VolumeError> {
     let expected = match (current, next, changed) {
         (None, Some(_), _) => managed_generation(1),
         (Some(generation), Some(_), false) => generation.clone(),
@@ -153,10 +154,6 @@ fn validate_generation(
 
 fn node_body(node: &NodeRecord) -> (NodeId, NodeKind, NodeAttributes, Option<FileVersionId>) {
     (node.id, node.kind, node.attributes, node.file_version)
-}
-
-fn invalid(action: &'static str, message: &'static str) -> ManagedError {
-    ManagedError::new(ManagedErrorKind::Invalid, action, message)
 }
 
 #[cfg(test)]

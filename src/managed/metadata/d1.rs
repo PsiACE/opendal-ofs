@@ -20,7 +20,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::managed::{ManagedError, ManagedErrorKind};
+use crate::filesystem::VolumeError;
+use crate::managed::error::{corrupt, invalid, unavailable};
 
 /// Connection scope for the D1 Query API.
 #[derive(Clone)]
@@ -38,7 +39,7 @@ impl D1Config {
         database_id: impl Into<String>,
         store_key: impl Into<String>,
         token: impl Into<String>,
-    ) -> Result<Self, ManagedError> {
+    ) -> Result<Self, VolumeError> {
         let config = Self {
             account_id: account_id.into(),
             database_id: database_id.into(),
@@ -50,13 +51,13 @@ impl D1Config {
         Ok(config)
     }
 
-    pub fn with_api_base(mut self, api_base: impl Into<String>) -> Result<Self, ManagedError> {
+    pub fn with_api_base(mut self, api_base: impl Into<String>) -> Result<Self, VolumeError> {
         self.api_base = api_base.into();
         self.validate()?;
         Ok(self)
     }
 
-    fn validate(&self) -> Result<(), ManagedError> {
+    fn validate(&self) -> Result<(), VolumeError> {
         let complete = [
             &self.account_id,
             &self.database_id,
@@ -74,11 +75,7 @@ impl D1Config {
                     .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
             });
         if !complete || !safe_scope {
-            return Err(ManagedError::new(
-                ManagedErrorKind::Invalid,
-                "configure D1 metadata",
-                "D1 scope is invalid",
-            ));
+            return Err(invalid("configure D1 metadata", "D1 scope is invalid"));
         }
         Ok(())
     }
@@ -91,11 +88,11 @@ pub(crate) struct D1Session {
 }
 
 impl D1Session {
-    pub(crate) fn new(config: D1Config) -> Result<Self, ManagedError> {
+    pub(crate) fn new(config: D1Config) -> Result<Self, VolumeError> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
-            .map_err(|_| unavailable("open D1 metadata"))?;
+            .map_err(|_| unavailable("open D1 metadata", "D1 metadata is unavailable"))?;
         Ok(Self { client, config })
     }
 
@@ -107,7 +104,7 @@ impl D1Session {
         &self,
         statements: Vec<D1Statement>,
         action: &'static str,
-    ) -> Result<Vec<D1Result>, ManagedError> {
+    ) -> Result<Vec<D1Result>, VolumeError> {
         let expected_results = statements.len();
         let endpoint = format!(
             "{}/accounts/{}/d1/database/{}/query",
@@ -122,9 +119,9 @@ impl D1Session {
             .json(&D1Request { batch: statements })
             .send()
             .await
-            .map_err(|_| unavailable(action))?;
+            .map_err(|_| unavailable(action, "D1 metadata is unavailable"))?;
         if !response.status().is_success() {
-            return Err(unavailable(action));
+            return Err(unavailable(action, "D1 metadata is unavailable"));
         }
         let reply: D1Reply = response
             .json()
@@ -136,25 +133,13 @@ impl D1Session {
                 .iter()
                 .any(|result| !result.success || result.meta.served_by_primary != Some(true))
         {
-            return Err(unavailable(action));
+            return Err(unavailable(action, "D1 metadata is unavailable"));
         }
         if reply.result.len() != expected_results {
             return Err(corrupt(action, "D1 returned an invalid result count"));
         }
         Ok(reply.result)
     }
-}
-
-fn unavailable(action: &'static str) -> ManagedError {
-    ManagedError::new(
-        ManagedErrorKind::Unavailable,
-        action,
-        "D1 metadata is unavailable",
-    )
-}
-
-fn corrupt(action: &'static str, message: &'static str) -> ManagedError {
-    ManagedError::new(ManagedErrorKind::Corrupt, action, message)
 }
 
 #[derive(Serialize)]

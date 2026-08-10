@@ -19,11 +19,32 @@ use crate::filesystem::{NodeId, NodeKind};
 pub(crate) struct ReconcilePlan {
     pub publish: bool,
     pub target: TargetManifest,
-    pub materialize: BTreeSet<String>,
-    pub reuse: BTreeMap<String, String>,
-    pub refresh: BTreeSet<String>,
+    pub edits: BTreeMap<String, TargetEdit>,
     pub conflicts: Vec<ConflictRecord>,
     pub renames: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TargetEdit {
+    Materialize,
+    Reuse(String),
+    Directory,
+}
+
+impl ReconcilePlan {
+    fn select_file(&mut self, path: String, entry: SnapshotEntry<'_>, edit: TargetEdit) {
+        self.target.select_file(
+            path.clone(),
+            TargetFile::from(entry.file.expect("remote file has a version")),
+            entry.node.attributes.executable,
+        );
+        self.edits.insert(path, edit);
+    }
+
+    fn select_directory(&mut self, path: String) {
+        self.target.select_directory(path.clone());
+        self.edits.insert(path, TargetEdit::Directory);
+    }
 }
 
 /// Reconcile staged local file content with one authoritative volume snapshot.
@@ -45,53 +66,47 @@ pub(crate) fn reconcile(
 
     validate_directory_deletions(replica, local, base, remote)?;
 
-    let mut target = local.source().clone();
-    let mut materialize = BTreeSet::new();
-    let mut reuse = BTreeMap::new();
-    let mut refresh = BTreeSet::new();
-    let mut conflicts = Vec::new();
-    let mut publish = false;
+    let mut plan = ReconcilePlan {
+        publish: false,
+        target: local.source().clone(),
+        edits: BTreeMap::new(),
+        conflicts: Vec::new(),
+        renames: BTreeMap::new(),
+    };
     let mut handled = BTreeSet::new();
     if let Some(base) = base {
-        reconcile_remote_renames(
-            base,
-            local,
-            remote,
-            &mut handled,
-            RemoteRenameEdits {
-                target: &mut target,
-                materialize: &mut materialize,
-                reuse: &mut reuse,
-                refresh: &mut refresh,
-            },
-        )?;
+        reconcile_remote_renames(base, local, remote, &mut handled, &mut plan)?;
     }
-    let renames = reconcile_local_renames(
+    plan.renames = reconcile_local_renames(
         replica,
         base,
         local,
         remote,
         &mut handled,
-        &mut conflicts,
-        &mut publish,
+        &mut plan.conflicts,
+        &mut plan.publish,
     )?;
 
     let mut paths = base
         .into_iter()
         .flat_map(|tree| tree.paths().keys().cloned())
         .collect::<BTreeSet<_>>();
-    paths.extend(local.entries().keys().cloned());
+    paths.extend(local.source().entries().keys().cloned());
     paths.extend(remote.paths().keys().cloned());
     for path in paths {
         if handled.contains(&path) {
             continue;
         }
         let base_entry = base.and_then(|tree| tree.get(&path));
-        let local_digest = local.file(&path).map(|file| file.logical_digest);
+        let local_digest = local.source().file(&path).map(|file| file.logical_digest);
         let remote_entry = remote.get(&path);
         let remote_digest = remote_entry.and_then(digest);
         let base_kind = base_entry.map(kind);
-        let local_kind = local.entries().get(&path).map(|entry| entry.local.kind);
+        let local_kind = local
+            .source()
+            .entries()
+            .get(&path)
+            .map(|entry| entry.local.kind);
         let remote_kind = remote_entry.map(kind);
         if local_kind != remote_kind {
             if local_kind != base_kind && remote_kind != base_kind {
@@ -101,16 +116,13 @@ pub(crate) fn reconcile(
             } else if local_kind == base_kind {
                 match remote_entry {
                     Some(entry) if kind(entry) == super::LocalKind::File => {
-                        select_file(&mut target, &mut materialize, &mut refresh, path, entry);
+                        plan.select_file(path, entry, TargetEdit::Materialize);
                     }
-                    Some(_) => {
-                        target.select_directory(path.clone());
-                        refresh.insert(path);
-                    }
-                    None => target.remove(&path),
+                    Some(_) => plan.select_directory(path),
+                    None => plan.target.remove(&path),
                 }
             } else {
-                publish = true;
+                plan.publish = true;
             }
             continue;
         }
@@ -118,6 +130,7 @@ pub(crate) fn reconcile(
             continue;
         }
         let local_executable = local
+            .source()
             .entries()
             .get(&path)
             .map(|entry| entry.local.executable);
@@ -144,12 +157,12 @@ pub(crate) fn reconcile(
                         .and_then(|entry| entry.file)
                         .expect("remote file has a version")
                         .into();
-                    target.select_attributes(&path, version, remote)?;
+                    plan.target.select_attributes(&path, version, remote)?;
                 }
                 (Some(base), Some(_), Some(remote)) if remote == base => {
-                    publish = true;
+                    plan.publish = true;
                 }
-                _ => conflicts.push(ConflictRecord {
+                _ => plan.conflicts.push(ConflictRecord {
                     path,
                     local_digest,
                     remote_digest,
@@ -158,15 +171,13 @@ pub(crate) fn reconcile(
         } else {
             match (local_changed, remote_changed) {
                 (false, false) => {}
-                (true, false) => publish = true,
+                (true, false) => plan.publish = true,
                 (false, true) => match remote_entry {
-                    Some(entry) => {
-                        select_file(&mut target, &mut materialize, &mut refresh, path, entry)
-                    }
-                    None => target.remove(&path),
+                    Some(entry) => plan.select_file(path, entry, TargetEdit::Materialize),
+                    None => plan.target.remove(&path),
                 },
                 (true, true) if local_digest == remote_digest => {}
-                (true, true) => conflicts.push(ConflictRecord {
+                (true, true) => plan.conflicts.push(ConflictRecord {
                     path,
                     local_digest,
                     remote_digest,
@@ -175,15 +186,7 @@ pub(crate) fn reconcile(
         }
     }
 
-    Ok(ReconcilePlan {
-        publish,
-        target,
-        materialize,
-        reuse,
-        refresh,
-        conflicts,
-        renames,
-    })
+    Ok(plan)
 }
 
 fn validate_directory_deletions(
@@ -203,6 +206,7 @@ fn validate_directory_deletions(
             continue;
         }
         let local_kept = local
+            .source()
             .entries()
             .get(path)
             .is_some_and(|entry| entry.local.kind == super::LocalKind::Directory);
@@ -228,18 +232,21 @@ fn local_subtree_changed(
 ) -> bool {
     let paths = subtree(&replica.installed, directory)
         .map(|(path, _)| path)
-        .chain(subtree(local.entries(), directory).map(|(path, _)| path))
+        .chain(subtree(local.source().entries(), directory).map(|(path, _)| path))
         .collect::<BTreeSet<_>>();
-    paths.into_iter().any(
-        |path| match (replica.installed.get(path), local.entries().get(path)) {
+    paths.into_iter().any(|path| {
+        match (
+            replica.installed.get(path),
+            local.source().entries().get(path),
+        ) {
             (Some(installed), Some(current)) => {
                 current.local.kind != kind(base.get(path).expect("installed path is in the base"))
                     || current.local.kind == super::LocalKind::File && installed != &current.local
             }
             (None, None) => false,
             _ => true,
-        },
-    )
+        }
+    })
 }
 
 fn remote_subtree_changed(
@@ -260,19 +267,12 @@ fn remote_subtree_changed(
         })
 }
 
-struct RemoteRenameEdits<'a> {
-    target: &'a mut TargetManifest,
-    materialize: &'a mut BTreeSet<String>,
-    reuse: &'a mut BTreeMap<String, String>,
-    refresh: &'a mut BTreeSet<String>,
-}
-
 fn reconcile_remote_renames(
     base: &SnapshotTree<'_>,
     local: &StagedTree,
     remote: &SnapshotTree<'_>,
     handled: &mut BTreeSet<String>,
-    edits: RemoteRenameEdits<'_>,
+    plan: &mut ReconcilePlan,
 ) -> Result<()> {
     let remote_by_node = unique_remote_nodes(remote);
     for old_path in base.paths().keys() {
@@ -297,21 +297,19 @@ fn reconcile_remote_renames(
         let renamed_executable = executable(renamed).expect("remote rename is a file");
         let base_executable = executable(base_entry).expect("a file digest has file attributes");
         if old_local == Some((base_digest, base_executable)) && new_local.is_none() {
-            edits.target.remove(old_path);
-            edits.target.select_file(
+            plan.target.remove(old_path);
+            plan.select_file(
                 new_path.clone(),
-                TargetFile::from(renamed.file.expect("remote rename is a file")),
-                renamed_executable,
+                renamed,
+                if renamed_digest == base_digest {
+                    TargetEdit::Reuse(old_path.clone())
+                } else {
+                    TargetEdit::Materialize
+                },
             );
-            if renamed_digest == base_digest {
-                edits.reuse.insert(new_path.clone(), old_path.clone());
-            } else {
-                edits.materialize.insert(new_path.clone());
-            }
-            edits.refresh.insert(new_path.clone());
         } else if old_local.is_none() && new_local.is_some_and(|file| file.0 == renamed_digest) {
             if new_local.is_some_and(|file| file.1 != renamed_executable) {
-                edits.target.select_attributes(
+                plan.target.select_attributes(
                     new_path,
                     TargetFile::from(renamed.file.expect("remote rename is a file")),
                     renamed_executable,
@@ -335,7 +333,7 @@ fn reconcile_local_renames(
     conflicts: &mut Vec<ConflictRecord>,
     publish: &mut bool,
 ) -> Result<BTreeMap<String, String>> {
-    let local_paths = local.entries();
+    let local_paths = local.source().entries();
     let mut renames = replica
         .pending
         .as_ref()
@@ -406,7 +404,7 @@ fn reconcile_local_renames(
             handled.insert(path.clone());
             conflicts.push(ConflictRecord {
                 path: path.clone(),
-                local_digest: local.file(path).map(|file| file.logical_digest),
+                local_digest: local.source().file(path).map(|file| file.logical_digest),
                 remote_digest: remote_target.or(remote_source).and_then(digest),
             });
         }
@@ -467,13 +465,13 @@ fn remote_matches_base(remote: SnapshotEntry<'_>, base: SnapshotEntry<'_>) -> bo
 fn local_matches_remote(local: &StagedTree, path: &str, remote: SnapshotEntry<'_>) -> bool {
     match remote.node.kind {
         NodeKind::RegularFile => local_file(local, path) == digest(remote).zip(executable(remote)),
-        NodeKind::Directory => local.file(path).is_none(),
+        NodeKind::Directory => local.source().file(path).is_none(),
     }
 }
 
 fn local_file(local: &StagedTree, path: &str) -> Option<([u8; 32], bool)> {
-    let file = local.file(path)?;
-    let entry = local.entries().get(path)?;
+    let file = local.source().file(path)?;
+    let entry = local.source().entries().get(path)?;
     (entry.local.kind == super::LocalKind::File)
         .then_some((file.logical_digest, entry.local.executable))
 }
@@ -484,7 +482,7 @@ fn reject_unidentified_moves(
     local: &StagedTree,
     handled: &mut BTreeSet<String>,
 ) -> Result<()> {
-    let local_paths = local.entries();
+    let local_paths = local.source().entries();
     let deleted = replica
         .installed
         .iter()
@@ -521,7 +519,7 @@ fn reject_unidentified_moves(
         base.and_then(|tree| tree.get(from))
             .is_some_and(|entry| kind(entry) == super::LocalKind::Directory)
             && added.iter().any(|path| {
-                local.file(path).is_none()
+                local.source().file(path).is_none()
                     && replica.installed[from]
                         .native_identity
                         .zip(local_paths[path].local.native_identity)
@@ -552,22 +550,6 @@ fn unique_remote_nodes(remote: &SnapshotTree<'_>) -> BTreeMap<NodeId, Option<Str
             .or_insert_with(|| Some(path.clone()));
     }
     nodes
-}
-
-fn select_file(
-    target: &mut TargetManifest,
-    materialize: &mut BTreeSet<String>,
-    refresh: &mut BTreeSet<String>,
-    path: String,
-    entry: SnapshotEntry<'_>,
-) {
-    target.select_file(
-        path.clone(),
-        TargetFile::from(entry.file.expect("remote file has a version")),
-        entry.node.attributes.executable,
-    );
-    materialize.insert(path.clone());
-    refresh.insert(path);
 }
 
 fn kind(entry: SnapshotEntry<'_>) -> super::LocalKind {

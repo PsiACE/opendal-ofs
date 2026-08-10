@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::{NamespaceChange, NamespaceSnapshot};
-use crate::filesystem::{BranchId, ChangeCursor, OperationId, VolumeId};
-use crate::managed::{ManagedError, ManagedErrorKind};
+use crate::filesystem::{BranchId, ChangeCursor, OperationId, VolumeError, VolumeId};
+use crate::managed::error::{conflict, corrupt};
 
 pub(crate) const MAX_TAIL_TRANSACTIONS: usize = 32;
 pub(crate) const MAX_TAIL_BYTES: usize = 128 * 1024;
@@ -32,10 +32,14 @@ pub(crate) struct CheckpointRef {
 pub(crate) type StoredChange = NamespaceChange;
 
 impl NamespaceChange {
-    pub(crate) fn fingerprint(&self) -> Result<([u8; 32], usize), ManagedError> {
+    pub(crate) fn fingerprint(&self) -> Result<([u8; 32], usize), VolumeError> {
         let mut bytes = Vec::new();
-        ciborium::into_writer(self, &mut bytes)
-            .map_err(|_| corrupt("namespace change cannot be encoded"))?;
+        ciborium::into_writer(self, &mut bytes).map_err(|_| {
+            corrupt(
+                "read Managed namespace",
+                "namespace change cannot be encoded",
+            )
+        })?;
         let length = bytes.len();
         Ok((Sha256::digest(bytes).into(), length))
     }
@@ -57,15 +61,21 @@ impl StoredNamespaceState {
             .map_or(self.checkpoint_cursor, |change| change.cursor)
     }
 
-    pub(crate) fn validate(&self, volume_id: VolumeId) -> Result<(), ManagedError> {
+    pub(crate) fn validate(&self, volume_id: VolumeId) -> Result<(), VolumeError> {
         if self.tail.len() > MAX_TAIL_TRANSACTIONS {
-            return Err(corrupt("namespace transaction tail exceeds its limit"));
+            return Err(corrupt(
+                "read Managed namespace",
+                "namespace transaction tail exceeds its limit",
+            ));
         }
         let mut parent = self.checkpoint_cursor;
         for change in &self.tail {
             change.validate(volume_id)?;
             if change.parent != parent {
-                return Err(corrupt("namespace transaction tail is not consecutive"));
+                return Err(corrupt(
+                    "read Managed namespace",
+                    "namespace transaction tail is not consecutive",
+                ));
             }
             parent = change.cursor;
         }
@@ -94,9 +104,12 @@ impl StoredCheckpoint {
     pub(crate) fn recover(
         self,
         volume_id: VolumeId,
-    ) -> Result<(NamespaceSnapshot, StoredResults), ManagedError> {
+    ) -> Result<(NamespaceSnapshot, StoredResults), VolumeError> {
         if self.snapshot.volume_id != volume_id {
-            return Err(corrupt("checkpoint identity is invalid"));
+            return Err(corrupt(
+                "read Managed namespace",
+                "checkpoint identity is invalid",
+            ));
         }
         super::validate_snapshot(&self.snapshot)?;
         let mut results = BTreeMap::new();
@@ -104,7 +117,10 @@ impl StoredCheckpoint {
             result.validate()?;
             let key = (result.origin_branch, result.operation);
             if results.insert(key, result).is_some() {
-                return Err(corrupt("checkpoint contains duplicate results"));
+                return Err(corrupt(
+                    "read Managed namespace",
+                    "checkpoint contains duplicate results",
+                ));
             }
         }
         Ok((self.snapshot, results))
@@ -114,7 +130,7 @@ impl StoredCheckpoint {
         &self,
         origin: Option<BranchId>,
         operation: OperationId,
-    ) -> Result<Option<&StoredCommittedResult>, ManagedError> {
+    ) -> Result<Option<&StoredCommittedResult>, VolumeError> {
         self.results
             .iter()
             .find(|result| result.origin_branch == origin && result.operation == operation)
@@ -133,7 +149,7 @@ pub(crate) struct StoredCommittedResult {
 }
 
 impl StoredCommittedResult {
-    pub(crate) fn from_change(change: &StoredChange) -> Result<Self, ManagedError> {
+    pub(crate) fn from_change(change: &StoredChange) -> Result<Self, VolumeError> {
         let result = Self {
             origin_branch: change.origin_branch,
             operation: change.operation,
@@ -144,9 +160,12 @@ impl StoredCommittedResult {
         Ok(result)
     }
 
-    pub(crate) fn validate(&self) -> Result<(), ManagedError> {
+    pub(crate) fn validate(&self) -> Result<(), VolumeError> {
         if self.cursor.operation() != Some(self.operation) {
-            return Err(corrupt("committed result cursor is invalid"));
+            return Err(corrupt(
+                "read Managed namespace",
+                "committed result cursor is invalid",
+            ));
         }
         Ok(())
     }
@@ -163,7 +182,7 @@ impl StoredHistory {
     pub(crate) fn new(
         volume_id: VolumeId,
         state: &StoredNamespaceState,
-    ) -> Result<Self, ManagedError> {
+    ) -> Result<Self, VolumeError> {
         let history = Self {
             volume_id,
             state: state.clone(),
@@ -172,9 +191,12 @@ impl StoredHistory {
         Ok(history)
     }
 
-    pub(crate) fn validate(&self, volume_id: VolumeId) -> Result<(), ManagedError> {
+    pub(crate) fn validate(&self, volume_id: VolumeId) -> Result<(), VolumeError> {
         if self.volume_id != volume_id {
-            return Err(corrupt("namespace history identity is invalid"));
+            return Err(corrupt(
+                "read Managed namespace",
+                "namespace history identity is invalid",
+            ));
         }
         self.state.validate(volume_id)
     }
@@ -188,20 +210,26 @@ pub(crate) fn recover_namespace(
     checkpoint: StoredCheckpoint,
     state: &StoredNamespaceState,
     volume_id: VolumeId,
-) -> Result<(NamespaceSnapshot, StoredResults), ManagedError> {
+) -> Result<(NamespaceSnapshot, StoredResults), VolumeError> {
     let (mut snapshot, results) = checkpoint.recover(volume_id)?;
     if snapshot.cursor != state.checkpoint_cursor {
-        return Err(corrupt("checkpoint and namespace HEAD disagree"));
+        return Err(corrupt(
+            "read Managed namespace",
+            "checkpoint and namespace HEAD disagree",
+        ));
     }
     for change in &state.tail {
         snapshot = change.apply(Some(snapshot))?;
     }
     if snapshot.cursor != state.cursor() {
-        return Err(corrupt("transaction tail does not reach namespace HEAD"));
+        return Err(corrupt(
+            "read Managed namespace",
+            "transaction tail does not reach namespace HEAD",
+        ));
     }
     if !state.tail.is_empty() {
         super::validate_snapshot(&snapshot)
-            .map_err(|_| corrupt("recovered namespace is invalid"))?;
+            .map_err(|_| corrupt("read Managed namespace", "recovered namespace is invalid"))?;
     }
     Ok((snapshot, results))
 }
@@ -209,7 +237,7 @@ pub(crate) fn recover_namespace(
 pub(crate) fn replay_tail_from(
     base: &NamespaceSnapshot,
     state: &StoredNamespaceState,
-) -> Result<Option<NamespaceSnapshot>, ManagedError> {
+) -> Result<Option<NamespaceSnapshot>, VolumeError> {
     super::validate_snapshot(base)?;
     if base.cursor == state.cursor() {
         return Ok(Some(base.clone()));
@@ -226,9 +254,13 @@ pub(crate) fn replay_tail_from(
         snapshot = change.apply(Some(snapshot))?;
     }
     if snapshot.cursor != state.cursor() {
-        return Err(corrupt("transaction tail does not reach namespace HEAD"));
+        return Err(corrupt(
+            "read Managed namespace",
+            "transaction tail does not reach namespace HEAD",
+        ));
     }
-    super::validate_snapshot(&snapshot).map_err(|_| corrupt("recovered namespace is invalid"))?;
+    super::validate_snapshot(&snapshot)
+        .map_err(|_| corrupt("read Managed namespace", "recovered namespace is invalid"))?;
     Ok(Some(snapshot))
 }
 
@@ -236,7 +268,7 @@ pub(crate) fn results_for_rotation(
     mut results: StoredResults,
     state: &StoredNamespaceState,
     committed: &StoredChange,
-) -> Result<StoredResults, ManagedError> {
+) -> Result<StoredResults, VolumeError> {
     for change in state.tail.iter().chain(std::iter::once(committed)) {
         let result = StoredCommittedResult::from_change(change)?;
         results.insert((result.origin_branch, result.operation), result);
@@ -247,18 +279,13 @@ pub(crate) fn results_for_rotation(
 pub(crate) fn require_request_digest(
     expected: Option<[u8; 32]>,
     observed: [u8; 32],
-) -> Result<(), ManagedError> {
+) -> Result<(), VolumeError> {
     if expected.is_none_or(|expected| expected == observed) {
         Ok(())
     } else {
-        Err(ManagedError::new(
-            ManagedErrorKind::Conflict,
+        Err(conflict(
             "publish Managed namespace",
             "operation identity was reused with another payload",
         ))
     }
-}
-
-fn corrupt(message: &'static str) -> ManagedError {
-    ManagedError::new(ManagedErrorKind::Corrupt, "read Managed namespace", message)
 }

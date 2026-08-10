@@ -1619,6 +1619,7 @@ dependencies = [
  "fuse3",
  "fuse3_opendal",
  "futures",
+ "hex",
  "libc",
  "log",
  "logforth",

@@ -18,14 +18,15 @@
 //! Credential-free local names for volumes.
 
 use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
-use std::io::{ErrorKind, Write as _};
-use std::path::{Path, PathBuf};
+use std::fs;
+use std::io::ErrorKind;
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+use crate::durable::{JsonFormat, install_json};
 use crate::filesystem::{VolumeId, VolumeModel};
 
 const SCHEMA_MAJOR: u16 = 1;
@@ -155,41 +156,8 @@ impl Catalog {
             schema_major: SCHEMA_MAJOR,
             volumes: self.volumes.clone(),
         };
-        let mut bytes = serde_json::to_vec_pretty(&stored)?;
-        bytes.push(b'\n');
-
-        let parent = self
-            .path
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        fs::create_dir_all(parent).context("create volume catalog directory")?;
-        let temporary = self
-            .path
-            .with_extension(format!("catalog.{}.tmp", std::process::id()));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        let mut file = options
-            .open(&temporary)
-            .context("create temporary volume catalog")?;
-        let result = (|| -> Result<()> {
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            drop(file);
-            fs::rename(&temporary, &self.path)?;
-            #[cfg(unix)]
-            std::fs::File::open(parent)?.sync_all()?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
-        result.context("write volume catalog")
+        install_json(&self.path, "catalog", &stored, JsonFormat::Pretty)
+            .context("write volume catalog")
     }
 }
 

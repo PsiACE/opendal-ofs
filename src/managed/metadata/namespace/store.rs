@@ -22,19 +22,21 @@ use super::{
     replay_tail_from, require_request_digest, results_for_rotation, validate_publication,
 };
 use crate::filesystem::{
-    BranchBinding, BranchId, ChangeCursor, CommitOutcome, OperationId, VolumeId,
+    BranchBinding, BranchId, ChangeCursor, CommitOutcome, OperationId, VolumeError,
+    VolumeErrorKind, VolumeId,
 };
+use crate::managed::error::{conflict, corrupt, invalid, unavailable};
+use crate::managed::format::{LowerHex, RecordDecodeError, RecordEncodeError, V1Record};
 use crate::managed::metadata::object::ensure_immutable;
 use crate::managed::metadata::object::read_content_addressed;
 use crate::managed::metadata::record::{RecordBackend, Revision};
-use crate::managed::{ManagedError, ManagedErrorKind};
 
 const BASE_HEAD_KEY: &str = ".ofs/managed/metadata/v1/head.ofs";
 const CHECKPOINT_ROOT: &str = ".ofs/managed/metadata/v1/checkpoints/sha256";
 const HISTORY_ROOT: &str = ".ofs/managed/metadata/v1/extensions/branch/v1/history/sha256";
 const HEAD_MAGIC: &[u8; 8] = b"OFS1HDZ1";
 const CHECKPOINT_MAGIC: &[u8; 8] = b"OFS1CKZ1";
-const HISTORY_MAGIC: &[u8; 8] = b"OFS1HST1";
+const HISTORY_RECORD: V1Record = V1Record::new(*b"OFS1HST1", MAX_HISTORY_BYTES);
 const MAX_HEAD_BYTES: usize = 256 * 1024;
 const MAX_CHECKPOINT_ENCODED_BYTES: usize = 256 * 1024 * 1024;
 const MAX_CHECKPOINT_DECODED_BYTES: usize = 256 * 1024 * 1024;
@@ -60,34 +62,12 @@ impl NamespaceObservation {
     }
 }
 
-#[derive(Clone, Debug)]
-enum NamespaceAuthority {
-    Base,
-    Branch(BranchBinding),
-}
-
-impl NamespaceAuthority {
-    fn branch_id(&self) -> Option<BranchId> {
-        match self {
-            Self::Base => None,
-            Self::Branch(binding) => Some(binding.id),
-        }
-    }
-
-    fn binding(&self) -> Option<&BranchBinding> {
-        match self {
-            Self::Base => None,
-            Self::Branch(binding) => Some(binding),
-        }
-    }
-}
-
 #[derive(Clone)]
 pub(crate) struct NamespaceStore {
     volume_id: VolumeId,
     data: Operator,
     backend: RecordBackend,
-    authority: NamespaceAuthority,
+    binding: Option<BranchBinding>,
     head_key: String,
 }
 
@@ -97,7 +77,7 @@ impl NamespaceStore {
             volume_id,
             data: operator,
             backend,
-            authority: NamespaceAuthority::Base,
+            binding: None,
             head_key: BASE_HEAD_KEY.to_owned(),
         }
     }
@@ -113,7 +93,7 @@ impl NamespaceStore {
             volume_id,
             data,
             backend,
-            authority: NamespaceAuthority::Branch(binding),
+            binding: Some(binding),
             head_key,
         }
     }
@@ -123,24 +103,28 @@ impl NamespaceStore {
     }
 
     pub(crate) fn binding(&self) -> Option<&BranchBinding> {
-        self.authority.binding()
+        self.binding.as_ref()
     }
 
-    pub(crate) async fn observe(&self) -> Result<Option<NamespaceObservation>, ManagedError> {
+    fn branch_id(&self) -> Option<BranchId> {
+        self.binding.as_ref().map(|binding| binding.id)
+    }
+
+    pub(crate) async fn observe(&self) -> Result<Option<NamespaceObservation>, VolumeError> {
         self.observe_from_optional(None).await
     }
 
     pub(crate) async fn observe_from(
         &self,
         base: &NamespaceSnapshot,
-    ) -> Result<Option<NamespaceObservation>, ManagedError> {
+    ) -> Result<Option<NamespaceObservation>, VolumeError> {
         self.observe_from_optional(Some(base)).await
     }
 
     async fn observe_from_optional(
         &self,
         base: Option<&NamespaceSnapshot>,
-    ) -> Result<Option<NamespaceObservation>, ManagedError> {
+    ) -> Result<Option<NamespaceObservation>, VolumeError> {
         let Some((head, revision)) = self.read_bound_head("read Managed namespace").await? else {
             return Ok(None);
         };
@@ -176,7 +160,7 @@ impl NamespaceStore {
         &self,
         observed: Option<(&NamespaceWitness, &NamespaceSnapshot)>,
         publication: &NamespacePublication,
-    ) -> Result<CommitOutcome, ManagedError> {
+    ) -> Result<CommitOutcome, VolumeError> {
         if publication.target.volume_id != self.volume_id {
             return Err(invalid(
                 "publish Managed namespace",
@@ -190,7 +174,7 @@ impl NamespaceStore {
                 Some(snapshot),
                 witness.checkpoint_results.clone(),
             ),
-            None if self.authority.branch_id().is_some() => {
+            None if self.branch_id().is_some() => {
                 let (head, revision) = self
                     .read_bound_head("publish Managed namespace")
                     .await?
@@ -207,7 +191,7 @@ impl NamespaceStore {
                 (StoredHead::unborn(self.volume_id, None), None, None, None)
             }
         };
-        let (valid, change) = validate_publication(publication, base, self.authority.branch_id())?;
+        let (valid, change) = validate_publication(publication, base, self.branch_id())?;
         let (request_digest, change_bytes) = change.fingerprint()?;
         if !valid {
             if matches!(
@@ -254,7 +238,7 @@ impl NamespaceStore {
                                 .1
                         }
                     };
-                    let previous_history = if self.authority.branch_id().is_some() {
+                    let previous_history = if self.branch_id().is_some() {
                         let history = StoredHistory::new(self.volume_id, current)?;
                         Some(self.write_history(&history).await?)
                     } else {
@@ -317,9 +301,9 @@ impl NamespaceStore {
     pub(crate) async fn resolve(
         &self,
         operation: OperationId,
-    ) -> Result<CommitOutcome, ManagedError> {
+    ) -> Result<CommitOutcome, VolumeError> {
         match self.resolve_known(operation, None).await {
-            Err(error) if error.kind() == ManagedErrorKind::Unavailable => {
+            Err(error) if error.kind() == VolumeErrorKind::Unavailable => {
                 Ok(CommitOutcome::Unknown)
             }
             result => result,
@@ -330,7 +314,7 @@ impl NamespaceStore {
         &self,
         operation: OperationId,
         expected: Option<[u8; 32]>,
-    ) -> Result<CommitOutcome, ManagedError> {
+    ) -> Result<CommitOutcome, VolumeError> {
         let Some((head, _)) = self.read_bound_head("resolve Managed publication").await? else {
             return Ok(CommitOutcome::Absent);
         };
@@ -338,13 +322,13 @@ impl NamespaceStore {
             return Ok(CommitOutcome::Absent);
         };
         if let Some(change) = state.tail.iter().find(|change| {
-            change.origin_branch == self.authority.branch_id() && change.operation == operation
+            change.origin_branch == self.branch_id() && change.operation == operation
         }) {
             require_request_digest(expected, change.fingerprint()?.0)?;
             return Ok(CommitOutcome::Committed(change.cursor));
         }
         let checkpoint = self.read_checkpoint(state.checkpoint).await?;
-        let Some(result) = checkpoint.resolve(self.authority.branch_id(), operation)? else {
+        let Some(result) = checkpoint.resolve(self.branch_id(), operation)? else {
             return Ok(CommitOutcome::Absent);
         };
         require_request_digest(expected, result.request_sha256)?;
@@ -354,7 +338,7 @@ impl NamespaceStore {
     async fn outcome_after_race(
         &self,
         operation: OperationId,
-    ) -> Result<CommitOutcome, ManagedError> {
+    ) -> Result<CommitOutcome, VolumeError> {
         match self.resolve(operation).await? {
             result @ (CommitOutcome::Committed(_) | CommitOutcome::Unknown) => Ok(result),
             _ => Ok(CommitOutcome::Conflict {
@@ -369,7 +353,7 @@ impl NamespaceStore {
     pub(crate) async fn read_checkpoint(
         &self,
         reference: CheckpointRef,
-    ) -> Result<StoredCheckpoint, ManagedError> {
+    ) -> Result<StoredCheckpoint, VolumeError> {
         let encoded_length = usize::try_from(reference.length)
             .ok()
             .filter(|length| *length <= MAX_CHECKPOINT_ENCODED_BYTES)
@@ -391,7 +375,12 @@ impl NamespaceStore {
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 return Err(corrupt("read Managed namespace", "checkpoint is missing"));
             }
-            Err(_) => return Err(unavailable("read Managed namespace")),
+            Err(_) => {
+                return Err(unavailable(
+                    "read Managed namespace",
+                    "storage operation failed",
+                ));
+            }
         };
         if bytes.len() != encoded_length
             || <[u8; 32]>::from(Sha256::digest(&bytes)) != reference.digest
@@ -414,7 +403,7 @@ impl NamespaceStore {
     async fn write_checkpoint(
         &self,
         checkpoint: &StoredCheckpoint,
-    ) -> Result<CheckpointRef, ManagedError> {
+    ) -> Result<CheckpointRef, VolumeError> {
         let bytes = encode_checkpoint(checkpoint)?;
         let reference = CheckpointRef {
             digest: Sha256::digest(&bytes).into(),
@@ -425,14 +414,14 @@ impl NamespaceStore {
             &checkpoint_key(reference.digest),
             &bytes,
             "checkpoint Managed namespace",
-            ManagedErrorKind::Corrupt,
+            VolumeErrorKind::Corrupt,
             "immutable checkpoint changed",
         )
         .await?;
         Ok(reference)
     }
 
-    pub(crate) async fn read_history(&self, id: [u8; 32]) -> Result<StoredHistory, ManagedError> {
+    pub(crate) async fn read_history(&self, id: [u8; 32]) -> Result<StoredHistory, VolumeError> {
         let bytes = read_content_addressed(
             &self.data,
             &history_key(id),
@@ -442,20 +431,24 @@ impl NamespaceStore {
             "namespace history identity is invalid",
         )
         .await?;
-        let history: StoredHistory = decode_record(HISTORY_MAGIC, &bytes, MAX_HISTORY_BYTES)?;
+        let history: StoredHistory = HISTORY_RECORD
+            .decode(&bytes)
+            .map_err(history_decode_error)?;
         history.validate(self.volume_id)?;
         Ok(history)
     }
 
-    async fn write_history(&self, history: &StoredHistory) -> Result<[u8; 32], ManagedError> {
-        let bytes = encode_record(HISTORY_MAGIC, history, MAX_HISTORY_BYTES)?;
+    async fn write_history(&self, history: &StoredHistory) -> Result<[u8; 32], VolumeError> {
+        let bytes = HISTORY_RECORD
+            .encode(history)
+            .map_err(history_encode_error)?;
         let id: [u8; 32] = Sha256::digest(&bytes).into();
         ensure_immutable(
             &self.data,
             &history_key(id),
             &bytes,
             "archive Managed history",
-            ManagedErrorKind::Corrupt,
+            VolumeErrorKind::Corrupt,
             "immutable namespace history changed",
         )
         .await?;
@@ -466,7 +459,7 @@ impl NamespaceStore {
         &self,
         mut history_id: Option<[u8; 32]>,
         sequence: u64,
-    ) -> Result<Option<StoredNamespaceState>, ManagedError> {
+    ) -> Result<Option<StoredNamespaceState>, VolumeError> {
         let mut visited = BTreeSet::new();
         while let Some(id) = history_id {
             if !visited.insert(id) {
@@ -486,7 +479,7 @@ impl NamespaceStore {
 
     pub(crate) async fn read_raw_head(
         &self,
-    ) -> Result<Option<(StoredHead, Revision)>, ManagedError> {
+    ) -> Result<Option<(StoredHead, Revision)>, VolumeError> {
         let Some((bytes, revision)) = self
             .backend
             .read(&self.head_key, "read Managed namespace")
@@ -495,16 +488,16 @@ impl NamespaceStore {
             return Ok(None);
         };
         let head = decode_head(&bytes)?;
-        head.validate(self.volume_id, self.authority.branch_id())?;
+        head.validate(self.volume_id, self.branch_id())?;
         Ok(Some((head, revision)))
     }
 
     async fn read_bound_head(
         &self,
         action: &'static str,
-    ) -> Result<Option<(StoredHead, Revision)>, ManagedError> {
+    ) -> Result<Option<(StoredHead, Revision)>, VolumeError> {
         let value = self.read_raw_head().await?;
-        if self.authority.branch_id().is_some() {
+        if self.branch_id().is_some() {
             let (head, _) = value
                 .as_ref()
                 .ok_or_else(|| conflict(action, "branch incarnation no longer exists"))?;
@@ -545,7 +538,7 @@ impl StoredHead {
         &self,
         volume_id: VolumeId,
         branch_id: Option<BranchId>,
-    ) -> Result<(), ManagedError> {
+    ) -> Result<(), VolumeError> {
         if self.volume_id != volume_id || self.branch_id != branch_id {
             return Err(corrupt(
                 "read Managed namespace",
@@ -559,7 +552,7 @@ impl StoredHead {
     }
 }
 
-fn encode_checkpoint(checkpoint: &StoredCheckpoint) -> Result<Vec<u8>, ManagedError> {
+fn encode_checkpoint(checkpoint: &StoredCheckpoint) -> Result<Vec<u8>, VolumeError> {
     let mut body = Vec::new();
     ciborium::into_writer(checkpoint, &mut body).map_err(|_| {
         invalid(
@@ -602,7 +595,7 @@ fn encode_checkpoint(checkpoint: &StoredCheckpoint) -> Result<Vec<u8>, ManagedEr
     Ok(bytes)
 }
 
-fn decode_checkpoint(bytes: &[u8]) -> Result<StoredCheckpoint, ManagedError> {
+fn decode_checkpoint(bytes: &[u8]) -> Result<StoredCheckpoint, VolumeError> {
     if bytes.len() > MAX_CHECKPOINT_ENCODED_BYTES {
         return Err(corrupt(
             "read Managed namespace",
@@ -639,7 +632,7 @@ fn decode_checkpoint(bytes: &[u8]) -> Result<StoredCheckpoint, ManagedError> {
     decode_value(&body)
 }
 
-pub(crate) fn encode_head(value: &StoredHead) -> Result<Vec<u8>, ManagedError> {
+pub(crate) fn encode_head(value: &StoredHead) -> Result<Vec<u8>, VolumeError> {
     let mut body = Vec::new();
     ciborium::into_writer(value, &mut body)
         .map_err(|_| invalid("write Managed namespace", "HEAD cannot be encoded"))?;
@@ -666,7 +659,7 @@ pub(crate) fn encode_head(value: &StoredHead) -> Result<Vec<u8>, ManagedError> {
     Ok(bytes)
 }
 
-pub(crate) fn decode_head(bytes: &[u8]) -> Result<StoredHead, ManagedError> {
+pub(crate) fn decode_head(bytes: &[u8]) -> Result<StoredHead, VolumeError> {
     let encoded = bytes
         .strip_prefix(HEAD_MAGIC)
         .and_then(|bytes| bytes.get(..bytes.len().checked_sub(32)?))
@@ -698,46 +691,29 @@ pub(crate) fn decode_head(bytes: &[u8]) -> Result<StoredHead, ManagedError> {
     decode_value(&body)
 }
 
-fn encode_record<T: Serialize>(
-    magic: &[u8; 8],
-    value: &T,
-    maximum: usize,
-) -> Result<Vec<u8>, ManagedError> {
-    let mut bytes = Vec::from(magic);
-    ciborium::into_writer(value, &mut bytes)
-        .map_err(|_| invalid("write Managed history", "record cannot be encoded"))?;
-    if bytes.len() - magic.len() > maximum {
-        return Err(invalid(
-            "write Managed history",
-            "record exceeds its size limit",
-        ));
+fn history_encode_error(error: RecordEncodeError) -> VolumeError {
+    match error {
+        RecordEncodeError::Encode => invalid("write Managed history", "record cannot be encoded"),
+        RecordEncodeError::TooLarge => {
+            invalid("write Managed history", "record exceeds its size limit")
+        }
     }
-    let checksum: [u8; 32] = Sha256::digest(&bytes).into();
-    bytes.extend_from_slice(&checksum);
-    Ok(bytes)
 }
 
-fn decode_record<T: DeserializeOwned>(
-    magic: &[u8; 8],
-    bytes: &[u8],
-    maximum: usize,
-) -> Result<T, ManagedError> {
-    let body = bytes
-        .strip_prefix(magic)
-        .and_then(|bytes| bytes.get(..bytes.len().checked_sub(32)?))
-        .ok_or_else(|| corrupt("read Managed history", "record format is invalid"))?;
-    if body.len() > maximum
-        || Sha256::digest(&bytes[..bytes.len() - 32]).as_slice() != &bytes[bytes.len() - 32..]
-    {
-        return Err(corrupt(
-            "read Managed history",
-            "record checksum is invalid",
-        ));
+fn history_decode_error(error: RecordDecodeError) -> VolumeError {
+    match error {
+        RecordDecodeError::Envelope => corrupt("read Managed history", "record format is invalid"),
+        RecordDecodeError::Checksum => {
+            corrupt("read Managed history", "record checksum is invalid")
+        }
+        RecordDecodeError::Decode => corrupt("read Managed namespace", "record cannot be decoded"),
+        RecordDecodeError::TrailingBytes => {
+            corrupt("read Managed namespace", "record has trailing bytes")
+        }
     }
-    decode_value(body)
 }
 
-fn decode_value<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, ManagedError> {
+fn decode_value<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, VolumeError> {
     let mut input = Cursor::new(bytes);
     let value = ciborium::from_reader(&mut input)
         .map_err(|_| corrupt("read Managed namespace", "record cannot be decoded"))?;
@@ -751,41 +727,11 @@ fn decode_value<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, ManagedError> {
 }
 
 pub(crate) fn checkpoint_key(id: [u8; 32]) -> String {
-    format!("{CHECKPOINT_ROOT}/{}.ofs", hex(&id))
+    format!("{CHECKPOINT_ROOT}/{}.ofs", LowerHex::encode(&id))
 }
 
 pub(crate) fn history_key(id: [u8; 32]) -> String {
-    format!("{HISTORY_ROOT}/{}.ofs", hex(&id))
-}
-
-fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        encoded.push(DIGITS[(byte >> 4) as usize] as char);
-        encoded.push(DIGITS[(byte & 0x0f) as usize] as char);
-    }
-    encoded
-}
-
-fn invalid(action: &'static str, message: &'static str) -> ManagedError {
-    ManagedError::new(ManagedErrorKind::Invalid, action, message)
-}
-
-fn conflict(action: &'static str, message: &'static str) -> ManagedError {
-    ManagedError::new(ManagedErrorKind::Conflict, action, message)
-}
-
-fn corrupt(action: &'static str, message: &'static str) -> ManagedError {
-    ManagedError::new(ManagedErrorKind::Corrupt, action, message)
-}
-
-fn unavailable(action: &'static str) -> ManagedError {
-    ManagedError::new(
-        ManagedErrorKind::Unavailable,
-        action,
-        "storage operation failed",
-    )
+    format!("{HISTORY_ROOT}/{}.ofs", LowerHex::encode(&id))
 }
 
 #[cfg(test)]
@@ -851,7 +797,7 @@ mod tests {
         *corrupt.last_mut().unwrap() ^= 1;
         assert_eq!(
             decode_checkpoint(&corrupt).unwrap_err().kind(),
-            ManagedErrorKind::Corrupt
+            VolumeErrorKind::Corrupt
         );
     }
 }

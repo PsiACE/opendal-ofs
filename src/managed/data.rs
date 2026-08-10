@@ -30,14 +30,15 @@ use opendal::{Buffer, ErrorKind, Operator, Writer};
 use sha2::{Digest as _, Sha256};
 use tokio::sync::{OnceCell, mpsc, oneshot};
 
-use super::{ManagedError, ManagedErrorKind};
-use crate::managed::format::{ContentRef, Extent, ExtentMap, SegmentRef};
+use super::error::{corrupt, invalid, unavailable};
+use crate::filesystem::{VolumeError, VolumeErrorKind};
+use crate::managed::format::{ContentRef, Extent, ExtentMap, LowerHex, SegmentRef};
 use crate::managed::metadata::namespace::FileVersionRecord;
 use crate::managed::metadata::object::ensure_immutable;
 
 const SEGMENT_ROOT: &str = ".ofs/managed/data/v1/segments/sha256";
 const REQUEST_EQUIVALENT_BYTES: u64 = 4 * 1024;
-const RANGE_FETCH_GAP: usize = 512 * 1024;
+const RANGE_FETCH_GAP: usize = REQUEST_EQUIVALENT_BYTES as usize;
 // Placement policy. These values are not part of the durable format.
 const TARGET_SEGMENT_SIZE: u64 = 16 * 1024 * 1024;
 const MATERIALIZE_WINDOW_BYTES: u64 = TARGET_SEGMENT_SIZE;
@@ -62,7 +63,7 @@ pub(crate) struct AuthorityKnownContent {
 }
 
 impl AuthorityKnownContent {
-    pub(crate) fn include(&mut self, version: &FileVersionRecord) -> Result<(), ManagedError> {
+    pub(crate) fn include(&mut self, version: &FileVersionRecord) -> Result<(), VolumeError> {
         if !version.is_valid() {
             return Err(corrupt(
                 "derive authority-known content",
@@ -118,7 +119,7 @@ struct PreparedChunk {
 struct PreparedStream {
     path: String,
     chunks: mpsc::Receiver<PreparedChunk>,
-    completion: oneshot::Receiver<Result<(u64, [u8; 32]), ManagedError>>,
+    completion: oneshot::Receiver<Result<(u64, [u8; 32]), VolumeError>>,
 }
 
 #[derive(Debug)]
@@ -147,7 +148,7 @@ pub(crate) struct ManagedData {
 }
 
 impl ManagedData {
-    pub(crate) fn new(operator: Operator) -> Result<Self, ManagedError> {
+    pub(crate) fn new(operator: Operator) -> Result<Self, VolumeError> {
         let capability = operator.info().full_capability();
         if !capability.read || !capability.write || !capability.write_with_if_not_exists {
             return Err(invalid(
@@ -169,7 +170,7 @@ impl ManagedData {
         paths: Vec<String>,
         known: &AuthorityKnownContent,
         concurrency: NonZeroUsize,
-    ) -> Result<BTreeMap<String, FileVersionRecord>, ManagedError> {
+    ) -> Result<BTreeMap<String, FileVersionRecord>, VolumeError> {
         let mut paths = paths;
         paths.sort();
         if paths.windows(2).any(|pair| pair[0] == pair[1]) {
@@ -189,7 +190,7 @@ impl ManagedData {
                 let result = stream_file(&source, &staging, &producer_path, &sender).await;
                 drop(sender);
                 let _ = complete.send(result);
-                Ok::<(), ManagedError>(())
+                Ok::<(), VolumeError>(())
             });
             prepared_streams.push(PreparedStream {
                 path,
@@ -245,10 +246,10 @@ impl ManagedData {
                         created.extend(segment.locations);
                     }
                 }
-                let (logical_size, logical_digest) = prepared
-                    .completion
-                    .await
-                    .map_err(|_| unavailable("stage Managed files"))??;
+                let (logical_size, logical_digest) =
+                    prepared.completion.await.map_err(|_| {
+                        unavailable("stage Managed files", "storage operation failed")
+                    })??;
                 files.push((
                     prepared.path,
                     PreparedFile {
@@ -290,7 +291,7 @@ impl ManagedData {
                                     segment_offset: stored.offset,
                                 })
                             })
-                            .collect::<Result<Vec<_>, ManagedError>>()?,
+                            .collect::<Result<Vec<_>, VolumeError>>()?,
                     };
                     let version = FileVersionRecord::from_extents(
                         file.logical_size,
@@ -322,7 +323,7 @@ impl ManagedData {
         staging: &Operator,
         files: Vec<(String, FileVersionRecord)>,
         known: &AuthorityKnownContent,
-    ) -> Result<(), ManagedError> {
+    ) -> Result<(), VolumeError> {
         let mut segments = BTreeMap::<SegmentRef, BTreeMap<u64, SegmentSource>>::new();
         for (path, version) in files {
             if !version.is_valid() {
@@ -408,7 +409,7 @@ impl ManagedData {
                 &segment_key(reference),
                 &segment,
                 "create data segment",
-                ManagedErrorKind::Corrupt,
+                VolumeErrorKind::Corrupt,
                 "immutable data segment changed",
             )
             .await?;
@@ -422,7 +423,7 @@ impl ManagedData {
         requests: Vec<(String, FileVersionRecord)>,
         full_tree: bool,
         concurrency: NonZeroUsize,
-    ) -> Result<(), ManagedError> {
+    ) -> Result<(), VolumeError> {
         let mut batch = Vec::new();
         let mut batch_bytes = 0_u64;
         for request in requests {
@@ -448,7 +449,7 @@ impl ManagedData {
         requests: Vec<(String, FileVersionRecord)>,
         full_tree: bool,
         concurrency: NonZeroUsize,
-    ) -> Result<(), ManagedError> {
+    ) -> Result<(), VolumeError> {
         if let [(path, version)] = requests.as_slice()
             && version.logical_size > MATERIALIZE_BATCH_BYTES
         {
@@ -488,7 +489,7 @@ impl ManagedData {
         Ok(())
     }
 
-    async fn cached_operator(&self) -> Result<Operator, ManagedError> {
+    async fn cached_operator(&self) -> Result<Operator, VolumeError> {
         self.cached
             .get_or_try_init(|| async {
                 let cache = HybridCacheBuilder::new()
@@ -499,7 +500,12 @@ impl ManagedData {
                     .storage()
                     .build()
                     .await
-                    .map_err(|_| unavailable("open materialization segment cache"))?;
+                    .map_err(|_| {
+                        unavailable(
+                            "open materialization segment cache",
+                            "storage operation failed",
+                        )
+                    })?;
                 Ok(self
                     .operator
                     .clone()
@@ -516,7 +522,7 @@ impl ManagedData {
         version: &FileVersionRecord,
         full_tree: bool,
         concurrency: NonZeroUsize,
-    ) -> Result<(), ManagedError> {
+    ) -> Result<(), VolumeError> {
         let all_demands = segment_demands(version.extent_map.extents.iter());
         let complete = complete_segments(
             &all_demands,
@@ -533,7 +539,7 @@ impl ManagedData {
         let mut writer = target
             .writer(path)
             .await
-            .map_err(|_| unavailable("write materialized file"))?;
+            .map_err(|_| unavailable("write materialized file", "storage operation failed"))?;
         let mut logical = Sha256::new();
         let mut written = 0_u64;
         let extents = &version.extent_map.extents;
@@ -582,7 +588,7 @@ impl ManagedData {
         verify: &BTreeMap<SegmentRef, SegmentDemand>,
         cached: Option<&Operator>,
         concurrency: NonZeroUsize,
-    ) -> Result<FetchedContent, ManagedError> {
+    ) -> Result<FetchedContent, VolumeError> {
         futures::future::try_join_all(demands.iter().map(|(segment, demands)| async move {
             let segment = *segment;
             let bytes = if complete.contains(&segment) {
@@ -597,7 +603,7 @@ impl ManagedData {
                 demands
                     .iter()
                     .map(|demand| slice_demand(&bytes, *demand).map(|bytes| (demand.2, bytes)))
-                    .collect::<Result<Vec<_>, ManagedError>>()?
+                    .collect::<Result<Vec<_>, VolumeError>>()?
             } else {
                 let reader = self
                     .operator
@@ -630,7 +636,7 @@ impl ManagedData {
                         verify_range_demand(&bytes, demand)?;
                         Ok((demand.2, bytes))
                     })
-                    .collect::<Result<Vec<_>, ManagedError>>()?
+                    .collect::<Result<Vec<_>, VolumeError>>()?
             };
             Ok(bytes)
         }))
@@ -696,11 +702,11 @@ async fn materialize_file(
     path: &str,
     version: &FileVersionRecord,
     fetched: &FetchedContent,
-) -> Result<(), ManagedError> {
+) -> Result<(), VolumeError> {
     let mut writer = target
         .writer(path)
         .await
-        .map_err(|_| unavailable("write materialized file"))?;
+        .map_err(|_| unavailable("write materialized file", "storage operation failed"))?;
     let mut logical = Sha256::new();
     let mut written = 0_u64;
     if let Err(error) = write_extents(
@@ -724,7 +730,7 @@ async fn write_extents(
     fetched: &FetchedContent,
     logical: &mut Sha256,
     written: &mut u64,
-) -> Result<(), ManagedError> {
+) -> Result<(), VolumeError> {
     for extent in extents {
         let bytes = fetched
             .get(&extent.content)
@@ -739,7 +745,7 @@ async fn write_extents(
         writer
             .write(bytes)
             .await
-            .map_err(|_| unavailable("write materialized file"))?;
+            .map_err(|_| unavailable("write materialized file", "storage operation failed"))?;
     }
     Ok(())
 }
@@ -749,7 +755,7 @@ async fn finish_materialized_file(
     version: &FileVersionRecord,
     logical: Sha256,
     written: u64,
-) -> Result<(), ManagedError> {
+) -> Result<(), VolumeError> {
     if written != version.logical_size
         || <[u8; 32]>::from(logical.finalize()) != version.logical_digest
     {
@@ -763,7 +769,7 @@ async fn finish_materialized_file(
         .close()
         .await
         .map(|_| ())
-        .map_err(|_| unavailable("write materialized file"))
+        .map_err(|_| unavailable("write materialized file", "storage operation failed"))
 }
 
 fn extent_window_end(extents: &[Extent], start: usize) -> usize {
@@ -787,7 +793,7 @@ fn verify_complete_demands(
     segment: SegmentRef,
     bytes: &Buffer,
     demands: &BTreeSet<DemandKey>,
-) -> Result<(), ManagedError> {
+) -> Result<(), VolumeError> {
     verify_complete_segment(segment, bytes)?;
     for demand @ (offset, length, _) in demands {
         let start = usize::try_from(*offset)
@@ -803,7 +809,7 @@ fn verify_complete_demands(
     Ok(())
 }
 
-fn verify_range_demand(bytes: &Buffer, demand: DemandKey) -> Result<(), ManagedError> {
+fn verify_range_demand(bytes: &Buffer, demand: DemandKey) -> Result<(), VolumeError> {
     let (_, length, content) = demand;
     if bytes.len() as u64 != length {
         return Err(corrupt(
@@ -820,7 +826,7 @@ fn verify_range_demand(bytes: &Buffer, demand: DemandKey) -> Result<(), ManagedE
     Ok(())
 }
 
-fn slice_demand(bytes: &Buffer, demand: DemandKey) -> Result<Buffer, ManagedError> {
+fn slice_demand(bytes: &Buffer, demand: DemandKey) -> Result<Buffer, VolumeError> {
     let (offset, demand_length, _) = demand;
     let start = usize::try_from(offset)
         .map_err(|_| corrupt("read data segment", "extent offset exceeds this process"))?;
@@ -882,11 +888,11 @@ async fn stream_file(
     staging: &Operator,
     path: &str,
     sender: &mpsc::Sender<PreparedChunk>,
-) -> Result<(u64, [u8; 32]), ManagedError> {
+) -> Result<(u64, [u8; 32]), VolumeError> {
     let metadata = source
         .stat(path)
         .await
-        .map_err(|_| unavailable("read frozen file"))?;
+        .map_err(|_| unavailable("read frozen file", "storage operation failed"))?;
     if !metadata.is_file() {
         return Err(invalid("read frozen file", "input is not a regular file"));
     }
@@ -895,14 +901,14 @@ async fn stream_file(
         staging
             .write(path, Vec::<u8>::new())
             .await
-            .map_err(|_| unavailable("write frozen file"))?;
+            .map_err(|_| unavailable("write frozen file", "storage operation failed"))?;
         return Ok((size, Sha256::digest([]).into()));
     }
     if size < FASTCDC_MINIMUM_FILE_SIZE {
         let bytes = source
             .read(path)
             .await
-            .map_err(|_| unavailable("read frozen file"))?
+            .map_err(|_| unavailable("read frozen file", "storage operation failed"))?
             .to_bytes()
             .to_vec();
         if bytes.len() as u64 != size {
@@ -914,7 +920,7 @@ async fn stream_file(
         staging
             .write(path, bytes.clone())
             .await
-            .map_err(|_| unavailable("write frozen file"))?;
+            .map_err(|_| unavailable("write frozen file", "storage operation failed"))?;
         let content = content_ref(&bytes);
         sender
             .send(PreparedChunk {
@@ -925,7 +931,7 @@ async fn stream_file(
                 bytes,
             })
             .await
-            .map_err(|_| unavailable("stage Managed files"))?;
+            .map_err(|_| unavailable("stage Managed files", "storage operation failed"))?;
         return Ok((size, content.digest));
     }
 
@@ -952,18 +958,18 @@ async fn stream_fastcdc(
     size: u64,
     sizes: FastCdcSizes,
     sender: &mpsc::Sender<PreparedChunk>,
-) -> Result<[u8; 32], ManagedError> {
+) -> Result<[u8; 32], VolumeError> {
     let reader = source
         .reader(path)
         .await
-        .map_err(|_| unavailable("read frozen file"))?
+        .map_err(|_| unavailable("read frozen file", "storage operation failed"))?
         .into_bytes_stream(..)
         .await
-        .map_err(|_| unavailable("read frozen file"))?;
+        .map_err(|_| unavailable("read frozen file", "storage operation failed"))?;
     let writer = staging
         .writer(path)
         .await
-        .map_err(|_| unavailable("write frozen file"))?;
+        .map_err(|_| unavailable("write frozen file", "storage operation failed"))?;
     let reader: std::pin::Pin<Box<dyn futures::Stream<Item = std::io::Result<Vec<u8>>> + Send>> =
         Box::pin(stream::try_unfold(
             (Box::pin(reader), Some(writer)),
@@ -998,7 +1004,8 @@ async fn stream_fastcdc(
     let mut logical = Sha256::new();
     let mut observed = 0_u64;
     while let Some(chunk) = chunks.next().await {
-        let chunk = chunk.map_err(|_| unavailable("chunk frozen file"))?;
+        let chunk =
+            chunk.map_err(|_| unavailable("chunk frozen file", "storage operation failed"))?;
         if chunk.offset != observed {
             return Err(invalid(
                 "read frozen file",
@@ -1019,7 +1026,7 @@ async fn stream_fastcdc(
                 bytes: chunk.data,
             })
             .await
-            .map_err(|_| unavailable("stage Managed files"))?;
+            .map_err(|_| unavailable("stage Managed files", "storage operation failed"))?;
     }
     if observed != size {
         return Err(invalid(
@@ -1032,7 +1039,7 @@ async fn stream_fastcdc(
 
 fn take_segment_contents(
     contents: &mut BTreeMap<ContentRef, Vec<u8>>,
-) -> Result<BTreeMap<ContentRef, Vec<u8>>, ManagedError> {
+) -> Result<BTreeMap<ContentRef, Vec<u8>>, VolumeError> {
     let mut batch = BTreeMap::new();
     let mut batch_size = 0_u64;
     while let Some((&content, _)) = contents.first_key_value() {
@@ -1070,7 +1077,7 @@ fn complete_segment_sources(reference: SegmentRef, sources: &BTreeMap<u64, Segme
 async fn fetch_segment_sources<'a>(
     staging: &Operator,
     sources: impl ExactSizeIterator<Item = &'a SegmentSource>,
-) -> Result<Vec<Buffer>, ManagedError> {
+) -> Result<Vec<Buffer>, VolumeError> {
     let mut requests = BTreeMap::<&str, Vec<(usize, Range<u64>)>>::new();
     let count = sources.len();
     for (index, source) in sources.enumerate() {
@@ -1088,14 +1095,21 @@ async fn fetch_segment_sources<'a>(
         .take(count)
         .collect::<Vec<Option<Buffer>>>();
     for (path, ranges) in requests {
-        let reader = staging
-            .reader(path)
-            .await
-            .map_err(|_| unavailable("read frozen file for publication"))?;
+        let reader = staging.reader(path).await.map_err(|_| {
+            unavailable(
+                "read frozen file for publication",
+                "storage operation failed",
+            )
+        })?;
         let bytes = reader
             .fetch(ranges.iter().map(|(_, range)| range.clone()).collect())
             .await
-            .map_err(|_| unavailable("read frozen file for publication"))?;
+            .map_err(|_| {
+                unavailable(
+                    "read frozen file for publication",
+                    "storage operation failed",
+                )
+            })?;
         if bytes.len() != ranges.len() {
             return Err(corrupt(
                 "finalize Managed files",
@@ -1112,7 +1126,7 @@ async fn fetch_segment_sources<'a>(
         .collect())
 }
 
-fn seal_segment(contents: BTreeMap<ContentRef, Vec<u8>>) -> Result<SealedSegment, ManagedError> {
+fn seal_segment(contents: BTreeMap<ContentRef, Vec<u8>>) -> Result<SealedSegment, VolumeError> {
     // Segment v1 is the stable ContentRef ordering of its raw contents. The
     // descriptor owns offsets; SegmentRef authenticates the complete object.
     let mut encoded = Vec::new();
@@ -1158,7 +1172,7 @@ fn seal_segment(contents: BTreeMap<ContentRef, Vec<u8>>) -> Result<SealedSegment
     })
 }
 
-fn verify_complete_segment(reference: SegmentRef, bytes: &Buffer) -> Result<(), ManagedError> {
+fn verify_complete_segment(reference: SegmentRef, bytes: &Buffer) -> Result<(), VolumeError> {
     if bytes.len() as u64 != reference.length
         || buffer_content_ref(bytes).digest != reference.digest
     {
@@ -1178,42 +1192,16 @@ fn content_ref(bytes: &[u8]) -> ContentRef {
 }
 
 fn segment_key(reference: SegmentRef) -> String {
-    let digest = hex(&reference.digest);
+    let digest = LowerHex::encode(&reference.digest);
     format!("{SEGMENT_ROOT}/{}/{}.seg", &digest[..2], digest)
 }
 
-fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(DIGITS[(byte >> 4) as usize] as char);
-        output.push(DIGITS[(byte & 0x0f) as usize] as char);
-    }
-    output
-}
-
-fn referenced_segment_error(action: &'static str, error: opendal::Error) -> ManagedError {
+fn referenced_segment_error(action: &'static str, error: opendal::Error) -> VolumeError {
     if error.kind() == ErrorKind::NotFound {
         corrupt(action, "file version references a missing data segment")
     } else {
-        unavailable(action)
+        unavailable(action, "storage operation failed")
     }
-}
-
-fn invalid(action: &'static str, message: &'static str) -> ManagedError {
-    ManagedError::new(ManagedErrorKind::Invalid, action, message)
-}
-
-fn corrupt(action: &'static str, message: &'static str) -> ManagedError {
-    ManagedError::new(ManagedErrorKind::Corrupt, action, message)
-}
-
-fn unavailable(action: &'static str) -> ManagedError {
-    ManagedError::new(
-        ManagedErrorKind::Unavailable,
-        action,
-        "storage operation failed",
-    )
 }
 
 #[cfg(test)]

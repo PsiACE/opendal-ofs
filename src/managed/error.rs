@@ -15,44 +15,32 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::fmt;
-
 use crate::filesystem::{VolumeError, VolumeErrorKind};
 
-/// Stable failure classes exposed by Managed volume actions.
-pub type ManagedErrorKind = VolumeErrorKind;
-
-/// Failure to create or read Managed volume state.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ManagedError(VolumeError);
-
-impl ManagedError {
-    pub const fn kind(&self) -> ManagedErrorKind {
-        self.0.kind()
-    }
-
-    pub(crate) fn new(
-        kind: ManagedErrorKind,
-        action: &'static str,
-        message: impl Into<String>,
-    ) -> Self {
-        Self(VolumeError::new(
-            kind,
-            format!("{action}: {}", message.into()),
-        ))
-    }
+pub(crate) fn invalid(action: &'static str, message: impl Into<String>) -> VolumeError {
+    error(VolumeErrorKind::Invalid, action, message)
 }
 
-impl fmt::Display for ManagedError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
+pub(crate) fn conflict(action: &'static str, message: impl Into<String>) -> VolumeError {
+    error(VolumeErrorKind::Conflict, action, message)
 }
 
-impl std::error::Error for ManagedError {}
+pub(crate) fn corrupt(action: &'static str, message: impl Into<String>) -> VolumeError {
+    error(VolumeErrorKind::Corrupt, action, message)
+}
 
-impl From<ManagedError> for VolumeError {
-    fn from(error: ManagedError) -> Self {
-        error.0
-    }
+pub(crate) fn unavailable(action: &'static str, message: impl Into<String>) -> VolumeError {
+    error(VolumeErrorKind::Unavailable, action, message)
+}
+
+pub(crate) fn unsupported(action: &'static str, message: impl Into<String>) -> VolumeError {
+    error(VolumeErrorKind::UnsupportedFormat, action, message)
+}
+
+pub(crate) fn error(
+    kind: VolumeErrorKind,
+    action: &'static str,
+    message: impl Into<String>,
+) -> VolumeError {
+    VolumeError::new(kind, format!("{action}: {}", message.into()))
 }

@@ -17,21 +17,20 @@
 
 //! Branch authority over native revision-CAS records.
 
-use std::io::Cursor;
-
 use super::records::{BranchInfo, ForkPoint, StoredBranchRegistry, info};
-use crate::filesystem::{BranchBinding, BranchId, BranchName, VolumeId};
+use crate::filesystem::{
+    BranchBinding, BranchId, BranchName, VolumeError, VolumeErrorKind, VolumeId,
+};
+use crate::managed::ManagedVolume;
+use crate::managed::error::{conflict, corrupt, invalid, unavailable};
+use crate::managed::format::{RecordDecodeError, RecordEncodeError, V1Record};
 use crate::managed::metadata::namespace::{NamespaceStore, StoredHead, decode_head, encode_head};
 use crate::managed::metadata::record::{RecordBackend, Revision};
-use crate::managed::{ManagedError, ManagedErrorKind, ManagedVolume};
 use opendal::Operator;
-use serde::Serialize;
-use serde::de::DeserializeOwned;
-use sha2::{Digest as _, Sha256};
 
 const ROOT: &str = ".ofs/managed/metadata/v1/extensions/branch/v1";
 const REGISTRY_KEY: &str = ".ofs/managed/metadata/v1/extensions/branch/v1/registry.ofs";
-const REGISTRY_MAGIC: &[u8; 8] = b"OFS1BRG1";
+const REGISTRY_RECORD: V1Record = V1Record::new(*b"OFS1BRG1", usize::MAX);
 
 #[derive(Clone)]
 pub struct BranchStore {
@@ -62,7 +61,7 @@ impl BranchStore {
 
     /// Idempotently create the first unborn branch. The head is prepared
     /// before the registry, making the registry the branch-existence authority.
-    pub async fn initialize(&self, default_name: BranchName) -> Result<BranchInfo, ManagedError> {
+    pub async fn initialize(&self, default_name: BranchName) -> Result<BranchInfo, VolumeError> {
         if let Some((registry, _)) = self.read_registry().await? {
             return self.initialized(&registry, default_name).await;
         }
@@ -76,7 +75,9 @@ impl BranchStore {
             .await?;
         let registry =
             StoredBranchRegistry::initial(self.volume_id, default_name.clone(), branch_id);
-        let encoded_registry = encode(REGISTRY_MAGIC, &registry, "initialize Managed branches")?;
+        let encoded_registry = REGISTRY_RECORD
+            .encode(&registry)
+            .map_err(|error| encode_error("initialize Managed branches", error))?;
         if !self
             .backend
             .create(
@@ -86,10 +87,12 @@ impl BranchStore {
             )
             .await?
         {
-            let (registry, _) = self
-                .read_registry()
-                .await?
-                .ok_or_else(|| unavailable("initialize Managed branches"))?;
+            let (registry, _) = self.read_registry().await?.ok_or_else(|| {
+                unavailable(
+                    "initialize Managed branches",
+                    "object branch metadata is unavailable",
+                )
+            })?;
             return self.initialized(&registry, default_name).await;
         }
         Ok(info(default_name, branch_id, &head, branch_id))
@@ -99,7 +102,7 @@ impl BranchStore {
         &self,
         registry: &StoredBranchRegistry,
         default_name: BranchName,
-    ) -> Result<BranchInfo, ManagedError> {
+    ) -> Result<BranchInfo, VolumeError> {
         if registry.default_binding().map(|binding| binding.name) != Some(default_name.clone()) {
             return Err(conflict(
                 "initialize Managed branches",
@@ -110,7 +113,7 @@ impl BranchStore {
             .await
     }
 
-    pub async fn list(&self) -> Result<Vec<BranchInfo>, ManagedError> {
+    pub async fn list(&self) -> Result<Vec<BranchInfo>, VolumeError> {
         let (registry, _) = self.registry().await?;
         let default = registry.default_branch;
         let mut branches = Vec::with_capacity(registry.branches.len());
@@ -123,7 +126,7 @@ impl BranchStore {
         Ok(branches)
     }
 
-    pub async fn get(&self, name: &BranchName) -> Result<BranchInfo, ManagedError> {
+    pub async fn get(&self, name: &BranchName) -> Result<BranchInfo, VolumeError> {
         let (registry, _) = self.registry().await?;
         self.registered_branch(&registry, name, "show Managed branch")
             .await
@@ -134,8 +137,10 @@ impl BranchStore {
         registry: &StoredBranchRegistry,
         name: &BranchName,
         action: &'static str,
-    ) -> Result<BranchInfo, ManagedError> {
-        let id = registry.branch_id(name).ok_or_else(|| not_found(action))?;
+    ) -> Result<BranchInfo, VolumeError> {
+        let id = registry
+            .branch_id(name)
+            .ok_or_else(|| invalid(action, "branch does not exist"))?;
         let (head, _) = self
             .read_head(id)
             .await?
@@ -143,11 +148,11 @@ impl BranchStore {
         Ok(info(name.clone(), id, &head, registry.default_branch))
     }
 
-    pub async fn open(&self, name: &BranchName) -> Result<ManagedVolume, ManagedError> {
+    pub async fn open(&self, name: &BranchName) -> Result<ManagedVolume, VolumeError> {
         let (registry, _) = self.registry().await?;
         let id = registry
             .branch_id(name)
-            .ok_or_else(|| not_found("open Managed branch"))?;
+            .ok_or_else(|| invalid("open Managed branch", "branch does not exist"))?;
         let namespace = self.namespace(BranchBinding {
             name: name.clone(),
             id,
@@ -155,7 +160,7 @@ impl BranchStore {
         ManagedVolume::new(namespace, self.data.clone())
     }
 
-    pub async fn open_default(&self) -> Result<ManagedVolume, ManagedError> {
+    pub async fn open_default(&self) -> Result<ManagedVolume, VolumeError> {
         let (registry, _) = self.registry().await?;
         let binding = registry
             .default_binding()
@@ -164,11 +169,11 @@ impl BranchStore {
         ManagedVolume::new(namespace, self.data.clone())
     }
 
-    pub async fn delete(&self, name: &BranchName) -> Result<(), ManagedError> {
+    pub async fn delete(&self, name: &BranchName) -> Result<(), VolumeError> {
         let (registry, _) = self.registry().await?;
         let branch_id = registry
             .branch_id(name)
-            .ok_or_else(|| not_found("delete Managed branch"))?;
+            .ok_or_else(|| invalid("delete Managed branch", "branch does not exist"))?;
         if registry.default_branch == branch_id {
             return Err(invalid(
                 "delete Managed branch",
@@ -219,7 +224,9 @@ impl BranchStore {
                 return Ok(());
             }
             registry.branches.remove(name);
-            let bytes = encode(REGISTRY_MAGIC, &registry, "delete Managed branch")?;
+            let bytes = REGISTRY_RECORD
+                .encode(&registry)
+                .map_err(|error| encode_error("delete Managed branch", error))?;
             match self
                 .backend
                 .replace(REGISTRY_KEY, &revision, bytes, "delete Managed branch")
@@ -244,7 +251,7 @@ impl BranchStore {
         source: Option<BranchName>,
         point: ForkPoint,
         target: BranchName,
-    ) -> Result<(BranchInfo, BranchName), ManagedError> {
+    ) -> Result<(BranchInfo, BranchName), VolumeError> {
         let (mut registry, revision) = self.registry().await?;
         if registry.branches.contains_key(&target) {
             return Err(conflict(
@@ -261,7 +268,7 @@ impl BranchStore {
         };
         let source_id = registry
             .branch_id(&source)
-            .ok_or_else(|| not_found("fork Managed branch"))?;
+            .ok_or_else(|| invalid("fork Managed branch", "branch does not exist"))?;
         let (source_head, _) = self
             .read_head(source_id)
             .await?
@@ -285,12 +292,17 @@ impl BranchStore {
                     })
                     .find_history_state(current.previous_history, sequence)
                     .await?
-                    .ok_or_else(|| position_not_retained("fork Managed branch"))?
+                    .ok_or_else(|| {
+                        invalid("fork Managed branch", "branch position is not retained")
+                    })?
                     .into()
                 }
             }
             (ForkPoint::Sequence(_), None) => {
-                return Err(position_not_retained("fork Managed branch"));
+                return Err(invalid(
+                    "fork Managed branch",
+                    "branch position is not retained",
+                ));
             }
         };
         let target_id = BranchId::generate();
@@ -311,7 +323,9 @@ impl BranchStore {
             ));
         }
         registry.branches.insert(target.clone(), target_id);
-        let bytes = encode(REGISTRY_MAGIC, &registry, "fork Managed branch")?;
+        let bytes = REGISTRY_RECORD
+            .encode(&registry)
+            .map_err(|error| encode_error("fork Managed branch", error))?;
         match self
             .backend
             .replace(REGISTRY_KEY, &revision, bytes, "fork Managed branch")
@@ -331,7 +345,7 @@ impl BranchStore {
                         "fork Managed branch",
                         "target branch was created concurrently",
                     )),
-                    Err(observed) if observed.kind() == ManagedErrorKind::Invalid => Err(error),
+                    Err(observed) if observed.kind() == VolumeErrorKind::Invalid => Err(error),
                     Err(observed) => Err(observed),
                 };
             }
@@ -342,15 +356,13 @@ impl BranchStore {
         ))
     }
 
-    async fn registry(&self) -> Result<(StoredBranchRegistry, Revision), ManagedError> {
+    async fn registry(&self) -> Result<(StoredBranchRegistry, Revision), VolumeError> {
         self.read_registry()
             .await?
             .ok_or_else(|| corrupt("read Managed branches", "branch registry is missing"))
     }
 
-    async fn read_registry(
-        &self,
-    ) -> Result<Option<(StoredBranchRegistry, Revision)>, ManagedError> {
+    async fn read_registry(&self) -> Result<Option<(StoredBranchRegistry, Revision)>, VolumeError> {
         let Some((bytes, revision)) = self
             .backend
             .read(REGISTRY_KEY, "read Managed branches")
@@ -358,8 +370,9 @@ impl BranchStore {
         else {
             return Ok(None);
         };
-        let registry: StoredBranchRegistry =
-            decode(REGISTRY_MAGIC, &bytes, "read Managed branches")?;
+        let registry: StoredBranchRegistry = REGISTRY_RECORD
+            .decode(&bytes)
+            .map_err(|error| decode_error("read Managed branches", error))?;
         registry.validate(self.volume_id)?;
         Ok(Some((registry, revision)))
     }
@@ -367,7 +380,7 @@ impl BranchStore {
     async fn read_head(
         &self,
         branch_id: BranchId,
-    ) -> Result<Option<(StoredHead, Revision)>, ManagedError> {
+    ) -> Result<Option<(StoredHead, Revision)>, VolumeError> {
         let Some((bytes, revision)) = self
             .backend
             .read(&head_key(branch_id), "read Managed branch")
@@ -385,71 +398,16 @@ fn head_key(branch: BranchId) -> String {
     format!("{ROOT}/heads/{branch}.ofs")
 }
 
-fn encode<T: Serialize>(
-    magic: &[u8; 8],
-    value: &T,
-    action: &'static str,
-) -> Result<Vec<u8>, ManagedError> {
-    let mut body = Vec::new();
-    ciborium::ser::into_writer(value, &mut body)
-        .map_err(|_| invalid(action, "branch record cannot be encoded"))?;
-    let mut bytes = Vec::with_capacity(magic.len() + body.len() + 32);
-    bytes.extend_from_slice(magic);
-    bytes.extend_from_slice(&body);
-    let checksum: [u8; 32] = Sha256::digest(&bytes).into();
-    bytes.extend_from_slice(&checksum);
-    Ok(bytes)
+fn encode_error(action: &'static str, _: RecordEncodeError) -> VolumeError {
+    invalid(action, "branch record cannot be encoded")
 }
 
-fn decode<T: DeserializeOwned>(
-    magic: &[u8; 8],
-    bytes: &[u8],
-    action: &'static str,
-) -> Result<T, ManagedError> {
-    let body = bytes
-        .strip_prefix(magic)
-        .and_then(|bytes| bytes.get(..bytes.len().checked_sub(32)?))
-        .ok_or_else(|| corrupt(action, "branch record format is invalid"))?;
-    if Sha256::digest(&bytes[..bytes.len() - 32]).as_slice() != &bytes[bytes.len() - 32..] {
-        return Err(corrupt(action, "branch record checksum is invalid"));
-    }
-    let mut input = Cursor::new(body);
-    let value = ciborium::de::from_reader(&mut input)
-        .map_err(|_| corrupt(action, "branch record cannot be decoded"))?;
-    if input.position() != body.len() as u64 {
-        return Err(corrupt(action, "branch record has trailing bytes"));
-    }
-    Ok(value)
-}
-
-fn invalid(action: &'static str, message: &'static str) -> ManagedError {
-    ManagedError::new(ManagedErrorKind::Invalid, action, message)
-}
-
-fn conflict(action: &'static str, message: &'static str) -> ManagedError {
-    ManagedError::new(ManagedErrorKind::Conflict, action, message)
-}
-
-fn position_not_retained(action: &'static str) -> ManagedError {
-    ManagedError::new(
-        ManagedErrorKind::Invalid,
-        action,
-        "branch position is not retained",
-    )
-}
-
-fn not_found(action: &'static str) -> ManagedError {
-    ManagedError::new(ManagedErrorKind::Invalid, action, "branch does not exist")
-}
-
-fn corrupt(action: &'static str, message: &'static str) -> ManagedError {
-    ManagedError::new(ManagedErrorKind::Corrupt, action, message)
-}
-
-fn unavailable(action: &'static str) -> ManagedError {
-    ManagedError::new(
-        ManagedErrorKind::Unavailable,
-        action,
-        "object branch metadata is unavailable",
-    )
+fn decode_error(action: &'static str, error: RecordDecodeError) -> VolumeError {
+    let message = match error {
+        RecordDecodeError::Envelope => "branch record format is invalid",
+        RecordDecodeError::Checksum => "branch record checksum is invalid",
+        RecordDecodeError::Decode => "branch record cannot be decoded",
+        RecordDecodeError::TrailingBytes => "branch record has trailing bytes",
+    };
+    corrupt(action, message)
 }

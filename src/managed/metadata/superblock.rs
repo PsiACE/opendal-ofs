@@ -17,8 +17,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::filesystem::VolumeId;
-use crate::managed::{ManagedError, ManagedErrorKind};
+use crate::filesystem::{VolumeError, VolumeId};
+use crate::managed::error::{corrupt, invalid, unsupported};
+use crate::managed::format::LowerHex;
 
 pub(crate) const SUPERBLOCK_KEY: &str = ".ofs/managed/metadata/v1/superblock.json";
 
@@ -44,10 +45,13 @@ impl ManagedExtension {
         }
     }
 
-    fn parse(value: &str) -> Result<Self, ManagedError> {
+    fn parse(value: &str) -> Result<Self, VolumeError> {
         match value {
             "branch/v1" => Ok(Self::BranchV1),
-            _ => Err(unsupported("superblock requires an unsupported extension")),
+            _ => Err(unsupported(
+                "open Managed volume",
+                "superblock requires an unsupported extension",
+            )),
         }
     }
 }
@@ -60,11 +64,14 @@ impl MetadataFormat {
         }
     }
 
-    fn parse(value: &str) -> Result<Self, ManagedError> {
+    fn parse(value: &str) -> Result<Self, VolumeError> {
         match value {
             "object" => Ok(Self::ObjectV1),
             "transactional" => Ok(Self::TransactionalV1),
-            _ => Err(unsupported("metadata format is unsupported")),
+            _ => Err(unsupported(
+                "open Managed volume",
+                "metadata format is unsupported",
+            )),
         }
     }
 }
@@ -110,26 +117,29 @@ impl ManagedFormat {
         self.required_extensions.binary_search(&extension).is_ok()
     }
 
-    pub(crate) fn encode(&self) -> Result<Vec<u8>, ManagedError> {
-        serde_json::to_vec(&SuperblockWire::from(self)).map_err(|_| {
-            ManagedError::new(
-                ManagedErrorKind::Invalid,
-                "create Managed volume",
-                "superblock cannot be encoded",
-            )
-        })
+    pub(crate) fn encode(&self) -> Result<Vec<u8>, VolumeError> {
+        serde_json::to_vec(&SuperblockWire::from(self))
+            .map_err(|_| invalid("create Managed volume", "superblock cannot be encoded"))
     }
 
-    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, ManagedError> {
-        let wire: SuperblockWire = serde_json::from_slice(bytes)
-            .map_err(|_| corrupt("superblock is not strict UTF-8 JSON"))?;
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, VolumeError> {
+        let wire: SuperblockWire = serde_json::from_slice(bytes).map_err(|_| {
+            corrupt(
+                "read Managed superblock",
+                "superblock is not strict UTF-8 JSON",
+            )
+        })?;
         if wire.extensions.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err(corrupt(
+                "read Managed superblock",
                 "required extensions are not strictly ordered or contain duplicates",
             ));
         }
         if wire.version != VERSION {
-            return Err(unsupported("Managed format version is unsupported"));
+            return Err(unsupported(
+                "open Managed volume",
+                "Managed format version is unsupported",
+            ));
         }
         let required_extensions = wire
             .extensions
@@ -142,22 +152,6 @@ impl ManagedFormat {
             required_extensions,
         })
     }
-}
-
-fn unsupported(message: &'static str) -> ManagedError {
-    ManagedError::new(
-        ManagedErrorKind::UnsupportedFormat,
-        "open Managed volume",
-        message,
-    )
-}
-
-fn corrupt(message: &'static str) -> ManagedError {
-    ManagedError::new(
-        ManagedErrorKind::Corrupt,
-        "read Managed superblock",
-        message,
-    )
 }
 
 #[derive(Deserialize, Serialize)]
@@ -173,7 +167,7 @@ impl From<&ManagedFormat> for SuperblockWire {
     fn from(format: &ManagedFormat) -> Self {
         Self {
             version: VERSION,
-            volume_id: encode_hex(format.volume_id.as_bytes()),
+            volume_id: LowerHex::encode(format.volume_id.as_bytes()),
             metadata: format.metadata_format.identifier().to_owned(),
             extensions: format
                 .required_extensions
@@ -184,29 +178,22 @@ impl From<&ManagedFormat> for SuperblockWire {
     }
 }
 
-fn encode_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn decode_volume_id(value: &str) -> Result<VolumeId, ManagedError> {
-    if value.len() != 32
-        || value
-            .bytes()
-            .any(|byte| !byte.is_ascii_digit() && !(b'a'..=b'f').contains(&byte))
-    {
-        return Err(corrupt("volume identity is not 16-byte lowercase hex"));
-    }
-    let mut bytes = [0; 16];
-    for (index, byte) in bytes.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
-            .map_err(|_| corrupt("volume identity is not 16-byte lowercase hex"))?;
-    }
+fn decode_volume_id(value: &str) -> Result<VolumeId, VolumeError> {
+    let bytes = LowerHex::decode(value)
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| {
+            corrupt(
+                "read Managed superblock",
+                "volume identity is not 16-byte lowercase hex",
+            )
+        })?;
     Ok(VolumeId::from_bytes(bytes))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::filesystem::VolumeErrorKind;
 
     fn object_format() -> ManagedFormat {
         ManagedFormat::v1(VolumeId::from_bytes([1; 16]), MetadataFormat::ObjectV1)
@@ -228,7 +215,7 @@ mod tests {
         let unknown = br#"{"version":1,"volume_id":"01010101010101010101010101010101","metadata":"object","extensions":["future/1"]}"#;
         assert_eq!(
             ManagedFormat::decode(unknown).unwrap_err().kind(),
-            ManagedErrorKind::UnsupportedFormat
+            VolumeErrorKind::UnsupportedFormat
         );
     }
 
@@ -237,7 +224,7 @@ mod tests {
         let duplicate = br#"{"version":1,"volume_id":"01010101010101010101010101010101","metadata":"object","extensions":["future/1","future/1"]}"#;
         assert_eq!(
             ManagedFormat::decode(duplicate).unwrap_err().kind(),
-            ManagedErrorKind::Corrupt
+            VolumeErrorKind::Corrupt
         );
     }
 
@@ -246,7 +233,7 @@ mod tests {
         let unknown = br#"{"version":1,"volume_id":"01010101010101010101010101010101","metadata":"object","extensions":[],"policy":"fastcdc"}"#;
         assert_eq!(
             ManagedFormat::decode(unknown).unwrap_err().kind(),
-            ManagedErrorKind::Corrupt
+            VolumeErrorKind::Corrupt
         );
     }
 
@@ -255,7 +242,7 @@ mod tests {
         let bytes = br#"{"version":1,"volume_id":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","metadata":"object","extensions":[]}"#;
         assert_eq!(
             ManagedFormat::decode(bytes).unwrap_err().kind(),
-            ManagedErrorKind::Corrupt
+            VolumeErrorKind::Corrupt
         );
     }
 }

@@ -29,37 +29,36 @@ use opendal::Operator;
 use record::RecordBackend;
 use superblock::SUPERBLOCK_KEY;
 
+use super::ManagedVolume;
+use super::error::{invalid, unavailable};
 use super::extensions::branch::BranchStore;
-use super::{ManagedError, ManagedVolume};
+use crate::filesystem::VolumeError;
 /// The selected format and sole mutable-record authority for one Managed volume.
 pub struct ManagedMetadata {
-    format: MetadataFormat,
     backend: RecordBackend,
 }
 
 impl ManagedMetadata {
-    pub fn object(operator: Operator) -> Result<Self, ManagedError> {
+    pub fn object(operator: Operator) -> Result<Self, VolumeError> {
         Ok(Self {
-            format: MetadataFormat::ObjectV1,
             backend: RecordBackend::object(operator, "open Managed metadata")?,
         })
     }
 
-    pub fn d1(config: D1Config) -> Result<Self, ManagedError> {
+    pub fn d1(config: D1Config) -> Result<Self, VolumeError> {
         Ok(Self {
-            format: MetadataFormat::TransactionalV1,
             backend: RecordBackend::d1(config)?,
         })
     }
 
     pub const fn metadata_format(&self) -> MetadataFormat {
-        self.format
+        self.backend.metadata_format()
     }
 
     pub async fn create_format(
         &self,
         desired: &ManagedFormat,
-    ) -> Result<ManagedFormat, ManagedError> {
+    ) -> Result<ManagedFormat, VolumeError> {
         self.require_backend_format(desired)?;
         let observed = self
             .backend
@@ -70,18 +69,12 @@ impl ManagedMetadata {
         Ok(observed)
     }
 
-    pub async fn read_format(&self) -> Result<ManagedFormat, ManagedError> {
+    pub async fn read_format(&self) -> Result<ManagedFormat, VolumeError> {
         let (bytes, _) = self
             .backend
             .read(SUPERBLOCK_KEY, "read Managed format")
             .await?
-            .ok_or_else(|| {
-                ManagedError::new(
-                    super::ManagedErrorKind::Unavailable,
-                    "read Managed format",
-                    "Managed format does not exist",
-                )
-            })?;
+            .ok_or_else(|| unavailable("read Managed format", "Managed format does not exist"))?;
         let format = ManagedFormat::decode(&bytes)?;
         self.require_backend_format(&format)?;
         Ok(format)
@@ -91,11 +84,10 @@ impl ManagedMetadata {
         &self,
         format: ManagedFormat,
         data: Operator,
-    ) -> Result<ManagedVolume, ManagedError> {
+    ) -> Result<ManagedVolume, VolumeError> {
         self.require_backend_format(&format)?;
         if !format.required_extensions().is_empty() {
-            return Err(ManagedError::new(
-                super::ManagedErrorKind::Invalid,
+            return Err(invalid(
                 "open Managed volume",
                 "base namespace does not accept Managed extensions",
             ));
@@ -109,11 +101,10 @@ impl ManagedMetadata {
         &self,
         format: &ManagedFormat,
         data: Operator,
-    ) -> Result<BranchStore, ManagedError> {
+    ) -> Result<BranchStore, VolumeError> {
         self.require_backend_format(format)?;
         if !format.requires_extension(ManagedExtension::BranchV1) {
-            return Err(ManagedError::new(
-                super::ManagedErrorKind::Invalid,
+            return Err(invalid(
                 "open Managed branches",
                 "Managed format does not enable branch/v1",
             ));
@@ -122,12 +113,11 @@ impl ManagedMetadata {
         Ok(BranchStore::new(volume_id, data, self.backend.clone()))
     }
 
-    fn require_backend_format(&self, format: &ManagedFormat) -> Result<(), ManagedError> {
+    fn require_backend_format(&self, format: &ManagedFormat) -> Result<(), VolumeError> {
         if format.metadata_format() == self.metadata_format() {
             Ok(())
         } else {
-            Err(ManagedError::new(
-                super::ManagedErrorKind::Invalid,
+            Err(invalid(
                 "open Managed metadata",
                 "superblock metadata format does not match its authority",
             ))

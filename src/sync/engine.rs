@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use super::local::{entry_at, fs_operator, set_executable};
 use super::path::SnapshotTree;
-use super::reconcile::ReconcilePlan;
+use super::reconcile::{ReconcilePlan, TargetEdit};
 use super::{
     ConflictRecord, LocalKind, LocalTree, ReplicaState, StagedTree, TargetManifest,
     build_publication, reconcile,
@@ -200,10 +200,17 @@ impl<V: Volume> SyncEngine<V> {
             return Ok(result(&state, false));
         }
 
+        let target_changes_staging = target_update
+            .as_ref()
+            .is_some_and(|plan| plan.target != *staged.manifest() || !plan.edits.is_empty());
         if target_update.is_some() || publish {
-            state.pending = Some(staged.pending(operation, data_finalized, local_renames.clone()));
+            let pending = staged.pending(operation, data_finalized, local_renames.clone());
+            let changed = state.pending.as_ref() != Some(&pending) || !state.conflicts.is_empty();
+            state.pending = Some(pending);
             state.conflicts.clear();
-            state.install(state_path)?;
+            if changed {
+                state.install(state_path)?;
+            }
         }
 
         if publish && !data_finalized {
@@ -211,9 +218,12 @@ impl<V: Volume> SyncEngine<V> {
             self.volume
                 .finalize_staged_files(&staging, staged.prepared_files()?, remote)
                 .await?;
-            data_finalized = true;
-            state.pending = Some(staged.pending(operation, data_finalized, local_renames.clone()));
-            state.install(state_path)?;
+            if target_changes_staging {
+                data_finalized = true;
+                state.pending =
+                    Some(staged.pending(operation, data_finalized, local_renames.clone()));
+                state.install(state_path)?;
+            }
         }
 
         if let Some(plan) = target_update {
@@ -261,9 +271,13 @@ impl<V: Volume> SyncEngine<V> {
             &staged,
             &local_renames,
         )?;
-        state.pending = Some(staged.pending(operation, data_finalized, local_renames));
+        let pending = staged.pending(operation, data_finalized, local_renames);
+        let changed = state.pending.as_ref() != Some(&pending) || !state.conflicts.is_empty();
+        state.pending = Some(pending);
         state.conflicts.clear();
-        state.install(state_path)?;
+        if changed {
+            state.install(state_path)?;
+        }
         match self.volume.publish(observed.as_ref(), &publication).await? {
             CommitOutcome::Committed(committed) if committed == publication.target.cursor => {
                 let unchanged = matches_local(replica_path, &local).await?;
@@ -313,9 +327,7 @@ async fn apply_target<V: Volume>(
 ) -> Result<()> {
     let ReconcilePlan {
         target: manifest,
-        mut materialize,
-        reuse,
-        refresh,
+        edits,
         ..
     } = plan;
     let root = staged.root().to_owned();
@@ -340,28 +352,32 @@ async fn apply_target<V: Volume>(
         };
         target.delete(&target_path).await?;
     }
-    for path in &refresh {
-        if manifest
-            .entries()
-            .get(path)
-            .is_some_and(|entry| entry.local.kind == LocalKind::Directory)
-        {
+    for (path, edit) in &edits {
+        if matches!(edit, TargetEdit::Directory) {
             target.create_dir(&format!("{path}/")).await?;
         }
     }
 
-    for (path, source) in reuse {
-        if !reuse_local_file(
-            source_root,
-            &root,
-            staged.source(),
-            &manifest,
-            &source,
-            &path,
-        )
-        .await?
-        {
-            materialize.insert(path);
+    let mut materialize = BTreeSet::new();
+    for (path, edit) in &edits {
+        match edit {
+            TargetEdit::Materialize => {
+                materialize.insert(path.clone());
+            }
+            TargetEdit::Reuse(source)
+                if !reuse_local_file(
+                    source_root,
+                    &root,
+                    staged.source(),
+                    &manifest,
+                    source,
+                    path,
+                )
+                .await? =>
+            {
+                materialize.insert(path.clone());
+            }
+            TargetEdit::Reuse(_) | TargetEdit::Directory => {}
         }
     }
 
@@ -394,7 +410,7 @@ async fn apply_target<V: Volume>(
             .executable;
         set_executable(&root.join(path), executable)?;
     }
-    staged.replace_manifest(manifest, &refresh).await
+    staged.replace_manifest(manifest, edits.keys()).await
 }
 
 async fn reuse_local_file(
