@@ -42,15 +42,135 @@ pub(crate) fn run_fixture(keep: bool, case: Option<&str>) {
     match case {
         Some("admission") => admission(&fixture),
         Some("growing") => growing(&fixture),
+        Some("reconcile") => reconcile(&fixture),
         Some("smoke") => smoke(&fixture),
         Some(name) => panic!("unknown Managed Sync behavior case: {name}"),
         None => {
             admission(&fixture);
             smoke(&fixture);
+            reconcile(&fixture);
             growing(&fixture);
         }
     }
     println!("Managed Sync behavior passed: {}", case.unwrap_or("all"));
+}
+
+fn reconcile(fixture: &Fixture) {
+    let root = CaseRoot::new();
+    let replica_a = root.path.join("replica-a");
+    let replica_b = root.path.join("replica-b");
+    let state_a = root.path.join("state-a");
+    let state_b = root.path.join("state-b");
+    fs::create_dir_all(&replica_a).expect("create reconcile replica A");
+    fs::create_dir_all(&replica_b).expect("create reconcile replica B");
+    let storage = fixture.storage_url("reconcile");
+
+    run_ofs_success(
+        ofs_sync(&replica_a, &state_a, &storage, true),
+        "initialize reconcile replica",
+    );
+    fs::write(replica_a.join("shared.txt"), b"common\n").expect("write common file");
+    fs::write(replica_a.join("delete-edit.txt"), b"common\n").expect("write delete-edit base");
+    run_ofs_success(
+        ofs_sync(&replica_a, &state_a, &storage, false),
+        "publish reconcile base",
+    );
+    run_ofs_success(
+        ofs_sync(&replica_b, &state_b, &storage, false),
+        "attach reconcile replica B",
+    );
+
+    fs::write(replica_a.join("from-a.txt"), b"from A\n").expect("write A-only change");
+    fs::write(replica_b.join("from-b.txt"), b"from B\n").expect("write B-only change");
+    run_ofs_success(
+        ofs_sync(&replica_a, &state_a, &storage, false),
+        "publish A-only change",
+    );
+    let merged = run_ofs_success(
+        ofs_sync(&replica_b, &state_b, &storage, false),
+        "merge B-only change",
+    );
+    assert!(
+        output_text(&merged.stdout).contains("(published)"),
+        "a disjoint two-replica merge publishes one combined generation"
+    );
+    run_ofs_success(
+        ofs_sync(&replica_a, &state_a, &storage, false),
+        "install disjoint merge in A",
+    );
+    assert_eq!(
+        tree_fingerprint(&replica_a),
+        tree_fingerprint(&replica_b),
+        "disjoint changes from both replicas converge"
+    );
+
+    fs::write(replica_a.join("shared.txt"), b"candidate A\n").expect("write A candidate");
+    fs::write(replica_b.join("shared.txt"), b"candidate B\n").expect("write B candidate");
+    run_ofs_success(
+        ofs_sync(&replica_a, &state_a, &storage, false),
+        "publish A conflict candidate",
+    );
+    let conflict = run_ofs_failure(
+        ofs_sync(&replica_b, &state_b, &storage, false),
+        "retain concurrent file conflict",
+    );
+    assert!(
+        output_text(&conflict.stderr).contains("retained 1 conflict"),
+        "a concurrent file update reports one retained conflict"
+    );
+    assert_eq!(
+        fs::read(replica_a.join("shared.txt")).expect("read remote candidate"),
+        b"candidate A\n"
+    );
+    assert_eq!(
+        fs::read(replica_b.join("shared.txt")).expect("read local candidate"),
+        b"candidate B\n"
+    );
+    let status = run_ofs_success(ofs_status(&replica_b, &state_b), "report retained conflict");
+    assert!(
+        output_text(&status.stdout).contains("\"conflicts\":1"),
+        "status reports the unresolved conflict"
+    );
+    run_ofs_success(
+        ofs_sync_resolve(&replica_b, &state_b, &storage, &["shared.txt"]),
+        "resolve file conflict with local candidate",
+    );
+    run_ofs_success(
+        ofs_sync(&replica_a, &state_a, &storage, false),
+        "install resolved file in A",
+    );
+    assert_eq!(
+        fs::read(replica_a.join("shared.txt")).expect("read resolved candidate"),
+        b"candidate B\n",
+        "explicit resolution publishes the selected local content"
+    );
+
+    fs::write(replica_a.join("delete-edit.txt"), b"edited in A\n").expect("edit delete-edit file");
+    fs::remove_file(replica_b.join("delete-edit.txt")).expect("delete file in B");
+    run_ofs_success(
+        ofs_sync(&replica_a, &state_a, &storage, false),
+        "publish edit before delete conflict",
+    );
+    run_ofs_failure(
+        ofs_sync(&replica_b, &state_b, &storage, false),
+        "retain delete-versus-edit conflict",
+    );
+    assert!(
+        replica_a.join("delete-edit.txt").is_file() && !replica_b.join("delete-edit.txt").exists(),
+        "delete-versus-edit retains both available user outcomes"
+    );
+    run_ofs_success(
+        ofs_sync_resolve(&replica_b, &state_b, &storage, &["delete-edit.txt"]),
+        "resolve delete-versus-edit with local deletion",
+    );
+    run_ofs_success(
+        ofs_sync(&replica_a, &state_a, &storage, false),
+        "install resolved deletion in A",
+    );
+    assert!(
+        !replica_a.join("delete-edit.txt").exists(),
+        "explicit local deletion resolution converges"
+    );
 }
 
 fn growing(fixture: &Fixture) {
@@ -341,6 +461,14 @@ fn ofs_status(replica: &Path, state: &Path) -> Command {
         .arg("--state")
         .arg(state)
         .arg("--json");
+    command
+}
+
+fn ofs_sync_resolve(replica: &Path, state: &Path, storage: &str, paths: &[&str]) -> Command {
+    let mut command = ofs_sync(replica, state, storage, false);
+    for path in paths {
+        command.arg("--resolve").arg(path);
+    }
     command
 }
 
