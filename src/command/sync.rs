@@ -36,9 +36,9 @@ pub(super) async fn run(args: SyncArgs) -> Result<()> {
 
     let metadata = ManagedMetadata::object(open_operator(&args)?)?;
     if args.init {
-        let format = metadata.initialize().await?;
-        ReplicaState::new(root, format.volume_id()).save_new(&args.state)?;
-        println!("initialized managed sync volume {}", format.volume_id());
+        let volume = metadata.initialize().await?;
+        ReplicaState::new(root, volume.id()).save_new(&args.state)?;
+        println!("initialized managed sync volume {}", volume.id());
         return Ok(());
     }
 
@@ -46,10 +46,10 @@ pub(super) async fn run(args: SyncArgs) -> Result<()> {
     if state.root != root {
         bail!("replica state belongs to a different local directory");
     }
-    let format = metadata.open(state.volume_id).await?;
+    let volume = metadata.open(state.volume_id).await?;
     println!(
         "opened managed sync volume {} at change {}",
-        format.volume_id(),
+        volume.id(),
         state.cursor.sequence()
     );
     Ok(())

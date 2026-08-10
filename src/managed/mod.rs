@@ -17,11 +17,15 @@
 
 //! Managed volume authority and durable storage format.
 
+mod data;
 mod error;
 mod format;
+mod head;
 mod object;
+mod record;
 
 pub use format::ManagedFormat;
+pub use head::{ManagedObservation, ManagedVolume};
 
 use opendal::Operator;
 
@@ -52,13 +56,17 @@ impl ManagedMetadata {
     }
 
     /// Create the Managed superblock once, or return the existing format.
-    pub async fn initialize(&self) -> Result<ManagedFormat, VolumeError> {
+    pub async fn initialize(&self) -> Result<ManagedVolume, VolumeError> {
         let desired = ManagedFormat::v1(VolumeId::generate());
         let encoded = desired.encode()?;
-        if object::create(&self.operator, SUPERBLOCK_KEY, encoded.clone()).await? {
-            return Ok(desired);
-        }
-        self.read_format().await
+        let format = if object::create(&self.operator, SUPERBLOCK_KEY, encoded).await? {
+            desired
+        } else {
+            self.read_format().await?
+        };
+        let volume = ManagedVolume::new(format, self.operator.clone());
+        volume.initialize().await?;
+        Ok(volume)
     }
 
     pub async fn read_format(&self) -> Result<ManagedFormat, VolumeError> {
@@ -69,7 +77,7 @@ impl ManagedMetadata {
     }
 
     /// Open the authority only when it belongs to the replica's recorded volume.
-    pub async fn open(&self, expected: VolumeId) -> Result<ManagedFormat, VolumeError> {
+    pub async fn open(&self, expected: VolumeId) -> Result<ManagedVolume, VolumeError> {
         let format = self.read_format().await?;
         if format.volume_id() != expected {
             return Err(invalid(
@@ -77,6 +85,11 @@ impl ManagedMetadata {
                 "replica state belongs to a different volume",
             ));
         }
-        Ok(format)
+        ManagedVolume::open(format, self.operator.clone()).await
+    }
+
+    pub async fn open_unbound(&self) -> Result<ManagedVolume, VolumeError> {
+        let format = self.read_format().await?;
+        ManagedVolume::open(format, self.operator.clone()).await
     }
 }

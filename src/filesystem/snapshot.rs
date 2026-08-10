@@ -86,6 +86,29 @@ pub struct VolumeSnapshot {
 }
 
 impl VolumeSnapshot {
+    /// Return every non-root path and its stable node identity.
+    pub fn paths(&self) -> Result<BTreeMap<String, NodeId>, VolumeError> {
+        self.validate()?;
+        let mut paths = BTreeMap::new();
+        let mut pending = vec![(String::new(), self.root)];
+        while let Some((path, node_id)) = pending.pop() {
+            if self.nodes[&node_id].kind == NodeKind::Directory {
+                for (name, entry) in self.directories[&node_id].entries.iter().rev() {
+                    let child = if path.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{path}/{name}")
+                    };
+                    pending.push((child, entry.node));
+                }
+            }
+            if !path.is_empty() {
+                paths.insert(path, node_id);
+            }
+        }
+        Ok(paths)
+    }
+
     pub fn validate(&self) -> Result<(), VolumeError> {
         let root = self
             .nodes
