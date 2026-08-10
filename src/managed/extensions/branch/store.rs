@@ -186,7 +186,7 @@ impl BranchStore {
     }
 
     pub async fn delete(&self, name: &BranchName) -> Result<(), VolumeError> {
-        let (registry, _) = self.registry().await?;
+        let (mut registry, mut registry_revision) = self.registry().await?;
         let branch_id = registry
             .branches
             .get(name)
@@ -249,7 +249,6 @@ impl BranchStore {
         }
 
         for _ in 0..BRANCH_CAS_ATTEMPTS {
-            let (mut registry, revision) = self.registry().await?;
             if registry.branches.get(name).copied() != Some(branch_id) {
                 return Ok(());
             }
@@ -259,11 +258,19 @@ impl BranchStore {
                 .map_err(|error| invalid("delete Managed branch", error.message()))?;
             match self
                 .backend
-                .replace(REGISTRY_KEY, &revision, bytes, "delete Managed branch")
+                .replace(
+                    REGISTRY_KEY,
+                    &registry_revision,
+                    bytes,
+                    "delete Managed branch",
+                )
                 .await
             {
                 Ok(true) => return Ok(()),
-                Ok(false) => tokio::task::yield_now().await,
+                Ok(false) => {
+                    (registry, registry_revision) = self.registry().await?;
+                    tokio::task::yield_now().await;
+                }
                 Err(error) => {
                     let (current, _) = self.registry().await?;
                     return if current.branches.get(name).copied() == Some(branch_id) {
