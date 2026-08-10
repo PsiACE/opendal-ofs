@@ -44,11 +44,6 @@ mod durable {
         value: &impl Serialize,
         format: JsonFormat,
     ) -> Result<()> {
-        let mut bytes = match format {
-            JsonFormat::Compact => serde_json::to_vec(value),
-            JsonFormat::Pretty => serde_json::to_vec_pretty(value),
-        }?;
-        bytes.push(b'\n');
         let parent = path
             .parent()
             .filter(|path| !path.as_os_str().is_empty())
@@ -68,7 +63,11 @@ mod durable {
         }
         let mut file = options.open(&temporary)?;
         let result = (|| -> Result<()> {
-            file.write_all(&bytes)?;
+            match format {
+                JsonFormat::Compact => serde_json::to_writer(&mut file, value),
+                JsonFormat::Pretty => serde_json::to_writer_pretty(&mut file, value),
+            }?;
+            file.write_all(b"\n")?;
             file.sync_all()?;
             drop(file);
             fs::rename(&temporary, path)?;
