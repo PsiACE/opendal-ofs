@@ -12,9 +12,11 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 printf '%s\n' 'admission: reject unsupported access combinations'
-OFS_CONFIG="$direct_config" "$OFS_BIN" volume create archive \
+env -u OFS_METADATA_URL -u OFS_D1_TOKEN \
+  OFS_CONFIG="$direct_config" "$OFS_BIN" volume create archive \
   --model direct --storage 'memory:///acceptance' >/dev/null
-if OFS_CONFIG="$direct_config" "$OFS_BIN" sync archive "$cold_replica" \
+if env -u OFS_METADATA_URL -u OFS_D1_TOKEN \
+  OFS_CONFIG="$direct_config" "$OFS_BIN" sync archive "$cold_replica" \
   --state "$OFS_CASE_ROOT/state/direct.json" >/dev/null 2>&1; then
   fail 'Direct Sync started even though that access combination is unavailable'
 fi
