@@ -506,32 +506,24 @@ fn slice_demand(bytes: &Buffer, demand: DemandKey) -> Result<Buffer, VolumeError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::managed::data::{content_ref, seal_segment};
+    use crate::managed::data::content_ref;
 
     #[test]
     fn complete_segment_rejects_corruption() {
         let first = content_ref(b"first");
         let other = content_ref(b"other");
-        let mut segment = seal_segment(BTreeMap::from([
-            (first, b"first".to_vec()),
-            (other, b"other".to_vec()),
-        ]))
-        .unwrap();
+        let mut bytes = b"firstother".to_vec();
+        let segment = SegmentRef {
+            digest: Sha256::digest(&bytes).into(),
+            length: bytes.len() as u64,
+        };
+        assert!(verify_complete_segment(segment, &Buffer::from(bytes.clone())).is_ok());
+        let wrong_mapping = BTreeSet::from([(0, first.length, other)]);
         assert!(
-            verify_complete_segment(segment.reference, &Buffer::from(segment.bytes.clone()))
-                .is_ok()
+            complete_demand_contents(segment, &Buffer::from(bytes.clone()), &wrong_mapping,)
+                .is_err()
         );
-        let wrong_mapping =
-            BTreeSet::from([(segment.locations[&first].offset, first.length, other)]);
-        assert!(
-            complete_demand_contents(
-                segment.reference,
-                &Buffer::from(segment.bytes.clone()),
-                &wrong_mapping,
-            )
-            .is_err()
-        );
-        segment.bytes[0] ^= 1;
-        assert!(verify_complete_segment(segment.reference, &Buffer::from(segment.bytes)).is_err());
+        bytes[0] ^= 1;
+        assert!(verify_complete_segment(segment, &Buffer::from(bytes)).is_err());
     }
 }
