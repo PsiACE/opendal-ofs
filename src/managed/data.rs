@@ -740,7 +740,11 @@ fn complete_demand_contents(
     verify_complete_segment(segment, bytes)?;
     demands
         .iter()
-        .map(|demand| slice_demand(bytes, *demand).map(|content| (demand.2, content)))
+        .map(|demand| {
+            let bytes = slice_demand(bytes, *demand)?;
+            verify_range_demand(&bytes, *demand)?;
+            Ok((demand.2, bytes))
+        })
         .collect()
 }
 
@@ -836,16 +840,9 @@ async fn stream_fastcdc(
         .reader(path)
         .await
         .map_err(|_| unavailable("read frozen file", "storage operation failed"))?
-        .into_bytes_stream(..)
+        .into_futures_async_read(..)
         .await
         .map_err(|_| unavailable("read frozen file", "storage operation failed"))?;
-    let reader: std::pin::Pin<Box<dyn futures::Stream<Item = std::io::Result<Vec<u8>>> + Send>> =
-        Box::pin(reader.map(|result| {
-            result
-                .map(|buffer| buffer.to_vec())
-                .map_err(std::io::Error::other)
-        }));
-    let reader = reader.into_async_read();
     let mut chunker = AsyncStreamCDC::new(
         reader,
         FASTCDC_MINIMUM_SIZE,
@@ -1129,12 +1126,26 @@ mod tests {
 
     #[test]
     fn complete_segment_rejects_corruption() {
-        let content = content_ref(b"verified bytes");
-        let mut segment =
-            seal_segment(BTreeMap::from([(content, b"verified bytes".to_vec())])).unwrap();
+        let first = content_ref(b"first");
+        let other = content_ref(b"other");
+        let mut segment = seal_segment(BTreeMap::from([
+            (first, b"first".to_vec()),
+            (other, b"other".to_vec()),
+        ]))
+        .unwrap();
         assert!(
             verify_complete_segment(segment.reference, &Buffer::from(segment.bytes.clone()))
                 .is_ok()
+        );
+        let wrong_mapping =
+            BTreeSet::from([(segment.locations[&first].offset, first.length, other)]);
+        assert!(
+            complete_demand_contents(
+                segment.reference,
+                &Buffer::from(segment.bytes.clone()),
+                &wrong_mapping,
+            )
+            .is_err()
         );
         segment.bytes[0] ^= 1;
         assert!(verify_complete_segment(segment.reference, &Buffer::from(segment.bytes)).is_err());
