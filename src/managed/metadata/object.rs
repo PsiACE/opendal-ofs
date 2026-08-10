@@ -126,7 +126,7 @@ pub(crate) async fn replace(
 pub(crate) async fn ensure_immutable(
     operator: &Operator,
     key: &str,
-    mut expected: Buffer,
+    expected: Buffer,
     action: &'static str,
 ) -> Result<(), VolumeError> {
     match operator
@@ -145,14 +145,7 @@ pub(crate) async fn ensure_immutable(
     let observed = read(operator, key, expected.len(), action)
         .await?
         .ok_or_else(|| unavailable(action, "object metadata is unavailable"))?;
-    let mut offset = 0;
-    let matches = observed.len() == expected.len()
-        && Iterator::all(&mut expected, |chunk| {
-            let end = offset + chunk.len();
-            let matches = observed[offset..end] == chunk[..];
-            offset = end;
-            matches
-        });
+    let matches = Iterator::eq(observed.iter().copied(), Iterator::flatten(expected));
     if matches {
         Ok(())
     } else {
