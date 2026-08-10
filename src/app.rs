@@ -410,11 +410,14 @@ fn hex_bytes(bytes: &[u8]) -> String {
 }
 
 fn open_operator(url: &Url, transfer_concurrency: NonZeroUsize) -> Result<Operator> {
+    let concurrency = transfer_concurrency.get();
     Operator::from_uri(url.as_str())
         .map(|operator| {
             operator
-                .layer(ConcurrentLimitLayer::new(transfer_concurrency.get()))
-                .layer(RetryLayer::new().with_jitter().with_max_times(4))
+                .layer(
+                    ConcurrentLimitLayer::new(concurrency).with_http_concurrent_limit(concurrency),
+                )
+                .layer(RetryLayer::new().with_jitter())
         })
         .map_err(|_| {
             anyhow!("cannot configure --storage; check its scheme, endpoint, bucket, and root")

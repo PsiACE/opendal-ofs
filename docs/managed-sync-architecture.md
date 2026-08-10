@@ -42,6 +42,21 @@ the shared `VolumeSnapshot` and `VolumeMutation`; only the opaque file-version
 descriptor crosses into the data plane. Object Metadata and D1 use the same
 namespace rules and checkpoint codec.
 
+## OpenDAL integration
+
+One application composition root constructs every remote OpenDAL operator.
+Its concurrency layer bounds both logical operations and provider HTTP
+requests; its retry layer supplies the native temporary-error policy. Direct
+Mount and Managed Sync receive the resulting operator instead of assembling
+their own transport behavior.
+
+Managed Data submits sparse reads through the OpenDAL reader and uses Foyer
+only for reusable, complete immutable segments. Publication CAS, operation
+recovery, content verification, staging bounds, and branch authority remain
+Managed domain behavior: they depend on volume history and are not transparent
+storage layers. Provider-native audit counters are the performance authority
+for request, transfer, and stored metadata costs.
+
 ## Namespace and publication
 
 A snapshot contains stable node identities, node generations, directory
