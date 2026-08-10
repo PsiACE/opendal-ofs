@@ -355,11 +355,6 @@ async fn apply_target<V: Volume>(
 
     let requests = materialize
         .iter()
-        .filter(|path| {
-            manifest
-                .file(path)
-                .is_some_and(|file| !staged.cached(path, file.id))
-        })
         .map(|path| -> Result<_> {
             let file = manifest
                 .file(path)
@@ -388,7 +383,7 @@ async fn apply_target<V: Volume>(
             .executable;
         set_executable(&root.join(path), executable)?;
     }
-    staged.replace_manifest(manifest, edits.keys()).await
+    staged.replace_manifest(manifest)
 }
 
 async fn reuse_local_file(
@@ -510,16 +505,7 @@ fn install_staged_changes(
         });
         let destination = replica.join(path);
         if !same_content {
-            let source = staged
-                .content_path(
-                    path,
-                    staged
-                        .manifest()
-                        .file(path)
-                        .expect("a target file has a file version")
-                        .id,
-                )
-                .with_context(|| format!("changed path {path:?} has no durable staged content"))?;
+            let source = staged.root.join(path);
             let parent = destination.parent().unwrap_or(replica);
             fs::create_dir_all(parent)?;
             let temporary = parent.join(format!(".ofs-install-{}", uuid::Uuid::new_v4()));

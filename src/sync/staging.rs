@@ -153,7 +153,6 @@ pub(crate) struct StagedTree {
     pub(super) source: TargetManifest,
     manifest: Option<TargetManifest>,
     prepared: BTreeMap<FileVersionId, FileVersion>,
-    cache: BTreeMap<String, FileVersionId>,
 }
 
 impl StagedTree {
@@ -191,7 +190,6 @@ impl StagedTree {
         }
         let mut entries = BTreeMap::new();
         let mut versions = BTreeMap::new();
-        let cache = BTreeMap::new();
         for (path, expected) in &tree.entries {
             let file = match expected.kind {
                 NodeKind::Directory => {
@@ -252,7 +250,6 @@ impl StagedTree {
             manifest: None,
             source,
             prepared: versions,
-            cache,
         };
         Ok(staged)
     }
@@ -285,7 +282,6 @@ impl StagedTree {
             source: intent.source.clone(),
             manifest: None,
             prepared,
-            cache: BTreeMap::new(),
         };
         staged.validate()?;
         Ok(staged)
@@ -325,14 +321,6 @@ impl StagedTree {
         }
     }
 
-    pub(crate) fn cached(&self, path: &str, version: FileVersionId) -> bool {
-        self.cache.get(path) == Some(&version)
-    }
-
-    pub(crate) fn content_path(&self, path: &str, version: FileVersionId) -> Option<PathBuf> {
-        self.cached(path, version).then(|| self.root.join(path))
-    }
-
     pub(crate) fn resolve_version<'a>(
         &'a self,
         file: &TargetFile,
@@ -349,30 +337,10 @@ impl StagedTree {
         Ok(version)
     }
 
-    pub(crate) async fn replace_manifest<'a>(
-        &mut self,
-        mut manifest: TargetManifest,
-        refreshed: impl IntoIterator<Item = &'a String>,
-    ) -> Result<()> {
-        for path in refreshed {
-            let local = entry_at(&self.root, path).await?;
-            let entry = manifest
-                .entries
-                .get_mut(path)
-                .with_context(|| format!("materialized path {path:?} is not in target manifest"))?;
-            if local.kind != entry.local.kind {
-                bail!("materialized path {path:?} has the wrong kind");
-            }
-            if let Some(file) = &entry.file {
-                self.cache.insert(path.clone(), file.id);
-            }
-            entry.local = local;
-        }
+    pub(crate) fn replace_manifest(&mut self, manifest: TargetManifest) -> Result<()> {
+        validate_manifest(&manifest)?;
         self.manifest = (manifest != self.source).then_some(manifest);
-        let target = self.manifest.as_ref().unwrap_or(&self.source);
-        self.cache
-            .retain(|path, version| target.file(path).is_some_and(|file| file.id == *version));
-        self.validate()
+        Ok(())
     }
 
     pub(crate) fn matches_source_observation(&self, observed: &LocalTree) -> bool {
@@ -389,20 +357,6 @@ impl StagedTree {
         validate_manifest(&self.source)?;
         if let Some(manifest) = &self.manifest {
             validate_manifest(manifest)?;
-        }
-        let target = self.manifest.as_ref().unwrap_or(&self.source);
-        for (path, version) in &self.cache {
-            let file = target
-                .file(path)
-                .with_context(|| format!("cached path {path:?} is not a target file"))?;
-            if file.id != *version {
-                bail!("cached path {path:?} has another file version");
-            }
-            let metadata = fs::symlink_metadata(self.root.join(path))
-                .with_context(|| format!("inspect staged content {path:?}"))?;
-            if !metadata.file_type().is_file() || metadata.len() != file.logical_size {
-                bail!("staged content {path:?} is incomplete");
-            }
         }
         Ok(())
     }
