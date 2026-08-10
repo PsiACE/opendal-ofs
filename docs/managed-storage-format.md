@@ -304,8 +304,9 @@ while a malformed descriptor cannot pass operation-idempotency resolution.
 
 An operation receipt uses magic `OFS1OPR1` with the same strict
 `magic || CBOR || SHA-256` envelope and a 4096-byte body limit. Its body stores
-authority scope, `OperationId`, committed cursor, and publication request
-digest. The deterministic key is scoped by `base` or the lowercase branch id.
+authority scope, committed cursor, and publication request digest. The
+committed cursor contains the `OperationId`; the deterministic key is scoped
+by `base` or the lowercase branch id.
 
 HEAD stores the most recent committed result and a fixed operation-prefix
 filter. Recent results remain reconstructable from the transaction tail and

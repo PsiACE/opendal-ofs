@@ -245,9 +245,10 @@ impl StoredNamespaceState {
         }
         let cursor = validate_change_chain(&self.tail, volume_id, self.checkpoint_cursor)?;
         if let Some(result) = &self.outcome {
-            if result.cursor.operation() != Some(result.operation)
-                || result.cursor != cursor
-                || !self.maybe_contains(result.operation)
+            if result.cursor != cursor
+                || result
+                    .operation()
+                    .is_none_or(|operation| !self.maybe_contains(operation))
             {
                 return Err(corrupt(
                     "read Managed namespace",
@@ -276,7 +277,11 @@ impl StoredNamespaceState {
     }
 
     pub(crate) fn record_outcome(&mut self, result: StoredCommittedResult) {
-        self.remember(result.operation);
+        self.remember(
+            result
+                .operation()
+                .expect("a committed result has an operation"),
+        );
         self.outcome = Some(result);
     }
 
@@ -315,9 +320,9 @@ impl StoredNamespaceState {
         origin: Option<BranchId>,
         operation: OperationId,
     ) -> Option<&StoredCommittedResult> {
-        self.outcome
-            .as_ref()
-            .filter(|result| result.origin_branch == origin && result.operation == operation)
+        self.outcome.as_ref().filter(|result| {
+            result.origin_branch == origin && result.operation() == Some(operation)
+        })
     }
 }
 
@@ -333,16 +338,18 @@ fn operation_prefix(operation: OperationId) -> usize {
 #[serde(deny_unknown_fields)]
 pub(crate) struct StoredCommittedResult {
     pub(crate) origin_branch: Option<BranchId>,
-    pub(crate) operation: OperationId,
     pub(crate) cursor: ChangeCursor,
     pub(crate) request_sha256: [u8; 32],
 }
 
 impl StoredCommittedResult {
+    pub(crate) const fn operation(&self) -> Option<OperationId> {
+        self.cursor.operation()
+    }
+
     pub(crate) fn from_change(change: &NamespaceChange, request_sha256: [u8; 32]) -> Self {
         Self {
             origin_branch: change.origin_branch,
-            operation: change.operation(),
             cursor: change.cursor(),
             request_sha256,
         }

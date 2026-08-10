@@ -588,10 +588,7 @@ impl NamespaceStore {
         let result: StoredCommittedResult = OPERATION_RECORD
             .decode(&bytes)
             .map_err(|error| corrupt("resolve Managed publication", error.message()))?;
-        if result.origin_branch != self.branch_id()
-            || result.operation != operation
-            || result.cursor.operation() != Some(operation)
-        {
+        if result.origin_branch != self.branch_id() || result.operation() != Some(operation) {
             return Err(corrupt(
                 "resolve Managed publication",
                 "operation receipt identity is invalid",
@@ -601,12 +598,15 @@ impl NamespaceStore {
     }
 
     async fn write_operation(&self, result: &StoredCommittedResult) -> Result<(), VolumeError> {
+        let operation = result
+            .operation()
+            .expect("a committed result has a publication operation");
         let bytes = OPERATION_RECORD
             .encode(result)
             .map_err(|error| invalid("record Managed publication", error.message()))?;
         ensure_immutable(
             &self.data,
-            &self.operation_key(result.operation),
+            &self.operation_key(operation),
             bytes.into(),
             "record Managed publication",
         )
