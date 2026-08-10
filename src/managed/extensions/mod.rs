@@ -17,5 +17,4 @@
 
 //! Required Managed capabilities layered over a bound metadata namespace.
 
-#[cfg(feature = "managed-branch")]
 pub mod branch;

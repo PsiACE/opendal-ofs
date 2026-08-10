@@ -13,15 +13,14 @@ Managed Sync. Direct Sync and Managed Mount are not implemented.
 The documentation is split by purpose:
 
 - [Managed Sync workflow](managed-sync-workflow.md) explains how to create a
-  volume, synchronize a replica, resolve conflicts, recover local state, and
-  collect unreachable data.
+  volume, synchronize a replica, resolve conflicts, and recover local state.
 - [Managed Sync architecture](managed-sync-architecture.md) explains the
   component boundaries, metadata authorities, publication path, and OpenDAL
   integration.
 - [Managed storage format](managed-storage-format.md) specifies the persistent
   namespace and data layout for `managed/1`.
 - [Managed branches](managed-branches.md) explains named current and historical
-  states, backend semantics, garbage collection, and capability limits.
+  states, backend semantics, and capability limits.
 
 The architectural definitions for volume and access models are in
 [RFC 016](../rfcs/0016_filesystem_architecture.md).

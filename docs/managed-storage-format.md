@@ -18,8 +18,8 @@ The base specification uses these boundaries:
 
 The base format has no data-location index. File versions contain the
 authoritative segment locations. Chunk sizes, target segment size, range
-coalescing, checkpoint cadence, transfer concurrency, retry settings, and
-garbage-collection schedules are policy and are not stored in the superblock.
+coalescing, checkpoint cadence, transfer concurrency, and retry settings are
+policy and are not stored in the superblock.
 
 ## Ownership and lifetime
 
@@ -235,10 +235,9 @@ Publication is ordered as follows:
 4. Write any immutable checkpoint objects.
 5. Commit with one conditional HEAD replacement or one native transaction.
 
-Segments written before a failed Metadata commit are unreachable. Garbage
-collection fixes a namespace cursor, marks reachable `SegmentRef` values, and
-deletes unreferenced segments. A segment remains reachable if any live file
-version references one of its extents.
+Segments written before a failed Metadata commit are unreachable. Managed v1
+does not reclaim data segments or immutable metadata objects, so publication
+never races with deletion of a staged or retained object.
 
 ## Validation
 

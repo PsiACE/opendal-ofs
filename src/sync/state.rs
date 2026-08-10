@@ -20,7 +20,7 @@ use crate::filesystem::{
     NodeRecord, OperationId, VolumeId, VolumeSnapshot,
 };
 use crate::sync::local::{LocalEntry, LocalKind};
-use crate::sync::staging::StagedFile;
+use crate::sync::staging::TargetManifest;
 
 const STATE_FORMAT: &str = "ofs-sync-replica";
 const STATE_MAJOR: u16 = 1;
@@ -31,9 +31,12 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub struct PendingIntent {
     pub operation: OperationId,
     pub staging: PathBuf,
+    pub data_finalized: bool,
     pub renames: BTreeMap<String, String>,
-    pub(crate) entries: BTreeMap<String, LocalEntry>,
-    pub(crate) files: BTreeMap<String, StagedFile>,
+    pub(crate) source: TargetManifest,
+    pub(crate) manifest: TargetManifest,
+    pub(crate) prepared: Vec<FileVersion>,
+    pub(crate) cache: BTreeMap<String, crate::filesystem::FileVersionId>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -116,9 +116,8 @@ At the `Volume` boundary, an observation retains one RFC 016 `VolumeSnapshot`
 and a small metadata CAS witness. The decoded Managed snapshot is consumed
 while constructing that value rather than retained as a second namespace
 graph. Data staging decodes only the reachable file-version descriptors needed
-for content reuse; publication and GC decode a complete Managed snapshot when
-they need extent maps. None of these paths clones the namespace merely to
-select a metadata backend.
+for content reuse, while publication decodes the complete Managed snapshot.
+Neither path clones the namespace merely to select a metadata backend.
 
 ## Data path
 
@@ -138,11 +137,19 @@ Staging performs the following work:
    a bounded channel.
 2. One segment builder reuses content referenced by the fixed authority
    snapshot and deduplicates new content across the publication.
-3. The builder seals a segment as soon as its placement target is reached and
-   uploads it with create-only semantics.
+3. The builder seals each placement-sized segment to calculate its identity
+   and extent locations; it does not upload data before reconciliation.
 4. File completion records supply the logical length and whole-file digest.
 5. The builder returns file versions with complete logical-to-physical extent
    maps, which the pending replica state stores without interpreting.
+
+After reconciliation has no unresolved conflict, Sync durably records its
+pending intent. The Volume then rebuilds each new segment from bounded ranges
+of the frozen files, verifies every content reference and the complete segment,
+and uploads it with create-only semantics. Only after that succeeds may Sync
+materialize a different target tree and publish namespace metadata. A durable
+finalization marker makes retries independent of paths changed by target
+materialization.
 
 Backpressure bounds buffered file data to the active segment, the channel, and
 at most one chunk held by each reader; only the resulting extent metadata grows
@@ -204,7 +211,7 @@ Sync engine do not dispatch on provider types.
 
 Object Metadata has one mutable `head.ofs` and immutable checkpoints. HEAD
 contains the current cursor, a checkpoint reference, an ordered
-tail of committed namespace changes, and garbage-collection maintenance state.
+tail of committed namespace changes.
 
 Publication writes immutable data first. It writes new checkpoint objects only
 when checkpoint policy requires them, then replaces HEAD with an ETag
@@ -245,11 +252,8 @@ it for its durable local staging area. Remote services such as S3 remain Cargo
 features. All supported feature combinations therefore retain the local Sync
 capability instead of compiling a partially usable binary.
 
-Capability admission is scoped to the operation that needs it. Normal Object
-namespace reads and publication require read and conditional writes; listing
-and deletion are checked only when garbage collection starts. Data garbage
-collection streams the provider listing and submits bounded bulk-delete
-batches through OpenDAL.
+Capability admission is scoped to the operation that needs it. Object
+namespace reads and publication require read and conditional writes.
 
 Object authority reads that also need a revision use one OpenDAL `Reader`: the
 object body and ETag come from the same GET response. They do not issue a
@@ -321,27 +325,6 @@ reuse those indexes. Canonical `/`-separated descendants form a bounded
 `BTreeMap` range, so subtree lookup does not rescan the namespace and reverse
 iteration gives children-before-parent deletion without a second depth sort.
 
-## Garbage collection
-
-Garbage collection acquires a maintenance fence from Metadata and fixes one
-namespace cursor. Data walks the reachable namespace, records referenced
-segments, and streams the segment listing. Each unreachable object is deleted
-without collecting the full provider listing in memory. A segment remains live
-if any reachable file version references it.
-
-The fence contains an epoch and owner token. A normal start conflicts with an
-active fence. `--resume` conditionally replaces the owner only after the
-operator has confirmed that the previous collector stopped; an old owner
-cannot finish or continue metadata maintenance. An unpublished namespace is a
-successful empty collection.
-
-Foreground publication and materialization do not list the data prefix.
-
-The collector itself performs the one current fence observation used for the
-sweep; callers cannot supply an older snapshot. Branch collection retains each
-checkpoint referenced by a live head or history state and recovers the
-snapshots used to mark shared data segments.
-
 ## Extensions
 
 A Managed extension adds authority semantics without adding another filesystem
@@ -355,16 +338,15 @@ the shared node, directory, precondition, and Managed file-version records.
 
 The branch feature controls commands and extension code only. It does not
 change `managed/1` base-volume readability or create an alternate data plane.
-Segments remain shared immutable content, and collection treats every retained
-base or branch snapshot as a root.
+Segments remain shared immutable content.
 
 ## Acceptance and regression coverage
 
 Tests protect contracts visible outside an implementation boundary:
 
 - behavior acceptance runs the CLI against real OpenDAL operators and checks
-  create/open, push, pull, conflict, recovery, branch, and garbage-collection
-  workflows by their files, exit status, and durable results;
+  create/open, push, pull, conflict, recovery, and branch workflows by their
+  files, exit status, and durable results;
 - format acceptance opens and mutates persisted `managed/1` fixtures through
   both metadata authorities where applicable;
 - regression tests are added for a concrete failure that could recur, and name

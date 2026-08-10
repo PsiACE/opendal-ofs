@@ -13,19 +13,18 @@ use std::fs;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
-use opendal::Operator;
-
-use super::local::{fs_operator, set_executable};
-use super::path::{SnapshotTree, subtree};
+use super::local::{entry_at, fs_operator, set_executable};
+use super::path::SnapshotTree;
+use super::reconcile::ReconcilePlan;
 use super::{
-    ConflictRecord, LocalKind, LocalTree, RemoteEdit, ReplicaState, StagedTree, build_publication,
-    reconcile,
+    ConflictRecord, LocalKind, LocalTree, ReplicaState, StagedTree, TargetManifest,
+    build_publication, reconcile,
 };
 use crate::filesystem::{
     ChangeCursor, CommitOutcome, FileVersion, MaterializeRequest, OperationId, Volume,
     VolumeObservation,
 };
+use anyhow::{Context, Result, bail};
 
 #[derive(Clone, Debug)]
 pub struct SyncResult {
@@ -57,6 +56,10 @@ impl<V: Volume> SyncEngine<V> {
     ) -> Result<SyncResult> {
         let replica_path = replica_path.as_ref();
         let state_path = state_path.as_ref();
+        let requested = resolve_paths.iter().cloned().collect::<BTreeSet<_>>();
+        if requested.len() != resolve_paths.len() {
+            bail!("a conflict resolution path was provided more than once");
+        }
         let volume_id = self.volume.id();
         let authority_identity = self.volume.authority();
         let mut state = ReplicaState::load(state_path)?
@@ -82,7 +85,7 @@ impl<V: Volume> SyncEngine<V> {
                                 &LocalTree::scan(replica_path).await?,
                             ) =>
                         {
-                            Some(staged)
+                            Some((staged, pending.operation, pending.data_finalized))
                         }
                         _ => {
                             let _ = remove_tree(&pending.staging);
@@ -98,7 +101,7 @@ impl<V: Volume> SyncEngine<V> {
                 }
                 CommitOutcome::Absent | CommitOutcome::Conflict { .. } => {
                     match StagedTree::recover(&pending) {
-                        Ok(staged) => Some(staged),
+                        Ok(staged) => Some((staged, pending.operation, pending.data_finalized)),
                         Err(_) => {
                             state.pending = None;
                             state.install(state_path)?;
@@ -131,8 +134,14 @@ impl<V: Volume> SyncEngine<V> {
             .transpose()?;
         let remote_tree = remote.map(SnapshotTree::new).transpose()?;
 
-        let (local, staging_path, mut staged) = match prior_staging {
-            Some(staged) => (staged.logical().clone(), staged.root().to_owned(), staged),
+        let (local, staging_path, mut staged, operation, mut data_finalized) = match prior_staging {
+            Some((staged, operation, data_finalized)) => (
+                staged.local_tree(),
+                staged.root().to_owned(),
+                staged,
+                operation,
+                data_finalized,
+            ),
             None => {
                 let local = LocalTree::scan(replica_path).await?;
                 if resolve_paths.is_empty()
@@ -144,85 +153,32 @@ impl<V: Volume> SyncEngine<V> {
                     return Ok(result(&state, false));
                 }
                 let staging_path = fresh_sibling(state_path, "publish");
-                let known_digests = known_local_digests(&local, &state, base.as_ref());
+                let known_versions = known_local_versions(&local, &state, base.as_ref());
                 let staged = StagedTree::prepare_for_publish(
                     &local,
                     &staging_path,
-                    &known_digests,
+                    &known_versions,
                     &self.volume,
                     remote,
                     self.transfer_concurrency,
                 )
                 .await?;
-                (local, staging_path, staged)
+                let operation = OperationId::generate();
+                (local, staging_path, staged, operation, false)
             }
         };
-        let source_files = staged.files().clone();
+        let source_manifest = staged.source().clone();
         let mut publish = remote.is_none() && !local.entries().is_empty();
-        let mut install_remote = false;
-        let mut install_full_tree = false;
         let mut conflicts = Vec::new();
         let mut local_renames = BTreeMap::new();
-        let requested = resolve_paths.iter().cloned().collect::<BTreeSet<_>>();
-        if requested.len() != resolve_paths.len() {
-            bail!("a conflict resolution path was provided more than once");
-        }
+        let mut target_update = None;
         let mut resolved = BTreeSet::new();
 
         if let Some(remote_tree) = remote_tree.as_ref() {
-            let remote = remote_tree.snapshot();
-            let plan = reconcile(&state, &staged, base.as_ref(), remote_tree)?;
-            install_remote |= remote.cursor != state.common();
-            let target = fs_operator(staged.root())?;
+            let mut plan = reconcile(&state, &staged, base.as_ref(), remote_tree)?;
             publish |= plan.publish;
-            local_renames = plan.renames;
-            let mut installs = Vec::new();
-            for edit in plan.edits {
-                match edit {
-                    RemoteEdit::InstallFile {
-                        path,
-                        version,
-                        digest,
-                        executable,
-                    } => {
-                        if staged
-                            .logical()
-                            .entries()
-                            .get(&path)
-                            .is_some_and(|entry| entry.kind == LocalKind::Directory)
-                        {
-                            remove_staged_path(&mut staged, &target, &path).await?;
-                        }
-                        let file = remote
-                            .file_versions
-                            .get(&version)
-                            .context("reconciliation references a missing remote file version")?
-                            .clone();
-                        installs.push((path, file, digest, executable));
-                    }
-                    RemoteEdit::InstallDirectory { path } => {
-                        if staged.logical().entries().contains_key(&path) {
-                            remove_staged_path(&mut staged, &target, &path).await?;
-                        }
-                        target.create_dir(&format!("{path}/")).await?;
-                        staged.record_materialized_directory(path).await?;
-                        install_remote = true;
-                    }
-                    RemoteEdit::Remove { path } => {
-                        remove_staged_path(&mut staged, &target, &path).await?;
-                        install_remote = true;
-                    }
-                    RemoteEdit::SetExecutable {
-                        path,
-                        digest,
-                        executable,
-                    } => {
-                        staged.apply_remote_attributes(&path, digest, executable)?;
-                        install_remote = true;
-                    }
-                }
-            }
-            for conflict in plan.conflicts {
+            local_renames = std::mem::take(&mut plan.renames);
+            for conflict in std::mem::take(&mut plan.conflicts) {
                 if requested.contains(&conflict.path) {
                     resolved.insert(conflict.path.clone());
                     publish = true;
@@ -230,24 +186,7 @@ impl<V: Volume> SyncEngine<V> {
                     conflicts.push(conflict);
                 }
             }
-            let full_tree = state.installed.is_empty() && local.entries().is_empty();
-            install_full_tree = full_tree;
-            let installed = materialize_files(
-                &self.volume,
-                &target,
-                staged.root(),
-                installs,
-                full_tree,
-                self.transfer_concurrency,
-            )
-            .await?;
-            for installed in installed {
-                let (path, digest, _) = installed;
-                staged
-                    .record_materialized_file(path.clone(), digest)
-                    .await?;
-                install_remote = true;
-            }
+            target_update = Some(plan);
         }
         if resolved != requested {
             let missing = requested.difference(&resolved).collect::<Vec<_>>();
@@ -261,17 +200,47 @@ impl<V: Volume> SyncEngine<V> {
             return Ok(result(&state, false));
         }
 
+        if target_update.is_some() || publish {
+            state.pending = Some(staged.pending(operation, data_finalized, local_renames.clone()));
+            state.conflicts.clear();
+            state.install(state_path)?;
+        }
+
+        if publish && !data_finalized {
+            let staging = fs_operator(staged.root())?;
+            self.volume
+                .finalize_staged_files(&staging, staged.prepared_files()?, remote)
+                .await?;
+            data_finalized = true;
+            state.pending = Some(staged.pending(operation, data_finalized, local_renames.clone()));
+            state.install(state_path)?;
+        }
+
+        if let Some(plan) = target_update {
+            apply_target(
+                &self.volume,
+                &mut staged,
+                replica_path,
+                remote,
+                plan,
+                state.installed.is_empty() && local.entries().is_empty(),
+                self.transfer_concurrency,
+            )
+            .await?;
+        }
+
         if !publish {
             state.conflicts.clear();
             if let Some(remote_tree) = remote_tree.as_ref() {
-                if install_remote && !matches_local(replica_path, &local).await? {
+                let remote_advanced = remote_tree.snapshot().cursor != state.common();
+                if remote_advanced && !matches_local(replica_path, &local).await? {
                     bail!("local replica changed while remote state was being installed");
                 }
-                if install_remote {
-                    if install_full_tree {
+                if remote_advanced {
+                    if state.installed.is_empty() && local.entries().is_empty() {
                         install_staged_tree(replica_path, &staging_path)?;
                     } else {
-                        install_staged_changes(replica_path, &staged, &local, &source_files)?;
+                        install_staged_changes(replica_path, &staged, &source_manifest)?;
                     }
                 }
                 state = state_from_snapshot(remote_tree, replica_path, &state).await?;
@@ -283,36 +252,16 @@ impl<V: Volume> SyncEngine<V> {
             return Ok(result(&state, resolved_commit.is_some()));
         }
 
-        let operation = OperationId::generate();
-        let requires_materialization = !same_content(&local, &source_files, &staged);
-        let prepared = staged
-            .files()
-            .iter()
-            .map(|(path, staged_file)| {
-                let remote_version = remote_tree
-                    .as_ref()
-                    .and_then(|tree| tree.get(path))
-                    .and_then(|entry| entry.file);
-                let version = match remote_version {
-                    Some(version) if staged_file.digest == version.logical_digest => version,
-                    _ => staged_file.prepared().with_context(|| {
-                        format!("staged file {path:?} has no prepared volume version")
-                    })?,
-                };
-                Ok((path.clone(), version.clone()))
-            })
-            .collect::<Result<BTreeMap<_, _>>>()?;
+        let requires_materialization = !source_manifest.same_content(staged.manifest());
 
         let publication = build_publication(
             &self.volume,
             operation,
             remote_tree.as_ref(),
-            base.as_ref(),
-            staged.logical(),
-            &prepared,
+            &staged,
             &local_renames,
         )?;
-        state.pending = Some(staged.pending(operation, local_renames));
+        state.pending = Some(staged.pending(operation, data_finalized, local_renames));
         state.conflicts.clear();
         state.install(state_path)?;
         match self.volume.publish(observed.as_ref(), &publication).await? {
@@ -322,7 +271,7 @@ impl<V: Volume> SyncEngine<V> {
                     return Ok(result(&state, false));
                 }
                 if requires_materialization {
-                    install_staged_changes(replica_path, &staged, &local, &source_files)?;
+                    install_staged_changes(replica_path, &staged, &source_manifest)?;
                 }
                 let committed = SnapshotTree::new(&publication.target)?;
                 state = state_from_snapshot(&committed, replica_path, &state).await?;
@@ -353,10 +302,36 @@ async fn matches_local(root: &Path, expected: &LocalTree) -> Result<bool> {
     Ok(LocalTree::scan(root).await?.entries() == expected.entries())
 }
 
-async fn remove_staged_path(staged: &mut StagedTree, target: &Operator, path: &str) -> Result<()> {
-    let removed = subtree(staged.logical().entries(), path)
+async fn apply_target<V: Volume>(
+    volume: &V,
+    staged: &mut StagedTree,
+    source_root: &Path,
+    authority: Option<&crate::filesystem::VolumeSnapshot>,
+    plan: ReconcilePlan,
+    full_tree: bool,
+    transfer_concurrency: NonZeroUsize,
+) -> Result<()> {
+    let ReconcilePlan {
+        target: manifest,
+        mut materialize,
+        reuse,
+        refresh,
+        ..
+    } = plan;
+    let root = staged.root().to_owned();
+    let target = fs_operator(&root)?;
+    let removed = staged
+        .manifest()
+        .entries()
+        .iter()
         .rev()
-        .map(|(path, entry)| (path.clone(), entry.kind))
+        .filter(|(path, entry)| {
+            manifest
+                .entries()
+                .get(*path)
+                .is_none_or(|desired| desired.local.kind != entry.local.kind)
+        })
+        .map(|(path, entry)| (path.clone(), entry.local.kind))
         .collect::<Vec<_>>();
     for (path, kind) in removed {
         let target_path = match kind {
@@ -365,8 +340,107 @@ async fn remove_staged_path(staged: &mut StagedTree, target: &Operator, path: &s
         };
         target.delete(&target_path).await?;
     }
-    staged.remove_logical_path(path);
-    Ok(())
+    for path in &refresh {
+        if manifest
+            .entries()
+            .get(path)
+            .is_some_and(|entry| entry.local.kind == LocalKind::Directory)
+        {
+            target.create_dir(&format!("{path}/")).await?;
+        }
+    }
+
+    for (path, source) in reuse {
+        if !reuse_local_file(
+            source_root,
+            &root,
+            staged.source(),
+            &manifest,
+            &source,
+            &path,
+        )
+        .await?
+        {
+            materialize.insert(path);
+        }
+    }
+
+    let requests = materialize
+        .iter()
+        .filter(|path| {
+            manifest
+                .file(path)
+                .is_some_and(|file| !staged.cached(path, file.id))
+        })
+        .map(|path| -> Result<_> {
+            let file = manifest
+                .file(path)
+                .with_context(|| format!("materialization path {path:?} is not a target file"))?;
+            Ok(MaterializeRequest {
+                path: path.clone(),
+                version: staged.resolve_version(file, authority)?.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    volume
+        .materialize(&target, requests, full_tree, transfer_concurrency)
+        .await?;
+    for path in &materialize {
+        let executable = manifest
+            .entries()
+            .get(path)
+            .with_context(|| format!("materialization path {path:?} is not in target manifest"))?
+            .local
+            .executable;
+        set_executable(&root.join(path), executable)?;
+    }
+    staged.replace_manifest(manifest, &refresh).await
+}
+
+async fn reuse_local_file(
+    source_root: &Path,
+    staging_root: &Path,
+    source: &TargetManifest,
+    target: &TargetManifest,
+    source_path: &str,
+    target_path: &str,
+) -> Result<bool> {
+    let Some(source_entry) = source.entries().get(source_path) else {
+        return Ok(false);
+    };
+    let (Some(source_file), Some(target_file)) =
+        (source.file(source_path), target.file(target_path))
+    else {
+        return Ok(false);
+    };
+    if source_file.logical_digest != target_file.logical_digest
+        || source_entry.local.size != target_file.logical_size
+    {
+        return Ok(false);
+    }
+    let Ok(observed) = entry_at(source_root, source_path).await else {
+        return Ok(false);
+    };
+    if observed != source_entry.local {
+        return Ok(false);
+    }
+
+    let destination = staging_root.join(target_path);
+    tokio::fs::create_dir_all(destination.parent().unwrap_or(staging_root)).await?;
+    let copied = match tokio::fs::copy(source_root.join(source_path), &destination).await {
+        Ok(copied) => copied,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).context("reuse local file for remote rename"),
+    };
+    let source_unchanged = entry_at(source_root, source_path)
+        .await
+        .is_ok_and(|observed| observed == source_entry.local);
+    if copied != target_file.logical_size || !source_unchanged {
+        let _ = tokio::fs::remove_file(destination).await;
+        return Ok(false);
+    }
+    set_executable(&destination, target.entries()[target_path].local.executable)?;
+    Ok(true)
 }
 
 async fn state_from_snapshot(
@@ -382,11 +456,11 @@ async fn state_from_snapshot(
     )
 }
 
-fn known_local_digests(
+fn known_local_versions(
     local: &LocalTree,
     state: &ReplicaState,
     tree: Option<&SnapshotTree<'_>>,
-) -> BTreeMap<String, [u8; 32]> {
+) -> BTreeMap<String, FileVersion> {
     let Some(tree) = tree else {
         return BTreeMap::new();
     };
@@ -397,7 +471,7 @@ fn known_local_digests(
             let base = state.installed.get(path)?;
             if entry.kind == LocalKind::File && base == entry {
                 let version = tree.get(path)?.file?;
-                Some((path.clone(), version.logical_digest))
+                Some((path.clone(), version.clone()))
             } else {
                 None
             }
@@ -405,28 +479,10 @@ fn known_local_digests(
         .collect()
 }
 
-fn same_content(
-    before: &LocalTree,
-    before_files: &BTreeMap<String, super::staging::StagedFile>,
-    after: &StagedTree,
-) -> bool {
-    before.entries().len() == after.logical().entries().len()
-        && before.entries().iter().all(|(path, entry)| {
-            after.logical().entries().get(path).is_some_and(|desired| {
-                entry.kind == desired.kind
-                    && entry.size == desired.size
-                    && entry.executable == desired.executable
-                    && before_files.get(path).map(|file| file.digest)
-                        == after.files().get(path).map(|file| file.digest)
-            })
-        })
-}
-
 fn install_staged_changes(
     replica: &Path,
     staged: &StagedTree,
-    before: &LocalTree,
-    before_files: &BTreeMap<String, super::staging::StagedFile>,
+    before: &TargetManifest,
 ) -> Result<()> {
     let removals = before
         .entries()
@@ -434,10 +490,10 @@ fn install_staged_changes(
         .rev()
         .filter(|(path, entry)| {
             staged
-                .logical()
+                .manifest()
                 .entries()
                 .get(*path)
-                .is_none_or(|desired| desired.kind != entry.kind)
+                .is_none_or(|desired| desired.local.kind != entry.local.kind)
         })
         .map(|(path, _)| path.clone())
         .collect::<Vec<_>>();
@@ -452,35 +508,42 @@ fn install_staged_changes(
         sync_parent(&target)?;
     }
 
-    for (path, entry) in staged.logical().entries() {
-        if entry.kind == LocalKind::Directory {
+    for (path, entry) in staged.manifest().entries() {
+        if entry.local.kind == LocalKind::Directory {
             fs::create_dir_all(replica.join(path))?;
         }
     }
-    for (path, entry) in staged.logical().entries() {
-        if entry.kind != LocalKind::File {
+    for (path, entry) in staged.manifest().entries() {
+        if entry.local.kind != LocalKind::File {
             continue;
         }
         let same_content = before.entries().get(path).is_some_and(|existing| {
-            existing.kind == LocalKind::File
-                && existing.size == entry.size
-                && before_files.get(path).map(|file| file.digest)
-                    == staged.files().get(path).map(|file| file.digest)
+            existing.local.kind == LocalKind::File
+                && existing.local.size == entry.local.size
+                && before.file(path).map(|file| file.logical_digest)
+                    == staged.manifest().file(path).map(|file| file.logical_digest)
         });
         let destination = replica.join(path);
         if !same_content {
             let source = staged
-                .content_path(path)
+                .content_path(
+                    path,
+                    staged
+                        .manifest()
+                        .file(path)
+                        .expect("a target file has a file version")
+                        .id,
+                )
                 .with_context(|| format!("changed path {path:?} has no durable staged content"))?;
             let parent = destination.parent().unwrap_or(replica);
             fs::create_dir_all(parent)?;
             let temporary = parent.join(format!(".ofs-install-{}", uuid::Uuid::new_v4()));
             let result = (|| -> Result<()> {
                 let copied = fs::copy(&source, &temporary)?;
-                if copied != entry.size {
+                if copied != entry.local.size {
                     bail!("staged path {path:?} returned a short copy")
                 }
-                set_executable(&temporary, entry.executable)?;
+                set_executable(&temporary, entry.local.executable)?;
                 fs::File::open(&temporary)?.sync_all()?;
                 fs::rename(&temporary, &destination)?;
                 sync_parent(&destination)
@@ -490,7 +553,7 @@ fn install_staged_changes(
             }
             result.with_context(|| format!("install staged path {path:?}"))?;
         } else {
-            set_executable(&destination, entry.executable)?;
+            set_executable(&destination, entry.local.executable)?;
         }
     }
     Ok(())
@@ -513,34 +576,6 @@ fn install_staged_tree(replica: &Path, staging: &Path) -> Result<()> {
         fs::remove_dir_all(backup).context("remove replaced replica tree")?;
     }
     Ok(())
-}
-
-async fn materialize_files<V: Volume>(
-    volume: &V,
-    target: &Operator,
-    root: &Path,
-    files: Vec<(String, FileVersion, [u8; 32], bool)>,
-    full_tree: bool,
-    transfer_concurrency: NonZeroUsize,
-) -> Result<Vec<(String, [u8; 32], bool)>> {
-    let requests = files
-        .iter()
-        .map(|(path, version, _, _)| MaterializeRequest {
-            path: path.clone(),
-            version: version.clone(),
-        })
-        .collect();
-    volume
-        .materialize(target, requests, full_tree, transfer_concurrency)
-        .await?;
-    for (path, _, _, executable) in &files {
-        set_executable(&root.join(path), *executable)?;
-    }
-    let installed = files
-        .into_iter()
-        .map(|(path, _, digest, executable)| (path, digest, executable))
-        .collect();
-    Ok(installed)
 }
 
 fn fresh_sibling(path: &Path, purpose: &str) -> PathBuf {

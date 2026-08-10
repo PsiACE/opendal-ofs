@@ -27,13 +27,15 @@ use super::{
     NamespaceSnapshot, NodePrecondition, NodeRecord,
 };
 use crate::filesystem::{
-    ChangeCursor, DirectoryEntry, FileVersionId, Generation, NodeId, OperationId, VolumeId,
+    BranchId, ChangeCursor, DirectoryEntry, FileVersionId, Generation, NodeId, OperationId,
+    VolumeId,
 };
 use crate::managed::{ManagedError, ManagedErrorKind};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct NamespaceChange {
+    pub(crate) origin_branch: Option<BranchId>,
     pub(crate) volume_id: VolumeId,
     pub(crate) operation: OperationId,
     pub(crate) parent: ChangeCursor,
@@ -113,6 +115,7 @@ impl NamespaceChange {
     pub(crate) fn from_publication(
         publication: &NamespacePublication,
         base: Option<&NamespaceSnapshot>,
+        origin_branch: Option<BranchId>,
     ) -> Self {
         let empty_nodes = BTreeMap::new();
         let empty_directories = BTreeMap::new();
@@ -127,6 +130,7 @@ impl NamespaceChange {
         expected_directories.sort_by_key(|condition| condition.directory);
 
         Self {
+            origin_branch,
             volume_id: target.volume_id,
             operation: publication.operation,
             parent: publication.parent,
@@ -175,72 +179,120 @@ impl NamespaceChange {
         base: Option<NamespaceSnapshot>,
     ) -> Result<NamespaceSnapshot, ManagedError> {
         self.validate(self.volume_id)?;
-        let mut target = match base {
-            Some(base) if base.volume_id == self.volume_id && base.cursor == self.parent => base,
-            Some(_) => return Err(corrupt("transaction base is invalid")),
-            None if self.parent == ChangeCursor::Genesis => NamespaceSnapshot {
-                volume_id: self.volume_id,
-                cursor: ChangeCursor::Genesis,
-                root: self.root,
-                nodes: BTreeMap::new(),
-                directories: BTreeMap::new(),
-                file_versions: BTreeMap::new(),
-            },
-            None => return Err(corrupt("initial transaction does not begin at genesis")),
-        };
+        if !self
+            .validate_against(base.as_ref())
+            .map_err(|_| corrupt("transaction transition is invalid"))?
+        {
+            return Err(corrupt("transaction preconditions are stale"));
+        }
+        let mut target = base.unwrap_or_else(|| NamespaceSnapshot {
+            volume_id: self.volume_id,
+            cursor: ChangeCursor::Genesis,
+            root: self.root,
+            nodes: BTreeMap::new(),
+            directories: BTreeMap::new(),
+            file_versions: BTreeMap::new(),
+        });
+        let put_directories = self
+            .put_directories
+            .iter()
+            .map(|delta| delta.apply(target.directories.get(&delta.node)))
+            .collect::<Result<Vec<_>, _>>()?;
+        for id in &self.remove_nodes {
+            target.nodes.remove(id);
+        }
+        target.nodes.extend(
+            self.put_nodes
+                .iter()
+                .cloned()
+                .map(|record| (record.id, record)),
+        );
+        for id in &self.remove_directories {
+            target.directories.remove(id);
+        }
+        target.directories.extend(
+            put_directories
+                .into_iter()
+                .map(|record| (record.node, record)),
+        );
+        for id in &self.remove_file_versions {
+            target.file_versions.remove(id);
+        }
+        target.file_versions.extend(
+            self.put_file_versions
+                .iter()
+                .cloned()
+                .map(|record| (record.id, record)),
+        );
+        target.root = self.root;
+        target.cursor = self.cursor;
+        Ok(target)
+    }
 
-        let expected_nodes = match_preconditions(
-            &target.nodes,
+    pub(crate) fn validate_against(
+        &self,
+        base: Option<&NamespaceSnapshot>,
+    ) -> Result<bool, ManagedError> {
+        if base.is_some_and(|base| base.volume_id != self.volume_id || base.cursor != self.parent)
+            || base.is_none() && self.parent != ChangeCursor::Genesis
+        {
+            return Err(corrupt("transaction base is invalid"));
+        }
+        let empty_nodes = BTreeMap::new();
+        let empty_directories = BTreeMap::new();
+        let empty_versions = BTreeMap::new();
+        let nodes = base.map_or(&empty_nodes, |snapshot| &snapshot.nodes);
+        let directories = base.map_or(&empty_directories, |snapshot| &snapshot.directories);
+        let versions = base.map_or(&empty_versions, |snapshot| &snapshot.file_versions);
+        let Some(expected_nodes) = match_preconditions(
+            nodes,
             self.expected_nodes
                 .iter()
                 .map(|condition| (condition.node, condition.expected_generation.as_ref())),
             |record| &record.generation,
             "duplicate node precondition",
-        )
-        .map_err(|_| corrupt("transaction is invalid"))?
-        .ok_or_else(|| corrupt("transaction preconditions are stale"))?;
-        apply_records(
-            &mut target.nodes,
+        )?
+        else {
+            return Ok(false);
+        };
+        validate_records(
+            nodes,
             self.remove_nodes.iter().copied(),
-            self.put_nodes.iter().cloned(),
+            self.put_nodes.iter(),
             |record| record.id,
             |id, current, next| {
                 validate_node_generation(current, next, expected_nodes.contains(&id))
             },
-            "node delta is invalid",
         )?;
         let put_directories = self
             .put_directories
             .iter()
-            .map(|delta| {
-                let base = target.directories.get(&delta.node);
-                delta.apply(base)
-            })
+            .map(|delta| delta.apply(directories.get(&delta.node)))
             .collect::<Result<Vec<_>, _>>()?;
-        let expected_directories = match_preconditions(
-            &target.directories,
+        let Some(expected_directories) = match_preconditions(
+            directories,
             self.expected_directories
                 .iter()
                 .map(|condition| (condition.directory, condition.expected_generation.as_ref())),
             |record| &record.generation,
             "duplicate directory precondition",
-        )
-        .map_err(|_| corrupt("transaction is invalid"))?
-        .ok_or_else(|| corrupt("transaction preconditions are stale"))?;
-        apply_records(
-            &mut target.directories,
+        )?
+        else {
+            return Ok(false);
+        };
+        validate_records(
+            directories,
             self.remove_directories.iter().copied(),
-            put_directories,
+            put_directories.iter(),
             |record| record.node,
             |id, current, next| {
                 validate_directory_generation(current, next, expected_directories.contains(&id))
             },
-            "directory delta is invalid",
         )?;
-        apply_records(
-            &mut target.file_versions,
+        validate_records(
+            versions,
             self.remove_file_versions.iter().copied(),
-            self.put_file_versions.iter().cloned(),
+            self.put_file_versions.iter(),
             |record| record.id,
             |_, current, next| {
                 if next.is_some_and(|next| {
@@ -251,11 +303,8 @@ impl NamespaceChange {
                     Ok(())
                 }
             },
-            "file version delta is invalid",
         )?;
-        target.root = self.root;
-        target.cursor = self.cursor;
-        Ok(target)
+        Ok(true)
     }
 
     pub(crate) fn validate(&self, volume_id: VolumeId) -> Result<(), ManagedError> {
@@ -269,13 +318,12 @@ impl NamespaceChange {
     }
 }
 
-fn apply_records<K, V>(
-    current: &mut BTreeMap<K, V>,
+fn validate_records<'a, K, V: 'a>(
+    current: &BTreeMap<K, V>,
     removed: impl IntoIterator<Item = K>,
-    put: impl IntoIterator<Item = V>,
+    put: impl IntoIterator<Item = &'a V>,
     key: impl Fn(&V) -> K,
     validate: impl Fn(K, Option<&V>, Option<&V>) -> Result<(), ManagedError>,
-    invalid_delta: &'static str,
 ) -> Result<(), ManagedError>
 where
     K: Copy + Ord,
@@ -283,19 +331,16 @@ where
     let mut changed = BTreeSet::new();
     for id in removed {
         if !changed.insert(id) || !current.contains_key(&id) {
-            return Err(corrupt(invalid_delta));
+            return Err(corrupt("transaction delta is invalid"));
         }
-        validate(id, current.get(&id), None).map_err(|_| corrupt("transaction is invalid"))?;
-        current.remove(&id);
+        validate(id, current.get(&id), None)?;
     }
     for record in put {
-        let id = key(&record);
+        let id = key(record);
         if !changed.insert(id) {
-            return Err(corrupt(invalid_delta));
+            return Err(corrupt("transaction delta is invalid"));
         }
-        validate(id, current.get(&id), Some(&record))
-            .map_err(|_| corrupt("transaction is invalid"))?;
-        current.insert(id, record);
+        validate(id, current.get(&id), Some(record))?;
     }
     Ok(())
 }

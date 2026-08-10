@@ -80,7 +80,6 @@ def object_class(path: str) -> str:
 
 def load_requests(path: Path, intervals):
     distribution = defaultdict(lambda: {"count": 0, "bytes_in": 0, "bytes_out": 0})
-    uploaded = defaultdict(lambda: {"request_bytes": 0, "data_put_bytes": 0})
     observed_runs = set()
     noop_data_puts = []
     for line in path.open(encoding="utf-8"):
@@ -97,9 +96,7 @@ def load_requests(path: Path, intervals):
         distribution[key]["count"] += 1
         distribution[key]["bytes_in"] += request["bytes_in"]
         distribution[key]["bytes_out"] += request["bytes_out"]
-        uploaded[run]["request_bytes"] += request["bytes_in"]
         if request["method"] == "PUT" and classification == "segment_data":
-            uploaded[run]["data_put_bytes"] += request["bytes_in"]
             if phase == "noop":
                 noop_data_puts.append(request)
     rows = [
@@ -114,7 +111,7 @@ def load_requests(path: Path, intervals):
         }
         for key, values in sorted(distribution.items())
     ]
-    return rows, dict(uploaded), observed_runs, noop_data_puts
+    return rows, observed_runs, noop_data_puts
 
 
 def load_object_inventory(directory: Path, inputs):
@@ -265,14 +262,12 @@ def main() -> None:
     directory = arguments.directory
     samples, intervals = load_metrics(directory / "samples.tsv")
     statistics_by_metric = summarize(samples)
-    requests, uploaded, observed_runs, noop_data_puts = load_requests(
+    requests, observed_runs, noop_data_puts = load_requests(
         directory / "requests.jsonl", intervals
     )
     inputs = load_inputs(directory / "inputs.tsv")
     object_inventory = load_object_inventory(directory, inputs)
     equal, manifests = logical_equality(directory, inputs)
-    for run, values in uploaded.items():
-        inputs[run].update(values)
     context = {key: value for key, value in read_tsv(directory / "context.tsv")}
     summary = comparison_summary(samples, requests, object_inventory, inputs, equal)
     baseline_summary = summary["releases"]["baseline"]
@@ -333,11 +328,8 @@ def main() -> None:
         },
         {
             "name": "object_inventory_observed",
-            "passed": all(
-                isinstance(values.get("stored_bytes"), int)
-                and isinstance(values.get("stored_objects"), int)
-                for values in inputs.values()
-            ),
+            "passed": set(inputs)
+            <= {row["run"] for row in object_inventory},
         },
         {
             "name": "logical_trees_are_equal",

@@ -24,7 +24,6 @@ mod store;
 mod validation;
 
 pub(crate) use change::NamespaceChange;
-pub use records::NamespaceGcSweep;
 pub(crate) use records::{
     DirectoryPrecondition, DirectoryRecord, FileVersionRecord, NamespacePublication,
     NamespaceSnapshot, NodePrecondition, NodeRecord, managed_generation, next_managed_generation,
@@ -35,6 +34,5 @@ pub(crate) use state::{
     require_request_digest, results_for_rotation,
 };
 pub(crate) use store::{NamespaceStore, NamespaceWitness};
-#[cfg(feature = "managed-branch")]
-pub(crate) use store::{StoredHead, checkpoint_key, decode_head, encode_head, history_key};
+pub(crate) use store::{StoredHead, decode_head, encode_head};
 pub(crate) use validation::{validate_publication, validate_snapshot};

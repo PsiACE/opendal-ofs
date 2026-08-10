@@ -26,14 +26,13 @@ use fastcdc::v2020::AsyncStreamCDC;
 use foyer::HybridCacheBuilder;
 use futures::{StreamExt, TryStreamExt, stream};
 use opendal::layers::{FoyerKey, FoyerLayer, FoyerValue};
-use opendal::{Buffer, ErrorKind, Operator};
+use opendal::{Buffer, ErrorKind, Operator, Writer};
 use sha2::{Digest as _, Sha256};
-use tokio::sync::{Mutex, OnceCell, mpsc, oneshot};
+use tokio::sync::{OnceCell, mpsc, oneshot};
 
 use super::{ManagedError, ManagedErrorKind};
-use crate::filesystem::NodeKind;
 use crate::managed::format::{ContentRef, Extent, ExtentMap, SegmentRef};
-use crate::managed::metadata::namespace::{FileVersionRecord, NamespaceSnapshot};
+use crate::managed::metadata::namespace::FileVersionRecord;
 use crate::managed::metadata::object::ensure_immutable;
 
 const SEGMENT_ROOT: &str = ".ofs/managed/data/v1/segments/sha256";
@@ -49,37 +48,6 @@ const FASTCDC_MINIMUM_SIZE: u32 = 64 * 1024;
 const FASTCDC_TARGET_SIZE: u32 = 256 * 1024;
 const FASTCDC_MAXIMUM_SIZE: u32 = 1024 * 1024;
 
-/// Data segments removed by one namespace-fenced garbage-collection sweep.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct SegmentGcMaintenance {
-    pub scanned: usize,
-    pub deleted: usize,
-    pub deleted_bytes: u64,
-}
-
-/// Unique immutable data segments retained across one or more namespace positions.
-#[derive(Default)]
-pub(crate) struct RetainedDataRoots(BTreeMap<[u8; 32], u64>);
-
-impl RetainedDataRoots {
-    pub(crate) fn retain(&mut self, snapshot: &NamespaceSnapshot) -> Result<(), ManagedError> {
-        visit_reachable_file_versions(snapshot, "mark retained data segments", |version| {
-            for extent in &version.extent_map.extents {
-                match self.0.insert(extent.segment.digest, extent.segment.length) {
-                    Some(length) if length != extent.segment.length => {
-                        return Err(corrupt(
-                            "mark retained data segments",
-                            "one segment digest has conflicting physical lengths",
-                        ));
-                    }
-                    _ => {}
-                }
-            }
-            Ok(())
-        })
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct StoredContent {
     segment: SegmentRef,
@@ -88,7 +56,10 @@ struct StoredContent {
 
 /// Physical locations already referenced by one fixed authority snapshot.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct AuthorityKnownContent(BTreeMap<ContentRef, StoredContent>);
+pub(crate) struct AuthorityKnownContent {
+    contents: BTreeMap<ContentRef, StoredContent>,
+    segments: BTreeSet<SegmentRef>,
+}
 
 impl AuthorityKnownContent {
     pub(crate) fn include(&mut self, version: &FileVersionRecord) -> Result<(), ManagedError> {
@@ -99,16 +70,23 @@ impl AuthorityKnownContent {
             ));
         }
         for extent in &version.extent_map.extents {
-            self.0.entry(extent.content).or_insert(StoredContent {
-                segment: extent.segment,
-                offset: extent.segment_offset,
-            });
+            self.contents
+                .entry(extent.content)
+                .or_insert(StoredContent {
+                    segment: extent.segment,
+                    offset: extent.segment_offset,
+                });
+            self.segments.insert(extent.segment);
         }
         Ok(())
     }
 
     fn get(&self, content: &ContentRef) -> Option<StoredContent> {
-        self.0.get(content).copied()
+        self.contents.get(content).copied()
+    }
+
+    fn contains_segment(&self, segment: &SegmentRef) -> bool {
+        self.segments.contains(segment)
     }
 }
 
@@ -150,34 +128,16 @@ struct SealedSegment {
     locations: BTreeMap<ContentRef, StoredContent>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SegmentSource {
+    path: String,
+    logical_offset: u64,
+    content: ContentRef,
+}
+
 type DemandKey = (u64, u64, ContentRef);
-type SegmentDemand = BTreeMap<DemandKey, usize>;
-
-struct MaterializationPlan {
-    segments: BTreeMap<SegmentRef, SegmentReadPlan>,
-}
-
-struct MaterializationContext {
-    target: Operator,
-    cached: Operator,
-    plans: MaterializationPlan,
-}
-
-enum SegmentReadPlan {
-    Complete {
-        demands: BTreeSet<DemandKey>,
-        verified: OnceCell<()>,
-    },
-    Ranged {
-        demands: BTreeSet<DemandKey>,
-        state: Mutex<RangeReadState>,
-    },
-}
-
-struct RangeReadState {
-    bytes: Option<BTreeMap<DemandKey, Buffer>>,
-    remaining: usize,
-}
+type SegmentDemand = BTreeSet<DemandKey>;
+type FetchedContent = BTreeMap<ContentRef, Buffer>;
 
 /// The Managed v1 data plane.
 #[derive(Clone)]
@@ -280,7 +240,9 @@ impl ManagedData {
                     while pending_bytes >= TARGET_SEGMENT_SIZE {
                         let contents = take_segment_contents(&mut new_content)?;
                         pending_bytes -= contents.keys().map(|content| content.length).sum::<u64>();
-                        created.extend(self.create_segment(seal_segment(contents)?).await?);
+                        let segment = seal_segment(contents)?;
+                        debug_assert_eq!(segment.reference.length, segment.bytes.len() as u64);
+                        created.extend(segment.locations);
                     }
                 }
                 let (logical_size, logical_digest) = prepared
@@ -299,7 +261,9 @@ impl ManagedData {
 
             while !new_content.is_empty() {
                 let contents = take_segment_contents(&mut new_content)?;
-                created.extend(self.create_segment(seal_segment(contents)?).await?);
+                let segment = seal_segment(contents)?;
+                debug_assert_eq!(segment.reference.length, segment.bytes.len() as u64);
+                created.extend(segment.locations);
             }
 
             files
@@ -348,21 +312,108 @@ impl ManagedData {
         Ok(files)
     }
 
-    async fn create_segment(
+    /// Rebuild prepared segments from the frozen source tree and publish them.
+    ///
+    /// The live files have already been read, chunked, and hashed by `stage_files`.
+    /// This pass uses the persisted extent plan, so memory is bounded by one
+    /// placement-sized segment and a crash can retry without consulting live paths.
+    pub(crate) async fn finalize_staged_files(
         &self,
-        segment: SealedSegment,
-    ) -> Result<BTreeMap<ContentRef, StoredContent>, ManagedError> {
-        let key = segment_key(segment.reference);
-        ensure_immutable(
-            &self.operator,
-            &key,
-            &segment.bytes,
-            "create data segment",
-            ManagedErrorKind::Corrupt,
-            "immutable data segment changed",
-        )
-        .await?;
-        Ok(segment.locations)
+        staging: &Operator,
+        files: Vec<(String, FileVersionRecord)>,
+        known: &AuthorityKnownContent,
+    ) -> Result<(), ManagedError> {
+        let mut segments = BTreeMap::<SegmentRef, BTreeMap<u64, SegmentSource>>::new();
+        for (path, version) in files {
+            if !version.is_valid() {
+                return Err(corrupt(
+                    "finalize Managed files",
+                    "prepared file version is invalid",
+                ));
+            }
+            for extent in version.extent_map.extents {
+                if known.contains_segment(&extent.segment) {
+                    continue;
+                }
+                let source = SegmentSource {
+                    path: path.clone(),
+                    logical_offset: extent.logical_offset,
+                    content: extent.content,
+                };
+                match segments
+                    .entry(extent.segment)
+                    .or_default()
+                    .entry(extent.segment_offset)
+                {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(source);
+                    }
+                    std::collections::btree_map::Entry::Occupied(entry)
+                        if entry.get().content != source.content =>
+                    {
+                        return Err(corrupt(
+                            "finalize Managed files",
+                            "prepared segment has conflicting contents",
+                        ));
+                    }
+                    std::collections::btree_map::Entry::Occupied(_) => {}
+                }
+            }
+        }
+
+        for (reference, sources) in segments {
+            if !complete_segment_sources(reference, &sources) {
+                let bytes = self
+                    .operator
+                    .read(&segment_key(reference))
+                    .await
+                    .map_err(|error| {
+                        referenced_segment_error("verify prepared data segment", error)
+                    })?;
+                verify_complete_segment(reference, &bytes)?;
+                continue;
+            }
+
+            let capacity = usize::try_from(reference.length).map_err(|_| {
+                corrupt(
+                    "finalize Managed files",
+                    "prepared segment is too large for this client",
+                )
+            })?;
+            let mut segment = Vec::with_capacity(capacity);
+            for (source, bytes) in sources
+                .values()
+                .zip(fetch_segment_sources(staging, sources.values()).await?)
+            {
+                if buffer_content_ref(&bytes) != source.content {
+                    return Err(corrupt(
+                        "finalize Managed files",
+                        "frozen content does not match its prepared extent",
+                    ));
+                }
+                for chunk in bytes {
+                    segment.extend_from_slice(&chunk);
+                }
+            }
+            if segment.len() as u64 != reference.length
+                || <[u8; 32]>::from(Sha256::digest(&segment)) != reference.digest
+            {
+                return Err(corrupt(
+                    "finalize Managed files",
+                    "rebuilt data segment does not match its reference",
+                ));
+            }
+            ensure_immutable(
+                &self.operator,
+                &segment_key(reference),
+                &segment,
+                "create data segment",
+                ManagedErrorKind::Corrupt,
+                "immutable data segment changed",
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn materialize(
@@ -372,54 +423,68 @@ impl ManagedData {
         full_tree: bool,
         concurrency: NonZeroUsize,
     ) -> Result<(), ManagedError> {
-        let mut batches = Vec::new();
         let mut batch = Vec::new();
         let mut batch_bytes = 0_u64;
         for request in requests {
             let size = request.1.logical_size;
             if !batch.is_empty() && batch_bytes.saturating_add(size) > MATERIALIZE_BATCH_BYTES {
-                batches.push(std::mem::take(&mut batch));
+                self.materialize_batch(target, std::mem::take(&mut batch), full_tree, concurrency)
+                    .await?;
                 batch_bytes = 0;
             }
             batch_bytes = batch_bytes.saturating_add(size);
             batch.push(request);
         }
         if !batch.is_empty() {
-            batches.push(batch);
-        }
-
-        for requests in batches {
-            let plans = MaterializationPlan::new(
-                &requests,
-                full_tree,
-                self.operator.info().full_capability().stat,
-            );
-            let cached = if plans
-                .segments
-                .values()
-                .any(|plan| matches!(plan, SegmentReadPlan::Complete { .. }))
-            {
-                self.cached_operator().await?
-            } else {
-                self.operator.clone()
-            };
-            let context = Arc::new(MaterializationContext {
-                target: target.clone(),
-                cached,
-                plans,
-            });
-            stream::iter(requests)
-                .map(|(path, version)| {
-                    let context = context.clone();
-                    async move {
-                        self.materialize_file(&context, path, version, concurrency)
-                            .await
-                    }
-                })
-                .buffer_unordered(concurrency.get())
-                .try_collect::<Vec<_>>()
+            self.materialize_batch(target, batch, full_tree, concurrency)
                 .await?;
         }
+        Ok(())
+    }
+
+    async fn materialize_batch(
+        &self,
+        target: &Operator,
+        requests: Vec<(String, FileVersionRecord)>,
+        full_tree: bool,
+        concurrency: NonZeroUsize,
+    ) -> Result<(), ManagedError> {
+        if let [(path, version)] = requests.as_slice()
+            && version.logical_size > MATERIALIZE_BATCH_BYTES
+        {
+            return self
+                .materialize_large_file(target, path, version, full_tree, concurrency)
+                .await;
+        }
+
+        let demands = segment_demands(
+            requests
+                .iter()
+                .flat_map(|(_, version)| version.extent_map.extents.iter()),
+        );
+        let complete = complete_segments(
+            &demands,
+            full_tree,
+            self.operator.info().full_capability().stat,
+            &BTreeSet::new(),
+        );
+        let cached = if complete.is_empty() {
+            None
+        } else {
+            Some(self.cached_operator().await?)
+        };
+        let fetched = self
+            .fetch_segments(&demands, &complete, &demands, cached.as_ref(), concurrency)
+            .await?;
+
+        stream::iter(requests)
+            .map(|(path, version)| {
+                let fetched = &fetched;
+                async move { materialize_file(target, &path, &version, fetched).await }
+            })
+            .buffer_unordered(concurrency.get())
+            .try_collect::<Vec<_>>()
+            .await?;
         Ok(())
     }
 
@@ -444,16 +509,29 @@ impl ManagedData {
             .cloned()
     }
 
-    async fn materialize_file(
+    async fn materialize_large_file(
         &self,
-        context: &MaterializationContext,
-        path: String,
-        version: FileVersionRecord,
+        target: &Operator,
+        path: &str,
+        version: &FileVersionRecord,
+        full_tree: bool,
         concurrency: NonZeroUsize,
     ) -> Result<(), ManagedError> {
-        let mut writer = context
-            .target
-            .writer(&path)
+        let all_demands = segment_demands(version.extent_map.extents.iter());
+        let complete = complete_segments(
+            &all_demands,
+            full_tree,
+            self.operator.info().full_capability().stat,
+            &segments_in_multiple_windows(&version.extent_map.extents),
+        );
+        let cached = if complete.is_empty() {
+            None
+        } else {
+            Some(self.cached_operator().await?)
+        };
+        let mut verified = BTreeSet::new();
+        let mut writer = target
+            .writer(path)
             .await
             .map_err(|_| unavailable("write materialized file"))?;
         let mut logical = Sha256::new();
@@ -462,8 +540,15 @@ impl ManagedData {
         let mut start = 0;
         while start < extents.len() {
             let end = extent_window_end(extents, start);
+            let demands = segment_demands(extents[start..end].iter());
+            let verify = demands
+                .keys()
+                .copied()
+                .filter(|segment| complete.contains(segment) && !verified.contains(segment))
+                .map(|segment| (segment, all_demands[&segment].clone()))
+                .collect();
             let fetched = match self
-                .read_extent_window(context, &extents[start..end], concurrency)
+                .fetch_segments(&demands, &complete, &verify, cached.as_ref(), concurrency)
                 .await
             {
                 Ok(fetched) => fetched,
@@ -472,285 +557,213 @@ impl ManagedData {
                     return Err(error);
                 }
             };
-            for bytes in fetched {
-                let Some(next_written) = written.checked_add(bytes.len() as u64) else {
-                    let _ = writer.abort().await;
-                    return Err(corrupt(
-                        "materialize Managed files",
-                        "logical file length overflows",
-                    ));
-                };
-                written = next_written;
-                for chunk in bytes.clone() {
-                    logical.update(&chunk);
-                }
-                if writer.write(bytes).await.is_err() {
-                    let _ = writer.abort().await;
-                    return Err(unavailable("write materialized file"));
-                }
+            verified.extend(verify.keys().copied());
+            if let Err(error) = write_extents(
+                &mut writer,
+                &extents[start..end],
+                &fetched,
+                &mut logical,
+                &mut written,
+            )
+            .await
+            {
+                let _ = writer.abort().await;
+                return Err(error);
             }
             start = end;
         }
-        if written != version.logical_size
-            || <[u8; 32]>::from(logical.finalize()) != version.logical_digest
-        {
-            let _ = writer.abort().await;
-            return Err(corrupt(
-                "materialize Managed files",
-                "logical digest does not match the file version",
-            ));
-        }
-        writer
-            .close()
-            .await
-            .map_err(|_| unavailable("write materialized file"))?;
-        Ok(())
+        finish_materialized_file(writer, version, logical, written).await
     }
 
-    async fn read_extent_window(
+    async fn fetch_segments(
         &self,
-        context: &MaterializationContext,
-        extents: &[Extent],
+        demands: &BTreeMap<SegmentRef, SegmentDemand>,
+        complete: &BTreeSet<SegmentRef>,
+        verify: &BTreeMap<SegmentRef, SegmentDemand>,
+        cached: Option<&Operator>,
         concurrency: NonZeroUsize,
-    ) -> Result<Vec<Buffer>, ManagedError> {
-        let mut reads = BTreeMap::<SegmentRef, Vec<(usize, Extent)>>::new();
-        for (index, extent) in extents.iter().copied().enumerate() {
-            reads
-                .entry(extent.segment)
-                .or_default()
-                .push((index, extent));
-        }
-
-        let fetched = stream::iter(reads)
-            .map(|(segment, extents)| async move {
-                context.plans.segments[&segment]
-                    .read_extents(&self.operator, &context.cached, segment, &extents)
-                    .await
-            })
-            .buffer_unordered(concurrency.get())
-            .try_collect::<Vec<Vec<_>>>()
-            .await?;
-        let mut ordered = vec![None; extents.len()];
-        for (index, bytes) in fetched.into_iter().flatten() {
-            ordered[index] = Some(bytes);
-        }
-        Ok(ordered
-            .into_iter()
-            .map(|bytes| bytes.expect("every planned extent produces one result"))
-            .collect())
-    }
-
-    pub(crate) async fn collect_unreachable_segments(
-        &self,
-        snapshot: &NamespaceSnapshot,
-    ) -> Result<SegmentGcMaintenance, ManagedError> {
-        let mut roots = RetainedDataRoots::default();
-        roots.retain(snapshot)?;
-        self.collect_unreachable_segments_from(&roots).await
-    }
-
-    pub(crate) async fn collect_unreachable_segments_from(
-        &self,
-        roots: &RetainedDataRoots,
-    ) -> Result<SegmentGcMaintenance, ManagedError> {
-        let capability = self.operator.info().full_capability();
-        if !capability.list || !capability.delete {
-            return Err(unavailable("collect unreachable data segments"));
-        }
-        let mut result = SegmentGcMaintenance::default();
-        let mut deleter = self
-            .operator
-            .deleter()
-            .await
-            .map_err(|_| unavailable("delete unreachable data segments"))?;
-        let mut entries = self
-            .operator
-            .lister_with(&format!("{SEGMENT_ROOT}/"))
-            .recursive(true)
-            .await
-            .map_err(|_| unavailable("list data segments"))?;
-        while let Some(entry) = entries
-            .try_next()
-            .await
-            .map_err(|_| unavailable("list data segments"))?
-        {
-            if !entry.metadata().is_file() {
-                continue;
-            }
-            let Some(reference) =
-                segment_ref_from_key(entry.path(), entry.metadata().content_length())
-            else {
-                continue;
-            };
-            result.scanned += 1;
-            if let Some(length) = roots.0.get(&reference.digest) {
-                if *length != reference.length {
-                    return Err(corrupt(
-                        "collect unreachable data segments",
-                        "live segment has an unexpected physical length",
-                    ));
-                }
-                continue;
-            }
-            let deleted_bytes = result
-                .deleted_bytes
-                .checked_add(reference.length)
-                .ok_or_else(|| {
-                    corrupt(
-                        "collect unreachable data segments",
-                        "deleted byte count exceeds format v1",
-                    )
-                })?;
-            deleter
-                .delete(entry.path())
-                .await
-                .map_err(|_| unavailable("delete unreachable data segments"))?;
-            result.deleted += 1;
-            result.deleted_bytes = deleted_bytes;
-        }
-        deleter
-            .close()
-            .await
-            .map_err(|_| unavailable("delete unreachable data segments"))?;
-        Ok(result)
-    }
-}
-
-impl MaterializationPlan {
-    fn new(
-        requests: &[(String, FileVersionRecord)],
-        full_tree: bool,
-        cache_complete_segments: bool,
-    ) -> Self {
-        let mut segments = BTreeMap::<SegmentRef, SegmentDemand>::new();
-        let oversized = requests
-            .iter()
-            .map(|(_, version)| version.logical_size)
-            .fold(0_u64, u64::saturating_add)
-            > MATERIALIZE_BATCH_BYTES;
-        let mut windows = BTreeMap::<SegmentRef, usize>::new();
-        for (_, version) in requests {
-            for extent in &version.extent_map.extents {
-                *segments
-                    .entry(extent.segment)
-                    .or_default()
-                    .entry(demand_key(extent))
-                    .or_default() += 1;
-            }
-            if oversized {
-                let mut start = 0;
-                while start < version.extent_map.extents.len() {
-                    let end = extent_window_end(&version.extent_map.extents, start);
-                    for segment in version.extent_map.extents[start..end]
-                        .iter()
-                        .map(|extent| extent.segment)
-                        .collect::<BTreeSet<_>>()
-                    {
-                        *windows.entry(segment).or_default() += 1;
-                    }
-                    start = end;
-                }
-            }
-        }
-        Self {
-            segments: segments
-                .into_iter()
-                .map(|(segment, demands)| {
-                    let plan = if cache_complete_segments
-                        && usize::try_from(segment.length)
-                            .is_ok_and(|length| length <= MATERIALIZE_CACHE_BYTES)
-                        && (prefer_complete_segment(segment, &demands, full_tree)
-                            || windows.get(&segment).is_some_and(|count| *count > 1))
-                    {
-                        SegmentReadPlan::Complete {
-                            demands: demands.keys().copied().collect(),
-                            verified: OnceCell::new(),
-                        }
-                    } else {
-                        let remaining = demands.values().sum();
-                        SegmentReadPlan::Ranged {
-                            demands: demands.keys().copied().collect(),
-                            state: Mutex::new(RangeReadState {
-                                bytes: None,
-                                remaining,
-                            }),
-                        }
-                    };
-                    (segment, plan)
-                })
-                .collect(),
-        }
-    }
-}
-
-impl SegmentReadPlan {
-    async fn read_extents(
-        &self,
-        operator: &Operator,
-        cached: &Operator,
-        segment: SegmentRef,
-        extents: &[(usize, Extent)],
-    ) -> Result<Vec<(usize, Buffer)>, ManagedError> {
-        match self {
-            Self::Complete { demands, verified } => {
+    ) -> Result<FetchedContent, ManagedError> {
+        futures::future::try_join_all(demands.iter().map(|(segment, demands)| async move {
+            let segment = *segment;
+            let bytes = if complete.contains(&segment) {
+                let cached = cached.expect("complete segment reads have a Foyer operator");
                 let bytes = cached
                     .read(&segment_key(segment))
                     .await
                     .map_err(|error| referenced_segment_error("read data segment", error))?;
-                verified
-                    .get_or_try_init(|| async { verify_complete_demands(segment, &bytes, demands) })
-                    .await?;
-                extents
+                if let Some(demands) = verify.get(&segment) {
+                    verify_complete_demands(segment, &bytes, demands)?;
+                }
+                demands
                     .iter()
-                    .map(|(index, extent)| {
-                        slice_extent(&bytes, 0, extent).map(|bytes| (*index, bytes))
+                    .map(|demand| slice_demand(&bytes, *demand).map(|bytes| (demand.2, bytes)))
+                    .collect::<Result<Vec<_>, ManagedError>>()?
+            } else {
+                let reader = self
+                    .operator
+                    .reader_with(&segment_key(segment))
+                    .gap(RANGE_FETCH_GAP)
+                    .concurrent(concurrency.get())
+                    .content_length_hint(segment.length)
+                    .await
+                    .map_err(|error| referenced_segment_error("read data segment", error))?;
+                let fetched = reader
+                    .fetch(
+                        demands
+                            .iter()
+                            .map(|(offset, length, _)| *offset..*offset + *length)
+                            .collect(),
+                    )
+                    .await
+                    .map_err(|error| referenced_segment_error("read data segment", error))?;
+                if fetched.len() != demands.len() {
+                    return Err(corrupt(
+                        "read data segment",
+                        "range fetch returned an unexpected result count",
+                    ));
+                }
+                demands
+                    .iter()
+                    .copied()
+                    .zip(fetched)
+                    .map(|(demand, bytes)| {
+                        verify_range_demand(&bytes, demand)?;
+                        Ok((demand.2, bytes))
                     })
-                    .collect()
-            }
-            Self::Ranged { demands, state } => {
-                let mut state = state.lock().await;
-                if state.bytes.is_none() {
-                    let reader = operator
-                        .reader_with(&segment_key(segment))
-                        .gap(RANGE_FETCH_GAP)
-                        .content_length_hint(segment.length)
-                        .await
-                        .map_err(|error| referenced_segment_error("read data segment", error))?;
-                    let fetched = reader
-                        .fetch(
-                            demands
-                                .iter()
-                                .map(|(offset, length, _)| *offset..*offset + *length)
-                                .collect(),
-                        )
-                        .await
-                        .map_err(|error| referenced_segment_error("read data segment", error))?;
-                    let mut bytes = BTreeMap::new();
-                    for (demand, buffer) in demands.iter().copied().zip(fetched) {
-                        verify_range_demand(&buffer, demand)?;
-                        bytes.insert(demand, buffer);
-                    }
-                    state.bytes = Some(bytes);
-                }
-                let bytes = state
-                    .bytes
-                    .as_ref()
-                    .expect("range bytes are initialized above");
-                let fetched = extents
-                    .iter()
-                    .map(|(index, extent)| (*index, bytes[&demand_key(extent)].clone()))
-                    .collect();
-                state.remaining = state
-                    .remaining
-                    .checked_sub(extents.len())
-                    .expect("each planned extent is consumed once");
-                if state.remaining == 0 {
-                    state.bytes = None;
-                }
-                Ok(fetched)
+                    .collect::<Result<Vec<_>, ManagedError>>()?
+            };
+            Ok(bytes)
+        }))
+        .await
+        .map(|segments| segments.into_iter().flatten().collect())
+    }
+}
+
+fn segment_demands<'a>(
+    extents: impl IntoIterator<Item = &'a Extent>,
+) -> BTreeMap<SegmentRef, SegmentDemand> {
+    let mut demands = BTreeMap::new();
+    for extent in extents {
+        demands
+            .entry(extent.segment)
+            .or_insert_with(BTreeSet::new)
+            .insert(demand_key(extent));
+    }
+    demands
+}
+
+fn complete_segments(
+    demands: &BTreeMap<SegmentRef, SegmentDemand>,
+    full_tree: bool,
+    cache_complete_segments: bool,
+    forced: &BTreeSet<SegmentRef>,
+) -> BTreeSet<SegmentRef> {
+    demands
+        .iter()
+        .filter(|(segment, segment_demands)| {
+            cache_complete_segments
+                && usize::try_from(segment.length)
+                    .is_ok_and(|length| length <= MATERIALIZE_CACHE_BYTES)
+                && (prefer_complete_segment(**segment, segment_demands, full_tree)
+                    || forced.contains(segment))
+        })
+        .map(|(segment, _)| *segment)
+        .collect()
+}
+
+fn segments_in_multiple_windows(extents: &[Extent]) -> BTreeSet<SegmentRef> {
+    let mut seen = BTreeSet::new();
+    let mut repeated = BTreeSet::new();
+    let mut start = 0;
+    while start < extents.len() {
+        let end = extent_window_end(extents, start);
+        for segment in extents[start..end]
+            .iter()
+            .map(|extent| extent.segment)
+            .collect::<BTreeSet<_>>()
+        {
+            if !seen.insert(segment) {
+                repeated.insert(segment);
             }
         }
+        start = end;
     }
+    repeated
+}
+
+async fn materialize_file(
+    target: &Operator,
+    path: &str,
+    version: &FileVersionRecord,
+    fetched: &FetchedContent,
+) -> Result<(), ManagedError> {
+    let mut writer = target
+        .writer(path)
+        .await
+        .map_err(|_| unavailable("write materialized file"))?;
+    let mut logical = Sha256::new();
+    let mut written = 0_u64;
+    if let Err(error) = write_extents(
+        &mut writer,
+        &version.extent_map.extents,
+        fetched,
+        &mut logical,
+        &mut written,
+    )
+    .await
+    {
+        let _ = writer.abort().await;
+        return Err(error);
+    }
+    finish_materialized_file(writer, version, logical, written).await
+}
+
+async fn write_extents(
+    writer: &mut Writer,
+    extents: &[Extent],
+    fetched: &FetchedContent,
+    logical: &mut Sha256,
+    written: &mut u64,
+) -> Result<(), ManagedError> {
+    for extent in extents {
+        let bytes = fetched
+            .get(&extent.content)
+            .cloned()
+            .ok_or_else(|| corrupt("materialize Managed files", "extent was not fetched"))?;
+        *written = written
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| corrupt("materialize Managed files", "logical file length overflows"))?;
+        for chunk in bytes.clone() {
+            logical.update(&chunk);
+        }
+        writer
+            .write(bytes)
+            .await
+            .map_err(|_| unavailable("write materialized file"))?;
+    }
+    Ok(())
+}
+
+async fn finish_materialized_file(
+    mut writer: Writer,
+    version: &FileVersionRecord,
+    logical: Sha256,
+    written: u64,
+) -> Result<(), ManagedError> {
+    if written != version.logical_size
+        || <[u8; 32]>::from(logical.finalize()) != version.logical_digest
+    {
+        let _ = writer.abort().await;
+        return Err(corrupt(
+            "materialize Managed files",
+            "logical digest does not match the file version",
+        ));
+    }
+    writer
+        .close()
+        .await
+        .map(|_| ())
+        .map_err(|_| unavailable("write materialized file"))
 }
 
 fn extent_window_end(extents: &[Extent], start: usize) -> usize {
@@ -807,19 +820,17 @@ fn verify_range_demand(bytes: &Buffer, demand: DemandKey) -> Result<(), ManagedE
     Ok(())
 }
 
-fn slice_extent(bytes: &Buffer, range_start: u64, extent: &Extent) -> Result<Buffer, ManagedError> {
-    let start = extent
-        .segment_offset
-        .checked_sub(range_start)
-        .and_then(|value| usize::try_from(value).ok())
-        .ok_or_else(|| corrupt("read data segment", "extent range is invalid"))?;
-    let length = usize::try_from(extent.content.length)
+fn slice_demand(bytes: &Buffer, demand: DemandKey) -> Result<Buffer, ManagedError> {
+    let (offset, demand_length, _) = demand;
+    let start = usize::try_from(offset)
+        .map_err(|_| corrupt("read data segment", "extent offset exceeds this process"))?;
+    let length = usize::try_from(demand_length)
         .map_err(|_| corrupt("read data segment", "extent length exceeds this process"))?;
     let end = start
         .checked_add(length)
         .filter(|end| *end <= bytes.len())
-        .ok_or_else(|| corrupt("read data segment", "extent exceeds fetched range"))?;
-    Ok(bytes.slice(start..end))
+        .ok_or_else(|| corrupt("read data segment", "extent exceeds data segment"))?;
+    Ok(Buffer::from(bytes.slice(start..end).to_bytes().to_vec()))
 }
 
 fn buffer_content_ref(bytes: &Buffer) -> ContentRef {
@@ -837,7 +848,7 @@ fn prefer_complete_segment(segment: SegmentRef, demands: &SegmentDemand, full_tr
     let mut requests = 0_u64;
     let mut transferred = 0_u64;
     let mut span: Option<Range<u64>> = None;
-    for (offset, length, _) in demands.keys() {
+    for (offset, length, _) in demands {
         let range = *offset..*offset + *length;
         match span.as_mut() {
             Some(current) if range.start.saturating_sub(current.end) <= RANGE_FETCH_GAP as u64 => {
@@ -1039,6 +1050,68 @@ fn take_segment_contents(
     Ok(batch)
 }
 
+fn complete_segment_sources(reference: SegmentRef, sources: &BTreeMap<u64, SegmentSource>) -> bool {
+    let mut expected = 0_u64;
+    for (offset, source) in sources {
+        if *offset != expected {
+            return false;
+        }
+        let Some(end) = expected.checked_add(source.content.length) else {
+            return false;
+        };
+        if end > reference.length {
+            return false;
+        }
+        expected = end;
+    }
+    expected == reference.length
+}
+
+async fn fetch_segment_sources<'a>(
+    staging: &Operator,
+    sources: impl ExactSizeIterator<Item = &'a SegmentSource>,
+) -> Result<Vec<Buffer>, ManagedError> {
+    let mut requests = BTreeMap::<&str, Vec<(usize, Range<u64>)>>::new();
+    let count = sources.len();
+    for (index, source) in sources.enumerate() {
+        let end = source
+            .logical_offset
+            .checked_add(source.content.length)
+            .ok_or_else(|| corrupt("finalize Managed files", "prepared source range overflows"))?;
+        requests
+            .entry(&source.path)
+            .or_default()
+            .push((index, source.logical_offset..end));
+    }
+
+    let mut fetched = std::iter::repeat_with(|| None)
+        .take(count)
+        .collect::<Vec<Option<Buffer>>>();
+    for (path, ranges) in requests {
+        let reader = staging
+            .reader(path)
+            .await
+            .map_err(|_| unavailable("read frozen file for publication"))?;
+        let bytes = reader
+            .fetch(ranges.iter().map(|(_, range)| range.clone()).collect())
+            .await
+            .map_err(|_| unavailable("read frozen file for publication"))?;
+        if bytes.len() != ranges.len() {
+            return Err(corrupt(
+                "finalize Managed files",
+                "frozen range fetch returned an unexpected result count",
+            ));
+        }
+        for ((index, _), bytes) in ranges.into_iter().zip(bytes) {
+            fetched[index] = Some(bytes);
+        }
+    }
+    Ok(fetched
+        .into_iter()
+        .map(|bytes| bytes.expect("every prepared source range was fetched"))
+        .collect())
+}
+
 fn seal_segment(contents: BTreeMap<ContentRef, Vec<u8>>) -> Result<SealedSegment, ManagedError> {
     // Segment v1 is the stable ContentRef ordering of its raw contents. The
     // descriptor owns offsets; SegmentRef authenticates the complete object.
@@ -1097,49 +1170,6 @@ fn verify_complete_segment(reference: SegmentRef, bytes: &Buffer) -> Result<(), 
     Ok(())
 }
 
-fn visit_reachable_file_versions(
-    snapshot: &NamespaceSnapshot,
-    action: &'static str,
-    mut visit: impl FnMut(&FileVersionRecord) -> Result<(), ManagedError>,
-) -> Result<(), ManagedError> {
-    let mut visited = BTreeSet::new();
-    let mut pending = vec![snapshot.root];
-    while let Some(node_id) = pending.pop() {
-        if !visited.insert(node_id) {
-            continue;
-        }
-        let node = snapshot
-            .nodes
-            .get(&node_id)
-            .ok_or_else(|| corrupt(action, "namespace references a missing node"))?;
-        match node.kind {
-            NodeKind::Directory => {
-                let directory = snapshot
-                    .directories
-                    .get(&node_id)
-                    .ok_or_else(|| corrupt(action, "namespace references a missing directory"))?;
-                pending.extend(directory.entries.values().map(|entry| entry.node));
-            }
-            NodeKind::RegularFile => {
-                let version_id = node
-                    .file_version
-                    .ok_or_else(|| corrupt(action, "live file has no file version"))?;
-                let version = snapshot.file_versions.get(&version_id).ok_or_else(|| {
-                    corrupt(action, "live node references a missing file version")
-                })?;
-                if !version.is_valid() {
-                    return Err(corrupt(
-                        action,
-                        "live node references an invalid file version",
-                    ));
-                }
-                visit(version)?;
-            }
-        }
-    }
-    Ok(())
-}
-
 fn content_ref(bytes: &[u8]) -> ContentRef {
     ContentRef {
         digest: Sha256::digest(bytes).into(),
@@ -1152,19 +1182,6 @@ fn segment_key(reference: SegmentRef) -> String {
     format!("{SEGMENT_ROOT}/{}/{}.seg", &digest[..2], digest)
 }
 
-fn segment_ref_from_key(path: &str, length: u64) -> Option<SegmentRef> {
-    let relative = path.strip_prefix(&format!("{SEGMENT_ROOT}/"))?;
-    let (partition, encoded) = relative.split_once('/')?;
-    let encoded = encoded.strip_suffix(".seg")?;
-    if partition.len() != 2 || encoded.len() != 64 || partition != &encoded[..2] {
-        return None;
-    }
-    Some(SegmentRef {
-        digest: parse_hex(encoded)?,
-        length,
-    })
-}
-
 fn hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len() * 2);
@@ -1173,25 +1190,6 @@ fn hex(bytes: &[u8]) -> String {
         output.push(DIGITS[(byte & 0x0f) as usize] as char);
     }
     output
-}
-
-fn parse_hex(value: &str) -> Option<[u8; 32]> {
-    if value.len() != 64 {
-        return None;
-    }
-    let mut output = [0; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
-        output[index] = (hex_digit(pair[0])? << 4) | hex_digit(pair[1])?;
-    }
-    Some(output)
-}
-
-fn hex_digit(value: u8) -> Option<u8> {
-    match value {
-        b'0'..=b'9' => Some(value - b'0'),
-        b'a'..=b'f' => Some(value - b'a' + 10),
-        _ => None,
-    }
 }
 
 fn referenced_segment_error(action: &'static str, error: opendal::Error) -> ManagedError {
@@ -1239,7 +1237,7 @@ mod tests {
             .collect::<Vec<_>>();
         source.write("small", small.clone()).await.unwrap();
         source.write("large", large.clone()).await.unwrap();
-        let data = ManagedData::new(storage).unwrap();
+        let data = ManagedData::new(storage.clone()).unwrap();
 
         let staged = data
             .stage_files(
@@ -1251,6 +1249,36 @@ mod tests {
             )
             .await
             .unwrap();
+        let small_segment = staged["small"].extent_map.extents[0].segment;
+        assert!(
+            staged["large"]
+                .extent_map
+                .extents
+                .iter()
+                .any(|extent| extent.segment == small_segment),
+            "the regression fixture must exercise one segment packed across files"
+        );
+        assert!(
+            storage
+                .stat(&segment_key(small_segment))
+                .await
+                .is_err_and(|error| error.kind() == ErrorKind::NotFound),
+            "staging must not publish data before reconciliation"
+        );
+        data.finalize_staged_files(
+            &staging,
+            staged
+                .iter()
+                .map(|(path, version)| (path.clone(), version.clone()))
+                .collect(),
+            &AuthorityKnownContent::default(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            storage.stat(&segment_key(small_segment)).await.is_ok(),
+            "finalization must publish prepared data"
+        );
         data.materialize(
             &target,
             staged.into_iter().collect(),

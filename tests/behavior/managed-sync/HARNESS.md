@@ -53,7 +53,7 @@ changing local or remote state. It does not start a FUSE session.
 `../managed-branch/workflow.sh` is the corresponding user-visible `branch/v1`
 contract. It covers the default branch, current, historical, and genesis forks,
 independent publication, deletion and name reuse, stale replica fencing,
-multi-root garbage collection, and a retained large-namespace parent. It uses
+historical branch materialization and a retained large-namespace parent. It uses
 the same provider inputs and likewise inspects only CLI output and ordinary
 replica files.
 

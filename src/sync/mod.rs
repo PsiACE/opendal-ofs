@@ -21,5 +21,5 @@ pub use state::{ConflictRecord, PendingIntent, ReplicaState};
 
 pub(crate) use local::{LocalKind, LocalTree};
 pub(crate) use publication::build_publication;
-pub(crate) use reconcile::{RemoteEdit, reconcile};
-pub(crate) use staging::StagedTree;
+pub(crate) use reconcile::reconcile;
+pub(crate) use staging::{StagedTree, TargetManifest};

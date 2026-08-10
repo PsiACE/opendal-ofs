@@ -12,22 +12,17 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 use ofs::catalog::{Catalog, VolumeDefinition};
-#[cfg(feature = "managed-branch")]
 use ofs::filesystem::BranchName;
 use ofs::filesystem::{Volume, VolumeId, VolumeModel};
-#[cfg(feature = "managed-branch")]
 use ofs::managed::extensions::branch::{BranchInfo, ForkPoint};
-use ofs::managed::{D1Config, ManagedFormat, ManagedMetadata, ManagedVolume, SegmentGcMaintenance};
+use ofs::managed::{D1Config, ManagedFormat, ManagedMetadata, ManagedVolume};
 use ofs::sync::{ReplicaState, SyncEngine};
 use opendal::Operator;
 use opendal::layers::{ConcurrentLimitLayer, RetryLayer};
 use url::Url;
 
-#[cfg(feature = "managed-branch")]
 use crate::cli::BranchCommand;
-use crate::cli::{
-    Cli, Command, MountArgs, StatusArgs, SyncArgs, VolumeCommand, VolumeCreateArgs, VolumeGcArgs,
-};
+use crate::cli::{Cli, Command, MountArgs, StatusArgs, SyncArgs, VolumeCommand, VolumeCreateArgs};
 
 struct ManagedContext {
     format: ManagedFormat,
@@ -41,10 +36,6 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
         Command::Volume {
             command: VolumeCommand::Create(args),
         } => create_volume(&config, args).await,
-        Command::Volume {
-            command: VolumeCommand::Gc(args),
-        } => gc_volume(&config, args).await,
-        #[cfg(feature = "managed-branch")]
         Command::Branch { command } => branch_command(&config, command).await,
         Command::Mount(args) => mount_volume(&config, args).await,
         Command::Sync(args) => sync_volume(&config, args).await,
@@ -52,7 +43,6 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
     }
 }
 
-#[cfg(feature = "managed-branch")]
 async fn branch_command(config: &Path, command: BranchCommand) -> Result<()> {
     let (alias, concurrency) = match &command {
         BranchCommand::List(args) => (&args.alias, args.runtime.transfer_concurrency),
@@ -113,12 +103,9 @@ async fn branch_command(config: &Path, command: BranchCommand) -> Result<()> {
         }
         BranchCommand::Create(args) => {
             let target = parse_branch_name(&args.branch)?;
-            let source = match args.from {
-                Some(source) => parse_branch_name(&source)?,
-                None => branches.default_name().await?,
-            };
+            let source = args.from.as_deref().map(parse_branch_name).transpose()?;
             let point = args.at.map_or(ForkPoint::Head, ForkPoint::Sequence);
-            let created = branches.fork(&source, point, target).await?;
+            let (created, source) = branches.fork(source, point, target).await?;
             println!(
                 "created branch {:?} {} from {:?} at change {}",
                 created.binding.name.as_str(),
@@ -137,14 +124,12 @@ async fn branch_command(config: &Path, command: BranchCommand) -> Result<()> {
     }
 }
 
-#[cfg(feature = "managed-branch")]
 fn parse_branch_name(value: &str) -> Result<BranchName> {
     value
         .parse()
         .map_err(|error| anyhow!("invalid branch name {value:?}: {error}"))
 }
 
-#[cfg(feature = "managed-branch")]
 fn branch_json(branch: &BranchInfo) -> serde_json::Value {
     serde_json::json!({
         "name": branch.binding.name.as_str(),
@@ -158,40 +143,6 @@ fn branch_json(branch: &BranchInfo) -> serde_json::Value {
     })
 }
 
-async fn gc_volume(config: &Path, args: VolumeGcArgs) -> Result<()> {
-    let ManagedContext {
-        format,
-        data,
-        metadata,
-    } = open_managed_context(config, &args.alias, args.runtime.transfer_concurrency).await?;
-    #[cfg(feature = "managed-branch")]
-    if format.requires_extension(ofs::managed::ManagedExtension::BranchV1) {
-        let branches = metadata.branches(&format, data)?;
-        let collected = if args.resume {
-            branches.resume_garbage_collect().await?
-        } else {
-            branches.garbage_collect().await?
-        };
-        print_gc_result(&args.alias, collected);
-        return Ok(());
-    }
-    let volume = metadata.open_volume(format, data)?;
-    let collected = if args.resume {
-        volume.resume_garbage_collect().await?
-    } else {
-        volume.garbage_collect().await?
-    };
-    print_gc_result(&args.alias, collected);
-    Ok(())
-}
-
-fn print_gc_result(alias: &str, collected: SegmentGcMaintenance) {
-    println!(
-        "garbage collected {:?}: scanned={} deleted={} bytes={}",
-        alias, collected.scanned, collected.deleted, collected.deleted_bytes,
-    );
-}
-
 async fn open_managed_volume(
     config: &Path,
     alias: &str,
@@ -203,7 +154,6 @@ async fn open_managed_volume(
         data,
         metadata,
     } = open_managed_context(config, alias, transfer_concurrency).await?;
-    #[cfg(feature = "managed-branch")]
     if format.requires_extension(ofs::managed::ManagedExtension::BranchV1) {
         let branches = metadata.branches(&format, data)?;
         let volume = match branch {
@@ -248,10 +198,6 @@ async fn create_volume(config: &Path, mut args: VolumeCreateArgs) -> Result<()> 
     if args.model == VolumeModel::Direct && branch_enabled {
         bail!("--enable branch requires --model managed");
     }
-    #[cfg(not(feature = "managed-branch"))]
-    if branch_enabled {
-        bail!("this ofs build does not include the managed-branch feature");
-    }
     if args.model == VolumeModel::Managed && args.metadata.is_none() {
         args.metadata = env::var_os("OFS_METADATA_URL")
             .filter(|value| !value.is_empty())
@@ -290,7 +236,6 @@ async fn create_volume(config: &Path, mut args: VolumeCreateArgs) -> Result<()> 
     let data = open_operator(&args.storage, NonZeroUsize::MIN)?;
     let metadata = open_metadata(data.clone(), args.metadata.as_ref())?;
     let desired = ManagedFormat::v1(provisional_id, metadata.metadata_format());
-    #[cfg(feature = "managed-branch")]
     let desired = if branch_enabled {
         desired.with_extension(ofs::managed::ManagedExtension::BranchV1)
     } else {
@@ -307,11 +252,9 @@ async fn create_volume(config: &Path, mut args: VolumeCreateArgs) -> Result<()> 
     {
         bail!("volume catalog and Managed format v1 binding disagree");
     }
-    #[cfg(feature = "managed-branch")]
     if branch_enabled && !format.requires_extension(ofs::managed::ManagedExtension::BranchV1) {
         bail!("existing Managed volume does not enable requested extension branch/v1");
     }
-    #[cfg(feature = "managed-branch")]
     if format.requires_extension(ofs::managed::ManagedExtension::BranchV1) {
         metadata
             .branches(&format, data.clone())?
@@ -320,8 +263,6 @@ async fn create_volume(config: &Path, mut args: VolumeCreateArgs) -> Result<()> 
     } else {
         metadata.open_volume(format.clone(), data)?;
     }
-    #[cfg(not(feature = "managed-branch"))]
-    metadata.open_volume(format.clone(), data)?;
     let volume_id = format.volume_id();
     let definition = VolumeDefinition::managed(volume_id, args.storage, args.metadata)?;
     let registered = catalog.register(&args.alias, definition)?;

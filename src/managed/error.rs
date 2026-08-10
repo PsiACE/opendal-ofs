@@ -17,27 +17,18 @@
 
 use std::fmt;
 
+use crate::filesystem::{VolumeError, VolumeErrorKind};
+
 /// Stable failure classes exposed by Managed volume actions.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ManagedErrorKind {
-    UnsupportedFormat,
-    Invalid,
-    Conflict,
-    Corrupt,
-    Unavailable,
-}
+pub type ManagedErrorKind = VolumeErrorKind;
 
 /// Failure to create or read Managed volume state.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ManagedError {
-    kind: ManagedErrorKind,
-    action: &'static str,
-    message: String,
-}
+pub struct ManagedError(VolumeError);
 
 impl ManagedError {
     pub const fn kind(&self) -> ManagedErrorKind {
-        self.kind
+        self.0.kind()
     }
 
     pub(crate) fn new(
@@ -45,18 +36,23 @@ impl ManagedError {
         action: &'static str,
         message: impl Into<String>,
     ) -> Self {
-        Self {
+        Self(VolumeError::new(
             kind,
-            action,
-            message: message.into(),
-        }
+            format!("{action}: {}", message.into()),
+        ))
     }
 }
 
 impl fmt::Display for ManagedError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}: {}", self.action, self.message)
+        self.0.fmt(formatter)
     }
 }
 
 impl std::error::Error for ManagedError {}
+
+impl From<ManagedError> for VolumeError {
+    fn from(error: ManagedError) -> Self {
+        error.0
+    }
+}

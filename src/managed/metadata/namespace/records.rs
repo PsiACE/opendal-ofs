@@ -18,7 +18,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::filesystem::{ChangeCursor, FileVersionId, Generation};
+use crate::filesystem::{FileVersionId, Generation};
 use crate::managed::format::{ContentRef, ExtentMap};
 
 pub(crate) type NodeRecord = crate::filesystem::NodeRecord;
@@ -128,32 +128,6 @@ pub(crate) type NamespaceSnapshot = crate::filesystem::VolumeSnapshot<FileVersio
 pub(crate) type NodePrecondition = crate::filesystem::NodePrecondition;
 pub(crate) type DirectoryPrecondition = crate::filesystem::DirectoryPrecondition;
 pub(crate) type NamespacePublication = crate::filesystem::VolumePublication<FileVersionRecord>;
-
-/// Durable identity of one namespace garbage-collection sweep.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct NamespaceGcSweep {
-    epoch: u64,
-    owner: [u8; 16],
-    fixed: ChangeCursor,
-}
-
-impl NamespaceGcSweep {
-    pub fn epoch(self) -> u64 {
-        self.epoch
-    }
-
-    pub fn fixed_cursor(self) -> ChangeCursor {
-        self.fixed
-    }
-
-    pub(crate) const fn new(epoch: u64, owner: [u8; 16], fixed: ChangeCursor) -> Self {
-        Self {
-            epoch,
-            owner,
-            fixed,
-        }
-    }
-}
 
 pub(crate) fn managed_generation(value: u64) -> Generation {
     Generation::from_bytes(value.to_be_bytes().to_vec())

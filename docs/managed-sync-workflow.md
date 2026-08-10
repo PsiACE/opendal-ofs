@@ -108,10 +108,11 @@ One invocation:
 2. Observes a fixed remote snapshot.
 3. Freezes and scans the local tree.
 4. Reconciles the common base, local tree, and remote snapshot.
-5. Stages immutable segments when local content must be published.
-6. Publishes one generation-checked namespace change.
-7. Installs and verifies the merged tree.
-8. Advances the common base and exits.
+5. Records a durable pending intent when local content must be published.
+6. Rebuilds, verifies, and uploads its immutable segments from frozen files.
+7. Publishes one generation-checked namespace change.
+8. Installs and verifies the merged tree.
+9. Advances the common base and exits.
 
 Disjoint changes from different replicas merge. If two publishers race, one
 conditional publication succeeds. The other command stops and reconciles
@@ -198,19 +199,6 @@ If the catalog was also lost, first run `volume create` with the original
 storage and metadata locators. The replacement alias may differ from the lost
 one. The command reads the existing superblock and binds the new local alias to
 that volume identity.
-
-## Collect unreachable segments
-
-Run garbage collection when failed publications or replaced file versions may
-have left unreachable segments:
-
-```shell
-ofs volume gc workspace
-```
-
-The command fences namespace publication, fixes one snapshot, lists the data
-segment prefix, and submits unreachable segments for bulk deletion. It never
-deletes a segment referenced by the fixed snapshot.
 
 ## Filesystem surface
 

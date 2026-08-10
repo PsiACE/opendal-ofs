@@ -17,20 +17,13 @@
 
 //! Branch authority over native revision-CAS records.
 
-use std::collections::BTreeSet;
 use std::io::Cursor;
 
 use super::records::{BranchInfo, ForkPoint, StoredBranchRegistry, info};
-use crate::filesystem::{BranchBinding, BranchId, BranchName, OperationId, VolumeId};
-use crate::managed::data::RetainedDataRoots;
-use crate::managed::metadata::namespace::{
-    NamespaceStore, StoredHead, StoredNamespaceState, checkpoint_key, decode_head, encode_head,
-    history_key,
-};
+use crate::filesystem::{BranchBinding, BranchId, BranchName, VolumeId};
+use crate::managed::metadata::namespace::{NamespaceStore, StoredHead, decode_head, encode_head};
 use crate::managed::metadata::record::{RecordBackend, Revision};
-use crate::managed::{
-    ManagedData, ManagedError, ManagedErrorKind, ManagedVolume, SegmentGcMaintenance,
-};
+use crate::managed::{ManagedError, ManagedErrorKind, ManagedVolume};
 use opendal::Operator;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -47,47 +40,6 @@ pub struct BranchStore {
     data: Operator,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct BranchGcFence {
-    epoch: u64,
-    owner: [u8; 16],
-}
-
-impl BranchGcFence {
-    fn owns_registry(self, registry: &StoredBranchRegistry) -> bool {
-        registry.maintenance_epoch == self.epoch && registry.maintenance_owner == Some(self.owner)
-    }
-
-    fn owns_head(self, head: &StoredHead) -> bool {
-        head.maintenance_epoch == self.epoch && head.maintenance_owner == Some(self.owner)
-    }
-}
-
-struct GcRoots {
-    data: RetainedDataRoots,
-    heads: BTreeSet<String>,
-    checkpoints: BTreeSet<String>,
-    histories: BTreeSet<String>,
-}
-
-enum CasMutation<T> {
-    Return(T),
-    Replace(T),
-}
-
-enum CasFailure {
-    BeforeReplace(ManagedError),
-    Replace(ManagedError),
-}
-
-impl From<CasFailure> for ManagedError {
-    fn from(failure: CasFailure) -> Self {
-        match failure {
-            CasFailure::BeforeReplace(error) | CasFailure::Replace(error) => error,
-        }
-    }
-}
-
 impl BranchStore {
     fn namespace(&self, binding: BranchBinding) -> NamespaceStore {
         let id = binding.id;
@@ -98,63 +50,6 @@ impl BranchStore {
             binding,
             head_key(id),
         )
-    }
-
-    async fn mutate_registry<T>(
-        &self,
-        action: &'static str,
-        mut mutate: impl FnMut(&mut StoredBranchRegistry) -> Result<CasMutation<T>, ManagedError>,
-    ) -> Result<T, CasFailure> {
-        loop {
-            let (mut registry, revision) =
-                self.registry().await.map_err(CasFailure::BeforeReplace)?;
-            let result = match mutate(&mut registry).map_err(CasFailure::BeforeReplace)? {
-                CasMutation::Return(result) => return Ok(result),
-                CasMutation::Replace(result) => result,
-            };
-            let bytes =
-                encode(REGISTRY_MAGIC, &registry, action).map_err(CasFailure::BeforeReplace)?;
-            match self
-                .backend
-                .replace(REGISTRY_KEY, &revision, bytes, action)
-                .await
-            {
-                Ok(true) => return Ok(result),
-                Ok(false) => continue,
-                Err(error) => return Err(CasFailure::Replace(error)),
-            }
-        }
-    }
-
-    async fn mutate_head<T>(
-        &self,
-        branch: BranchId,
-        action: &'static str,
-        mut mutate: impl FnMut(&mut StoredHead) -> Result<CasMutation<T>, ManagedError>,
-    ) -> Result<Option<T>, CasFailure> {
-        loop {
-            let Some((mut head, revision)) = self
-                .read_head(branch)
-                .await
-                .map_err(CasFailure::BeforeReplace)?
-            else {
-                return Ok(None);
-            };
-            let result = match mutate(&mut head).map_err(CasFailure::BeforeReplace)? {
-                CasMutation::Return(result) => return Ok(Some(result)),
-                CasMutation::Replace(result) => result,
-            };
-            let bytes = encode_head(&head).map_err(CasFailure::BeforeReplace)?;
-            match self
-                .backend
-                .replace(&head_key(branch), &revision, bytes, action)
-                .await
-            {
-                Ok(true) => return Ok(Some(result)),
-                Ok(false) => continue,
-                Err(error) => return Err(CasFailure::Replace(error)),
-            }
-        }
     }
 
     pub(crate) fn new(volume_id: VolumeId, data: Operator, backend: RecordBackend) -> Self {
@@ -228,14 +123,6 @@ impl BranchStore {
         Ok(branches)
     }
 
-    pub async fn default_name(&self) -> Result<BranchName, ManagedError> {
-        let (registry, _) = self.registry().await?;
-        registry
-            .default_binding()
-            .map(|binding| binding.name)
-            .ok_or_else(|| corrupt("read default Managed branch", "default branch is missing"))
-    }
-
     pub async fn get(&self, name: &BranchName) -> Result<BranchInfo, ManagedError> {
         let (registry, _) = self.registry().await?;
         self.registered_branch(&registry, name, "show Managed branch")
@@ -265,7 +152,7 @@ impl BranchStore {
             name: name.clone(),
             id,
         });
-        ManagedVolume::bound(self.data.clone(), namespace)
+        ManagedVolume::new(namespace, self.data.clone())
     }
 
     pub async fn open_default(&self) -> Result<ManagedVolume, ManagedError> {
@@ -274,17 +161,11 @@ impl BranchStore {
             .default_binding()
             .ok_or_else(|| corrupt("open default Managed branch", "default branch is missing"))?;
         let namespace = self.namespace(binding);
-        ManagedVolume::bound(self.data.clone(), namespace)
+        ManagedVolume::new(namespace, self.data.clone())
     }
 
     pub async fn delete(&self, name: &BranchName) -> Result<(), ManagedError> {
         let (registry, _) = self.registry().await?;
-        if registry.maintenance_active {
-            return Err(conflict(
-                "delete Managed branch",
-                "branch maintenance is active",
-            ));
-        }
         let branch_id = registry
             .branch_id(name)
             .ok_or_else(|| not_found("delete Managed branch"))?;
@@ -295,398 +176,97 @@ impl BranchStore {
             ));
         }
 
-        let sealed = self
-            .mutate_head(branch_id, "delete Managed branch", |head| {
-                if head.sealed {
-                    return Ok(CasMutation::Return(()));
-                }
-                if head.maintenance_active {
-                    return Err(conflict(
-                        "delete Managed branch",
-                        "branch maintenance is active",
-                    ));
-                }
-                head.sealed = true;
-                Ok(CasMutation::Replace(()))
-            })
-            .await;
-        match sealed {
-            Ok(Some(())) => {}
-            Ok(None) => {
+        loop {
+            let Some((mut head, revision)) = self.read_head(branch_id).await? else {
                 return Err(corrupt(
                     "delete Managed branch",
                     "registered branch HEAD is missing",
                 ));
+            };
+            if head.sealed {
+                break;
             }
-            Err(CasFailure::Replace(error)) => {
-                if !self
-                    .read_head(branch_id)
-                    .await?
-                    .is_some_and(|(head, _)| head.sealed)
-                {
+            head.sealed = true;
+            let bytes = encode_head(&head)?;
+            match self
+                .backend
+                .replace(
+                    &head_key(branch_id),
+                    &revision,
+                    bytes,
+                    "delete Managed branch",
+                )
+                .await
+            {
+                Ok(true) => break,
+                Ok(false) => continue,
+                Err(error) => {
+                    if self
+                        .read_head(branch_id)
+                        .await?
+                        .is_some_and(|(head, _)| head.sealed)
+                    {
+                        break;
+                    }
                     return Err(error);
                 }
             }
-            Err(error) => return Err(error.into()),
         }
 
-        let removed = self
-            .mutate_registry("delete Managed branch", |registry| {
-                if registry.branch_id(name) != Some(branch_id) {
-                    return Ok(CasMutation::Return(()));
-                }
-                if registry.maintenance_active {
-                    return Err(conflict(
-                        "delete Managed branch",
-                        "branch maintenance is active",
-                    ));
-                }
-                registry.branches.remove(name);
-                Ok(CasMutation::Replace(()))
-            })
-            .await;
-        match removed {
-            Ok(()) => Ok(()),
-            Err(CasFailure::Replace(error)) => {
-                let (current, _) = self.registry().await?;
-                if current.branch_id(name) == Some(branch_id) {
-                    Err(error)
-                } else {
-                    Ok(())
-                }
+        loop {
+            let (mut registry, revision) = self.registry().await?;
+            if registry.branch_id(name) != Some(branch_id) {
+                return Ok(());
             }
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    async fn begin_gc(&self) -> Result<BranchGcFence, ManagedError> {
-        let (registry, fence) = self
-            .mutate_registry("begin Managed branch GC", |registry| {
-                if registry.maintenance_active {
-                    return Err(conflict(
-                        "begin Managed branch GC",
-                        "branch maintenance is already active",
-                    ));
-                }
-                registry.maintenance_epoch =
-                    registry.maintenance_epoch.checked_add(1).ok_or_else(|| {
-                        invalid("begin Managed branch GC", "maintenance epoch is exhausted")
-                    })?;
-                registry.maintenance_active = true;
-                let fence = BranchGcFence {
-                    epoch: registry.maintenance_epoch,
-                    owner: *OperationId::generate().as_bytes(),
-                };
-                registry.maintenance_owner = Some(fence.owner);
-                Ok(CasMutation::Replace((registry.clone(), fence)))
-            })
-            .await
-            .map_err(ManagedError::from)?;
-
-        self.fix_gc_heads(&registry, fence, "begin Managed branch GC")
-            .await?;
-        Ok(fence)
-    }
-
-    async fn fix_gc_heads(
-        &self,
-        registry: &StoredBranchRegistry,
-        fence: BranchGcFence,
-        action: &'static str,
-    ) -> Result<(), ManagedError> {
-        for (name, branch_id) in &registry.branches {
-            let sealed = self
-                .mutate_head(*branch_id, action, |head| {
-                    if head.sealed {
-                        return Ok(CasMutation::Return(true));
-                    }
-                    if head.maintenance_active && fence.owns_head(head) {
-                        return Ok(CasMutation::Return(false));
-                    }
-                    head.maintenance_epoch = fence.epoch;
-                    head.maintenance_active = true;
-                    head.maintenance_owner = Some(fence.owner);
-                    head.maintenance_fixed_cursor = Some(head.cursor());
-                    Ok(CasMutation::Replace(false))
-                })
+            registry.branches.remove(name);
+            let bytes = encode(REGISTRY_MAGIC, &registry, "delete Managed branch")?;
+            match self
+                .backend
+                .replace(REGISTRY_KEY, &revision, bytes, "delete Managed branch")
                 .await
-                .map_err(ManagedError::from)?
-                .ok_or_else(|| corrupt(action, "registered branch HEAD is missing"))?;
-            if !sealed {
-                continue;
-            }
-            self.mutate_registry(action, |registry| {
-                if !registry.maintenance_active || !fence.owns_registry(registry) {
-                    return Err(conflict(action, "GC fence changed while fixing roots"));
+            {
+                Ok(true) => return Ok(()),
+                Ok(false) => continue,
+                Err(error) => {
+                    let (current, _) = self.registry().await?;
+                    return if current.branch_id(name) == Some(branch_id) {
+                        Err(error)
+                    } else {
+                        Ok(())
+                    };
                 }
-                if registry.branch_id(name) != Some(*branch_id) {
-                    return Ok(CasMutation::Return(()));
-                }
-                if registry.default_branch == *branch_id {
-                    return Err(corrupt(action, "default branch HEAD is sealed"));
-                }
-                registry.branches.remove(name);
-                Ok(CasMutation::Replace(()))
-            })
-            .await
-            .map_err(ManagedError::from)?;
-        }
-        self.ensure_gc_fence(fence, action).await
-    }
-
-    async fn gc_roots(&self, fence: BranchGcFence) -> Result<GcRoots, ManagedError> {
-        let (registry, _) = self.registry().await?;
-        if !registry.maintenance_active || !fence.owns_registry(&registry) {
-            return Err(conflict(
-                "mark Managed branch GC roots",
-                "GC fence does not match the registry",
-            ));
-        }
-        let mut roots = GcRoots {
-            data: RetainedDataRoots::default(),
-            heads: BTreeSet::new(),
-            checkpoints: BTreeSet::new(),
-            histories: BTreeSet::new(),
-        };
-        for (name, branch) in &registry.branches {
-            let branch_id = *branch;
-            let namespace = self.namespace(BranchBinding {
-                name: name.clone(),
-                id: branch_id,
-            });
-            roots.heads.insert(head_key(branch_id));
-            let (head, _) = self.read_head(branch_id).await?.ok_or_else(|| {
-                corrupt(
-                    "mark Managed branch GC roots",
-                    "registered branch HEAD is missing",
-                )
-            })?;
-            if head.sealed || !head.maintenance_active || !fence.owns_head(&head) {
-                return Err(conflict(
-                    "mark Managed branch GC roots",
-                    "branch HEAD is not fixed by this GC fence",
-                ));
-            }
-            let Some(state) = head.state else {
-                continue;
-            };
-            self.retain_state_roots(&namespace, &mut roots, &state)
-                .await?;
-            let mut history_id = state.previous_history;
-            let mut chain = BTreeSet::new();
-            while let Some(id) = history_id {
-                if !chain.insert(id) {
-                    return Err(corrupt(
-                        "mark Managed branch GC roots",
-                        "branch history contains a cycle",
-                    ));
-                }
-                if !roots.histories.insert(history_key(id)) {
-                    break;
-                }
-                let history = namespace.read_history(id).await?;
-                self.retain_state_roots(&namespace, &mut roots, &history.state)
-                    .await?;
-                history_id = history.state.previous_history;
             }
         }
-        self.ensure_gc_fence(fence, "mark Managed branch GC roots")
-            .await?;
-        Ok(roots)
-    }
-
-    async fn finish_gc(&self, fence: BranchGcFence) -> Result<(), ManagedError> {
-        let branches = self
-            .mutate_registry("finish Managed branch GC", |registry| {
-                if !fence.owns_registry(registry) {
-                    return Err(conflict(
-                        "finish Managed branch GC",
-                        "GC fence does not match the registry",
-                    ));
-                }
-                let branches = registry.branches.clone();
-                if !registry.maintenance_active {
-                    return Ok(CasMutation::Return(branches));
-                }
-                registry.maintenance_active = false;
-                Ok(CasMutation::Replace(branches))
-            })
-            .await
-            .map_err(ManagedError::from)?;
-
-        for branch in branches.values() {
-            let branch_id = *branch;
-            self.mutate_head(branch_id, "finish Managed branch GC", |head| {
-                if !head.maintenance_active || !fence.owns_head(head) {
-                    return Ok(CasMutation::Return(()));
-                }
-                head.maintenance_active = false;
-                head.maintenance_fixed_cursor = None;
-                Ok(CasMutation::Replace(()))
-            })
-            .await
-            .map_err(ManagedError::from)?;
-        }
-        Ok(())
-    }
-
-    /// Mark every retained branch position, sweep the shared data plane once,
-    /// and release the volume fence only after deletion succeeds.
-    pub async fn garbage_collect(&self) -> Result<SegmentGcMaintenance, ManagedError> {
-        let fence = self.begin_gc().await?;
-        self.collect_with_fence(fence).await
-    }
-
-    /// Resume an interrupted collection after the caller has established that
-    /// the collector which owns the active fence is no longer running.
-    pub async fn resume_garbage_collect(&self) -> Result<SegmentGcMaintenance, ManagedError> {
-        let (registry, revision) = self.registry().await?;
-        if !registry.maintenance_active {
-            return Err(conflict(
-                "resume Managed branch GC",
-                "branch maintenance is not active",
-            ));
-        }
-        let fence = BranchGcFence {
-            epoch: registry.maintenance_epoch,
-            owner: *OperationId::generate().as_bytes(),
-        };
-        let mut resumed = registry.clone();
-        resumed.maintenance_owner = Some(fence.owner);
-        let bytes = encode(REGISTRY_MAGIC, &resumed, "resume Managed branch GC")?;
-        if !self
-            .backend
-            .replace(REGISTRY_KEY, &revision, bytes, "resume Managed branch GC")
-            .await?
-        {
-            return Err(conflict(
-                "resume Managed branch GC",
-                "branch registry changed",
-            ));
-        }
-        self.fix_gc_heads(&resumed, fence, "resume Managed branch GC")
-            .await?;
-        self.collect_with_fence(fence).await
-    }
-
-    async fn collect_with_fence(
-        &self,
-        fence: BranchGcFence,
-    ) -> Result<SegmentGcMaintenance, ManagedError> {
-        let roots = self.gc_roots(fence).await?;
-        let data = ManagedData::new(self.data.clone())?;
-        let maintenance = data.collect_unreachable_segments_from(&roots.data).await?;
-        self.sweep_metadata(fence, &roots).await?;
-        self.finish_gc(fence).await?;
-        Ok(maintenance)
-    }
-
-    async fn sweep_metadata(
-        &self,
-        fence: BranchGcFence,
-        roots: &GcRoots,
-    ) -> Result<(), ManagedError> {
-        self.ensure_gc_fence(fence, "sweep Managed branch GC metadata")
-            .await?;
-        let head_prefix = format!("{ROOT}/heads/");
-        let checkpoint_prefix = ".ofs/managed/metadata/v1/checkpoints/sha256/";
-        let history_prefix = format!("{ROOT}/history/sha256/");
-        let unreachable_heads = self
-            .backend
-            .list(&format!("{ROOT}/"), "scan Managed branch GC metadata")
-            .await?
-            .into_iter()
-            .filter(|key| {
-                canonical_metadata_key(key, &head_prefix, 16) && !roots.heads.contains(key)
-            })
-            .collect::<Vec<_>>();
-        let mut unreachable_objects = Vec::new();
-        for (prefix, retained) in [
-            (checkpoint_prefix, &roots.checkpoints),
-            (history_prefix.as_str(), &roots.histories),
-        ] {
-            unreachable_objects.extend(
-                self.data
-                    .list_with(prefix)
-                    .recursive(true)
-                    .await
-                    .map_err(|_| unavailable("scan Managed branch GC metadata"))?
-                    .into_iter()
-                    .filter(|entry| {
-                        entry.metadata().is_file()
-                            && canonical_metadata_key(entry.path(), prefix, 32)
-                            && !retained.contains(entry.path())
-                    })
-                    .map(|entry| entry.path().to_owned()),
-            );
-        }
-        self.ensure_gc_fence(fence, "sweep Managed branch GC metadata")
-            .await?;
-        self.backend
-            .delete(unreachable_heads, "sweep Managed branch GC metadata")
-            .await?;
-        self.data
-            .delete_iter(unreachable_objects.iter().map(String::as_str))
-            .await
-            .map_err(|_| unavailable("sweep Managed branch GC metadata"))?;
-        self.ensure_gc_fence(fence, "sweep Managed branch GC metadata")
-            .await
-    }
-
-    async fn ensure_gc_fence(
-        &self,
-        fence: BranchGcFence,
-        action: &'static str,
-    ) -> Result<(), ManagedError> {
-        let (registry, _) = self.registry().await?;
-        if registry.maintenance_active && fence.owns_registry(&registry) {
-            Ok(())
-        } else {
-            Err(conflict(action, "GC fence changed during metadata sweep"))
-        }
-    }
-
-    async fn retain_state_roots(
-        &self,
-        namespace: &NamespaceStore,
-        roots: &mut GcRoots,
-        state: &StoredNamespaceState,
-    ) -> Result<(), ManagedError> {
-        roots
-            .checkpoints
-            .insert(checkpoint_key(state.checkpoint.digest));
-        namespace
-            .visit_retained(state, |snapshot| roots.data.retain(snapshot))
-            .await
     }
 
     pub async fn fork(
         &self,
-        source: &BranchName,
+        source: Option<BranchName>,
         point: ForkPoint,
         target: BranchName,
-    ) -> Result<BranchInfo, ManagedError> {
+    ) -> Result<(BranchInfo, BranchName), ManagedError> {
         let (mut registry, revision) = self.registry().await?;
-        if registry.maintenance_active {
-            return Err(conflict(
-                "fork Managed branch",
-                "branch maintenance is active",
-            ));
-        }
         if registry.branches.contains_key(&target) {
             return Err(conflict(
                 "fork Managed branch",
                 "target branch already exists",
             ));
         }
+        let source = match source {
+            Some(source) => source,
+            None => registry
+                .default_binding()
+                .map(|binding| binding.name)
+                .ok_or_else(|| corrupt("fork Managed branch", "default branch is missing"))?,
+        };
         let source_id = registry
-            .branch_id(source)
+            .branch_id(&source)
             .ok_or_else(|| not_found("fork Managed branch"))?;
         let (source_head, _) = self
             .read_head(source_id)
             .await?
             .ok_or_else(|| corrupt("fork Managed branch", "source branch HEAD is missing"))?;
-        if source_head.sealed || source_head.maintenance_active {
+        if source_head.sealed {
             return Err(conflict(
                 "fork Managed branch",
                 "source branch is sealed for deletion",
@@ -746,7 +326,7 @@ impl BranchStore {
             }
             Err(error) => {
                 return match self.get(&target).await {
-                    Ok(current) if current.binding.id == target_id => Ok(current),
+                    Ok(current) if current.binding.id == target_id => Ok((current, source)),
                     Ok(_) => Err(conflict(
                         "fork Managed branch",
                         "target branch was created concurrently",
@@ -756,11 +336,9 @@ impl BranchStore {
                 };
             }
         }
-        Ok(info(
-            target,
-            target_id,
-            &target_head,
-            registry.default_branch,
+        Ok((
+            info(target, target_id, &target_head, registry.default_branch),
+            source,
         ))
     }
 
@@ -805,19 +383,6 @@ impl BranchStore {
 
 fn head_key(branch: BranchId) -> String {
     format!("{ROOT}/heads/{branch}.ofs")
-}
-
-fn canonical_metadata_key(path: &str, prefix: &str, identity_bytes: usize) -> bool {
-    let Some(identity) = path
-        .strip_prefix(prefix)
-        .and_then(|path| path.strip_suffix(".ofs"))
-    else {
-        return false;
-    };
-    identity.len() == identity_bytes * 2
-        && identity
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 fn encode<T: Serialize>(

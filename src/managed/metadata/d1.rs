@@ -188,8 +188,6 @@ pub(crate) struct D1Result {
 pub(crate) struct D1Row {
     pub(crate) value_hex: Option<String>,
     pub(crate) revision: Option<u64>,
-    #[cfg(feature = "managed-branch")]
-    pub(crate) record_key: Option<String>,
 }
 
 #[derive(Default, Deserialize)]

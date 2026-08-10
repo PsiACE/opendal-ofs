@@ -25,8 +25,8 @@ boundary. The data plane, filesystem core, and publication contract remain
 unchanged after a branch has been bound.
 
 `branch/v1` provides a linear history per branch, fork from the current head
-or any retained sequence, deletion with safe name reuse, and volume-wide
-garbage collection. It does not provide merge, tags, branch reset, automatic
+or any retained sequence, and deletion with safe name reuse. It does not
+provide merge, tags, branch reset, automatic
 history expiry, a mounted filesystem, or a per-filesystem-call event log.
 
 # Why branches belong in Managed metadata
@@ -46,13 +46,11 @@ Managed volumes already provide the expensive pieces:
 
 Adding another commit graph, copying every metadata record, or reference
 counting every shared segment would duplicate those mechanisms. The missing
-pieces are named authorities, retained tails after checkpoint rotation, and a
-garbage collector that treats all branches as roots.
+pieces are named authorities and retained tails after checkpoint rotation.
 
 The extension reuses the common namespace snapshot, change, validation,
 publication, file-version, data-segment, and checkpoint models. Only
-the registry, branch heads, retained history, lifecycle, and multi-root garbage
-collection are extension-owned.
+the registry, branch heads, retained history, and lifecycle are extension-owned.
 
 The extension boundary keeps these rules out of base Managed volumes. The base
 and extension formats may share code, but they do not share mutable authority
@@ -143,29 +141,6 @@ before its name becomes reusable. Shared data is not removed synchronously.
 identity, sequence, default status, and lifecycle. It does not expose object
 keys, SQL revisions, provider errors, or credentials.
 
-## Garbage collection
-
-```text
-ofs volume gc workspace
-```
-
-On a branching volume this is a volume-wide operation. It freezes branch
-lifecycle and publication, recovers every current and retained state of every
-registered branch, unions their data-segment references, and performs one
-sweep. A single-branch sweep would be unsafe because checkpoints and data are
-shared.
-
-If collection fails, the maintenance fence remains active. After confirming
-that the prior collector process has stopped, an operator resumes it
-explicitly:
-
-```text
-ofs volume gc workspace --resume
-```
-
-A second ordinary GC never joins an active epoch. Publication and branch
-lifecycle operations return a conflict until collection finishes.
-
 ## Capability coverage
 
 The extension deliberately covers storage history, not every workflow offered
@@ -178,7 +153,6 @@ by the systems that informed it:
 | Fork independent of namespace size | Yes | Yes | No | Yes |
 | Fork retained history | Sequence | Commit | Not its clone contract | Timestamp |
 | Durable cross-host resume | After publication | Yes | Yes | Yes |
-| Safe shared-data GC | Multi-root tracing | Commit reachability | Reference counting and trash | Log/object retention |
 | Merge and tags | No | Yes | No | No |
 | Mounted filesystem | Not yet | Gateway-dependent | Yes | Yes |
 | Per-filesystem-call durable log | No | No | Metadata transactions | Yes |
@@ -231,9 +205,6 @@ BranchRegistry {
     volume_id
     default_branch: BranchId
     branches: BranchName -> BranchId
-    maintenance_epoch
-    maintenance_state
-    maintenance_owner
 }
 ```
 
@@ -249,9 +220,6 @@ BranchHead {
     branch_id
     lifecycle: active | sealed
     state: unborn | NamespaceState
-    maintenance_epoch
-    maintenance_state
-    maintenance_owner
 }
 
 NamespaceState {
@@ -316,7 +284,6 @@ BranchStore
     fork(source, point, target)
     delete(name)
     bind(name) -> Namespace
-    garbage_collect(data)
 
 Namespace
     observe_from(base)
@@ -339,23 +306,16 @@ Publication remains data before metadata:
 
 ```text
 observe bound branch
-    -> stage immutable segments
+    -> prepare file versions in local staging
     -> validate generations against the observation
+    -> upload and verify immutable segments
     -> prepare checkpoint or history if needed
     -> conditionally replace that branch head
     -> acknowledge the branch position
 ```
 
-The head revision and registry maintenance state are checked at commit. A
-concurrent publication, deletion, or GC fence causes a conflict rather than a
-last-writer-wins update.
-
-Sync writes a pending intent before staging remote data. If GC begins after
-observation, the old publication cannot pass the fenced head. A later Sync
-attempt resolves the intent and stages the immutable segments again before
-retrying publication. Mount must preserve the same observation-to-publication
-contract; if it reuses staged descriptors across sessions, it will need an
-explicit pin or lease.
+The head revision is checked at commit. A concurrent publication or deletion
+causes a conflict rather than a last-writer-wins update.
 
 ## Object Metadata representation
 
@@ -376,15 +336,11 @@ branching volume.
 
 Base and branch namespaces share the checkpoint builder and recovery
 validation. One record backend contains the complete Object/D1 dispatch and
-provides native read, create, revision-CAS replace, list, and delete
-operations. Namespace and branch layers do not branch on providers.
+provides native read, create, and revision-CAS replace operations. Namespace
+and branch layers do not branch on providers.
 
 Opening Object metadata requires OpenDAL capabilities for read, create-only
-write, and conditional replace; list and delete are required by GC when it is
-run.
-
-Correctness never depends on listing heads. The registry supplies live branch
-roots. Listing is used only during garbage collection of unreachable objects.
+write, and conditional replace.
 
 ## D1 representation
 
@@ -411,8 +367,7 @@ representation, not an arbitrary format cutoff.
 Fork prepares a new head with a new `BranchId`, then conditionally adds its
 name to the observed registry. The registry update is the existence
 linearization point. A source publication can order before or after the fork;
-an existing target name, source deletion, or active GC fence prevents the
-registry update.
+an existing target name or source deletion prevents the registry update.
 
 Deletion first seals the exact registered head, then conditionally removes
 that exact name-to-id mapping. A crash between those operations leaves a sealed
@@ -421,35 +376,6 @@ update before the seal or conflicts with it.
 
 Name reuse is safe because deletion compares the registered `BranchId`. A
 retry for an old incarnation never removes a replacement with the same name.
-
-## Garbage collection
-
-GC is fenced at the branch registry with an epoch and an owner token. Every
-current head is marked with the same token because registry and heads are
-separate revision-CAS records.
-
-The collector recovers every snapshot represented by each current head and
-each retained history interval. It unions reachable `SegmentRef` values and
-then sweeps the shared data prefix once. Missing or corrupt roots abort the
-sweep; uncertain reachability retains data.
-
-Lifecycle and publication stay blocked until deletion succeeds and the fence
-is released. A failed mark or sweep leaves the epoch active for explicit
-recovery. A normal GC rejects an active epoch. After the operator has confirmed
-that the previous process stopped, `--resume` conditionally replaces the owner
-token and continues the same fixed epoch. The old owner can no longer mark,
-sweep metadata, or release the fence. `--resume` is not a concurrent takeover
-protocol; running it while the old collector can still delete data violates
-its command precondition.
-
-Unpublished immutable segments may be removed, but a fenced Sync publication
-cannot reference them and retry stages them again.
-
-Extension metadata uses the same roots. Registered heads, referenced
-checkpoints, and reachable history remain live. Sealed or unregistered heads
-and unreferenced immutable records can be reclaimed
-under the same fence. Listing and deletion are paged or streamed, so provider
-request size is not a namespace-format limit.
 
 ## Sync and future Mount
 
@@ -466,7 +392,7 @@ when that cannot overwrite a local change. This permits moving a state file
 with its replica and recovering after local cache cleanup.
 
 Mount will consume the same bound `Volume` and can reuse branch selection,
-publication, history, data staging, and GC roots. Mount still needs its own
+publication, history, and data staging. Mount still needs its own
 contract for handle lifetime, cache coherence, writeback, `flush`, `fsync`,
 writer sessions, and any eager journal. Those concerns do not belong in the
 branch metadata extension.
@@ -483,10 +409,7 @@ branch metadata extension.
 | Publication races with deletion | Publication or seal wins; never both |
 | Delete crashes after Object head seal | Repeated delete completes registry removal |
 | Deleted name is reused | Old replica fails branch identity validation |
-| GC races with publication or fork | Registry epoch forces the mutation to retry |
-| Two ordinary GC commands overlap | The second command fails without joining the epoch |
-| `--resume` while the prior collector still runs | Operator error; stop the prior process before recovery |
-| Retained record is missing or corrupt | Fail closed; do not synthesize state or sweep data |
+| Retained record is missing or corrupt | Fail closed; do not synthesize state |
 
 # Acceptance and regression coverage
 
@@ -499,15 +422,14 @@ cargo x managed-sync test all
 It covers Direct rejection before mutation, remote extension negotiation,
 default branch creation, current fork, independent divergence, historical
 fork after a long history, deletion and name reuse, stale replica rejection
-without local mutation, multi-root GC, cold materialization after GC, a large
-namespace publication with a retained parent, and stable JSON status.
+without local mutation, cold historical materialization, a large namespace
+publication with a retained parent, and stable JSON status.
 
 Regression tests cover mistakes that would silently violate durable behavior:
 
 - every cursor remains recoverable across checkpoint rotation;
 - committed operations are scoped to their origin branch;
-- deleting an old incarnation cannot remove a recreated name; and
-- divergent branches contribute independent GC roots.
+- deleting an old incarnation cannot remove a recreated name.
 
 Tests do not constrain buffer allocation, SQL statement layout, object-key
 call order, private error variants, or other implementation details users
@@ -531,11 +453,6 @@ The registry is a single mutable record. Branch lifecycle is therefore atomic
 and simple, but the practical branch count remains bounded by the selected
 backend. A content-addressed branch index behind the mutable root is a later
 format change if that limit becomes material.
-
-GC briefly blocks publication and branch lifecycle. This favors a small,
-auditable safety protocol over concurrent reclamation. A future implementation
-may add retention pins or generational deletion that permits more concurrency
-without weakening reachability.
 
 There is no merge, tag, branch reset, mounted frontend, writer lease, or
 filesystem-operation journal. These are separate capabilities and should not
@@ -570,5 +487,5 @@ and fork more complex and could fail dangerously by undercounting. Tracing
 from immutable roots is slower but fails safely by retaining data.
 
 Branches also cannot be modeled as separate volumes. That would duplicate
-catalog entries and superblocks while making shared-data GC unsafe. They are
-independent namespace authorities inside one Managed volume.
+catalog entries and superblocks. They are independent namespace authorities
+inside one Managed volume.

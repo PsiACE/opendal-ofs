@@ -25,8 +25,6 @@ use crate::managed::metadata::object;
 use crate::managed::{D1Config, ManagedError, ManagedErrorKind};
 
 const RECORDS: &str = "ofs_managed_v1_authority_records";
-#[cfg(feature = "managed-branch")]
-const DELETE_BATCH: usize = 99;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Revision {
@@ -185,62 +183,6 @@ impl D1Backend {
             .await?;
         changed(&results[1], action)
     }
-    #[cfg(feature = "managed-branch")]
-    async fn list(&self, prefix: &str, action: &'static str) -> Result<Vec<String>, ManagedError> {
-        let results = self
-            .session
-            .query(
-                vec![
-                    schema(),
-                    D1Statement {
-                        sql: format!(
-                            "SELECT record_key FROM {RECORDS} WHERE store_key = ? AND record_key LIKE ? ESCAPE '\\' ORDER BY record_key"
-                        ),
-                        params: vec![
-                            self.session.store_key().to_owned().into(),
-                            format!("{}%", escape_like(prefix)).into(),
-                        ],
-                    },
-                ],
-                action,
-            )
-            .await?;
-        results[1]
-            .results
-            .iter()
-            .map(|row| {
-                row.record_key
-                    .clone()
-                    .ok_or_else(|| corrupt(action, "D1 returned an invalid Managed record"))
-            })
-            .collect()
-    }
-
-    #[cfg(feature = "managed-branch")]
-    async fn delete(&self, keys: Vec<String>, action: &'static str) -> Result<(), ManagedError> {
-        for keys in keys.chunks(DELETE_BATCH) {
-            let placeholders = std::iter::repeat_n("?", keys.len())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let mut params = vec![self.session.store_key().to_owned().into()];
-            params.extend(keys.iter().cloned().map(Value::from));
-            self.session
-                .query(
-                    vec![
-                        schema(),
-                        D1Statement {
-                            sql: format!(
-                                "DELETE FROM {RECORDS} WHERE store_key = ? AND record_key IN ({placeholders})"
-                            ),
-                            params,
-                        },
-                    ],
-                    action,
-                )
-                .await?;
-        }
-        Ok(())
-    }
     fn params(&self, key: &str) -> Vec<Value> {
         vec![
             self.session.store_key().to_owned().into(),
@@ -338,44 +280,6 @@ impl RecordBackend {
             )),
         }
     }
-
-    #[cfg(feature = "managed-branch")]
-    pub(crate) async fn list(
-        &self,
-        prefix: &str,
-        action: &'static str,
-    ) -> Result<Vec<String>, ManagedError> {
-        match self {
-            Self::Object(operator) => operator
-                .list_with(prefix)
-                .recursive(true)
-                .await
-                .map(|entries| {
-                    entries
-                        .into_iter()
-                        .filter(|entry| entry.metadata().is_file())
-                        .map(|entry| entry.path().to_owned())
-                        .collect()
-                })
-                .map_err(|_| unavailable(action)),
-            Self::D1(backend) => backend.list(prefix, action).await,
-        }
-    }
-
-    #[cfg(feature = "managed-branch")]
-    pub(crate) async fn delete(
-        &self,
-        keys: Vec<String>,
-        action: &'static str,
-    ) -> Result<(), ManagedError> {
-        match self {
-            Self::Object(operator) => operator
-                .delete_iter(keys.iter().map(String::as_str))
-                .await
-                .map_err(|_| unavailable(action)),
-            Self::D1(backend) => backend.delete(keys, action).await,
-        }
-    }
 }
 
 fn schema() -> D1Statement {
@@ -428,14 +332,6 @@ fn digit(value: u8) -> Option<u8> {
         b'a'..=b'f' => Some(value - b'a' + 10),
         _ => None,
     }
-}
-
-#[cfg(feature = "managed-branch")]
-fn escape_like(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
 }
 
 fn corrupt(action: &'static str, message: &'static str) -> ManagedError {

@@ -29,26 +29,15 @@ pub(crate) struct CheckpointRef {
     pub(crate) length: u64,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct StoredChange {
-    pub(crate) origin_branch: Option<BranchId>,
-    pub(crate) change: NamespaceChange,
-}
+pub(crate) type StoredChange = NamespaceChange;
 
-impl StoredChange {
-    pub(crate) fn request_digest(&self) -> Result<[u8; 32], ManagedError> {
+impl NamespaceChange {
+    pub(crate) fn fingerprint(&self) -> Result<([u8; 32], usize), ManagedError> {
         let mut bytes = Vec::new();
         ciborium::into_writer(self, &mut bytes)
             .map_err(|_| corrupt("namespace change cannot be encoded"))?;
-        Ok(Sha256::digest(bytes).into())
-    }
-
-    pub(crate) fn encoded_len(&self) -> Result<usize, ManagedError> {
-        let mut bytes = Vec::new();
-        ciborium::into_writer(self, &mut bytes)
-            .map_err(|_| corrupt("namespace change cannot be encoded"))?;
-        Ok(bytes.len())
+        let length = bytes.len();
+        Ok((Sha256::digest(bytes).into(), length))
     }
 }
 
@@ -65,7 +54,7 @@ impl StoredNamespaceState {
     pub(crate) fn cursor(&self) -> ChangeCursor {
         self.tail
             .last()
-            .map_or(self.checkpoint_cursor, |change| change.change.cursor)
+            .map_or(self.checkpoint_cursor, |change| change.cursor)
     }
 
     pub(crate) fn validate(&self, volume_id: VolumeId) -> Result<(), ManagedError> {
@@ -74,16 +63,15 @@ impl StoredNamespaceState {
         }
         let mut parent = self.checkpoint_cursor;
         for change in &self.tail {
-            change.change.validate(volume_id)?;
-            if change.change.parent != parent {
+            change.validate(volume_id)?;
+            if change.parent != parent {
                 return Err(corrupt("namespace transaction tail is not consecutive"));
             }
-            parent = change.change.cursor;
+            parent = change.cursor;
         }
         Ok(())
     }
 
-    #[cfg(feature = "managed-branch")]
     pub(crate) fn at_sequence(&self, sequence: u64) -> Option<Self> {
         let checkpoint = self.checkpoint_cursor.sequence();
         if sequence < checkpoint || sequence > self.cursor().sequence() {
@@ -148,9 +136,9 @@ impl StoredCommittedResult {
     pub(crate) fn from_change(change: &StoredChange) -> Result<Self, ManagedError> {
         let result = Self {
             origin_branch: change.origin_branch,
-            operation: change.change.operation,
-            cursor: change.change.cursor,
-            request_sha256: change.request_digest()?,
+            operation: change.operation,
+            cursor: change.cursor,
+            request_sha256: change.fingerprint()?.0,
         };
         result.validate()?;
         Ok(result)
@@ -191,7 +179,6 @@ impl StoredHistory {
         self.state.validate(volume_id)
     }
 
-    #[cfg(feature = "managed-branch")]
     pub(crate) fn state_at(&self, sequence: u64) -> Option<StoredNamespaceState> {
         self.state.at_sequence(sequence)
     }
@@ -207,7 +194,7 @@ pub(crate) fn recover_namespace(
         return Err(corrupt("checkpoint and namespace HEAD disagree"));
     }
     for change in &state.tail {
-        snapshot = change.change.apply(Some(snapshot))?;
+        snapshot = change.apply(Some(snapshot))?;
     }
     if snapshot.cursor != state.cursor() {
         return Err(corrupt("transaction tail does not reach namespace HEAD"));
@@ -230,13 +217,13 @@ pub(crate) fn replay_tail_from(
     let Some(start) = state
         .tail
         .iter()
-        .position(|change| change.change.parent == base.cursor)
+        .position(|change| change.parent == base.cursor)
     else {
         return Ok(None);
     };
     let mut snapshot = base.clone();
     for change in &state.tail[start..] {
-        snapshot = change.change.apply(Some(snapshot))?;
+        snapshot = change.apply(Some(snapshot))?;
     }
     if snapshot.cursor != state.cursor() {
         return Err(corrupt("transaction tail does not reach namespace HEAD"));

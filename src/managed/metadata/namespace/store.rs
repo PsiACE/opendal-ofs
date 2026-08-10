@@ -8,7 +8,6 @@
 
 //! One namespace authority state machine over a bound revision-CAS HEAD.
 
-#[cfg(feature = "managed-branch")]
 use std::collections::BTreeSet;
 use std::io::Cursor;
 
@@ -18,16 +17,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::{
-    CheckpointRef, NamespaceChange, NamespaceGcSweep, NamespacePublication, NamespaceSnapshot,
-    StoredChange, StoredCheckpoint, StoredCommittedResult, StoredHistory, StoredNamespaceState,
-    StoredResults, recover_namespace, replay_tail_from, require_request_digest,
-    results_for_rotation, validate_publication,
+    CheckpointRef, NamespacePublication, NamespaceSnapshot, StoredCheckpoint,
+    StoredCommittedResult, StoredHistory, StoredNamespaceState, StoredResults, recover_namespace,
+    replay_tail_from, require_request_digest, results_for_rotation, validate_publication,
 };
 use crate::filesystem::{
     BranchBinding, BranchId, ChangeCursor, CommitOutcome, OperationId, VolumeId,
 };
 use crate::managed::metadata::object::ensure_immutable;
-#[cfg(feature = "managed-branch")]
 use crate::managed::metadata::object::read_content_addressed;
 use crate::managed::metadata::record::{RecordBackend, Revision};
 use crate::managed::{ManagedError, ManagedErrorKind};
@@ -63,18 +60,9 @@ impl NamespaceObservation {
     }
 }
 
-impl NamespaceWitness {
-    pub(crate) fn gc_sweep(&self) -> Option<NamespaceGcSweep> {
-        self.head
-            .gc_sweep()
-            .expect("observed HEAD has valid maintenance state")
-    }
-}
-
 #[derive(Clone, Debug)]
 enum NamespaceAuthority {
     Base,
-    #[cfg(feature = "managed-branch")]
     Branch(BranchBinding),
 }
 
@@ -82,7 +70,6 @@ impl NamespaceAuthority {
     fn branch_id(&self) -> Option<BranchId> {
         match self {
             Self::Base => None,
-            #[cfg(feature = "managed-branch")]
             Self::Branch(binding) => Some(binding.id),
         }
     }
@@ -90,7 +77,6 @@ impl NamespaceAuthority {
     fn binding(&self) -> Option<&BranchBinding> {
         match self {
             Self::Base => None,
-            #[cfg(feature = "managed-branch")]
             Self::Branch(binding) => Some(binding),
         }
     }
@@ -116,7 +102,6 @@ impl NamespaceStore {
         }
     }
 
-    #[cfg(feature = "managed-branch")]
     pub(crate) fn branch(
         volume_id: VolumeId,
         data: Operator,
@@ -222,19 +207,8 @@ impl NamespaceStore {
                 (StoredHead::unborn(self.volume_id, None), None, None, None)
             }
         };
-        if head.maintenance_active {
-            return Ok(CommitOutcome::Conflict {
-                observed: base.map_or(ChangeCursor::Genesis, |snapshot| snapshot.cursor),
-            });
-        }
-
-        let valid = validate_publication(publication, base)?;
-        let change = StoredChange {
-            origin_branch: self.authority.branch_id(),
-            change: NamespaceChange::from_publication(publication, base),
-        };
-        let request_digest = change.request_digest()?;
-        let change_bytes = change.encoded_len()?;
+        let (valid, change) = validate_publication(publication, base, self.authority.branch_id())?;
+        let (request_digest, change_bytes) = change.fingerprint()?;
         if !valid {
             if matches!(
                 self.resolve_known(publication.operation, Some(request_digest))
@@ -265,8 +239,8 @@ impl NamespaceStore {
             (Some(current), checkpoint_results) => {
                 let tail_bytes = current.tail.iter().try_fold(0_usize, |total, change| {
                     change
-                        .encoded_len()
-                        .map(|length| total.saturating_add(length))
+                        .fingerprint()
+                        .map(|(_, length)| total.saturating_add(length))
                 })?;
                 if current.tail.len() + 1 >= super::state::MAX_TAIL_TRANSACTIONS
                     || tail_bytes.saturating_add(change_bytes) > super::state::MAX_TAIL_BYTES
@@ -364,11 +338,10 @@ impl NamespaceStore {
             return Ok(CommitOutcome::Absent);
         };
         if let Some(change) = state.tail.iter().find(|change| {
-            change.origin_branch == self.authority.branch_id()
-                && change.change.operation == operation
+            change.origin_branch == self.authority.branch_id() && change.operation == operation
         }) {
-            require_request_digest(expected, change.request_digest()?)?;
-            return Ok(CommitOutcome::Committed(change.change.cursor));
+            require_request_digest(expected, change.fingerprint()?.0)?;
+            return Ok(CommitOutcome::Committed(change.cursor));
         }
         let checkpoint = self.read_checkpoint(state.checkpoint).await?;
         let Some(result) = checkpoint.resolve(self.authority.branch_id(), operation)? else {
@@ -390,118 +363,6 @@ impl NamespaceStore {
                     .await?
                     .map_or(ChangeCursor::Genesis, |value| value.snapshot.cursor),
             }),
-        }
-    }
-
-    pub(crate) async fn begin_gc(
-        &self,
-        observed: &NamespaceWitness,
-    ) -> Result<NamespaceGcSweep, ManagedError> {
-        if self.authority.branch_id().is_some() {
-            return Err(invalid(
-                "begin Managed namespace GC",
-                "branch GC belongs to its volume control plane",
-            ));
-        }
-        let mut head = observed.head.clone();
-        let sweep = head.begin_gc(*OperationId::generate().as_bytes())?;
-        if self
-            .backend
-            .replace(
-                &self.head_key,
-                &observed.revision,
-                encode_head(&head)?,
-                "begin Managed namespace GC",
-            )
-            .await?
-        {
-            Ok(sweep)
-        } else {
-            Err(conflict(
-                "begin Managed namespace GC",
-                "namespace authority changed",
-            ))
-        }
-    }
-
-    pub(crate) async fn resume_gc(
-        &self,
-        observed: &NamespaceWitness,
-    ) -> Result<NamespaceGcSweep, ManagedError> {
-        let mut head = observed.head.clone();
-        let sweep = head.resume_gc(*OperationId::generate().as_bytes())?;
-        if self
-            .backend
-            .replace(
-                &self.head_key,
-                &observed.revision,
-                encode_head(&head)?,
-                "resume Managed namespace GC",
-            )
-            .await?
-        {
-            Ok(sweep)
-        } else {
-            Err(conflict(
-                "resume Managed namespace GC",
-                "namespace authority changed",
-            ))
-        }
-    }
-
-    pub(crate) async fn finish_gc(&self, sweep: NamespaceGcSweep) -> Result<(), ManagedError> {
-        let (mut head, revision) = self
-            .read_bound_head("finish Managed namespace GC")
-            .await?
-            .ok_or_else(|| {
-                conflict("finish Managed namespace GC", "namespace authority changed")
-            })?;
-        if head.maintenance_epoch == sweep.epoch() && head.gc_sweep()?.is_none() {
-            return Ok(());
-        }
-        if head.gc_sweep()? != Some(sweep) {
-            return Err(conflict(
-                "finish Managed namespace GC",
-                "GC sweep token does not match the authority",
-            ));
-        }
-        if self.authority.branch_id().is_some() {
-            return Err(invalid(
-                "sweep Managed checkpoints",
-                "branch checkpoint GC belongs to its volume control plane",
-            ));
-        }
-        let retained = head
-            .state
-            .as_ref()
-            .map(|state| checkpoint_key(state.checkpoint.digest));
-        sweep_checkpoint_objects(&self.data, retained.as_deref()).await?;
-        head.finish_gc(sweep)?;
-        if self
-            .backend
-            .replace(
-                &self.head_key,
-                &revision,
-                encode_head(&head)?,
-                "finish Managed namespace GC",
-            )
-            .await?
-        {
-            return Ok(());
-        }
-        let (current, _) = self
-            .read_bound_head("finish Managed namespace GC")
-            .await?
-            .ok_or_else(|| {
-                conflict("finish Managed namespace GC", "namespace authority changed")
-            })?;
-        if current.maintenance_epoch == sweep.epoch() && current.gc_sweep()?.is_none() {
-            Ok(())
-        } else {
-            Err(conflict(
-                "finish Managed namespace GC",
-                "namespace authority changed",
-            ))
         }
     }
 
@@ -571,7 +432,6 @@ impl NamespaceStore {
         Ok(reference)
     }
 
-    #[cfg(feature = "managed-branch")]
     pub(crate) async fn read_history(&self, id: [u8; 32]) -> Result<StoredHistory, ManagedError> {
         let bytes = read_content_addressed(
             &self.data,
@@ -602,7 +462,6 @@ impl NamespaceStore {
         Ok(id)
     }
 
-    #[cfg(feature = "managed-branch")]
     pub(crate) async fn find_history_state(
         &self,
         mut history_id: Option<[u8; 32]>,
@@ -623,32 +482,6 @@ impl NamespaceStore {
             history_id = history.state.previous_history;
         }
         Ok(None)
-    }
-
-    #[cfg(feature = "managed-branch")]
-    pub(crate) async fn visit_retained(
-        &self,
-        state: &StoredNamespaceState,
-        mut visit: impl FnMut(&NamespaceSnapshot) -> Result<(), ManagedError>,
-    ) -> Result<(), ManagedError> {
-        let checkpoint = self.read_checkpoint(state.checkpoint).await?;
-        let (mut snapshot, _) = checkpoint.recover(self.volume_id)?;
-        if snapshot.cursor != state.checkpoint_cursor {
-            return Err(corrupt(
-                "read Managed history",
-                "checkpoint and retained state disagree",
-            ));
-        }
-        visit(&snapshot)?;
-        for change in &state.tail {
-            snapshot = change.change.apply(Some(snapshot))?;
-            visit(&snapshot)?;
-        }
-        if !state.tail.is_empty() {
-            super::validate_snapshot(&snapshot)
-                .map_err(|_| corrupt("read Managed history", "recovered namespace is invalid"))?;
-        }
-        Ok(())
     }
 
     pub(crate) async fn read_raw_head(
@@ -678,9 +511,6 @@ impl NamespaceStore {
             if head.sealed {
                 return Err(conflict(action, "branch incarnation no longer exists"));
             }
-            if head.maintenance_active {
-                return Err(conflict(action, "branch maintenance is active"));
-            }
         }
         Ok(value)
     }
@@ -693,10 +523,6 @@ pub(crate) struct StoredHead {
     pub(crate) branch_id: Option<BranchId>,
     pub(crate) sealed: bool,
     pub(crate) state: Option<StoredNamespaceState>,
-    pub(crate) maintenance_epoch: u64,
-    pub(crate) maintenance_active: bool,
-    pub(crate) maintenance_owner: Option<[u8; 16]>,
-    pub(crate) maintenance_fixed_cursor: Option<ChangeCursor>,
 }
 
 impl StoredHead {
@@ -706,10 +532,6 @@ impl StoredHead {
             branch_id,
             sealed: false,
             state: None,
-            maintenance_epoch: 0,
-            maintenance_active: false,
-            maintenance_owner: None,
-            maintenance_fixed_cursor: None,
         }
     }
 
@@ -733,80 +555,6 @@ impl StoredHead {
         if let Some(state) = &self.state {
             state.validate(volume_id)?;
         }
-        self.gc_sweep()?;
-        Ok(())
-    }
-
-    pub(crate) fn gc_sweep(&self) -> Result<Option<NamespaceGcSweep>, ManagedError> {
-        match (
-            self.maintenance_active,
-            self.maintenance_owner,
-            self.maintenance_fixed_cursor,
-        ) {
-            (false, _, None) => Ok(None),
-            (true, Some(owner), Some(fixed))
-                if self.maintenance_epoch > 0 && fixed == self.cursor() =>
-            {
-                Ok(Some(NamespaceGcSweep::new(
-                    self.maintenance_epoch,
-                    owner,
-                    fixed,
-                )))
-            }
-            _ => Err(corrupt(
-                "read Managed namespace",
-                "HEAD maintenance state is invalid",
-            )),
-        }
-    }
-
-    fn begin_gc(&mut self, owner: [u8; 16]) -> Result<NamespaceGcSweep, ManagedError> {
-        if self.gc_sweep()?.is_some() {
-            return Err(conflict(
-                "begin Managed namespace GC",
-                "another namespace GC is active",
-            ));
-        }
-        self.maintenance_epoch = self.maintenance_epoch.checked_add(1).ok_or_else(|| {
-            corrupt(
-                "begin Managed namespace GC",
-                "maintenance epoch is exhausted",
-            )
-        })?;
-        self.maintenance_active = true;
-        self.maintenance_owner = Some(owner);
-        self.maintenance_fixed_cursor = Some(self.cursor());
-        Ok(NamespaceGcSweep::new(
-            self.maintenance_epoch,
-            owner,
-            self.cursor(),
-        ))
-    }
-
-    fn resume_gc(&mut self, owner: [u8; 16]) -> Result<NamespaceGcSweep, ManagedError> {
-        let active = self.gc_sweep()?.ok_or_else(|| {
-            conflict(
-                "resume Managed namespace GC",
-                "no interrupted namespace GC is active",
-            )
-        })?;
-        self.maintenance_owner = Some(owner);
-        Ok(NamespaceGcSweep::new(
-            active.epoch(),
-            owner,
-            active.fixed_cursor(),
-        ))
-    }
-
-    fn finish_gc(&mut self, sweep: NamespaceGcSweep) -> Result<(), ManagedError> {
-        if self.gc_sweep()? != Some(sweep) {
-            return Err(conflict(
-                "finish Managed namespace GC",
-                "GC sweep token does not match the authority",
-            ));
-        }
-        self.maintenance_active = false;
-        self.maintenance_fixed_cursor = None;
         Ok(())
     }
 }
@@ -969,7 +717,6 @@ fn encode_record<T: Serialize>(
     Ok(bytes)
 }
 
-#[cfg(feature = "managed-branch")]
 fn decode_record<T: DeserializeOwned>(
     magic: &[u8; 8],
     bytes: &[u8],
@@ -1001,28 +748,6 @@ fn decode_value<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, ManagedError> {
         ));
     }
     Ok(value)
-}
-
-async fn sweep_checkpoint_objects(
-    data: &Operator,
-    retained: Option<&str>,
-) -> Result<(), ManagedError> {
-    let prefix = format!("{CHECKPOINT_ROOT}/");
-    let unreachable = data
-        .list_with(&prefix)
-        .recursive(true)
-        .await
-        .map_err(|_| unavailable("sweep Managed checkpoints"))?
-        .into_iter()
-        .filter(|entry| entry.metadata().is_file() && retained != Some(entry.path()))
-        .map(|entry| entry.path().to_owned())
-        .collect::<Vec<_>>();
-    if !unreachable.is_empty() {
-        data.delete_iter(unreachable.iter().map(String::as_str))
-            .await
-            .map_err(|_| unavailable("sweep Managed checkpoints"))?;
-    }
-    Ok(())
 }
 
 pub(crate) fn checkpoint_key(id: [u8; 32]) -> String {
@@ -1068,8 +793,6 @@ mod tests {
     use std::collections::BTreeMap;
     use std::num::NonZeroU64;
 
-    use opendal::services::Memory;
-
     use super::*;
     use crate::filesystem::{DirectoryRecord, NodeAttributes, NodeId, NodeKind, NodeRecord};
     use crate::managed::metadata::namespace::managed_generation;
@@ -1105,23 +828,17 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn checkpoint_identity_and_base_gc_are_durable() {
+    #[test]
+    fn checkpoint_identity_is_durable() {
         let volume_id = VolumeId::from_bytes([1; 16]);
         let operation = OperationId::from_bytes([2; 16]);
         let cursor = ChangeCursor::at(NonZeroU64::MIN, operation);
         let current = checkpoint_snapshot(volume_id, cursor, NodeId::from_bytes([3; 16]));
-        let old = checkpoint_snapshot(
-            volume_id,
-            ChangeCursor::Genesis,
-            NodeId::from_bytes([4; 16]),
-        );
         let current_bytes = encode_checkpoint(&StoredCheckpoint {
             snapshot: current.clone(),
             results: Vec::new(),
         })
         .unwrap();
-        let current_id: [u8; 32] = Sha256::digest(&current_bytes).into();
         assert_eq!(
             decode_checkpoint(&current_bytes)
                 .unwrap()
@@ -1136,26 +853,5 @@ mod tests {
             decode_checkpoint(&corrupt).unwrap_err().kind(),
             ManagedErrorKind::Corrupt
         );
-
-        let old_bytes = encode_checkpoint(&StoredCheckpoint {
-            snapshot: old,
-            results: Vec::new(),
-        })
-        .unwrap();
-        let old_id: [u8; 32] = Sha256::digest(&old_bytes).into();
-        let operator = Operator::new(Memory::default()).unwrap().finish();
-        operator
-            .write(&checkpoint_key(current_id), current_bytes)
-            .await
-            .unwrap();
-        operator
-            .write(&checkpoint_key(old_id), old_bytes)
-            .await
-            .unwrap();
-        sweep_checkpoint_objects(&operator, Some(&checkpoint_key(current_id)))
-            .await
-            .unwrap();
-        assert!(operator.exists(&checkpoint_key(current_id)).await.unwrap());
-        assert!(!operator.exists(&checkpoint_key(old_id)).await.unwrap());
     }
 }

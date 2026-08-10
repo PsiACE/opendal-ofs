@@ -32,7 +32,6 @@ pub(crate) enum Command {
         command: VolumeCommand,
     },
     /// Manage durable branches of a Managed volume.
-    #[cfg(feature = "managed-branch")]
     Branch {
         #[command(subcommand)]
         command: BranchCommand,
@@ -61,11 +60,8 @@ pub(crate) struct MountArgs {
 pub(crate) enum VolumeCommand {
     /// Register an alias and save its credential-free volume binding.
     Create(VolumeCreateArgs),
-    /// Remove data segments unreachable from all retained Managed namespace roots.
-    Gc(VolumeGcArgs),
 }
 
-#[cfg(feature = "managed-branch")]
 #[derive(Debug, Subcommand)]
 pub(crate) enum BranchCommand {
     /// List the branches of a Managed volume.
@@ -78,7 +74,6 @@ pub(crate) enum BranchCommand {
     Delete(BranchDeleteArgs),
 }
 
-#[cfg(feature = "managed-branch")]
 #[derive(Debug, Args)]
 pub(crate) struct BranchListArgs {
     /// Named Managed volume from the local catalog.
@@ -92,7 +87,6 @@ pub(crate) struct BranchListArgs {
     pub runtime: StorageOptions,
 }
 
-#[cfg(feature = "managed-branch")]
 #[derive(Debug, Args)]
 pub(crate) struct BranchShowArgs {
     /// Named Managed volume from the local catalog.
@@ -109,7 +103,6 @@ pub(crate) struct BranchShowArgs {
     pub runtime: StorageOptions,
 }
 
-#[cfg(feature = "managed-branch")]
 #[derive(Debug, Args)]
 pub(crate) struct BranchCreateArgs {
     /// Named Managed volume from the local catalog.
@@ -130,7 +123,6 @@ pub(crate) struct BranchCreateArgs {
     pub runtime: StorageOptions,
 }
 
-#[cfg(feature = "managed-branch")]
 #[derive(Debug, Args)]
 pub(crate) struct BranchDeleteArgs {
     /// Named Managed volume from the local catalog.
@@ -138,19 +130,6 @@ pub(crate) struct BranchDeleteArgs {
 
     /// Branch to delete.
     pub branch: String,
-
-    #[command(flatten)]
-    pub runtime: StorageOptions,
-}
-
-#[derive(Debug, Args)]
-pub(crate) struct VolumeGcArgs {
-    /// Named Managed volume from the local catalog.
-    pub alias: String,
-
-    /// Resume a fenced collection after confirming its prior process stopped.
-    #[arg(long)]
-    pub resume: bool,
 
     #[command(flatten)]
     pub runtime: StorageOptions,

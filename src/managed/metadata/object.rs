@@ -16,7 +16,6 @@
 // under the License.
 
 use opendal::{ErrorKind, Operator};
-#[cfg(feature = "managed-branch")]
 use sha2::{Digest as _, Sha256};
 
 use crate::managed::{ManagedError, ManagedErrorKind};
@@ -56,7 +55,6 @@ pub(crate) async fn read_with_revision(
     Ok(Some((bytes, revision)))
 }
 
-#[cfg(feature = "managed-branch")]
 pub(crate) async fn read_content_addressed(
     operator: &Operator,
     key: &str,

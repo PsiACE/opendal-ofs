@@ -24,13 +24,9 @@ use opendal::Operator;
 
 use super::format::ExtentMap;
 use super::metadata::namespace::{
-    FileVersionRecord, NamespaceGcSweep, NamespacePublication, NamespaceSnapshot, NamespaceStore,
-    NamespaceWitness,
+    FileVersionRecord, NamespacePublication, NamespaceSnapshot, NamespaceStore, NamespaceWitness,
 };
-use super::metadata::record::RecordBackend;
-use super::{
-    AuthorityKnownContent, ManagedData, ManagedError, ManagedErrorKind, SegmentGcMaintenance,
-};
+use super::{AuthorityKnownContent, ManagedData, ManagedError, ManagedErrorKind};
 use crate::filesystem::{AuthorityIdentity, CommitOutcome, OperationId, VolumeId};
 use crate::filesystem::{
     FileVersion, MaterializeRequest, Volume, VolumeError, VolumeErrorKind, VolumeObservation,
@@ -49,37 +45,15 @@ pub struct ManagedObservation {
     filesystem_snapshot: VolumeSnapshot,
 }
 
-impl ManagedObservation {
-    fn gc_sweep(&self) -> Option<NamespaceGcSweep> {
-        self.witness.gc_sweep()
-    }
-}
-
 impl ManagedVolume {
     pub(crate) fn new(
-        volume_id: VolumeId,
-        data_operator: Operator,
-        backend: RecordBackend,
-    ) -> Result<Self, ManagedError> {
-        Ok(Self {
-            namespace: NamespaceStore::new(volume_id, data_operator.clone(), backend),
-            data: ManagedData::new(data_operator)?,
-        })
-    }
-
-    #[cfg(feature = "managed-branch")]
-    pub(crate) fn bound(
-        data_operator: Operator,
         namespace: NamespaceStore,
+        data_operator: Operator,
     ) -> Result<Self, ManagedError> {
         Ok(Self {
             namespace,
             data: ManagedData::new(data_operator)?,
         })
-    }
-
-    pub async fn observe(&self) -> Result<Option<ManagedObservation>, ManagedError> {
-        self.observe_from(None).await
     }
 
     /// Observe the authority, reusing an already verified Sync common base when it is current.
@@ -113,47 +87,6 @@ impl ManagedVolume {
             )
         });
         self.namespace.publish(observed, publication).await
-    }
-
-    /// Mark the current namespace, sweep unreachable data, then release publication.
-    pub async fn garbage_collect(&self) -> Result<SegmentGcMaintenance, ManagedError> {
-        self.collect(false).await
-    }
-
-    /// Take ownership of an interrupted sweep and complete it.
-    pub async fn resume_garbage_collect(&self) -> Result<SegmentGcMaintenance, ManagedError> {
-        self.collect(true).await
-    }
-
-    async fn collect(&self, resume: bool) -> Result<SegmentGcMaintenance, ManagedError> {
-        let Some(observed) = self.observe().await? else {
-            return Ok(SegmentGcMaintenance::default());
-        };
-        let sweep = if resume {
-            self.namespace.resume_gc(&observed.witness).await?
-        } else {
-            self.namespace.begin_gc(&observed.witness).await?
-        };
-        let observed = self.observe().await?.ok_or_else(|| {
-            ManagedError::new(
-                ManagedErrorKind::Conflict,
-                "collect unreachable data segments",
-                "namespace authority changed",
-            )
-        })?;
-        if observed.gc_sweep() != Some(sweep)
-            || observed.filesystem_snapshot.cursor != sweep.fixed_cursor()
-        {
-            return Err(ManagedError::new(
-                ManagedErrorKind::Conflict,
-                "collect unreachable data segments",
-                "GC sweep ownership changed",
-            ));
-        }
-        let snapshot = to_managed_snapshot(&observed.filesystem_snapshot)?;
-        let collected = self.data.collect_unreachable_segments(&snapshot).await?;
-        self.namespace.finish_gc(sweep).await?;
-        Ok(collected)
     }
 }
 
@@ -221,6 +154,26 @@ impl Volume for ManagedVolume {
             .into_iter()
             .map(|(path, version)| Ok((path, encode_file_version(&version)?)))
             .collect()
+    }
+
+    async fn finalize_staged_files(
+        &self,
+        staging: &Operator,
+        files: Vec<(String, FileVersion)>,
+        authority: Option<&VolumeSnapshot>,
+    ) -> Result<(), VolumeError> {
+        let known = authority
+            .map(authority_known_content)
+            .transpose()?
+            .unwrap_or_default();
+        let files = files
+            .into_iter()
+            .map(|(path, version)| Ok((path, decode_file_version(&version)?)))
+            .collect::<Result<Vec<_>, VolumeError>>()?;
+        self.data
+            .finalize_staged_files(staging, files, &known)
+            .await
+            .map_err(Into::into)
     }
 
     async fn publish(
@@ -366,17 +319,4 @@ fn to_managed_publication(
         expected_directories: publication.expected_directories.clone(),
         target: to_managed_snapshot(&publication.target)?,
     })
-}
-
-impl From<ManagedError> for VolumeError {
-    fn from(error: ManagedError) -> Self {
-        let kind = match error.kind() {
-            ManagedErrorKind::UnsupportedFormat => VolumeErrorKind::UnsupportedFormat,
-            ManagedErrorKind::Invalid => VolumeErrorKind::Invalid,
-            ManagedErrorKind::Conflict => VolumeErrorKind::Conflict,
-            ManagedErrorKind::Corrupt => VolumeErrorKind::Corrupt,
-            ManagedErrorKind::Unavailable => VolumeErrorKind::Unavailable,
-        };
-        Self::new(kind, error.to_string())
-    }
 }

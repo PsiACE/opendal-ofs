@@ -11,12 +11,12 @@ use std::num::NonZeroU64;
 
 use anyhow::{Context, Result, bail};
 
+use super::LocalKind;
 use super::path::SnapshotTree;
-use super::{LocalKind, LocalTree};
+use super::staging::{StagedTree, TargetManifest};
 use crate::filesystem::{
-    ChangeCursor, DirectoryEntry, DirectoryPrecondition, DirectoryRecord, FileVersion,
-    NodeAttributes, NodeId, NodeKind, NodePrecondition, NodeRecord, OperationId, Volume,
-    VolumePublication, VolumeSnapshot,
+    ChangeCursor, DirectoryEntry, DirectoryPrecondition, DirectoryRecord, NodeAttributes, NodeId,
+    NodeKind, NodePrecondition, NodeRecord, OperationId, Volume, VolumePublication, VolumeSnapshot,
 };
 
 /// Build one complete volume namespace target from a stable local observation.
@@ -27,11 +27,10 @@ pub(crate) fn build_publication<V: Volume>(
     volume_api: &V,
     operation: OperationId,
     authoritative: Option<&SnapshotTree<'_>>,
-    base: Option<&SnapshotTree<'_>>,
-    local: &LocalTree,
-    prepared: &BTreeMap<String, FileVersion>,
+    staged: &StagedTree,
     renames: &BTreeMap<String, String>,
 ) -> Result<VolumePublication> {
+    let target_manifest = staged.manifest();
     let volume = volume_api.id();
     let authoritative_snapshot = authoritative.map(SnapshotTree::snapshot);
     let empty_paths = BTreeMap::new();
@@ -40,15 +39,6 @@ pub(crate) fn build_publication<V: Volume>(
     if authoritative_snapshot.is_some_and(|state| state.volume_id != volume) {
         bail!("namespace and requested volume disagree");
     }
-    reject_unresolved_renames(
-        local,
-        old_paths,
-        base,
-        authoritative_snapshot,
-        renames,
-        prepared,
-    )?;
-
     let rename_sources = renames
         .iter()
         .map(|(from, path)| (path.clone(), from.clone()))
@@ -59,8 +49,8 @@ pub(crate) fn build_publication<V: Volume>(
     let root = authoritative_snapshot.map_or_else(NodeId::generate, |state| state.root);
     let mut identities = BTreeMap::from([(String::new(), root)]);
     let mut used = BTreeSet::from([root]);
-    for (path, entry) in local.entries() {
-        let kind = node_kind(entry.kind);
+    for (path, entry) in target_manifest.entries() {
+        let kind = node_kind(entry.local.kind);
         let identity = old_paths
             .get(path)
             .or_else(|| {
@@ -79,23 +69,27 @@ pub(crate) fn build_publication<V: Volume>(
     let mut nodes = BTreeMap::new();
     let mut file_versions = BTreeMap::new();
     for (path, kind) in std::iter::once(("", NodeKind::Directory)).chain(
-        local
+        target_manifest
             .entries()
             .iter()
-            .map(|(path, entry)| (path.as_str(), node_kind(entry.kind))),
+            .map(|(path, entry)| (path.as_str(), node_kind(entry.local.kind))),
     ) {
         let id = identities[path];
         let file_version = if kind == NodeKind::RegularFile {
-            let version = prepared
-                .get(path)
-                .with_context(|| format!("local file {path:?} has no prepared file version"))?;
-            let size = local.entries()[path].size;
+            let file = target_manifest
+                .file(path)
+                .with_context(|| format!("target file {path:?} has no volume version"))?;
+            let version = staged
+                .resolve_version(file, authoritative_snapshot)
+                .with_context(|| format!("resolve target file version for {path:?}"))?
+                .clone();
+            let size = target_manifest.entries()[path].local.size;
             if version.logical_size != size {
-                bail!("prepared file version for {path:?} does not match the local file");
+                bail!("target file version for {path:?} does not match the local file");
             }
             match file_versions.insert(version.id, version.clone()) {
-                Some(existing) if existing != *version => {
-                    bail!("prepared file version identity is reused with different content")
+                Some(existing) if existing != version => {
+                    bail!("target file version identity is reused with different content")
                 }
                 _ => {}
             }
@@ -103,12 +97,13 @@ pub(crate) fn build_publication<V: Volume>(
         } else {
             None
         };
-        let attributes = local
-            .entries()
-            .get(path)
-            .map_or_else(NodeAttributes::default, |entry| NodeAttributes {
-                executable: entry.executable,
-            });
+        let attributes =
+            target_manifest
+                .entries()
+                .get(path)
+                .map_or_else(NodeAttributes::default, |entry| NodeAttributes {
+                    executable: entry.local.executable,
+                });
         let body = (kind, attributes, file_version);
         let generation = next_node_generation(volume_api, id, body, old_nodes)?;
         nodes.insert(
@@ -123,13 +118,13 @@ pub(crate) fn build_publication<V: Volume>(
         );
     }
 
-    let entries = directory_entries(local, &identities)?;
+    let entries = directory_entries(target_manifest, &identities)?;
     let mut directories = BTreeMap::new();
     for (path, kind) in std::iter::once(("", NodeKind::Directory)).chain(
-        local
+        target_manifest
             .entries()
             .iter()
-            .map(|(path, entry)| (path.as_str(), node_kind(entry.kind))),
+            .map(|(path, entry)| (path.as_str(), node_kind(entry.local.kind))),
     ) {
         if kind != NodeKind::Directory {
             continue;
@@ -174,68 +169,26 @@ pub(crate) fn build_publication<V: Volume>(
     })
 }
 
-fn reject_unresolved_renames(
-    local: &LocalTree,
-    old_paths: &BTreeMap<String, NodeId>,
-    base: Option<&SnapshotTree<'_>>,
-    authoritative: Option<&VolumeSnapshot>,
-    renames: &BTreeMap<String, String>,
-    prepared: &BTreeMap<String, FileVersion>,
-) -> Result<()> {
-    let Some(authoritative) = authoritative else {
-        return Ok(());
-    };
-    let Some(base) = base else {
-        return Ok(());
-    };
-    for (path, entry) in local.entries() {
-        if old_paths.contains_key(path) || entry.kind != LocalKind::File {
-            continue;
-        }
-        if renames.values().any(|target| target == path) {
-            continue;
-        }
-        let digest = prepared
-            .get(path)
-            .with_context(|| format!("local file {path:?} has no prepared file version"))?
-            .logical_digest;
-        let possible = base.paths().iter().any(|(old_path, node)| {
-            !local.entries().contains_key(old_path)
-                && authoritative.nodes.contains_key(node)
-                && base
-                    .get(old_path)
-                    .and_then(|entry| entry.file)
-                    .is_some_and(|version| version.logical_digest == digest)
-        });
-        if possible {
-            bail!(
-                "local path {path:?} may be a rename; reconcile it before building a publication"
-            );
-        }
-    }
-    Ok(())
-}
-
 fn directory_entries(
-    local: &LocalTree,
+    target: &TargetManifest,
     identities: &BTreeMap<String, NodeId>,
 ) -> Result<BTreeMap<String, BTreeMap<String, DirectoryEntry>>> {
     let mut directories = BTreeMap::<String, BTreeMap<String, DirectoryEntry>>::new();
     directories.insert(String::new(), BTreeMap::new());
-    for (path, entry) in local.entries() {
+    for (path, entry) in target.entries() {
         let (parent, name) = split_path(path)?;
         if name.is_empty() {
             bail!("local path {path:?} is invalid");
         }
         if !parent.is_empty()
-            && !local
+            && !target
                 .entries()
                 .get(parent)
-                .is_some_and(|entry| entry.kind == LocalKind::Directory)
+                .is_some_and(|entry| entry.local.kind == LocalKind::Directory)
         {
             bail!("local path {path:?} has no directory parent");
         }
-        let kind = node_kind(entry.kind);
+        let kind = node_kind(entry.local.kind);
         directories.entry(parent.to_owned()).or_default().insert(
             name.to_owned(),
             DirectoryEntry {

@@ -15,7 +15,7 @@ workspace=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
 suite="$workspace/tests/performance/managed-sync"
 candidate_sha=${OFS_PERF_CANDIDATE:-$(git -C "$workspace" rev-parse HEAD)}
 candidate_binary=${OFS_PERF_CANDIDATE_BIN:-}
-output=${1:-$workspace/.local/performance/managed-sync-ab-$(date -u +%Y%m%dT%H%M%SZ)}
+output=
 rounds=${OFS_PERF_ROUNDS:-12}
 profile=${OFS_PERF_PROFILE:-standard}
 bucket=ofs-managed-performance
@@ -24,6 +24,65 @@ secret_key=ofs-performance-password
 minio_image=${MINIO_IMAGE:-quay.io/minio/minio:RELEASE.2024-09-22T00-33-43Z}
 mc_image=${MC_IMAGE:-quay.io/minio/mc:RELEASE.2024-09-16T17-43-14Z}
 schedule=(baseline candidate candidate baseline baseline candidate)
+
+usage() {
+  cat <<'EOF'
+Usage: cargo x managed-sync perf [OPTIONS] [OUTPUT]
+
+Options:
+  --baseline REF_OR_BINARY
+  --candidate REF_OR_BINARY
+  --rounds N
+  --profile standard|agent-home
+EOF
+}
+
+select_source() {
+  local role=$1 value=$2 path
+  if [[ -f $value ]]; then
+    path=$(cd "$(dirname "$value")" && pwd)/$(basename "$value")
+    [[ -x $path ]] || { printf '%s binary is not executable: %s\n' "$role" "$value" >&2; exit 2; }
+    if [[ $role == baseline ]]; then
+      baseline_binary=$path
+      baseline_sha=
+    else
+      candidate_binary=$path
+      candidate_sha=
+    fi
+  elif [[ $role == baseline ]]; then
+    baseline_binary=
+    baseline_sha=$value
+  else
+    candidate_binary=
+    candidate_sha=$value
+  fi
+}
+
+while (($#)); do
+  case $1 in
+    --baseline|--candidate|--rounds|--profile)
+      (($# >= 2)) || { printf '%s requires a value\n' "$1" >&2; exit 2; }
+      option=$1
+      value=$2
+      shift 2
+      case $option in
+        --baseline) select_source baseline "$value" ;;
+        --candidate) select_source candidate "$value" ;;
+        --rounds) rounds=$value ;;
+        --profile) profile=$value ;;
+      esac
+      ;;
+    -h|--help) usage; exit ;;
+    -*) printf 'unknown option: %s\n' "$1" >&2; exit 2 ;;
+    *)
+      [[ -z $output ]] || { printf 'unexpected argument: %s\n' "$1" >&2; exit 2; }
+      output=$1
+      shift
+      ;;
+  esac
+done
+[[ $rounds =~ ^[1-9][0-9]*$ ]] || { printf '--rounds must be greater than zero\n' >&2; exit 2; }
+output=${output:-$workspace/.local/performance/managed-sync-ab-$(date -u +%Y%m%dT%H%M%SZ)}
 
 case $profile in
   standard) workload="$suite/workload.sh" ;;
@@ -109,6 +168,7 @@ done
 curl -fsS "http://127.0.0.1:$minio_port/minio/health/ready" >/dev/null
 
 mc_run() {
+  # shellcheck disable=SC2016
   "$runtime" run --rm --network host --entrypoint /bin/sh "$mc_image" -c '
     endpoint=$1 user=$2 password=$3
     shift 3
@@ -159,20 +219,10 @@ for index in "${!schedule[@]}"; do
     OFS_COMMANDS="$output/commands.tsv" OFS_RELEASE="$release" OFS_RUN_ID="$run" \
     OFS_PERF_ROUNDS="$rounds" OFS_CONTAINER_RUNTIME="$runtime" "$workload"
 
-  mc_run du --json "performance/$bucket/$object_root" >"$run_root/object-inventory.json"
   mc_run ls --recursive --json "performance/$bucket/$object_root" \
     >"$run_root/objects.jsonl"
-  read -r stored_bytes stored_objects < <(
-    python3 - "$run_root/object-inventory.json" <<'PY'
-import json, sys
-records = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8")]
-record = [item for item in records if item.get("status") == "success"][-1]
-print(record["size"], record["objects"])
-PY
-  )
-  [[ $stored_bytes =~ ^[0-9]+$ && $stored_objects =~ ^[0-9]+$ ]]
-  printf '%s\t%s\tstored_bytes\t%s\n' "$release" "$run" "$stored_bytes" >>"$output/inputs.tsv"
-  printf '%s\t%s\tstored_objects\t%s\n' "$release" "$run" "$stored_objects" >>"$output/inputs.tsv"
 done
 
 python3 "$suite/analyze.py" "$output"
+rm "$output/context.tsv" "$output/inputs.tsv" "$output/samples.tsv"
+printf 'canonical evidence: %s\n' "$output/results.json"

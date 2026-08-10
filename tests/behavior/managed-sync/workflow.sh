@@ -108,9 +108,6 @@ fi
 printf '%s\n' 'acceptance: register one managed volume under client-local aliases'
 OFS_CONFIG="$config" "$OFS_BIN" volume create workspace "${volume_options[@]}"
 OFS_CONFIG="$config" "$OFS_BIN" volume create workspace "${volume_options[@]}"
-empty_gc=$(OFS_CONFIG="$config" "$OFS_BIN" volume gc workspace)
-grep -Eq 'scanned=0 deleted=0 bytes=0' <<<"$empty_gc" || \
-  fail 'garbage collection of an unpublished volume was not an empty success'
 if extension_error=$(OFS_CONFIG="$extension_mismatch_config" "$OFS_BIN" volume create branching-workspace \
   "${volume_options[@]}" --enable branch 2>&1); then
   fail 'an explicit extension request changed an existing incompatible Managed volume'
@@ -336,10 +333,6 @@ done
 OFS_CONFIG="$peer_config" "$OFS_BIN" sync "$peer_alias" "$replica_b" --state "$state_b"
 grep -Fxq 'history change 60' "$replica_b/checkpoint.txt" || \
   fail 'replica did not recover the fixed target after a long change history'
-printf '%s\n' 'regression: collect obsolete segments without changing the live tree'
-garbage_collection=$(OFS_CONFIG="$config" "$OFS_BIN" volume gc workspace)
-grep -Eq 'deleted=[1-9][0-9]*' <<<"$garbage_collection" || \
-  fail 'namespace-fenced collection removed no unreachable data segments'
 
 printf '%s\n' 'acceptance: rebuild a cold client under another local alias'
 OFS_CONFIG="$cold_config" "$OFS_BIN" volume create "$cold_alias" "${volume_options[@]}"

@@ -22,14 +22,13 @@ pub(crate) mod record;
 mod superblock;
 
 pub use d1::D1Config;
-pub use namespace::NamespaceGcSweep;
 pub use superblock::{ManagedExtension, ManagedFormat, MetadataFormat};
 
+use namespace::NamespaceStore;
 use opendal::Operator;
 use record::RecordBackend;
 use superblock::SUPERBLOCK_KEY;
 
-#[cfg(feature = "managed-branch")]
 use super::extensions::branch::BranchStore;
 use super::{ManagedError, ManagedVolume};
 /// The selected format and sole mutable-record authority for one Managed volume.
@@ -102,10 +101,10 @@ impl ManagedMetadata {
             ));
         }
         let volume_id = format.volume_id();
-        ManagedVolume::new(volume_id, data, self.backend.clone())
+        let namespace = NamespaceStore::new(volume_id, data.clone(), self.backend.clone());
+        ManagedVolume::new(namespace, data)
     }
 
-    #[cfg(feature = "managed-branch")]
     pub fn branches(
         &self,
         format: &ManagedFormat,

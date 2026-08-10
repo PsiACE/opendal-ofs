@@ -57,7 +57,7 @@ experiment_cold="$OFS_CASE_ROOT/experiment-cold"
 rewind_replica="$OFS_CASE_ROOT/rewind"
 empty_replica="$OFS_CASE_ROOT/empty"
 new_experiment="$OFS_CASE_ROOT/new-experiment"
-rewind_after_gc="$OFS_CASE_ROOT/rewind-after-gc"
+rewind_cold="$OFS_CASE_ROOT/rewind-cold"
 large_replica="$OFS_CASE_ROOT/large"
 large_parent="$OFS_CASE_ROOT/large-parent"
 state_root="$OFS_CASE_ROOT/state"
@@ -67,7 +67,7 @@ experiment_state="$state_root/experiment.json"
 mkdir -p "$(dirname "$config")" "$(dirname "$observed_config")" \
   "$main_replica" "$experiment_replica" \
   "$main_cold" "$experiment_cold" "$rewind_replica" "$new_experiment" \
-  "$empty_replica" "$rewind_after_gc" "$large_replica" "$large_parent" \
+  "$empty_replica" "$rewind_cold" "$large_replica" "$large_parent" \
   "$state_root"
 
 volume_options=(--model managed --enable branch --storage "$OFS_STORAGE_URL")
@@ -178,14 +178,13 @@ new_status=$(OFS_CONFIG="$config" "$OFS_BIN" status --state "$state_root/new-exp
   fail 'recreated branch reused its deleted incarnation'
 grep -Fxq 'main state' "$new_experiment/shared.txt" || fail 'recreated branch did not fork current main'
 
-printf '%s\n' 'acceptance: volume GC preserves content reachable only through another branch'
-OFS_CONFIG="$config" "$OFS_BIN" volume gc workspace
-OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$rewind_after_gc" --branch rewind \
-  --state "$state_root/rewind-after-gc.json"
-diff -ru "$rewind_replica" "$rewind_after_gc" || fail 'GC removed historical branch content'
+printf '%s\n' 'acceptance: materialize content reachable through a historical branch'
+OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$rewind_cold" --branch rewind \
+  --state "$state_root/rewind-cold.json"
+diff -ru "$rewind_replica" "$rewind_cold" || fail 'historical branch content was not retained'
 
 printf '%s\n' 'acceptance: branch status is complete and does not expose secrets'
-status_json=$(OFS_CONFIG="$config" "$OFS_BIN" status --state "$state_root/rewind-after-gc.json" --json)
+status_json=$(OFS_CONFIG="$config" "$OFS_BIN" status --state "$state_root/rewind-cold.json" --json)
 [[ "$(json_field "$status_json" branch_name)" == rewind ]] || fail 'status omitted branch name'
 grep -Eq '"branch_id"[[:space:]]*:[[:space:]]*"[0-9a-f]{32}"' <<<"$status_json" || \
   fail 'status omitted the complete branch identity'

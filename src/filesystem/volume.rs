@@ -329,6 +329,18 @@ pub trait Volume: Clone + Send + Sync {
         concurrency: NonZeroUsize,
     ) -> Result<BTreeMap<String, FileVersion>, VolumeError>;
 
+    /// Make every data object referenced by locally prepared file versions durable.
+    ///
+    /// Sync persists its pending intent before calling this method and does not
+    /// publish namespace metadata until it succeeds. Implementations must make
+    /// retries idempotent and must not depend on the live source tree.
+    async fn finalize_staged_files(
+        &self,
+        staging: &Operator,
+        files: Vec<(String, FileVersion)>,
+        authority: Option<&VolumeSnapshot>,
+    ) -> Result<(), VolumeError>;
+
     async fn publish(
         &self,
         observed: Option<&Self::Observation>,

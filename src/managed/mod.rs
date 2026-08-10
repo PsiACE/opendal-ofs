@@ -19,16 +19,12 @@
 
 mod data;
 mod error;
-#[cfg(feature = "managed-branch")]
 pub mod extensions;
 mod format;
 mod metadata;
 mod volume;
 
-pub use data::SegmentGcMaintenance;
 pub(crate) use data::{AuthorityKnownContent, ManagedData};
 pub use error::{ManagedError, ManagedErrorKind};
-pub use metadata::{
-    D1Config, ManagedExtension, ManagedFormat, ManagedMetadata, MetadataFormat, NamespaceGcSweep,
-};
+pub use metadata::{D1Config, ManagedExtension, ManagedFormat, ManagedMetadata, MetadataFormat};
 pub use volume::{ManagedObservation, ManagedVolume};

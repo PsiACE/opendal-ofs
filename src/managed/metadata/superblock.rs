@@ -34,21 +34,18 @@ pub enum MetadataFormat {
 /// A required Managed format capability understood by this build.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ManagedExtension {
-    #[cfg(feature = "managed-branch")]
     BranchV1,
 }
 
 impl ManagedExtension {
     pub const fn identifier(self) -> &'static str {
         match self {
-            #[cfg(feature = "managed-branch")]
             Self::BranchV1 => "branch/v1",
         }
     }
 
     fn parse(value: &str) -> Result<Self, ManagedError> {
         match value {
-            #[cfg(feature = "managed-branch")]
             "branch/v1" => Ok(Self::BranchV1),
             _ => Err(unsupported("superblock requires an unsupported extension")),
         }

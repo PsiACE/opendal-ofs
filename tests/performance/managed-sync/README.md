@@ -3,7 +3,7 @@
 Run the comparison with an executable, branch, or commit:
 
 ```shell
-python3 scripts/managed_sync_perf.py \
+cargo x managed-sync perf \
   --baseline managed-sync-layers \
   --profile agent-home \
   --rounds 20 \
@@ -12,7 +12,6 @@ python3 scripts/managed_sync_perf.py \
 
 The candidate defaults to a fresh release build of the current working tree.
 Pass `--candidate PATH_OR_REF` to compare two supplied binaries or refs.
-`cargo x managed-sync perf [OUTPUT_DIRECTORY]` invokes the same entry point.
 
 Both binaries use the same host, one long-running local MinIO, and separate
 object roots. Samples run in the fixed order baseline, candidate, candidate,
