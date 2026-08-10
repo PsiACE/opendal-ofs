@@ -17,8 +17,8 @@ minio_port=${OFS_MANAGED_SYNC_MINIO_PORT:-19000}
 d1_port=${OFS_MANAGED_SYNC_D1_PORT:-19001}
 binary="$workspace/target/debug/ofs"
 fixtures_started=false
-proxy_pid=
-proxy_port=
+audit_root=${OFS_MANAGED_SYNC_AUDIT_DIR:-$workspace/.local/managed-sync-audit}
+audit_owned=false
 declare -a compose
 
 usage() {
@@ -61,6 +61,7 @@ select_compose() {
 
 compose_run() {
   OFS_MANAGED_SYNC_MINIO_PORT="$minio_port" OFS_MANAGED_SYNC_D1_PORT="$d1_port" \
+    OFS_MANAGED_SYNC_AUDIT_DIR="$audit_root" \
     "${compose[@]}" --project-name "$project" --file "$compose_file" "$@"
 }
 
@@ -75,7 +76,9 @@ wait_for_http() {
 
 fixtures_up() {
   select_compose
-  compose_run up --detach minio d1
+  mkdir -p "$audit_root"
+  : >"$audit_root/audit.jsonl"
+  compose_run up --detach audit minio d1
   wait_for_http "http://127.0.0.1:$minio_port/minio/health/ready"
   wait_for_http "http://127.0.0.1:$d1_port/health"
   compose_run run --rm -T minio-client \
@@ -89,35 +92,13 @@ fixtures_down() { select_compose; compose_run down --volumes --remove-orphans; }
 cleanup() {
   local status=$?
   trap - EXIT
-  stop_request_proxy
   if [[ $fixtures_started == true ]] && ! fixtures_down; then
     ((status == 0)) && status=1
   fi
-  exit "$status"
-}
-
-start_request_proxy() {
-  local root=$1 ready="$1/proxy.port"
-  : >"$root/requests.jsonl"
-  python3 "$workspace/tests/performance/managed-sync/s3-proxy.py" \
-    --upstream "127.0.0.1:$minio_port" --log "$root/requests.jsonl" --ready "$ready" &
-  proxy_pid=$!
-  for _ in $(seq 1 100); do
-    [[ -s $ready ]] && break
-    kill -0 "$proxy_pid" 2>/dev/null || fail 'Managed Sync request proxy exited before ready'
-    sleep 0.05
-  done
-  [[ -s $ready ]] || fail 'Managed Sync request proxy did not become ready'
-  proxy_port=$(<"$ready")
-}
-
-stop_request_proxy() {
-  if [[ -n $proxy_pid ]]; then
-    kill "$proxy_pid" >/dev/null 2>&1 || true
-    wait "$proxy_pid" 2>/dev/null || true
-    proxy_pid=
-    proxy_port=
+  if [[ $audit_owned == true ]]; then
+    rm -rf -- "$audit_root"
   fi
+  exit "$status"
 }
 
 case_environment() {
@@ -125,7 +106,7 @@ case_environment() {
   export OFS_BIN="$binary" OFS_CASE_ROOT="$root" OFS_STORAGE_URL="$storage"
   export OFS_METADATA_MODE="$metadata"
   export AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin AWS_REGION=us-east-1
-  unset OFS_METADATA_URL OFS_D1_TOKEN OFS_REQUEST_LOG
+  unset OFS_METADATA_URL OFS_D1_TOKEN OFS_AUDIT_LOG
   if [[ $metadata == d1 ]]; then
     local case_id api_base
     case_id=$(basename "$(dirname "$root")")
@@ -136,33 +117,28 @@ case_environment() {
 }
 
 run_case() {
-  local suite=$1 metadata=$2 run_root case_id endpoint_port endpoint storage script case_root
+  local suite=$1 metadata=$2 run_root case_id endpoint storage script case_root
   run_root=$(mktemp -d "${TMPDIR:-/tmp}/ofs-managed-${suite}.XXXXXX")
   case_id=$(basename "$run_root")
   case_root="$run_root/case"
-  endpoint_port=$minio_port
   case $suite in
     workflow) script="$workspace/tests/behavior/managed-sync/workflow.sh" ;;
     branch) script="$workspace/tests/behavior/managed-branch/workflow.sh" ;;
     staging)
       script="$workspace/tests/performance/managed-sync/staging.sh"
       case_root=$run_root
-      start_request_proxy "$run_root"
-      endpoint_port=$proxy_port
       ;;
     *) fail "unknown acceptance suite: $suite" ;;
   esac
-  endpoint="http%3A%2F%2F127.0.0.1%3A${endpoint_port}"
+  endpoint="http%3A%2F%2F127.0.0.1%3A${minio_port}"
   storage="s3://managed-sync/${case_id}?endpoint=${endpoint}&region=us-east-1"
   case_environment "$case_root" "$storage" "$metadata"
   if [[ $suite == staging ]]; then
-    export OFS_REQUEST_LOG="$run_root/requests.jsonl"
+    export OFS_AUDIT_LOG="$audit_root/audit.jsonl"
   fi
   if bash "$script"; then
-    stop_request_proxy
     rm -rf -- "$run_root"
   else
-    stop_request_proxy
     printf 'Managed %s evidence retained at %s\n' "$suite" "$run_root" >&2
     return 1
   fi
@@ -185,6 +161,8 @@ run_tests() {
     *) fail 'expected test all, test workflow|branch object|d1, or test staging' ;;
   esac
   cargo build --locked
+  audit_root=$(mktemp -d "${TMPDIR:-/tmp}/ofs-managed-audit.XXXXXX")
+  audit_owned=true
   fixtures_started=true
   trap cleanup EXIT
   fixtures_up

@@ -23,6 +23,7 @@ access_key=ofs-performance
 secret_key=ofs-performance-password
 minio_image=${MINIO_IMAGE:-quay.io/minio/minio:RELEASE.2024-09-22T00-33-43Z}
 mc_image=${MC_IMAGE:-quay.io/minio/mc:RELEASE.2024-09-16T17-43-14Z}
+audit_image=${AUDIT_IMAGE:-python:3.13.7-alpine3.22}
 schedule=(baseline candidate candidate baseline baseline candidate)
 
 usage() {
@@ -121,15 +122,16 @@ mkdir -p "$output/runs"
 output=$(cd "$output" && pwd)
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/ofs-managed-perf.XXXXXX")
 container="ofs-managed-perf-${PPID}-$$"
-proxy_pid=
+audit_container="$container-audit"
+network="$container-network"
+network_created=false
 
 cleanup() {
   local status=$?
-  if [[ -n $proxy_pid ]]; then
-    kill "$proxy_pid" >/dev/null 2>&1 || true
-    wait "$proxy_pid" 2>/dev/null || true
+  "$runtime" stop --time 1 "$container" "$audit_container" >/dev/null 2>&1 || true
+  if [[ $network_created == true ]]; then
+    "$runtime" network rm "$network" >/dev/null 2>&1 || true
   fi
-  "$runtime" rm -f "$container" >/dev/null 2>&1 || true
   for tree in "$scratch/baseline" "$scratch/candidate"; do
     if [[ -d $tree ]]; then
       git -C "$workspace" worktree remove --force "$tree" >/dev/null 2>&1 || true
@@ -157,8 +159,27 @@ build_release() {
 build_release baseline "$scratch/baseline" "$baseline_binary" "$baseline_sha"
 build_release candidate "$scratch/candidate" "$candidate_binary" "$candidate_sha"
 
-"$runtime" run -d --rm --name "$container" -p 127.0.0.1::9000 \
+"$runtime" network create "$network" >/dev/null
+network_created=true
+: >"$output/audit.jsonl"
+"$runtime" run -d --rm --name "$audit_container" --network "$network" \
+  --network-alias audit -v "$suite/minio-audit.py:/fixture/minio-audit.py:ro,Z" \
+  -v "$output/audit.jsonl:/evidence/audit.jsonl:Z" \
+  "$audit_image" python /fixture/minio-audit.py --host 0.0.0.0 --port 8080 \
+  --log /evidence/audit.jsonl --ready /tmp/audit.ready >/dev/null
+for _ in $(seq 1 100); do
+  "$runtime" exec "$audit_container" test -s /tmp/audit.ready && break
+  sleep 0.05
+done
+"$runtime" exec "$audit_container" test -s /tmp/audit.ready
+
+"$runtime" run -d --rm --name "$container" --network "$network" \
+  --network-alias minio -p 127.0.0.1::9000 \
+  -e NO_PROXY=audit,localhost,127.0.0.1 -e no_proxy=audit,localhost,127.0.0.1 \
   -e "MINIO_ROOT_USER=$access_key" -e "MINIO_ROOT_PASSWORD=$secret_key" \
+  -e MINIO_AUDIT_WEBHOOK_ENABLE_HARNESS=on \
+  -e MINIO_AUDIT_WEBHOOK_ENDPOINT_HARNESS=http://audit:8080 \
+  -e MINIO_AUDIT_WEBHOOK_BATCH_SIZE_HARNESS=1 \
   "$minio_image" server /data >/dev/null
 minio_port=$("$runtime" port "$container" 9000/tcp | tail -n 1 | sed 's/.*://')
 for _ in $(seq 1 100); do
@@ -169,25 +190,17 @@ curl -fsS "http://127.0.0.1:$minio_port/minio/health/ready" >/dev/null
 
 mc_run() {
   # shellcheck disable=SC2016
-  "$runtime" run --rm --network host --entrypoint /bin/sh "$mc_image" -c '
+  "$runtime" run --rm --network "$network" \
+    -e NO_PROXY=minio,localhost,127.0.0.1 -e no_proxy=minio,localhost,127.0.0.1 \
+    --entrypoint /bin/sh "$mc_image" -c '
+    set -e
     endpoint=$1 user=$2 password=$3
     shift 3
     mc alias set performance "$endpoint" "$user" "$password" >/dev/null
     exec mc "$@"
-  ' shell "http://127.0.0.1:$minio_port" "$access_key" "$secret_key" "$@"
+  ' shell http://minio:9000 "$access_key" "$secret_key" "$@"
 }
 mc_run mb --ignore-existing "performance/$bucket" >/dev/null
-
-proxy_ready="$scratch/proxy.port"
-python3 "$suite/s3-proxy.py" \
-  --upstream "127.0.0.1:$minio_port" --log "$output/requests.jsonl" --ready "$proxy_ready" &
-proxy_pid=$!
-for _ in $(seq 1 100); do
-  [[ -s $proxy_ready ]] && break
-  sleep 0.05
-done
-[[ -s $proxy_ready ]]
-proxy_port=$(<"$proxy_ready")
 
 : >"$output/samples.tsv"
 : >"$output/inputs.tsv"
@@ -202,6 +215,7 @@ proxy_port=$(<"$proxy_ready")
     printf 'agent_image\t%s\n' "${OFS_AGENT_IMAGE:-quay.io/fedora/fedora:44}"
   fi
   printf 'minio_image\t%s\n' "$minio_image"
+  printf 'audit_image\t%s\n' "$audit_image"
   printf 'rounds\t%s\n' "$rounds"
   printf 'profile\t%s\n' "$profile"
 } >"$output/context.tsv"
@@ -212,7 +226,7 @@ for index in "${!schedule[@]}"; do
   run_root="$output/runs/$run"
   object_root="ab/$run"
   mkdir "$run_root"
-  storage_url="s3://$bucket/$object_root?endpoint=http%3A%2F%2F127.0.0.1%3A$proxy_port&region=us-east-1"
+  storage_url="s3://$bucket/$object_root?endpoint=http%3A%2F%2F127.0.0.1%3A$minio_port&region=us-east-1"
   AWS_ACCESS_KEY_ID="$access_key" AWS_SECRET_ACCESS_KEY="$secret_key" AWS_REGION=us-east-1 \
     OFS_BIN="$scratch/ofs-$release" OFS_RUN_ROOT="$run_root" OFS_STORAGE_URL="$storage_url" \
     OFS_METRICS="$output/samples.tsv" OFS_INPUTS="$output/inputs.tsv" \
@@ -221,6 +235,20 @@ for index in "${!schedule[@]}"; do
 
   mc_run ls --recursive --json "performance/$bucket/$object_root" \
     >"$run_root/objects.jsonl"
+done
+
+previous_size=-1
+stable_checks=0
+for _ in $(seq 1 100); do
+  current_size=$(wc -c <"$output/audit.jsonl")
+  if [[ $current_size == "$previous_size" ]]; then
+    stable_checks=$((stable_checks + 1))
+    ((stable_checks >= 5)) && break
+  else
+    stable_checks=0
+    previous_size=$current_size
+  fi
+  sleep 0.05
 done
 
 python3 "$suite/analyze.py" "$output"

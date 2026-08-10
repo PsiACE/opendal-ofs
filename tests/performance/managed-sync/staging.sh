@@ -9,7 +9,7 @@
 
 set -euo pipefail
 
-: "${OFS_BIN:?}" "${OFS_CASE_ROOT:?}" "${OFS_STORAGE_URL:?}" "${OFS_REQUEST_LOG:?}"
+: "${OFS_BIN:?}" "${OFS_CASE_ROOT:?}" "${OFS_STORAGE_URL:?}" "${OFS_AUDIT_LOG:?}"
 
 fail() {
   printf 'managed-sync staging regression: %s\n' "$*" >&2
@@ -131,13 +131,15 @@ grep -Fxq 'resolved local candidate' "$replica/conflict.txt" || \
   fail 'explicit conflict resolution did not converge on the retained local candidate'
 diff -qr "$replica" "$peer" >/dev/null || fail 'replicas diverged after conflict resolution recovery'
 
-python3 - "$OFS_REQUEST_LOG" \
+python3 - "$OFS_AUDIT_LOG" \
   "$conflict_started_ns" "$conflict_ended_ns" \
   "$resolve_started_ns" "$resolve_paused_ns" \
   "$retry_started_ns" "$retry_ended_ns" <<'PY'
 import json
 import pathlib
 import sys
+import time
+from datetime import datetime
 
 log = pathlib.Path(sys.argv[1])
 windows = {
@@ -146,13 +148,25 @@ windows = {
     "retry": (int(sys.argv[6]), int(sys.argv[7])),
 }
 puts = {name: 0 for name in windows}
-for line in log.read_text(encoding="utf-8").splitlines():
-    request = json.loads(line)
-    if request["method"] != "PUT" or "/.ofs/managed/data/v1/segments/sha256/" not in request["path"]:
-        continue
-    for name, (start, end) in windows.items():
-        if start <= request["start_ns"] <= end:
-            puts[name] += 1
+deadline = time.monotonic() + 5
+while True:
+    puts = {name: 0 for name in windows}
+    for line in log.read_text(encoding="utf-8").splitlines():
+        event = json.loads(line)
+        if event["api"]["name"] != "PutObject":
+            continue
+        if "/.ofs/managed/data/v1/segments/sha256/" not in event["requestPath"]:
+            continue
+        event_ns = int(
+            datetime.fromisoformat(event["time"].replace("Z", "+00:00")).timestamp()
+            * 1_000_000_000
+        )
+        for name, (start, end) in windows.items():
+            if start <= event_ns <= end:
+                puts[name] += 1
+    if puts["retry"] or time.monotonic() >= deadline:
+        break
+    time.sleep(0.05)
 if puts["conflict"]:
     raise SystemExit(f"unresolved conflict uploaded {puts['conflict']} data segment(s)")
 if puts["before_finalize"]:

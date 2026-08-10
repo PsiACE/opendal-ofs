@@ -14,6 +14,7 @@ import json
 import math
 import statistics
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -60,11 +61,16 @@ def summarize(samples):
     }
 
 
-def request_phase(start_ns: int, intervals) -> str:
+def request_phase(event_ns: int, intervals) -> str:
     for interval in intervals:
-        if interval["start_ns"] <= start_ns <= interval["end_ns"]:
+        if interval["start_ns"] <= event_ns <= interval["end_ns"]:
             return interval["metric"]
-    return "setup_or_lifecycle"
+    return "outside_measured_phase"
+
+
+def audit_time_ns(value: str) -> int:
+    instant = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return int(instant.timestamp() * 1_000_000_000)
 
 
 def object_class(path: str) -> str:
@@ -78,32 +84,35 @@ def object_class(path: str) -> str:
     return "control"
 
 
-def load_requests(path: Path, intervals):
+def load_audit(path: Path, intervals):
     distribution = defaultdict(lambda: {"count": 0, "bytes_in": 0, "bytes_out": 0})
     observed_runs = set()
     noop_data_puts = []
     for line in path.open(encoding="utf-8"):
-        request = json.loads(line)
-        decoded_path = unquote(request["path"])
+        event = json.loads(line)
+        if " mc/" in event.get("userAgent", ""):
+            continue
+        api = event["api"]
+        decoded_path = unquote(event["requestPath"])
         run = next((name for name in intervals if f"/ab/{name}" in decoded_path), None)
         if run is None:
             continue
         observed_runs.add(run)
-        phase = request_phase(request["start_ns"], intervals[run])
+        phase = request_phase(audit_time_ns(event["time"]), intervals[run])
         classification = object_class(decoded_path)
-        is_range = request.get("range") is not None
-        key = (run, phase, request["method"], request["status"], classification, is_range)
+        is_range = "Range" in event.get("requestHeader", {})
+        key = (run, phase, api["name"], api["statusCode"], classification, is_range)
         distribution[key]["count"] += 1
-        distribution[key]["bytes_in"] += request["bytes_in"]
-        distribution[key]["bytes_out"] += request["bytes_out"]
-        if request["method"] == "PUT" and classification == "segment_data":
+        distribution[key]["bytes_in"] += api["rx"]
+        distribution[key]["bytes_out"] += api["tx"]
+        if api["name"] == "PutObject" and classification == "segment_data":
             if phase == "noop":
-                noop_data_puts.append(request)
+                noop_data_puts.append(event)
     rows = [
         {
             "run": key[0],
             "phase": key[1],
-            "method": key[2],
+            "operation": key[2],
             "status": key[3],
             "object_class": key[4],
             "range": key[5],
@@ -157,7 +166,7 @@ def logical_equality(directory: Path, inputs) -> tuple[bool, dict[str, list[dict
 
 def comparison_summary(samples, requests, inventories, inputs, equal):
     request_totals = defaultdict(lambda: {"count": 0, "request_bytes": 0, "response_bytes": 0})
-    request_methods = defaultdict(lambda: defaultdict(int))
+    request_operations = defaultdict(lambda: defaultdict(int))
     range_gets = defaultdict(int)
     catchup_segment_gets = defaultdict(int)
     for row in requests:
@@ -165,12 +174,12 @@ def comparison_summary(samples, requests, inventories, inputs, equal):
         total["count"] += row["count"]
         total["request_bytes"] += row["bytes_in"]
         total["response_bytes"] += row["bytes_out"]
-        request_methods[row["run"]][row["method"]] += row["count"]
-        if row["method"] == "GET" and row["range"]:
+        request_operations[row["run"]][row["operation"]] += row["count"]
+        if row["operation"] == "GetObject" and row["range"]:
             range_gets[row["run"]] += row["count"]
         if (
             row["phase"] == "catchup"
-            and row["method"] == "GET"
+            and row["operation"] == "GetObject"
             and row["object_class"] == "segment_data"
         ):
             catchup_segment_gets[row["run"]] += row["count"]
@@ -199,7 +208,7 @@ def comparison_summary(samples, requests, inventories, inputs, equal):
             total["data_bytes"] += row["bytes"]
 
     releases = sorted({values["release"] for values in inputs.values()})
-    methods = sorted({row["method"] for row in requests})
+    operations = sorted({row["operation"] for row in requests})
     result = {"logical_equality": equal, "releases": {}}
     for release in releases:
         runs = [run for run, values in inputs.items() if values["release"] == release]
@@ -212,11 +221,11 @@ def comparison_summary(samples, requests, inventories, inputs, equal):
                 "count_median": med(request_totals, "count"),
                 "request_bytes_median": med(request_totals, "request_bytes"),
                 "response_bytes_median": med(request_totals, "response_bytes"),
-                "by_method_count_median": {
-                    method: statistics.median(
-                        request_methods[run][method] for run in runs
+                "by_operation_count_median": {
+                    operation: statistics.median(
+                        request_operations[run][operation] for run in runs
                     )
-                    for method in methods
+                    for operation in operations
                 },
                 "range_get_count_median": statistics.median(
                     range_gets[run] for run in runs
@@ -262,8 +271,8 @@ def main() -> None:
     directory = arguments.directory
     samples, intervals = load_metrics(directory / "samples.tsv")
     statistics_by_metric = summarize(samples)
-    requests, observed_runs, noop_data_puts = load_requests(
-        directory / "requests.jsonl", intervals
+    requests, observed_runs, noop_data_puts = load_audit(
+        directory / "audit.jsonl", intervals
     )
     inputs = load_inputs(directory / "inputs.tsv")
     object_inventory = load_object_inventory(directory, inputs)
@@ -342,11 +351,11 @@ def main() -> None:
         "version": 1,
         "verdict": verdict,
         "context": context,
-        "order": ["baseline", "candidate", "candidate", "baseline", "baseline", "candidate"],
+        "order": [values["release"] for values in inputs.values()],
         "inputs_and_storage": inputs,
         "samples": samples,
         "statistics": statistics_by_metric,
-        "request_distribution": requests,
+        "audit_distribution": requests,
         "object_inventory": object_inventory,
         "logical_manifests": manifests,
         "summary": summary,
