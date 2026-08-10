@@ -357,7 +357,10 @@ impl NamespaceStore {
         }
     }
 
-    pub(crate) async fn begin_gc(&self, resume: bool) -> Result<NamespaceGcSweep, VolumeError> {
+    pub(crate) async fn begin_gc(
+        &self,
+        resume: bool,
+    ) -> Result<(NamespaceGcSweep, Option<VolumeSnapshot>), VolumeError> {
         if self.branch_id().is_some() {
             return Err(invalid(
                 "begin Managed data collection",
@@ -415,35 +418,17 @@ impl NamespaceStore {
                     .await?
             }
         };
-        if replaced {
-            Ok(sweep)
-        } else {
-            Err(conflict(
+        if !replaced {
+            return Err(conflict(
                 "begin Managed data collection",
                 "namespace authority changed",
-            ))
-        }
-    }
-
-    pub(crate) async fn fixed_gc_snapshot(
-        &self,
-        sweep: NamespaceGcSweep,
-    ) -> Result<Option<VolumeSnapshot>, VolumeError> {
-        let (head, _) = self
-            .read_raw_head()
-            .await?
-            .ok_or_else(|| conflict("mark retained data segments", "namespace disappeared"))?;
-        if head.maintenance != Some(sweep) || head.cursor() != sweep.fixed_cursor {
-            return Err(conflict(
-                "mark retained data segments",
-                "collection fence changed",
             ));
         }
         let Some(state) = &head.state else {
-            return Ok(None);
+            return Ok((sweep, None));
         };
         let checkpoint = self.read_checkpoint(state.checkpoint).await?;
-        recover_namespace(checkpoint, state, self.volume_id).map(Some)
+        recover_namespace(checkpoint, state, self.volume_id).map(|snapshot| (sweep, Some(snapshot)))
     }
 
     pub(crate) async fn retain_state_data(

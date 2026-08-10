@@ -59,9 +59,9 @@ impl ManagedVolume {
 
     /// Collect segments unreachable from the fixed base namespace.
     pub async fn garbage_collect(&self, resume: bool) -> Result<SegmentGcMaintenance, VolumeError> {
-        let sweep = self.namespace.begin_gc(resume).await?;
+        let (sweep, snapshot) = self.namespace.begin_gc(resume).await?;
         let mut roots = RetainedDataRoots::default();
-        if let Some(snapshot) = self.namespace.fixed_gc_snapshot(sweep).await? {
+        if let Some(snapshot) = snapshot {
             roots.retain(&snapshot)?;
         }
         let result = self.data.collect_unreachable_segments(&roots).await?;
