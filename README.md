@@ -26,17 +26,8 @@ A Direct volume exposes an existing object namespace. A Managed volume stores
 filesystem identity and namespace metadata. Mount provides an online filesystem,
 while Sync reconciles an ordinary local directory only when explicitly invoked.
 
-Managed Sync uses a local directory as the working filesystem and publishes
-explicitly to a format v1 Managed volume. Namespace metadata can use colocated
-objects or D1, while immutable data is accessed through OpenDAL. Volume names
-are client-local catalog aliases, so disposable containers may register the
-same remote volume under different names. See the
-[Managed Sync documentation](docs/managed-sync.md) for the workflow,
-architecture, and storage format.
-
-Managed volumes can also enable durable named branches for isolated current or
-historical states. See [Managed branches](docs/managed-branches.md) for the
-user workflow, storage semantics, and capability limits.
+See the [Managed Sync documentation](docs/managed-sync.md) for its workflow,
+architecture, persistent format, and optional durable branches.
 
 ## How to use `ofs`
 
@@ -101,10 +92,8 @@ the selected backend and frontend can enforce generation-checked publication.
 
 ### Create and synchronize a Managed volume
 
-Managed Sync keeps the working tree on the native local filesystem and
-publishes only during an explicit `ofs sync`. See the
-[Managed Sync workflow](docs/managed-sync-workflow.md) for Object and D1 setup,
-conflict handling, recovery, and maintenance.
+See the [Managed Sync workflow](docs/managed-sync-workflow.md) for Object and
+D1 setup, synchronization, branches, conflict handling, and recovery.
 
 ## Branding
 

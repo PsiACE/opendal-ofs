@@ -23,10 +23,8 @@ Without `--metadata`, namespace metadata is stored beside the data objects.
 The storage URL saved in the catalog must not contain credentials.
 `OFS_STORAGE_URL` may provide the storage URL instead of `--storage`.
 
-The command registers `workspace` as a local alias. If the selected root has no
-Managed superblock, it creates one. Otherwise it reads the existing `VolumeId`
-and binds the alias to it. Repeating the same local binding verifies it; a
-different binding for an existing alias is rejected.
+The command registers `workspace` as a client-local alias, creating the remote
+volume only when it is absent.
 
 ## Create a volume with D1 Metadata
 
@@ -65,8 +63,7 @@ The first sync has two possible outcomes:
 - If the volume already contains files and the local directory is empty, the
   command materializes the published tree.
 
-The state file records the volume identity, verified common base, pending
-operation, and retained conflicts. Do not place it inside the replica.
+Do not place the state file inside the replica.
 
 ## Attach from another container
 
@@ -86,12 +83,9 @@ ofs sync restored-memory /workspace/memory \
   --state /state/agent-b-replica.state
 ```
 
-The create command reads the existing superblock, so `restored-memory` resolves
-to the same remote `VolumeId` that another client may call `workspace`. The
-first sync into an empty directory materializes the current generation. Both
-clients can then edit their ordinary directories and publish with their own
-aliases. The normal generation checks, three-way merge, and conflict rules
-apply; aliases never participate in reconciliation.
+The create command discovers the existing remote volume. The first sync into
+the empty directory materializes its current state; aliases do not participate
+in reconciliation.
 
 ## Work and publish
 
@@ -102,21 +96,11 @@ ofs sync workspace ./workspace \
   --state ./workspace.state
 ```
 
-One invocation:
-
-1. Resolves an interrupted operation recorded in the state file.
-2. Observes a fixed remote snapshot.
-3. Scans the local tree and seals changed content into local staged segments.
-4. Reconciles the common base, local tree, and remote snapshot.
-5. Records a durable pending intent when local content must be published.
-6. Verifies and uploads the sealed immutable segments.
-7. Publishes one generation-checked namespace change.
-8. Installs and verifies the merged tree.
-9. Advances the common base and exits.
-
-Disjoint changes from different replicas merge. If two publishers race, one
-conditional publication succeeds. The other command stops and reconciles
-again on its next explicit sync.
+The command resolves interrupted work, reconciles one fixed remote snapshot,
+and installs or publishes the result. Disjoint changes merge. A publisher that
+loses a concurrent publication race stops and reconciles on the next explicit
+sync. See [Managed Sync architecture](managed-sync-architecture.md#sync-transaction)
+for the transaction path.
 
 Use `--transfer-concurrency` or `OFS_TRANSFER_CONCURRENCY` to bound storage
 operations for one command. The default is four.
@@ -154,6 +138,48 @@ The JSON object contains:
 }
 ```
 
+## Use branches
+
+Enable the built-in branch extension when creating the volume:
+
+```shell
+ofs volume create workspace \
+  --model managed \
+  --enable branch \
+  --storage <storage-url>
+```
+
+This creates the default branch `main`. Select another branch with `--branch`,
+or create one from a current or retained position:
+
+```shell
+ofs sync workspace ./experiment --branch experiment --state ./experiment.state
+ofs branch workspace create experiment
+ofs branch workspace create retry --from experiment
+ofs branch workspace create rewind --from main --at 42
+```
+
+Inspect or remove branches with:
+
+```shell
+ofs branch workspace list
+ofs branch workspace show experiment
+ofs branch workspace delete experiment
+```
+
+The default branch cannot be deleted. Deleting and recreating a name creates a
+new branch identity, so start it with a new replica state file.
+
+Reachability collection is always explicit:
+
+```shell
+ofs volume gc workspace
+ofs volume gc workspace --resume # only after an interrupted collection
+```
+
+See [Managed Sync architecture](managed-sync-architecture.md#built-in-branches)
+for branch semantics and limits.
+
 ## Resolve conflicts
 
 When local and remote changes overlap, Sync keeps the local candidate and
@@ -183,11 +209,8 @@ ofs sync workspace ./workspace \
   --state ./workspace.state
 ```
 
-The saved `OperationId` lets Metadata determine whether the publication
-committed. Sync resolves that operation before preparing another publication.
-
-Staged file installation also has a durable intent. The common base advances
-only after the complete local tree has been installed and verified.
+Keep the replica and state file together. The repeated command resolves any
+pending publication or installation before starting new work.
 
 ## Recover a lost replica
 
@@ -212,15 +235,10 @@ that volume identity.
 ## Filesystem surface
 
 Managed Sync accepts regular files, directories, empty directories, portable
-UTF-8 names, and the Unix executable bit. Names must be NFC, at most 255 UTF-8
-bytes per component and 4096 bytes per relative path, valid as Windows desktop
-names, and unique after full Unicode case folding within a directory. Sync
-rejects symbolic links, hard links, unsupported file types, and ambiguous
-portable names before remote publication.
-
-The current Sync frontend requires Unix native file identity and executable
-attributes. It rejects another platform at admission instead of changing those
-semantics.
+UTF-8 names, and the Unix executable bit. It rejects links, unsupported file
+types, and ambiguous or non-portable names before publication. The precise
+admission rules are explained in
+[Managed Sync architecture](managed-sync-architecture.md#filesystem-admission).
 
 The replica contains only user files. Catalog data, credentials, replica
 state, staging data, and conflict records stay outside the synchronized tree.

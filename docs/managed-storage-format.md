@@ -79,15 +79,14 @@ is not versioned: a client must discover and reject an unsupported format
 instead of creating another superblock under a version-specific key.
 
 The built-in `branch/v1` extension replaces the single namespace authority with
-durable named authorities. Its format and lifecycle rules are described in
-[Managed branches](managed-branches.md).
+durable named authorities. Its records are specified below.
 
 The superblock does not contain credentials, endpoints, local paths,
 client-local aliases, index inventory, or policy settings.
 
 ## Identities and references
 
-- `VolumeId`, `NodeId`, and `OperationId` are 16 opaque bytes.
+- `VolumeId`, `NodeId`, `OperationId`, and `BranchId` are 16 opaque bytes.
 - `ContentRef` contains a SHA-256 digest and the length of one raw content
   extent.
 - `SegmentRef` contains a SHA-256 digest and the total encoded segment length.
@@ -166,6 +165,27 @@ Object Metadata uses these keys:
 `head.ofs` is the only mutable namespace object. A conditional replacement is
 the commit point. Checkpoints and change segments are immutable and
 content-addressed; operation receipts have immutable deterministic keys.
+
+### branch/v1 authorities
+
+The extension registry maps case-sensitive `BranchName` values to `BranchId`
+values and identifies the default branch. Names are 1 to 63 ASCII bytes, start
+with a letter or digit, and otherwise contain only letters, digits, `.`, `_`,
+or `-`. Names are record values and are never interpolated into object keys or
+SQL identifiers.
+
+Each `BranchId` selects one unborn, active, or sealed namespace HEAD. Object
+Metadata stores the mutable registry and heads at:
+
+```text
+.ofs/managed/metadata/v1/extensions/branch/v1/registry.ofs
+.ofs/managed/metadata/v1/extensions/branch/v1/heads/<branch-id>.ofs
+```
+
+D1 stores the same logical records in its authority table. Branch HEADs use the
+base HEAD envelope, namespace state machine, checkpoint and change formats,
+operation receipts, validation rules, and data layout. Operation identities
+are scoped to their originating authority and are not copied by a fork.
 
 ### HEAD
 

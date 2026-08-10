@@ -24,7 +24,6 @@ Sync -> filesystem model -> Managed volume -> Metadata (Object or D1)
 
 The catalog binds a client-local alias to a remote `VolumeId` and
 credential-free locators. Provider credentials and replica paths remain local.
-Different clients may use different aliases for the same volume.
 
 ## Ownership
 
@@ -95,10 +94,31 @@ is a conflict. A saved pending operation can therefore be resolved after a
 timeout without guessing whether the commit happened.
 
 Object Metadata commits by conditionally replacing one HEAD object. D1 commits
-one revision-CAS authority record. Immutable checkpoints, change segments,
-operation receipts, file versions, and data segments use the same v1 formats
-for both authorities. A branch selects another authority; it does not add a
-second namespace or data implementation.
+one revision-CAS authority record. Both use the same namespace and data
+formats. A branch selects another authority; it does not add a second
+namespace or data implementation.
+
+## Built-in branches
+
+The `branch/v1` extension adds named namespace authorities over the same
+immutable checkpoints, file versions, and data segments. A fork selects a
+current or retained source position and reuses its records instead of copying
+the filesystem graph or file bytes. Sequences are branch-local, and a position
+older than retained history cannot be forked.
+
+The registry update is the creation commit point. Deletion first seals the
+registered HEAD and then removes its exact name-to-identity mapping. A new
+branch may reuse a deleted name but receives another `BranchId`, which fences
+old replicas and interrupted deletions from the replacement. Publication,
+fork, deletion, and collection serialize through their authority CAS and
+maintenance fences; unknown publication results use the same durable operation
+resolution as the base namespace.
+
+The extension provides named mutable branches, retained-position forks,
+deletion, Sync recovery, and explicit collection. It does not provide merge,
+tags, reset, unbounded history, automatic collection, Mount, or writer leases.
+Its records are specified in
+[Managed storage format](managed-storage-format.md#branchv1-authorities).
 
 ## Data path
 
@@ -158,11 +178,11 @@ resolved before a missing or malformed staging cache is discarded and rebuilt.
 ## Filesystem admission
 
 Local scanning and authoritative snapshot validation share one portable-name
-policy: NFC names, fixed component and path limits, no Windows-reserved names,
-and uniqueness after Unicode case folding. Sync accepts regular files,
-directories, empty directories, and Unix executable state. It rejects links,
-unsupported file types, and platforms that cannot supply stable native rename
-identity and executable attributes.
+policy: NFC names, at most 255 UTF-8 bytes per component and 4096 bytes per
+relative path, no Windows-reserved names, and uniqueness after full Unicode
+case folding. Sync accepts regular files, directories, empty directories, and
+Unix executable state. It rejects links, unsupported file types, and platforms
+that cannot supply stable native rename identity and executable attributes.
 
 Canonical relative paths are kept in ordered maps. Reconciliation and
 installation use bounded subtree ranges; directory moves are stored as
@@ -172,5 +192,4 @@ non-overlapping root moves and expanded only at validation or publication.
 
 - [Managed Sync workflow](managed-sync-workflow.md)
 - [Managed storage format](managed-storage-format.md)
-- [Managed branches](managed-branches.md)
 - [RFC 016](../rfcs/0016_filesystem_architecture.md)
