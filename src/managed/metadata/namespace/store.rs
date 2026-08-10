@@ -515,11 +515,7 @@ impl NamespaceStore {
         if head.maintenance != Some(sweep) {
             return Err(conflict(
                 "finish Managed data collection",
-                if self.branch_id().is_some() {
-                    "branch collection fence changed"
-                } else {
-                    "collection fence changed"
-                },
+                "collection fence changed",
             ));
         }
         head.maintenance = None;
@@ -537,11 +533,7 @@ impl NamespaceStore {
         } else {
             Err(conflict(
                 "finish Managed data collection",
-                if self.branch_id().is_some() {
-                    "branch HEAD changed"
-                } else {
-                    "namespace authority changed"
-                },
+                "namespace authority changed",
             ))
         }
     }
