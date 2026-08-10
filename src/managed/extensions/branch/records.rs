@@ -43,6 +43,8 @@ pub(crate) struct StoredBranchRegistry {
     pub(crate) volume_id: VolumeId,
     pub(crate) default_branch: BranchId,
     pub(crate) branches: BTreeMap<BranchName, BranchId>,
+    pub(crate) maintenance_epoch: u64,
+    pub(crate) maintenance_owner: Option<[u8; 16]>,
 }
 
 impl StoredBranchRegistry {
@@ -55,6 +57,8 @@ impl StoredBranchRegistry {
             volume_id,
             default_branch: default_id,
             branches: BTreeMap::from([(default_name, default_id)]),
+            maintenance_epoch: 0,
+            maintenance_owner: None,
         }
     }
 
@@ -63,6 +67,7 @@ impl StoredBranchRegistry {
         if self.volume_id != volume_id
             || unique_ids.len() != self.branches.len()
             || !self.branches.values().any(|id| *id == self.default_branch)
+            || self.maintenance_owner.is_some() && self.maintenance_epoch == 0
         {
             return Err(corrupt("read Managed branch", "branch registry is invalid"));
         }

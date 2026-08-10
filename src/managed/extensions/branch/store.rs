@@ -22,10 +22,12 @@ use crate::filesystem::{
     BranchBinding, BranchId, BranchName, VolumeError, VolumeErrorKind, VolumeId,
 };
 use crate::managed::ManagedVolume;
+use crate::managed::data::{RetainedDataRoots, SegmentGcMaintenance};
 use crate::managed::error::{conflict, corrupt, invalid, unavailable};
 use crate::managed::format::V1Record;
 use crate::managed::metadata::namespace::{
-    NamespaceStore, StoredHead, encode_head, read_head_record,
+    NamespaceGcSweep, NamespaceStore, RetainedMetadataReads, StoredHead, StoredNamespaceState,
+    encode_head, read_head_record,
 };
 use crate::managed::metadata::record::{RecordBackend, Revision};
 use futures::{StreamExt, TryStreamExt, stream};
@@ -187,6 +189,12 @@ impl BranchStore {
 
     pub async fn delete(&self, name: &BranchName) -> Result<(), VolumeError> {
         let (mut registry, mut registry_revision) = self.registry().await?;
+        if registry.maintenance_owner.is_some() {
+            return Err(conflict(
+                "delete Managed branch",
+                "data collection is active",
+            ));
+        }
         let branch_id = registry
             .branches
             .get(name)
@@ -294,6 +302,9 @@ impl BranchStore {
         target: BranchName,
     ) -> Result<(BranchInfo, BranchName), VolumeError> {
         let (mut registry, revision) = self.registry().await?;
+        if registry.maintenance_owner.is_some() {
+            return Err(conflict("fork Managed branch", "data collection is active"));
+        }
         if registry.branches.contains_key(&target) {
             return Err(conflict(
                 "fork Managed branch",
@@ -391,6 +402,197 @@ impl BranchStore {
             info(target, target_id, &target_head, registry.default_branch),
             source,
         ))
+    }
+
+    /// Collect data unreachable from every current and retained branch position.
+    pub async fn garbage_collect(&self, resume: bool) -> Result<SegmentGcMaintenance, VolumeError> {
+        let (mut registry, revision) = self.registry().await?;
+        let owner = *crate::filesystem::OperationId::generate().as_bytes();
+        if resume {
+            if registry.maintenance_owner.is_none() {
+                return Err(conflict(
+                    "resume Managed data collection",
+                    "no interrupted collection is active",
+                ));
+            }
+        } else {
+            if registry.maintenance_owner.is_some() {
+                return Err(conflict(
+                    "begin Managed data collection",
+                    "another collection is active",
+                ));
+            }
+            registry.maintenance_epoch =
+                registry.maintenance_epoch.checked_add(1).ok_or_else(|| {
+                    corrupt(
+                        "begin Managed data collection",
+                        "maintenance epoch is exhausted",
+                    )
+                })?;
+        }
+        registry.maintenance_owner = Some(owner);
+        if !self
+            .backend
+            .replace(
+                REGISTRY_KEY,
+                &revision,
+                REGISTRY_RECORD
+                    .encode(&registry)
+                    .map_err(|error| invalid("begin Managed data collection", error.message()))?,
+                "begin Managed data collection",
+            )
+            .await?
+        {
+            return Err(conflict(
+                "begin Managed data collection",
+                "branch registry changed",
+            ));
+        }
+
+        let mut roots = RetainedDataRoots::default();
+        let mut reads = RetainedMetadataReads::default();
+        let mut sweeps = Vec::with_capacity(registry.branches.len());
+        for (name, id) in &registry.branches {
+            let (sweep, state) = self
+                .lock_head(*id, registry.maintenance_epoch, owner)
+                .await?;
+            if let Some(state) = &state {
+                self.namespace(BranchBinding {
+                    name: name.clone(),
+                    id: *id,
+                })
+                .retain_state_data(state, &mut roots, &mut reads)
+                .await?;
+            }
+            sweeps.push((*id, sweep));
+        }
+        let current = self.registry().await?.0;
+        if current.maintenance_owner != Some(owner)
+            || current.maintenance_epoch != registry.maintenance_epoch
+            || current.branches != registry.branches
+        {
+            return Err(conflict(
+                "mark retained data segments",
+                "branch registry collection fence changed",
+            ));
+        }
+
+        let result = crate::managed::ManagedData::new(self.data.clone())?
+            .collect_unreachable_segments(&roots)
+            .await?;
+        for (id, sweep) in sweeps {
+            self.unlock_head(id, sweep).await?;
+        }
+        let (mut current, revision) = self.registry().await?;
+        if current.maintenance_owner != Some(owner)
+            || current.maintenance_epoch != registry.maintenance_epoch
+        {
+            return Err(conflict(
+                "finish Managed data collection",
+                "branch registry collection fence changed",
+            ));
+        }
+        current.maintenance_owner = None;
+        if !self
+            .backend
+            .replace(
+                REGISTRY_KEY,
+                &revision,
+                REGISTRY_RECORD
+                    .encode(&current)
+                    .map_err(|error| invalid("finish Managed data collection", error.message()))?,
+                "finish Managed data collection",
+            )
+            .await?
+        {
+            return Err(conflict(
+                "finish Managed data collection",
+                "branch registry changed",
+            ));
+        }
+        Ok(result)
+    }
+
+    async fn lock_head(
+        &self,
+        id: BranchId,
+        epoch: u64,
+        owner: [u8; 16],
+    ) -> Result<(NamespaceGcSweep, Option<StoredNamespaceState>), VolumeError> {
+        for _ in 0..BRANCH_CAS_ATTEMPTS {
+            let (mut head, revision) = self.read_head(id).await?.ok_or_else(|| {
+                corrupt(
+                    "begin Managed data collection",
+                    "registered branch HEAD is missing",
+                )
+            })?;
+            if head.maintenance_epoch > epoch
+                || head
+                    .maintenance
+                    .is_some_and(|maintenance| maintenance.epoch != epoch)
+            {
+                return Err(conflict(
+                    "begin Managed data collection",
+                    "branch collection fence changed",
+                ));
+            }
+            let sweep = NamespaceGcSweep {
+                epoch,
+                owner,
+                fixed_cursor: head.cursor(),
+            };
+            head.maintenance_epoch = epoch;
+            head.maintenance = Some(sweep);
+            if self
+                .backend
+                .replace(
+                    &head_key(id),
+                    &revision,
+                    encode_head(&head)?,
+                    "begin Managed data collection",
+                )
+                .await?
+            {
+                return Ok((sweep, head.state));
+            }
+        }
+        Err(conflict(
+            "begin Managed data collection",
+            "branch HEAD kept changing",
+        ))
+    }
+
+    async fn unlock_head(&self, id: BranchId, sweep: NamespaceGcSweep) -> Result<(), VolumeError> {
+        let (mut head, revision) = self.read_head(id).await?.ok_or_else(|| {
+            corrupt(
+                "finish Managed data collection",
+                "registered branch HEAD is missing",
+            )
+        })?;
+        if head.maintenance != Some(sweep) {
+            return Err(conflict(
+                "finish Managed data collection",
+                "branch collection fence changed",
+            ));
+        }
+        head.maintenance = None;
+        if self
+            .backend
+            .replace(
+                &head_key(id),
+                &revision,
+                encode_head(&head)?,
+                "finish Managed data collection",
+            )
+            .await?
+        {
+            Ok(())
+        } else {
+            Err(conflict(
+                "finish Managed data collection",
+                "branch HEAD changed",
+            ))
+        }
     }
 
     async fn registry(&self) -> Result<(StoredBranchRegistry, Revision), VolumeError> {

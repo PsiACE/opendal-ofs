@@ -130,18 +130,26 @@ impl RetainedDataRoots {
         snapshot: &crate::filesystem::VolumeSnapshot,
     ) -> Result<(), VolumeError> {
         for version in snapshot.file_versions.values() {
-            let version = crate::managed::metadata::namespace::decode_file_version(version)?;
-            for extent in version.extent_map.extents {
-                if self
-                    .0
-                    .insert(extent.segment.digest, extent.segment.length)
-                    .is_some_and(|length| length != extent.segment.length)
-                {
-                    return Err(corrupt(
-                        "mark retained data segments",
-                        "one segment digest has conflicting physical lengths",
-                    ));
-                }
+            self.retain_file_version(version)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn retain_file_version(
+        &mut self,
+        version: &crate::filesystem::FileVersion,
+    ) -> Result<(), VolumeError> {
+        let version = crate::managed::metadata::namespace::decode_file_version(version)?;
+        for extent in version.extent_map.extents {
+            if self
+                .0
+                .insert(extent.segment.digest, extent.segment.length)
+                .is_some_and(|length| length != extent.segment.length)
+            {
+                return Err(corrupt(
+                    "mark retained data segments",
+                    "one segment digest has conflicting physical lengths",
+                ));
             }
         }
         Ok(())

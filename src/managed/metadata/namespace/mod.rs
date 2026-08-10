@@ -32,6 +32,6 @@ pub(crate) use state::{
     ChangeSegmentRef, CheckpointRef, StoredChangeSegment, StoredCommittedResult,
     StoredNamespaceState, recover_namespace, replay_tail_from, require_request_digest,
 };
-pub(crate) use store::{NamespaceStore, NamespaceWitness};
+pub(crate) use store::{NamespaceGcSweep, NamespaceStore, NamespaceWitness, RetainedMetadataReads};
 pub(crate) use store::{StoredHead, encode_head, read_head_record};
 pub(crate) use validation::{validate_snapshot, validate_snapshot_structure};

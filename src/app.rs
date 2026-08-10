@@ -54,13 +54,17 @@ async fn gc_volume(config: &Path, args: VolumeGcArgs) -> Result<()> {
         data,
         metadata,
     } = open_managed_context(config, &args.alias, args.runtime.transfer_concurrency).await?;
-    if format.requires_extension(ManagedExtension::BranchV1) {
-        bail!("branch-enabled volume collection is not available in this build");
-    }
-    let result = metadata
-        .open_volume(format, data)?
-        .garbage_collect(args.resume)
-        .await?;
+    let result = if format.requires_extension(ManagedExtension::BranchV1) {
+        metadata
+            .branches(&format, data)?
+            .garbage_collect(args.resume)
+            .await?
+    } else {
+        metadata
+            .open_volume(format, data)?
+            .garbage_collect(args.resume)
+            .await?
+    };
     println!(
         "garbage collected {:?}: scanned={} deleted={} bytes={}",
         args.alias, result.scanned, result.deleted, result.deleted_bytes,

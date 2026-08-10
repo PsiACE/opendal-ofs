@@ -176,10 +176,24 @@ new_status=$(OFS_CONFIG="$config" "$OFS_BIN" status --state "$state_root/new-exp
   fail 'recreated branch reused its deleted incarnation'
 grep -Fxq 'main state' "$new_experiment/shared.txt" || fail 'recreated branch did not fork current main'
 
-printf '%s\n' 'acceptance: materialize content reachable through a historical branch'
+printf '%s\n' 'acceptance: collection preserves every active and historical branch root'
+if [[ "$OFS_METADATA_MODE" == d1 ]]; then
+  if AWS_SECRET_ACCESS_KEY=invalid OFS_CONFIG="$config" \
+    "$OFS_BIN" volume gc workspace >/dev/null 2>&1; then
+    fail 'collection unexpectedly completed with unavailable data storage'
+  fi
+  if OFS_CONFIG="$config" "$OFS_BIN" volume gc workspace >/dev/null 2>&1; then
+    fail 'a new collector replaced an interrupted collection'
+  fi
+  collection=$(OFS_CONFIG="$config" "$OFS_BIN" volume gc workspace --resume)
+else
+  collection=$(OFS_CONFIG="$config" "$OFS_BIN" volume gc workspace)
+fi
+grep -Eq 'deleted=[1-9][0-9]*' <<<"$collection" || \
+  fail 'branch reachability collection removed no orphaned segment'
 OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$rewind_cold" --branch rewind \
   --state "$state_root/rewind-cold.json"
-diff -ru "$rewind_replica" "$rewind_cold" || fail 'historical branch content was not retained'
+diff -ru "$rewind_replica" "$rewind_cold" || fail 'collection removed historical branch content'
 
 printf '%s\n' 'acceptance: branch status is complete and does not expose secrets'
 status_json=$(OFS_CONFIG="$config" "$OFS_BIN" status --state "$state_root/rewind-cold.json" --json)

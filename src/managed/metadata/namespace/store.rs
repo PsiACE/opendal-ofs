@@ -8,6 +8,7 @@
 
 //! One namespace authority state machine over a bound revision-CAS HEAD.
 
+use std::collections::BTreeMap;
 use std::io::Cursor;
 
 use futures::future::try_join_all;
@@ -24,6 +25,7 @@ use crate::filesystem::{
     BranchBinding, BranchId, ChangeCursor, CommitOutcome, OperationId, VolumeError,
     VolumeErrorKind, VolumeId, VolumeSnapshot,
 };
+use crate::managed::data::RetainedDataRoots;
 use crate::managed::error::{conflict, corrupt, invalid, unavailable};
 use crate::managed::format::{LowerHex, V1Record};
 use crate::managed::metadata::object::{ensure_immutable, read};
@@ -53,9 +55,15 @@ pub(crate) struct NamespaceWitness {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct NamespaceGcSweep {
-    epoch: u64,
-    owner: [u8; 16],
-    fixed_cursor: ChangeCursor,
+    pub(crate) epoch: u64,
+    pub(crate) owner: [u8; 16],
+    pub(crate) fixed_cursor: ChangeCursor,
+}
+
+#[derive(Default)]
+pub(crate) struct RetainedMetadataReads {
+    checkpoints: BTreeMap<[u8; 32], CheckpointRef>,
+    changes: BTreeMap<[u8; 32], ChangeSegmentRef>,
 }
 
 #[derive(Clone)]
@@ -437,6 +445,62 @@ impl NamespaceStore {
         };
         let checkpoint = self.read_checkpoint(state.checkpoint).await?;
         recover_namespace(checkpoint, state, self.volume_id).map(Some)
+    }
+
+    pub(crate) async fn retain_state_data(
+        &self,
+        state: &StoredNamespaceState,
+        roots: &mut RetainedDataRoots,
+        reads: &mut RetainedMetadataReads,
+    ) -> Result<(), VolumeError> {
+        self.retain_checkpoint(state.checkpoint, roots, reads)
+            .await?;
+        for change in &state.tail {
+            for version in &change.mutation.put_file_versions {
+                roots.retain_file_version(version)?;
+            }
+        }
+        for reference in &state.segments {
+            if let Some(current) = reads.changes.get(&reference.digest) {
+                if current != reference {
+                    return Err(corrupt(
+                        "mark retained data segments",
+                        "one change-segment digest has conflicting references",
+                    ));
+                }
+                continue;
+            }
+            reads.changes.insert(reference.digest, *reference);
+            let segment = self.read_change_segment(*reference).await?;
+            self.retain_checkpoint(segment.checkpoint, roots, reads)
+                .await?;
+            for change in segment.changes {
+                for version in &change.mutation.put_file_versions {
+                    roots.retain_file_version(version)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn retain_checkpoint(
+        &self,
+        reference: CheckpointRef,
+        roots: &mut RetainedDataRoots,
+        reads: &mut RetainedMetadataReads,
+    ) -> Result<(), VolumeError> {
+        if let Some(current) = reads.checkpoints.get(&reference.digest) {
+            return if *current == reference {
+                Ok(())
+            } else {
+                Err(corrupt(
+                    "mark retained data segments",
+                    "one checkpoint digest has conflicting references",
+                ))
+            };
+        }
+        reads.checkpoints.insert(reference.digest, reference);
+        roots.retain(&self.read_checkpoint(reference).await?)
     }
 
     pub(crate) async fn finish_gc(&self, sweep: NamespaceGcSweep) -> Result<(), VolumeError> {
