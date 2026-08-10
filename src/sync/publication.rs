@@ -113,7 +113,7 @@ pub(crate) fn build_publication<V: Volume>(
         if path.is_empty() {
             continue;
         }
-        let (parent, name) = split_path(path)?;
+        let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
         if !parent.is_empty()
             && !target_manifest
                 .entries
@@ -178,19 +178,6 @@ fn rename_source(renames: &BTreeMap<String, String>, path: &str) -> Option<Strin
         }
     }
     None
-}
-
-fn split_path(path: &str) -> Result<(&str, &str)> {
-    let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
-    if path.starts_with('/')
-        || path.ends_with('/')
-        || path.contains("//")
-        || name == "."
-        || name == ".."
-    {
-        bail!("local path {path:?} is not canonical");
-    }
-    Ok((parent, name))
 }
 
 fn fresh_node(used: &mut BTreeSet<NodeId>, old: Option<&BTreeMap<NodeId, NodeRecord>>) -> NodeId {

@@ -14,7 +14,7 @@ use anyhow::{Context, Result, bail};
 
 use super::{ReconcilePlan, TargetEdit, digest, executable, remote_matches_base};
 use crate::filesystem::{NodeId, NodeKind};
-use crate::sync::path::{SnapshotEntry, SnapshotTree, subtree};
+use crate::sync::path::{SnapshotEntry, SnapshotTree, descendants, subtree};
 use crate::sync::staging::TargetEntry;
 use crate::sync::{ConflictRecord, ReplicaState, StagedTree};
 
@@ -173,7 +173,9 @@ fn compact_renames(renames: BTreeMap<String, String>) -> Result<BTreeMap<String,
     }
     let mut targets = BTreeMap::new();
     for (source, target) in &roots {
-        if covering_mapping(&targets, target).is_some() {
+        if covering_mapping(&targets, target).is_some()
+            || descendants(&targets, target).next().is_some()
+        {
             bail!("remembered local renames overlap at their targets");
         }
         if targets.insert(target.clone(), source.clone()).is_some() {
@@ -266,61 +268,50 @@ fn reject_unidentified_moves(
     replica: &ReplicaState,
     base: Option<&SnapshotTree<'_>>,
     local: &StagedTree,
-    handled: &mut BTreeSet<String>,
+    handled: &BTreeSet<String>,
 ) -> Result<()> {
     let local_paths = &local.source.entries;
     let deleted = replica
         .installed
         .iter()
         .filter(|(path, _)| !local_paths.contains_key(*path))
-        .map(|(path, _)| path.clone())
+        .filter(|(path, _)| !handled.contains(*path))
         .collect::<Vec<_>>();
     let added = local_paths
-        .keys()
-        .filter(|path| !replica.installed.contains_key(*path))
-        .cloned()
-        .collect::<Vec<_>>();
-    let deleted = deleted
-        .into_iter()
-        .filter(|path| !handled.contains(path))
-        .collect::<Vec<_>>();
-    let added = added
-        .into_iter()
-        .filter(|path| !handled.contains(path))
+        .iter()
+        .filter(|(path, _)| !replica.installed.contains_key(*path))
+        .filter(|(path, _)| !handled.contains(*path))
         .collect::<Vec<_>>();
     if deleted.is_empty() || added.is_empty() {
         return Ok(());
     }
-    let identities_are_reliable = deleted.iter().all(|path| {
-        replica
-            .installed
-            .get(path)
-            .is_some_and(|entry| entry.native_identity.is_some())
-    }) && added.iter().all(|path| {
-        local_paths
-            .get(path)
-            .is_some_and(|entry| entry.local.native_identity.is_some())
-    });
-    let crosses_devices = deleted.iter().any(|from| {
+    let identities_are_reliable = deleted
+        .iter()
+        .all(|(_, entry)| entry.native_identity.is_some())
+        && added
+            .iter()
+            .all(|(_, entry)| entry.local.native_identity.is_some());
+    let crosses_devices = deleted.iter().any(|(from, installed)| {
         base.and_then(|tree| tree.get(from))
             .is_some_and(|entry| entry.node.kind == NodeKind::Directory)
-            && added.iter().any(|path| {
-                local.source.file(path).is_none()
-                    && replica.installed[from]
+            && added.iter().any(|(_, current)| {
+                current.local.kind == NodeKind::Directory
+                    && installed
                         .native_identity
-                        .zip(local_paths[path].local.native_identity)
+                        .zip(current.local.native_identity)
                         .is_some_and(|(from, to)| from.device != to.device)
             })
     });
     if identities_are_reliable && !crosses_devices {
         return Ok(());
     }
-    let suspects = deleted.into_iter().chain(added).collect::<BTreeSet<_>>();
-    handled.extend(suspects.iter().cloned());
-    if let Some(path) = suspects.into_iter().next() {
-        bail!("cannot reconcile {path:?}: local move lacks a stable same-filesystem identity");
-    }
-    Ok(())
+    let path = deleted
+        .iter()
+        .map(|(path, _)| *path)
+        .chain(added.iter().map(|(path, _)| *path))
+        .min()
+        .expect("an unidentified move has a changed path");
+    bail!("cannot reconcile {path:?}: local move lacks a stable same-filesystem identity")
 }
 
 fn unique_remote_nodes(remote: &SnapshotTree<'_>) -> BTreeMap<NodeId, Option<String>> {
@@ -336,4 +327,18 @@ fn unique_remote_nodes(remote: &SnapshotTree<'_>) -> BTreeMap<NodeId, Option<Str
             .or_insert_with(|| Some(path.clone()));
     }
     nodes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rename_target_cannot_cover_an_earlier_target() {
+        let renames = BTreeMap::from([
+            ("a".to_owned(), "target/child".to_owned()),
+            ("b".to_owned(), "target".to_owned()),
+        ]);
+        assert!(compact_renames(renames).is_err());
+    }
 }

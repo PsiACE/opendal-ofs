@@ -90,26 +90,22 @@ pub(crate) fn reconcile(
         &mut plan.publish,
     )?;
 
-    let mut paths = base
+    let paths = base
         .into_iter()
-        .flat_map(|tree| tree.paths.keys().cloned())
+        .flat_map(|tree| tree.paths.keys())
+        .chain(local.source.entries.keys())
+        .chain(remote.paths.keys())
         .collect::<BTreeSet<_>>();
-    paths.extend(local.source.entries.keys().cloned());
-    paths.extend(remote.paths.keys().cloned());
     for path in paths {
-        if handled.contains(&path) {
+        if handled.contains(path) {
             continue;
         }
-        let base_entry = base.and_then(|tree| tree.get(&path));
-        let local_digest = local.source.file(&path).map(|file| file.logical_digest);
-        let remote_entry = remote.get(&path);
+        let base_entry = base.and_then(|tree| tree.get(path));
+        let local_digest = local.source.file(path).map(|file| file.logical_digest);
+        let remote_entry = remote.get(path);
         let remote_digest = remote_entry.and_then(digest);
         let base_kind = base_entry.map(|entry| entry.node.kind);
-        let local_kind = local
-            .source
-            .entries
-            .get(&path)
-            .map(|entry| entry.local.kind);
+        let local_kind = local.source.entries.get(path).map(|entry| entry.local.kind);
         let remote_kind = remote_entry.map(|entry| entry.node.kind);
         if local_kind != remote_kind {
             if local_kind != base_kind && remote_kind != base_kind {
@@ -119,10 +115,10 @@ pub(crate) fn reconcile(
             } else if local_kind == base_kind {
                 match remote_entry {
                     Some(entry) if entry.node.kind == NodeKind::RegularFile => {
-                        plan.select_file(path, entry, TargetEdit::Materialize);
+                        plan.select_file(path.clone(), entry, TargetEdit::Materialize);
                     }
-                    Some(_) => plan.select_directory(path),
-                    None => plan.target.remove(&path),
+                    Some(_) => plan.select_directory(path.clone()),
+                    None => plan.target.remove(path),
                 }
             } else {
                 plan.publish = true;
@@ -135,7 +131,7 @@ pub(crate) fn reconcile(
         let local_executable = local
             .source
             .entries
-            .get(&path)
+            .get(path)
             .map(|entry| entry.local.executable);
         let base_executable = base_entry.and_then(executable);
         let remote_executable = remote_entry.and_then(executable);
@@ -159,13 +155,13 @@ pub(crate) fn reconcile(
                     let version = remote_entry
                         .and_then(|entry| entry.file)
                         .expect("remote file has a version");
-                    plan.target.select_attributes(&path, version, remote)?;
+                    plan.target.select_attributes(path, version, remote)?;
                 }
                 (Some(base), Some(_), Some(remote)) if remote == base => {
                     plan.publish = true;
                 }
                 _ => plan.conflicts.push(ConflictRecord {
-                    path,
+                    path: path.clone(),
                     local_digest,
                     remote_digest,
                 }),
@@ -175,12 +171,12 @@ pub(crate) fn reconcile(
                 (false, false) => {}
                 (true, false) => plan.publish = true,
                 (false, true) => match remote_entry {
-                    Some(entry) => plan.select_file(path, entry, TargetEdit::Materialize),
-                    None => plan.target.remove(&path),
+                    Some(entry) => plan.select_file(path.clone(), entry, TargetEdit::Materialize),
+                    None => plan.target.remove(path),
                 },
                 (true, true) if local_digest == remote_digest => {}
                 (true, true) => plan.conflicts.push(ConflictRecord {
-                    path,
+                    path: path.clone(),
                     local_digest,
                     remote_digest,
                 }),

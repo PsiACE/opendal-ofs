@@ -22,6 +22,7 @@ use super::path::descendants;
 use super::state::PendingIntent;
 use crate::filesystem::{
     FileVersion, FileVersionId, NodeKind, OperationId, Volume, VolumeSnapshot,
+    validate_portable_paths,
 };
 
 const TREE_DIR: &str = "tree";
@@ -79,7 +80,6 @@ impl TargetManifest {
     }
 
     pub(crate) fn select_directory(&mut self, path: String) {
-        self.entries.remove(&path);
         self.entries.insert(
             path,
             TargetEntry {
@@ -177,13 +177,12 @@ impl StagedTree {
             })
             .map(|(path, _)| path.clone())
             .collect::<Vec<_>>();
-        let prepared = volume
-            .stage_files(&source, &segments, changed.clone(), authority, concurrency)
+        let changed_count = changed.len();
+        let mut prepared = volume
+            .stage_files(&source, &segments, changed, authority, concurrency)
             .await
             .map_err(anyhow::Error::new)?;
-        if prepared.len() != changed.len()
-            || changed.iter().any(|path| !prepared.contains_key(path))
-        {
+        if prepared.len() != changed_count {
             bail!("volume did not prepare every changed file exactly once");
         }
         let mut entries = BTreeMap::new();
@@ -200,7 +199,7 @@ impl StagedTree {
                     None
                 }
                 NodeKind::RegularFile => {
-                    let version = match prepared.get(path) {
+                    let file = match prepared.remove(path) {
                         Some(version) => {
                             if version.logical_size != expected.size {
                                 bail!("volume returned the wrong size for staged file {path:?}");
@@ -210,13 +209,17 @@ impl StagedTree {
                                     "source file {path:?} changed while preparing publication; retry sync"
                                 );
                             }
-                            match versions.insert(version.id, version.clone()) {
-                                Some(existing) if existing != *version => bail!(
+                            if versions
+                                .get(&version.id)
+                                .is_some_and(|existing| existing != &version)
+                            {
+                                bail!(
                                     "volume reused a file version identity for different content"
-                                ),
-                                _ => {}
+                                );
                             }
-                            version
+                            let file = TargetFile::from(&version);
+                            versions.entry(version.id).or_insert(version);
+                            file
                         }
                         None => {
                             require_same_identity(
@@ -225,15 +228,17 @@ impl StagedTree {
                                 expected.kind,
                                 expected.native_identity,
                             )?;
-                            known_versions
-                                .get(path.as_str())
-                                .and_then(|version| known_snapshot?.file_versions.get(version))
-                                .with_context(|| {
-                                    format!("unchanged file {path:?} has no common version")
-                                })?
+                            TargetFile::from(
+                                known_versions
+                                    .get(path.as_str())
+                                    .and_then(|version| known_snapshot?.file_versions.get(version))
+                                    .with_context(|| {
+                                        format!("unchanged file {path:?} has no common version")
+                                    })?,
+                            )
                         }
                     };
-                    Some(TargetFile::from(version))
+                    Some(file)
                 }
             };
             entries.insert(
@@ -344,17 +349,18 @@ impl StagedTree {
     }
 
     pub(crate) fn matches_source_observation(&self, observed: &LocalTree) -> bool {
-        self.source.entries.len() == observed.entries.len()
-            && self.source.entries.iter().all(|(path, entry)| {
-                observed
-                    .entries
-                    .get(path)
-                    .is_some_and(|observed| observed == &entry.local)
-            })
+        self.source
+            .entries
+            .iter()
+            .map(|(path, entry)| (path, &entry.local))
+            .eq(observed.entries.iter())
     }
 }
 
 fn validate_manifest(manifest: &TargetManifest) -> Result<()> {
+    validate_portable_paths(manifest.entries.keys().map(String::as_str))
+        .map_err(anyhow::Error::new)
+        .context("staged manifest contains a non-portable path")?;
     for (path, entry) in &manifest.entries {
         if (entry.local.kind == NodeKind::RegularFile) != entry.file.is_some() {
             bail!("staged path {path:?} has inconsistent kind and file state");
