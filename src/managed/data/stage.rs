@@ -27,8 +27,8 @@ use sha2::{Digest as _, Sha256};
 use tokio::sync::{mpsc, oneshot};
 
 use super::{
-    ManagedData, STAGING_PLAN_KEY, STAGING_PLAN_RECORD, TARGET_SEGMENT_SIZE, content_ref,
-    read_staging_plan, segment_key, verify_complete_segment,
+    ManagedData, STAGING_PLAN_KEY, STAGING_PLAN_RECORD, TARGET_SEGMENT_SIZE, buffer_content_ref,
+    content_ref, read_staging_plan, segment_key, verify_complete_segment,
 };
 use crate::filesystem::VolumeError;
 use crate::managed::error::{corrupt, invalid, unavailable};
@@ -79,7 +79,7 @@ struct PreparedFile {
 
 struct PreparedChunk {
     content: ContentRef,
-    bytes: Vec<u8>,
+    bytes: Buffer,
 }
 
 struct PreparedStream {
@@ -137,7 +137,7 @@ impl ManagedData {
 
         let collect = async {
             let mut files = Vec::with_capacity(prepared_streams.len());
-            let mut new_content = BTreeMap::<ContentRef, Vec<u8>>::new();
+            let mut new_content = BTreeMap::<ContentRef, Buffer>::new();
             let mut pending_bytes = 0_u64;
             let mut created = BTreeMap::new();
             for mut prepared in prepared_streams {
@@ -156,7 +156,7 @@ impl ManagedData {
                                     })?;
                             }
                             std::collections::btree_map::Entry::Occupied(entry)
-                                if entry.get() != &bytes =>
+                                if entry.get().to_bytes() != bytes.to_bytes() =>
                             {
                                 return Err(corrupt(
                                     "stage Managed files",
@@ -294,16 +294,14 @@ async fn stream_file(
         let bytes = source
             .read(path)
             .await
-            .map_err(|_| unavailable("read frozen file", "storage operation failed"))?
-            .to_bytes()
-            .to_vec();
+            .map_err(|_| unavailable("read frozen file", "storage operation failed"))?;
         if bytes.len() as u64 != size {
             return Err(invalid(
                 "read frozen file",
                 "frozen input changed while it was being staged",
             ));
         }
-        let content = content_ref(&bytes);
+        let content = buffer_content_ref(&bytes);
         sender
             .send(PreparedChunk { content, bytes })
             .await
@@ -355,7 +353,7 @@ async fn stream_fastcdc(
         sender
             .send(PreparedChunk {
                 content,
-                bytes: chunk.data,
+                bytes: Buffer::from(chunk.data),
             })
             .await
             .map_err(|_| unavailable("stage Managed files", "storage operation failed"))?;
@@ -370,8 +368,8 @@ async fn stream_fastcdc(
 }
 
 fn take_segment_contents(
-    contents: &mut BTreeMap<ContentRef, Vec<u8>>,
-) -> Result<BTreeMap<ContentRef, Vec<u8>>, VolumeError> {
+    contents: &mut BTreeMap<ContentRef, Buffer>,
+) -> Result<BTreeMap<ContentRef, Buffer>, VolumeError> {
     let mut batch = BTreeMap::new();
     let mut batch_size = 0_u64;
     while let Some((&content, _)) = contents.first_key_value() {
@@ -389,7 +387,7 @@ fn take_segment_contents(
     Ok(batch)
 }
 
-fn seal_segment(contents: BTreeMap<ContentRef, Vec<u8>>) -> Result<SealedSegment, VolumeError> {
+fn seal_segment(contents: BTreeMap<ContentRef, Buffer>) -> Result<SealedSegment, VolumeError> {
     // Segment v1 is the stable ContentRef ordering of its raw contents. The
     // descriptor owns offsets; SegmentRef authenticates the complete object.
     let mut chunks = Vec::with_capacity(contents.len());
@@ -407,8 +405,10 @@ fn seal_segment(contents: BTreeMap<ContentRef, Vec<u8>>) -> Result<SealedSegment
         length = length
             .checked_add(content.length)
             .ok_or_else(|| invalid("seal data segment", "segment content length overflows"))?;
-        digest.update(&bytes);
-        chunks.extend(Buffer::from(bytes));
+        for chunk in bytes.clone() {
+            digest.update(&chunk);
+        }
+        chunks.extend(bytes);
     }
     if offsets.is_empty() {
         return Err(invalid(
