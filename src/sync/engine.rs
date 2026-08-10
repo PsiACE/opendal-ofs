@@ -77,41 +77,33 @@ impl<V: Volume> SyncEngine<V> {
 
         let mut resolved_commit = None;
         let prior_staging = if let Some(pending) = state.pending.clone() {
-            match self.volume.resolve(pending.operation).await? {
-                CommitOutcome::Committed(committed) => {
-                    let staged = StagedTree::recover(&pending).ok();
-                    let staged = match staged {
-                        Some(staged)
-                            if staged.matches_source_observation(
-                                &LocalTree::scan(replica_path).await?,
-                            ) =>
-                        {
-                            Some((staged, pending.operation))
-                        }
-                        _ => {
-                            let _ = remove_tree(&pending.staging);
-                            None
-                        }
-                    };
-                    state.pending = None;
-                    resolved_commit = Some(committed);
-                    staged
-                }
+            let committed = match self.volume.resolve(pending.operation).await? {
+                CommitOutcome::Committed(committed) => Some(committed),
                 CommitOutcome::Unknown => {
                     return Ok(result(&state, false));
                 }
-                CommitOutcome::Absent | CommitOutcome::Conflict { .. } => {
-                    match StagedTree::recover(&pending) {
-                        Ok(staged) => Some((staged, pending.operation)),
-                        Err(_) => {
-                            state.pending = None;
-                            state.install(state_path)?;
-                            let _ = remove_tree(&pending.staging);
-                            None
-                        }
-                    }
+                CommitOutcome::Absent | CommitOutcome::Conflict { .. } => None,
+            };
+            let staged = match StagedTree::recover(&pending) {
+                Ok(staged)
+                    if staged.matches_source_observation(&LocalTree::scan(replica_path).await?) =>
+                {
+                    Some(staged)
+                }
+                _ => None,
+            };
+            if staged.is_none() {
+                let _ = remove_tree(&pending.staging);
+                if committed.is_none() {
+                    state.pending = None;
+                    state.install(state_path)?;
                 }
             }
+            if let Some(committed) = committed {
+                state.pending = None;
+                resolved_commit = Some(committed);
+            }
+            staged
         } else {
             None
         };
@@ -135,13 +127,8 @@ impl<V: Volume> SyncEngine<V> {
             .transpose()?;
         let remote_tree = remote.map(SnapshotTree::new).transpose()?;
 
-        let (local, staging_path, mut staged, operation) = match prior_staging {
-            Some((staged, operation)) => (
-                staged.local_tree(),
-                staged.staging.clone(),
-                staged,
-                operation,
-            ),
+        let (local, staging_path, mut staged) = match prior_staging {
+            Some(staged) => (staged.local_tree(), staged.staging.clone(), staged),
             None => {
                 let local = LocalTree::scan(replica_path).await?;
                 if resolve_paths.is_empty()
@@ -163,10 +150,10 @@ impl<V: Volume> SyncEngine<V> {
                     self.transfer_concurrency,
                 )
                 .await?;
-                let operation = OperationId::generate();
-                (local, staging_path, staged, operation)
+                (local, staging_path, staged)
             }
         };
+        let operation = OperationId::generate();
         let source_manifest = staged.source.clone();
         let mut publish = remote.is_none() && !local.entries.is_empty();
         let mut conflicts = Vec::new();

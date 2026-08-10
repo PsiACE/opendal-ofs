@@ -74,11 +74,14 @@ pause_when_pending "$peer_catalog" "$peer_state" "$sync_pid" || \
 
 kill -KILL "$sync_pid" 2>/dev/null || true
 wait "$sync_pid" 2>/dev/null || true
+printf '%s\n' 'edited after the interrupted sync' >"$peer/after-crash.txt"
 OFS_CONFIG="$peer_catalog" "$OFS_BIN" sync staging "$peer" --state "$peer_state" \
   --resolve conflict.txt >/dev/null || fail 'pending resolved sync did not recover'
 OFS_CONFIG="$catalog" "$OFS_BIN" sync staging "$replica" --state "$state" >/dev/null
 grep -Fxq 'resolved local candidate' "$replica/conflict.txt" || \
   fail 'explicit conflict resolution did not converge on the retained local candidate'
+grep -Fxq 'edited after the interrupted sync' "$replica/after-crash.txt" || \
+  fail 'a local edit made after interruption was not included by the retry'
 diff -qr "$replica" "$peer" >/dev/null || fail 'replicas diverged after conflict resolution recovery'
 
 mkdir "$replica/committed-cache-loss"
