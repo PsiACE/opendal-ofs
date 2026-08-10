@@ -21,4 +21,12 @@ sync_b >/dev/null
 grep -Fxq 'history change 60' "$replica_b/checkpoint.txt" || \
   fail 'replica did not recover the fixed target after a long change history'
 
+printf '%s\n' 'scale: explicitly collect unreachable segments without changing the live tree'
+collection=$(OFS_CONFIG="$config" "$OFS_BIN" volume gc workspace)
+grep -Eq 'deleted=[1-9][0-9]*' <<<"$collection" || \
+  fail 'reachability collection removed no obsolete segment'
+OFS_CONFIG="$cold_config" "$OFS_BIN" volume create "$cold_alias" "${volume_options[@]}" >/dev/null
+sync_cold >/dev/null
+diff -ru "$replica_a" "$cold_replica" || fail 'cold rebuild changed after collection'
+
 printf 'managed-sync scale passed (%s metadata)\n' "$OFS_METADATA_MODE"

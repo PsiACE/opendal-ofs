@@ -22,6 +22,7 @@ use std::num::NonZeroUsize;
 
 use opendal::Operator;
 
+use super::data::{RetainedDataRoots, SegmentGcMaintenance};
 use super::metadata::namespace::{
     NamespaceChange, NamespaceStore, NamespaceWitness, decode_file_version, encode_file_version,
 };
@@ -54,6 +55,18 @@ impl ManagedVolume {
             namespace,
             data: ManagedData::new(data_operator)?,
         })
+    }
+
+    /// Collect segments unreachable from the fixed base namespace.
+    pub async fn garbage_collect(&self, resume: bool) -> Result<SegmentGcMaintenance, VolumeError> {
+        let sweep = self.namespace.begin_gc(resume).await?;
+        let mut roots = RetainedDataRoots::default();
+        if let Some(snapshot) = self.namespace.fixed_gc_snapshot(sweep).await? {
+            roots.retain(&snapshot)?;
+        }
+        let result = self.data.collect_unreachable_segments(&roots).await?;
+        self.namespace.finish_gc(sweep).await?;
+        Ok(result)
     }
 }
 

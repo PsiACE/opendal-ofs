@@ -50,6 +50,14 @@ pub(crate) struct NamespaceWitness {
     head: StoredHead,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NamespaceGcSweep {
+    epoch: u64,
+    owner: [u8; 16],
+    fixed_cursor: ChangeCursor,
+}
+
 #[derive(Clone)]
 pub(crate) struct NamespaceStore {
     volume_id: VolumeId,
@@ -173,6 +181,11 @@ impl NamespaceStore {
                 (StoredHead::unborn(self.volume_id, None), None, None)
             }
         };
+        if head.maintenance.is_some() {
+            return Ok(CommitOutcome::Conflict {
+                observed: head.cursor(),
+            });
+        }
         if let Some(result) = head
             .state
             .as_ref()
@@ -334,6 +347,126 @@ impl NamespaceStore {
                 Ok(CommitOutcome::Unknown)
             }
             result => result,
+        }
+    }
+
+    pub(crate) async fn begin_gc(&self, resume: bool) -> Result<NamespaceGcSweep, VolumeError> {
+        if self.branch_id().is_some() {
+            return Err(invalid(
+                "begin Managed data collection",
+                "branch collection belongs to its volume control plane",
+            ));
+        }
+        let current = self.read_raw_head().await?;
+        let (mut head, revision) = current
+            .map(|(head, revision)| (head, Some(revision)))
+            .unwrap_or_else(|| (StoredHead::unborn(self.volume_id, None), None));
+        let owner = *OperationId::generate().as_bytes();
+        if resume {
+            let maintenance = head.maintenance.as_mut().ok_or_else(|| {
+                conflict(
+                    "resume Managed data collection",
+                    "no interrupted collection is active",
+                )
+            })?;
+            maintenance.owner = owner;
+        } else {
+            if head.maintenance.is_some() {
+                return Err(conflict(
+                    "begin Managed data collection",
+                    "another collection is active",
+                ));
+            }
+            head.maintenance_epoch = head.maintenance_epoch.checked_add(1).ok_or_else(|| {
+                corrupt(
+                    "begin Managed data collection",
+                    "maintenance epoch is exhausted",
+                )
+            })?;
+            head.maintenance = Some(NamespaceGcSweep {
+                epoch: head.maintenance_epoch,
+                owner,
+                fixed_cursor: head.cursor(),
+            });
+        }
+        let sweep = head.maintenance.expect("collection was installed above");
+        let bytes = encode_head(&head)?;
+        let replaced = match revision {
+            Some(revision) => {
+                self.backend
+                    .replace(
+                        &self.head_key,
+                        &revision,
+                        bytes,
+                        "begin Managed data collection",
+                    )
+                    .await?
+            }
+            None => {
+                self.backend
+                    .create(&self.head_key, bytes, "begin Managed data collection")
+                    .await?
+            }
+        };
+        if replaced {
+            Ok(sweep)
+        } else {
+            Err(conflict(
+                "begin Managed data collection",
+                "namespace authority changed",
+            ))
+        }
+    }
+
+    pub(crate) async fn fixed_gc_snapshot(
+        &self,
+        sweep: NamespaceGcSweep,
+    ) -> Result<Option<VolumeSnapshot>, VolumeError> {
+        let (head, _) = self
+            .read_raw_head()
+            .await?
+            .ok_or_else(|| conflict("mark retained data segments", "namespace disappeared"))?;
+        if head.maintenance != Some(sweep) || head.cursor() != sweep.fixed_cursor {
+            return Err(conflict(
+                "mark retained data segments",
+                "collection fence changed",
+            ));
+        }
+        let Some(state) = &head.state else {
+            return Ok(None);
+        };
+        let checkpoint = self.read_checkpoint(state.checkpoint).await?;
+        recover_namespace(checkpoint, state, self.volume_id).map(Some)
+    }
+
+    pub(crate) async fn finish_gc(&self, sweep: NamespaceGcSweep) -> Result<(), VolumeError> {
+        let (mut head, revision) = self
+            .read_raw_head()
+            .await?
+            .ok_or_else(|| conflict("finish Managed data collection", "namespace disappeared"))?;
+        if head.maintenance != Some(sweep) {
+            return Err(conflict(
+                "finish Managed data collection",
+                "collection fence changed",
+            ));
+        }
+        head.maintenance = None;
+        if self
+            .backend
+            .replace(
+                &self.head_key,
+                &revision,
+                encode_head(&head)?,
+                "finish Managed data collection",
+            )
+            .await?
+        {
+            Ok(())
+        } else {
+            Err(conflict(
+                "finish Managed data collection",
+                "namespace authority changed",
+            ))
         }
     }
 
@@ -758,6 +891,8 @@ pub(crate) struct StoredHead {
     pub(crate) branch_id: Option<BranchId>,
     pub(crate) sealed: bool,
     pub(crate) state: Option<StoredNamespaceState>,
+    pub(crate) maintenance_epoch: u64,
+    pub(crate) maintenance: Option<NamespaceGcSweep>,
 }
 
 impl StoredHead {
@@ -767,6 +902,8 @@ impl StoredHead {
             branch_id,
             sealed: false,
             state: None,
+            maintenance_epoch: 0,
+            maintenance: None,
         }
     }
 
@@ -799,6 +936,16 @@ impl StoredHead {
                     "HEAD outcome authority is invalid",
                 ));
             }
+        }
+        if self.maintenance.as_ref().is_some_and(|maintenance| {
+            maintenance.epoch == 0
+                || maintenance.epoch != self.maintenance_epoch
+                || maintenance.fixed_cursor != self.cursor()
+        }) {
+            return Err(corrupt(
+                "read Managed namespace",
+                "namespace maintenance fence is invalid",
+            ));
         }
         Ok(())
     }

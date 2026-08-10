@@ -22,7 +22,9 @@ use opendal::layers::{ConcurrentLimitLayer, RetryLayer};
 use url::Url;
 
 use crate::cli::BranchCommand;
-use crate::cli::{Cli, Command, MountArgs, StatusArgs, SyncArgs, VolumeCommand, VolumeCreateArgs};
+use crate::cli::{
+    Cli, Command, MountArgs, StatusArgs, SyncArgs, VolumeCommand, VolumeCreateArgs, VolumeGcArgs,
+};
 
 struct ManagedContext {
     format: ManagedFormat,
@@ -36,11 +38,34 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
         Command::Volume {
             command: VolumeCommand::Create(args),
         } => create_volume(&config, args).await,
+        Command::Volume {
+            command: VolumeCommand::Gc(args),
+        } => gc_volume(&config, args).await,
         Command::Branch { command } => branch_command(&config, command).await,
         Command::Mount(args) => mount_volume(&config, args).await,
         Command::Sync(args) => sync_volume(&config, args).await,
         Command::Status(args) => status(&config, args),
     }
+}
+
+async fn gc_volume(config: &Path, args: VolumeGcArgs) -> Result<()> {
+    let ManagedContext {
+        format,
+        data,
+        metadata,
+    } = open_managed_context(config, &args.alias, args.runtime.transfer_concurrency).await?;
+    if format.requires_extension(ManagedExtension::BranchV1) {
+        bail!("branch-enabled volume collection is not available in this build");
+    }
+    let result = metadata
+        .open_volume(format, data)?
+        .garbage_collect(args.resume)
+        .await?;
+    println!(
+        "garbage collected {:?}: scanned={} deleted={} bytes={}",
+        args.alias, result.scanned, result.deleted, result.deleted_bytes,
+    );
+    Ok(())
 }
 
 async fn branch_command(config: &Path, command: BranchCommand) -> Result<()> {

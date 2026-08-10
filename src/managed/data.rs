@@ -112,6 +112,42 @@ type DemandKey = (u64, u64, ContentRef);
 type SegmentDemand = BTreeSet<DemandKey>;
 type FetchedContent = BTreeMap<ContentRef, Buffer>;
 
+/// Data segments removed by one explicit reachability sweep.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SegmentGcMaintenance {
+    pub scanned: usize,
+    pub deleted: usize,
+    pub deleted_bytes: u64,
+}
+
+/// Immutable segments retained by one or more fixed namespace roots.
+#[derive(Default)]
+pub(crate) struct RetainedDataRoots(BTreeMap<[u8; 32], u64>);
+
+impl RetainedDataRoots {
+    pub(crate) fn retain(
+        &mut self,
+        snapshot: &crate::filesystem::VolumeSnapshot,
+    ) -> Result<(), VolumeError> {
+        for version in snapshot.file_versions.values() {
+            let version = crate::managed::metadata::namespace::decode_file_version(version)?;
+            for extent in version.extent_map.extents {
+                if self
+                    .0
+                    .insert(extent.segment.digest, extent.segment.length)
+                    .is_some_and(|length| length != extent.segment.length)
+                {
+                    return Err(corrupt(
+                        "mark retained data segments",
+                        "one segment digest has conflicting physical lengths",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The Managed v1 data plane.
 #[derive(Clone)]
 pub(crate) struct ManagedData {
@@ -314,6 +350,85 @@ impl ManagedData {
             .buffer_unordered(concurrency.get())
             .try_for_each(|()| async { Ok(()) })
             .await
+    }
+
+    pub(crate) async fn collect_unreachable_segments(
+        &self,
+        roots: &RetainedDataRoots,
+    ) -> Result<SegmentGcMaintenance, VolumeError> {
+        let capability = self.operator.info().full_capability();
+        if !capability.list || !capability.delete {
+            return Err(unavailable(
+                "collect unreachable data segments",
+                "data storage requires list and delete",
+            ));
+        }
+        let mut result = SegmentGcMaintenance::default();
+        let mut deleter = self.operator.deleter().await.map_err(|_| {
+            unavailable(
+                "collect unreachable data segments",
+                "storage operation failed",
+            )
+        })?;
+        let mut entries = self
+            .operator
+            .lister_with(&format!("{SEGMENT_ROOT}/"))
+            .recursive(true)
+            .await
+            .map_err(|_| {
+                unavailable(
+                    "collect unreachable data segments",
+                    "storage operation failed",
+                )
+            })?;
+        while let Some(entry) = entries.try_next().await.map_err(|_| {
+            unavailable(
+                "collect unreachable data segments",
+                "storage operation failed",
+            )
+        })? {
+            if !entry.metadata().is_file() {
+                continue;
+            }
+            let Some(reference) =
+                segment_ref_from_key(entry.path(), entry.metadata().content_length())
+            else {
+                continue;
+            };
+            result.scanned += 1;
+            if let Some(length) = roots.0.get(&reference.digest) {
+                if *length != reference.length {
+                    return Err(corrupt(
+                        "collect unreachable data segments",
+                        "live segment has an unexpected physical length",
+                    ));
+                }
+                continue;
+            }
+            deleter.delete(entry.path()).await.map_err(|_| {
+                unavailable(
+                    "collect unreachable data segments",
+                    "storage operation failed",
+                )
+            })?;
+            result.deleted += 1;
+            result.deleted_bytes = result
+                .deleted_bytes
+                .checked_add(reference.length)
+                .ok_or_else(|| {
+                    corrupt(
+                        "collect unreachable data segments",
+                        "deleted byte count overflows",
+                    )
+                })?;
+        }
+        deleter.close().await.map_err(|_| {
+            unavailable(
+                "collect unreachable data segments",
+                "storage operation failed",
+            )
+        })?;
+        Ok(result)
     }
 
     pub(crate) async fn materialize(
@@ -1018,6 +1133,17 @@ fn content_ref(bytes: &[u8]) -> ContentRef {
 fn segment_key(reference: SegmentRef) -> String {
     let digest = LowerHex::encode(&reference.digest);
     format!("{SEGMENT_ROOT}/{}/{}.seg", &digest[..2], digest)
+}
+
+fn segment_ref_from_key(path: &str, length: u64) -> Option<SegmentRef> {
+    let relative = path.strip_prefix(SEGMENT_ROOT)?.strip_prefix('/')?;
+    let (shard, name) = relative.split_once('/')?;
+    let digest = name.strip_suffix(".seg")?;
+    if shard.len() != 2 || digest.len() != 64 || !digest.starts_with(shard) {
+        return None;
+    }
+    let digest: [u8; 32] = LowerHex::decode(digest)?.try_into().ok()?;
+    Some(SegmentRef { digest, length })
 }
 
 fn referenced_segment_error(action: &'static str, error: opendal::Error) -> VolumeError {

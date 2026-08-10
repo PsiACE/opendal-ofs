@@ -24,6 +24,7 @@ mod format;
 mod metadata;
 mod volume;
 
+pub use data::SegmentGcMaintenance;
 pub(crate) use data::{AuthorityKnownContent, ManagedData};
 pub use metadata::{D1Config, ManagedExtension, ManagedFormat, ManagedMetadata};
 pub use volume::{ManagedObservation, ManagedVolume};

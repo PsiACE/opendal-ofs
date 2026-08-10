@@ -60,6 +60,21 @@ pub(crate) struct MountArgs {
 pub(crate) enum VolumeCommand {
     /// Register an alias and save its credential-free volume binding.
     Create(VolumeCreateArgs),
+    /// Explicitly collect unreachable Managed data segments.
+    Gc(VolumeGcArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct VolumeGcArgs {
+    /// Named Managed volume from the local catalog.
+    pub alias: String,
+
+    /// Resume an interrupted collection after its previous process stopped.
+    #[arg(long)]
+    pub resume: bool,
+
+    #[command(flatten)]
+    pub runtime: StorageOptions,
 }
 
 #[derive(Debug, Subcommand)]
