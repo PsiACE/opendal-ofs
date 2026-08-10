@@ -646,25 +646,18 @@ async fn materialize_file(
     version: &DecodedFileVersion,
     fetched: &FetchedContent,
 ) -> Result<(), VolumeError> {
-    let mut logical = Sha256::new();
-    let mut written = 0_u64;
     let mut chunks = Vec::new();
     for extent in &version.extent_map.extents {
         let bytes = fetched
             .get(&extent.content)
             .cloned()
             .ok_or_else(|| corrupt("materialize Managed files", "extent was not fetched"))?;
-        written = written
-            .checked_add(bytes.len() as u64)
-            .ok_or_else(|| corrupt("materialize Managed files", "logical file length overflows"))?;
-        for chunk in bytes {
-            logical.update(&chunk);
-            chunks.push(chunk);
-        }
+        chunks.extend(bytes);
     }
-    verify_materialized_file(version, logical, written)?;
+    let bytes = Buffer::from(chunks);
+    verify_materialized_file(version, buffer_content_ref(&bytes))?;
     target
-        .write(path, Buffer::from(chunks))
+        .write(path, bytes)
         .await
         .map(|_| ())
         .map_err(|_| unavailable("write materialized file", "storage operation failed"))
@@ -702,7 +695,11 @@ async fn finish_materialized_file(
     logical: Sha256,
     written: u64,
 ) -> Result<(), VolumeError> {
-    if let Err(error) = verify_materialized_file(version, logical, written) {
+    let content = ContentRef {
+        digest: logical.finalize().into(),
+        length: written,
+    };
+    if let Err(error) = verify_materialized_file(version, content) {
         let _ = writer.abort().await;
         return Err(error);
     }
@@ -715,12 +712,9 @@ async fn finish_materialized_file(
 
 fn verify_materialized_file(
     version: &DecodedFileVersion,
-    logical: Sha256,
-    written: u64,
+    content: ContentRef,
 ) -> Result<(), VolumeError> {
-    if written != version.logical_size
-        || <[u8; 32]>::from(logical.finalize()) != version.logical_digest
-    {
+    if content.length != version.logical_size || content.digest != version.logical_digest {
         return Err(corrupt(
             "materialize Managed files",
             "logical digest does not match the file version",
