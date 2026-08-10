@@ -382,7 +382,7 @@ fn status(config: &Path, args: StatusArgs) -> Result<()> {
             "namespace_publication": "generation_cas",
         },
         "common_sequence": state.common().sequence(),
-        "common_operation": state.common().operation().map(|operation| hex_bytes(operation.as_bytes())),
+        "common_operation": state.common().operation().map(|operation| operation.to_string()),
         "pending": state.pending.is_some(),
         "conflicts": state.conflicts.len(),
     });
@@ -403,10 +403,6 @@ fn status(config: &Path, args: StatusArgs) -> Result<()> {
         );
     }
     Ok(())
-}
-
-fn hex_bytes(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn open_operator(url: &Url, transfer_concurrency: NonZeroUsize) -> Result<Operator> {

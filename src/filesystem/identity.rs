@@ -98,7 +98,7 @@ fixed_identity!(
 );
 
 random_identity!(VolumeId, BranchId, NodeId, OperationId);
-display_identity!(VolumeId, BranchId);
+display_identity!(VolumeId, BranchId, OperationId);
 
 /// An opaque optimistic-concurrency token owned by a volume implementation.
 ///
