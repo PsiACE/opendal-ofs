@@ -28,8 +28,8 @@ use super::metadata::namespace::{
 use super::{AuthorityKnownContent, ManagedData};
 use crate::filesystem::{AuthorityIdentity, CommitOutcome, OperationId, VolumeId};
 use crate::filesystem::{
-    FileVersion, MaterializeRequest, Volume, VolumeError, VolumeMutation, VolumeObservation,
-    VolumePublication, VolumeSnapshot,
+    FileVersion, MaterializeRequest, Volume, VolumeError, VolumeObservation, VolumePublication,
+    VolumeSnapshot,
 };
 use crate::managed::error::{corrupt, invalid};
 
@@ -54,34 +54,6 @@ impl ManagedVolume {
             namespace,
             data: ManagedData::new(data_operator)?,
         })
-    }
-
-    /// Observe the authority, reusing an already verified Sync common base when it is current.
-    async fn observe_from(
-        &self,
-        base: Option<&VolumeSnapshot>,
-    ) -> Result<Option<ManagedObservation>, VolumeError> {
-        match base {
-            Some(base) => self.namespace.observe_from(base).await?,
-            None => self.namespace.observe().await?,
-        }
-        .map(|observed| {
-            let (snapshot, witness) = observed.into_parts();
-            Ok(ManagedObservation { witness, snapshot })
-        })
-        .transpose()
-    }
-
-    async fn publish(
-        &self,
-        observed: Option<&ManagedObservation>,
-        mutation: VolumeMutation,
-    ) -> Result<CommitOutcome, VolumeError> {
-        let observed = observed.map(|observed| (&observed.witness, &observed.snapshot));
-        let origin_branch = self.namespace.binding().map(|binding| binding.id);
-        self.namespace
-            .publish(observed, NamespaceChange::new(mutation, origin_branch))
-            .await
     }
 }
 
@@ -125,7 +97,8 @@ impl Volume for ManagedVolume {
         &self,
         base: Option<&VolumeSnapshot>,
     ) -> Result<Option<Self::Observation>, VolumeError> {
-        ManagedVolume::observe_from(self, base).await
+        let observed = self.namespace.observe(base).await?;
+        Ok(observed.map(|(snapshot, witness)| ManagedObservation { witness, snapshot }))
     }
 
     async fn stage_files(
@@ -167,7 +140,14 @@ impl Volume for ManagedVolume {
         observed: Option<&Self::Observation>,
         publication: &VolumePublication,
     ) -> Result<CommitOutcome, VolumeError> {
-        ManagedVolume::publish(self, observed, publication.mutation().clone()).await
+        let observed = observed.map(|observed| (&observed.witness, &observed.snapshot));
+        let origin_branch = self.namespace.binding().map(|binding| binding.id);
+        self.namespace
+            .publish(
+                observed,
+                NamespaceChange::new(publication.mutation().clone(), origin_branch),
+            )
+            .await
     }
 
     async fn resolve(&self, operation: OperationId) -> Result<CommitOutcome, VolumeError> {
@@ -206,7 +186,7 @@ fn authority_known_content(
                 "live node references a missing file version",
             )
         })?;
-        known.include(&decode_file_version(version)?)?;
+        known.include(&decode_file_version(version)?);
     }
     Ok(known)
 }

@@ -64,7 +64,6 @@ impl NamespaceChange {
         &self,
         base: Option<VolumeSnapshot>,
     ) -> Result<VolumeSnapshot, VolumeError> {
-        self.validate(self.mutation.volume_id)?;
         let Some(validated) = self.validate_against(base.as_ref()).map_err(|_| {
             corrupt(
                 "read Managed transaction",

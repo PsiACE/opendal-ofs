@@ -45,11 +45,6 @@ resolution, no-op sync, structured status, and absence of credentials. It does
 not inspect object keys, metadata rows, state-file contents, private call order,
 or implementation-specific errors.
 
-The same workflow also checks the shared command surface: a Direct volume can
-be created and reopened by name, `mount` and `sync` are separate access
-commands, and unavailable Direct Sync or Managed Mount combinations fail before
-changing local or remote state. It does not start a FUSE session.
-
 `../managed-branch/workflow.sh` is the corresponding user-visible `branch/v1`
 contract. It covers the default branch, current, historical, and genesis forks,
 independent publication, deletion and name reuse, stale replica fencing,
@@ -60,7 +55,7 @@ replica files.
 Run the complete provider matrix and the staging/cache-loss regression with:
 
 ```text
-cargo x managed-sync test all
+tests/behavior/managed-sync/run.sh test all
 ```
 
 The performance command uses MinIO's native audit webhook as its request and
@@ -72,5 +67,5 @@ native HTTP request count, request bytes, response bytes, and SQL statement
 count without logging credentials or query parameters.
 
 ```text
-cargo x managed-sync perf --baseline <commit-or-binary>
+tests/behavior/managed-sync/run.sh perf --baseline <commit-or-binary>
 ```

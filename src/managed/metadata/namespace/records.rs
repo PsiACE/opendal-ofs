@@ -47,12 +47,6 @@ impl DecodedFileVersion {
             extent_map,
         })
     }
-
-    pub(crate) fn is_valid(&self) -> bool {
-        extent_map_valid(self.logical_size, &self.logical_digest, &self.extent_map)
-            && canonical_file_version_id(self.logical_size, &self.logical_digest, &self.extent_map)
-                == Some(self.id)
-    }
 }
 
 fn extent_map_valid(size: u64, digest: &[u8; 32], extent_map: &ExtentMap) -> bool {

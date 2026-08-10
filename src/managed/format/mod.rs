@@ -35,6 +35,26 @@ pub(crate) enum RecordDecodeError {
     TrailingBytes,
 }
 
+impl RecordEncodeError {
+    pub(crate) const fn message(&self) -> &'static str {
+        match self {
+            Self::Encode => "record cannot be encoded",
+            Self::TooLarge => "record exceeds its size limit",
+        }
+    }
+}
+
+impl RecordDecodeError {
+    pub(crate) const fn message(&self) -> &'static str {
+        match self {
+            Self::Envelope => "record format is invalid",
+            Self::Checksum => "record checksum is invalid",
+            Self::Decode => "record cannot be decoded",
+            Self::TrailingBytes => "record has trailing bytes",
+        }
+    }
+}
+
 /// The stable `magic || CBOR || SHA-256` envelope used by Managed v1 records.
 pub(crate) struct V1Record {
     magic: [u8; 8],

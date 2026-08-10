@@ -23,7 +23,7 @@ use crate::filesystem::{
 };
 use crate::managed::ManagedVolume;
 use crate::managed::error::{conflict, corrupt, invalid, unavailable};
-use crate::managed::format::{RecordDecodeError, RecordEncodeError, V1Record};
+use crate::managed::format::V1Record;
 use crate::managed::metadata::namespace::{
     MAX_HEAD_ENCODED_BYTES, NamespaceStore, StoredHead, decode_head, encode_head,
 };
@@ -40,8 +40,8 @@ const BRANCH_CAS_ATTEMPTS: usize = 8;
 
 #[derive(Clone)]
 pub struct BranchStore {
-    pub(crate) volume_id: VolumeId,
-    pub(crate) backend: RecordBackend,
+    volume_id: VolumeId,
+    backend: RecordBackend,
     data: Operator,
 }
 
@@ -83,7 +83,7 @@ impl BranchStore {
             StoredBranchRegistry::initial(self.volume_id, default_name.clone(), branch_id);
         let encoded_registry = REGISTRY_RECORD
             .encode(&registry)
-            .map_err(|error| encode_error("initialize Managed branches", error))?;
+            .map_err(|error| invalid("initialize Managed branches", error.message()))?;
         if !self
             .backend
             .create(
@@ -109,7 +109,7 @@ impl BranchStore {
         registry: &StoredBranchRegistry,
         default_name: BranchName,
     ) -> Result<BranchInfo, VolumeError> {
-        if registry.default_binding().map(|binding| binding.name) != Some(default_name.clone()) {
+        if registry.default_binding().name != default_name {
             return Err(conflict(
                 "initialize Managed branches",
                 "the volume has another default branch",
@@ -149,7 +149,9 @@ impl BranchStore {
         action: &'static str,
     ) -> Result<BranchInfo, VolumeError> {
         let id = registry
-            .branch_id(name)
+            .branches
+            .get(name)
+            .copied()
             .ok_or_else(|| invalid(action, "branch does not exist"))?;
         let (head, _) = self
             .read_head(id)
@@ -161,7 +163,9 @@ impl BranchStore {
     pub async fn open(&self, name: &BranchName) -> Result<ManagedVolume, VolumeError> {
         let (registry, _) = self.registry().await?;
         let id = registry
-            .branch_id(name)
+            .branches
+            .get(name)
+            .copied()
             .ok_or_else(|| invalid("open Managed branch", "branch does not exist"))?;
         let namespace = self.namespace(BranchBinding {
             name: name.clone(),
@@ -172,9 +176,7 @@ impl BranchStore {
 
     pub async fn open_default(&self) -> Result<ManagedVolume, VolumeError> {
         let (registry, _) = self.registry().await?;
-        let binding = registry
-            .default_binding()
-            .ok_or_else(|| corrupt("open default Managed branch", "default branch is missing"))?;
+        let binding = registry.default_binding();
         let namespace = self.namespace(binding);
         ManagedVolume::new(namespace, self.data.clone())
     }
@@ -182,7 +184,9 @@ impl BranchStore {
     pub async fn delete(&self, name: &BranchName) -> Result<(), VolumeError> {
         let (registry, _) = self.registry().await?;
         let branch_id = registry
-            .branch_id(name)
+            .branches
+            .get(name)
+            .copied()
             .ok_or_else(|| invalid("delete Managed branch", "branch does not exist"))?;
         if registry.default_branch == branch_id {
             return Err(invalid(
@@ -242,13 +246,13 @@ impl BranchStore {
 
         for _ in 0..BRANCH_CAS_ATTEMPTS {
             let (mut registry, revision) = self.registry().await?;
-            if registry.branch_id(name) != Some(branch_id) {
+            if registry.branches.get(name).copied() != Some(branch_id) {
                 return Ok(());
             }
             registry.branches.remove(name);
             let bytes = REGISTRY_RECORD
                 .encode(&registry)
-                .map_err(|error| encode_error("delete Managed branch", error))?;
+                .map_err(|error| invalid("delete Managed branch", error.message()))?;
             match self
                 .backend
                 .replace(REGISTRY_KEY, &revision, bytes, "delete Managed branch")
@@ -258,7 +262,7 @@ impl BranchStore {
                 Ok(false) => tokio::task::yield_now().await,
                 Err(error) => {
                     let (current, _) = self.registry().await?;
-                    return if current.branch_id(name) == Some(branch_id) {
+                    return if current.branches.get(name).copied() == Some(branch_id) {
                         Err(error)
                     } else {
                         Ok(())
@@ -287,13 +291,12 @@ impl BranchStore {
         }
         let source = match source {
             Some(source) => source,
-            None => registry
-                .default_binding()
-                .map(|binding| binding.name)
-                .ok_or_else(|| corrupt("fork Managed branch", "default branch is missing"))?,
+            None => registry.default_binding().name,
         };
         let source_id = registry
-            .branch_id(&source)
+            .branches
+            .get(&source)
+            .copied()
             .ok_or_else(|| invalid("fork Managed branch", "branch does not exist"))?;
         let (source_head, _) = self
             .read_head(source_id)
@@ -348,7 +351,7 @@ impl BranchStore {
         registry.branches.insert(target.clone(), target_id);
         let bytes = REGISTRY_RECORD
             .encode(&registry)
-            .map_err(|error| encode_error("fork Managed branch", error))?;
+            .map_err(|error| invalid("fork Managed branch", error.message()))?;
         match self
             .backend
             .replace(REGISTRY_KEY, &revision, bytes, "fork Managed branch")
@@ -399,7 +402,7 @@ impl BranchStore {
         };
         let registry: StoredBranchRegistry = REGISTRY_RECORD
             .decode(&bytes)
-            .map_err(|error| decode_error("read Managed branches", error))?;
+            .map_err(|error| corrupt("read Managed branches", error.message()))?;
         registry.validate(self.volume_id)?;
         Ok(Some((registry, revision)))
     }
@@ -427,18 +430,4 @@ impl BranchStore {
 
 fn head_key(branch: BranchId) -> String {
     format!("{ROOT}/heads/{branch}.ofs")
-}
-
-fn encode_error(action: &'static str, _: RecordEncodeError) -> VolumeError {
-    invalid(action, "branch record cannot be encoded")
-}
-
-fn decode_error(action: &'static str, error: RecordDecodeError) -> VolumeError {
-    let message = match error {
-        RecordDecodeError::Envelope => "branch record format is invalid",
-        RecordDecodeError::Checksum => "branch record checksum is invalid",
-        RecordDecodeError::Decode => "branch record cannot be decoded",
-        RecordDecodeError::TrailingBytes => "branch record has trailing bytes",
-    };
-    corrupt(action, message)
 }

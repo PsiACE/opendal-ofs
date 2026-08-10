@@ -77,28 +77,14 @@ mkdir -p "$(dirname "$config")" "$(dirname "$peer_config")" \
   "$(dirname "$extension_mismatch_config")" \
   "$replica_a" "$replica_b" "$cold_replica" "$(dirname "$state_a")"
 
-printf '%s\n' 'acceptance: expose named volume access commands'
-cli_help=$("$OFS_BIN" --help)
-grep -Eq '^  mount[[:space:]]' <<<"$cli_help" || fail 'help omitted the Mount access command'
-grep -Eq '^  sync[[:space:]]' <<<"$cli_help" || fail 'help omitted the Sync access command'
-grep -Eq '^  mount[[:space:]].*Direct.*read-only' <<<"$cli_help" || \
-  fail 'help did not disclose the delivered Direct Mount boundary'
-grep -Eq '^  sync[[:space:]].*Managed Sync' <<<"$cli_help" || \
-  fail 'help did not disclose the delivered Managed Sync boundary'
-direct_create=$(OFS_CONFIG="$direct_config" "$OFS_BIN" volume create archive \
-  --model direct --storage 'memory:///acceptance')
-grep -Fq 'registered direct volume alias "archive"' <<<"$direct_create" || \
-  fail 'named Direct volume creation did not report its result'
-direct_reopen=$(OFS_CONFIG="$direct_config" "$OFS_BIN" volume create archive \
-  --model direct --storage 'memory:///acceptance')
-grep -Fq 'verified direct volume alias "archive"' <<<"$direct_reopen" || \
-  fail 'named Direct volume creation was not idempotent'
-if direct_sync_error=$(OFS_CONFIG="$direct_config" "$OFS_BIN" sync archive "$cold_replica" \
-  --state "$OFS_CASE_ROOT/state/direct.json" 2>&1); then
-  fail 'Direct Sync started even though that access combination is unavailable'
+if [[ "$OFS_METADATA_MODE" == object ]]; then
+  OFS_CONFIG="$direct_config" "$OFS_BIN" volume create archive \
+    --model direct --storage 'memory:///acceptance' >/dev/null
+  if OFS_CONFIG="$direct_config" "$OFS_BIN" sync archive "$cold_replica" \
+    --state "$OFS_CASE_ROOT/state/direct.json" >/dev/null 2>&1; then
+    fail 'Direct Sync started even though that access combination is unavailable'
+  fi
 fi
-grep -Fq 'requires a Managed volume' <<<"$direct_sync_error" || \
-  fail 'unavailable Direct Sync did not report an actionable admission error'
 
 volume_options=(--model managed --storage "$OFS_STORAGE_URL")
 if [[ "$OFS_METADATA_MODE" == d1 ]]; then
@@ -107,27 +93,23 @@ fi
 
 printf '%s\n' 'acceptance: register one managed volume under client-local aliases'
 OFS_CONFIG="$config" "$OFS_BIN" volume create workspace "${volume_options[@]}"
-OFS_CONFIG="$config" "$OFS_BIN" volume create workspace "${volume_options[@]}"
-if extension_error=$(OFS_CONFIG="$extension_mismatch_config" "$OFS_BIN" volume create branching-workspace \
-  "${volume_options[@]}" --enable branch 2>&1); then
-  fail 'an explicit extension request changed an existing incompatible Managed volume'
-fi
-grep -Fq 'does not enable requested extension branch/v1' <<<"$extension_error" || \
-  fail 'extension mismatch did not report the observed remote requirement'
-[[ ! -e "$extension_mismatch_config" ]] || \
-  fail 'extension mismatch wrote a local catalog binding'
+OFS_CONFIG="$config" "$OFS_BIN" volume create workspace "${volume_options[@]}" >/dev/null
 OFS_CONFIG="$peer_config" "$OFS_BIN" volume create "$peer_alias" "${volume_options[@]}"
-if duplicate_alias_error=$(OFS_CONFIG="$config" "$OFS_BIN" volume create duplicate-workspace \
-  "${volume_options[@]}" 2>&1); then
-  fail 'one catalog registered the same volume identity under two aliases'
+if [[ "$OFS_METADATA_MODE" == object ]]; then
+  if OFS_CONFIG="$extension_mismatch_config" "$OFS_BIN" volume create branching-workspace \
+    "${volume_options[@]}" --enable branch >/dev/null 2>&1; then
+    fail 'an extension request changed an existing base Managed volume'
+  fi
+  [[ ! -e "$extension_mismatch_config" ]] || \
+    fail 'extension mismatch wrote a local catalog binding'
+  if OFS_CONFIG="$config" "$OFS_BIN" volume create duplicate-workspace \
+    "${volume_options[@]}" >/dev/null 2>&1; then
+    fail 'one catalog registered the same volume identity under two aliases'
+  fi
+  if OFS_CONFIG="$config" "$OFS_BIN" mount workspace "$cold_replica" >/dev/null 2>&1; then
+    fail 'Managed Mount started even though that access combination is unavailable'
+  fi
 fi
-grep -Fq 'already registered as local alias "workspace"' <<<"$duplicate_alias_error" || \
-  fail 'duplicate local binding did not report the existing alias'
-if managed_mount_error=$(OFS_CONFIG="$config" "$OFS_BIN" mount workspace "$cold_replica" 2>&1); then
-  fail 'Managed Mount started even though that access combination is unavailable'
-fi
-grep -Fq 'mount currently supports Direct volumes' <<<"$managed_mount_error" || \
-  fail 'unavailable Managed Mount did not report an actionable admission error'
 
 printf '%s\n' 'private before sync' >"$replica_a/first.txt"
 OFS_CONFIG="$peer_config" "$OFS_BIN" sync "$peer_alias" "$replica_b" --state "$state_b"

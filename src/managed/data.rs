@@ -30,7 +30,7 @@ use sha2::{Digest as _, Sha256};
 use tokio::sync::{OnceCell, mpsc, oneshot};
 
 use super::error::{corrupt, invalid, unavailable};
-use crate::filesystem::{VolumeError, VolumeErrorKind};
+use crate::filesystem::VolumeError;
 use crate::managed::format::{ContentRef, Extent, ExtentMap, LowerHex, SegmentRef, V1Record};
 use crate::managed::metadata::namespace::DecodedFileVersion;
 use crate::managed::metadata::object::ensure_immutable;
@@ -62,13 +62,7 @@ pub(crate) struct AuthorityKnownContent {
 }
 
 impl AuthorityKnownContent {
-    pub(crate) fn include(&mut self, version: &DecodedFileVersion) -> Result<(), VolumeError> {
-        if !version.is_valid() {
-            return Err(corrupt(
-                "derive authority-known content",
-                "live node references an invalid file version",
-            ));
-        }
+    pub(crate) fn include(&mut self, version: &DecodedFileVersion) {
         for extent in &version.extent_map.extents {
             self.contents
                 .entry(extent.content)
@@ -77,19 +71,11 @@ impl AuthorityKnownContent {
                     offset: extent.segment_offset,
                 });
         }
-        Ok(())
     }
 
     fn get(&self, content: &ContentRef) -> Option<StoredContent> {
         self.contents.get(content).copied()
     }
-}
-
-#[derive(Clone, Copy)]
-struct FastCdcSizes {
-    minimum: u32,
-    target: u32,
-    maximum: u32,
 }
 
 #[derive(Debug)]
@@ -228,7 +214,6 @@ impl ManagedData {
                         let contents = take_segment_contents(&mut new_content)?;
                         pending_bytes -= contents.keys().map(|content| content.length).sum::<u64>();
                         let segment = seal_segment(contents)?;
-                        debug_assert_eq!(segment.reference.length, segment.bytes.len() as u64);
                         created.extend(stage_segment(segment_staging, segment).await?);
                     }
                 }
@@ -249,7 +234,6 @@ impl ManagedData {
             while !new_content.is_empty() {
                 let contents = take_segment_contents(&mut new_content)?;
                 let segment = seal_segment(contents)?;
-                debug_assert_eq!(segment.reference.length, segment.bytes.len() as u64);
                 created.extend(stage_segment(segment_staging, segment).await?);
             }
 
@@ -331,8 +315,6 @@ impl ManagedData {
                     &key,
                     &segment.to_bytes(),
                     "create data segment",
-                    VolumeErrorKind::Corrupt,
-                    "immutable data segment changed",
                 )
                 .await
             })
@@ -413,19 +395,12 @@ impl ManagedData {
         );
         // One fetch already deduplicates a segment within this batch. Foyer is
         // reserved for complete segments reused by separate fetch windows.
-        let complete = BTreeSet::new();
-        let cached = if complete.is_empty() {
-            None
-        } else {
-            Some(self.cached_operator().await?)
-        };
         let fetched = self
             .fetch_segments(
                 &demands,
-                &complete,
+                &BTreeSet::new(),
                 segment_staging,
                 staged_segments,
-                cached.as_ref(),
                 concurrency,
             )
             .await?;
@@ -490,18 +465,12 @@ impl ManagedData {
             let end = extent_window_end(extents, start);
             let demands = segment_demands(extents[start..end].iter());
             let complete = complete_segments(&demands, cache_complete_segments, &reusable);
-            let cached = if complete.is_empty() {
-                None
-            } else {
-                Some(self.cached_operator().await?)
-            };
             let fetched = match self
                 .fetch_segments(
                     &demands,
                     &complete,
                     segment_staging,
                     staged_segments,
-                    cached.as_ref(),
                     concurrency,
                 )
                 .await
@@ -535,9 +504,14 @@ impl ManagedData {
         complete: &BTreeSet<SegmentRef>,
         segment_staging: Option<&Operator>,
         staged_segments: &BTreeSet<SegmentRef>,
-        cached: Option<&Operator>,
         concurrency: NonZeroUsize,
     ) -> Result<FetchedContent, VolumeError> {
+        let cached = if complete.is_empty() {
+            None
+        } else {
+            Some(self.cached_operator().await?)
+        };
+        let cached = cached.as_ref();
         // Schedule at the segment boundary. Reader::fetch owns range merging;
         // the outer bound gives concurrency one meaning across the data plane.
         stream::iter(demands.iter())
@@ -553,11 +527,7 @@ impl ManagedData {
                             unavailable("read data segment", "storage operation failed")
                         }
                     })?;
-                    verify_complete_demands(segment, &bytes, demands)?;
-                    return demands
-                        .iter()
-                        .map(|demand| slice_demand(&bytes, *demand).map(|bytes| (demand.2, bytes)))
-                        .collect::<Result<Vec<_>, VolumeError>>();
+                    return complete_demand_contents(segment, &bytes, demands);
                 }
                 if complete.contains(&segment) {
                     let cached = cached.expect("complete segment reads have a Foyer operator");
@@ -565,11 +535,7 @@ impl ManagedData {
                         .read(&segment_key(segment))
                         .await
                         .map_err(|error| referenced_segment_error("read data segment", error))?;
-                    verify_complete_demands(segment, &bytes, demands)?;
-                    return demands
-                        .iter()
-                        .map(|demand| slice_demand(&bytes, *demand).map(|bytes| (demand.2, bytes)))
-                        .collect::<Result<Vec<_>, VolumeError>>();
+                    return complete_demand_contents(segment, &bytes, demands);
                 }
 
                 let reader = self
@@ -772,24 +738,16 @@ fn demand_key(extent: &Extent) -> DemandKey {
     (extent.segment_offset, extent.content.length, extent.content)
 }
 
-fn verify_complete_demands(
+fn complete_demand_contents(
     segment: SegmentRef,
     bytes: &Buffer,
     demands: &BTreeSet<DemandKey>,
-) -> Result<(), VolumeError> {
+) -> Result<Vec<(ContentRef, Buffer)>, VolumeError> {
     verify_complete_segment(segment, bytes)?;
-    for demand @ (offset, length, _) in demands {
-        let start = usize::try_from(*offset)
-            .map_err(|_| corrupt("read data segment", "extent offset exceeds this process"))?;
-        let length = usize::try_from(*length)
-            .map_err(|_| corrupt("read data segment", "extent length exceeds this process"))?;
-        let end = start
-            .checked_add(length)
-            .filter(|end| *end <= bytes.len())
-            .ok_or_else(|| corrupt("read data segment", "extent exceeds data segment"))?;
-        verify_range_demand(&bytes.slice(start..end), *demand)?;
-    }
-    Ok(())
+    demands
+        .iter()
+        .map(|demand| slice_demand(bytes, *demand).map(|content| (demand.2, content)))
+        .collect()
 }
 
 fn verify_range_demand(bytes: &Buffer, demand: DemandKey) -> Result<(), VolumeError> {
@@ -876,18 +834,7 @@ async fn stream_file(
         return Ok((size, content.digest));
     }
 
-    let digest = stream_fastcdc(
-        source,
-        path,
-        size,
-        FastCdcSizes {
-            minimum: FASTCDC_MINIMUM_SIZE,
-            target: FASTCDC_TARGET_SIZE,
-            maximum: FASTCDC_MAXIMUM_SIZE,
-        },
-        sender,
-    )
-    .await?;
+    let digest = stream_fastcdc(source, path, size, sender).await?;
     Ok((size, digest))
 }
 
@@ -895,7 +842,6 @@ async fn stream_fastcdc(
     source: &Operator,
     path: &str,
     size: u64,
-    sizes: FastCdcSizes,
     sender: &mpsc::Sender<PreparedChunk>,
 ) -> Result<[u8; 32], VolumeError> {
     let reader = source
@@ -912,7 +858,12 @@ async fn stream_fastcdc(
                 .map_err(std::io::Error::other)
         }));
     let reader = reader.into_async_read();
-    let mut chunker = AsyncStreamCDC::new(reader, sizes.minimum, sizes.target, sizes.maximum);
+    let mut chunker = AsyncStreamCDC::new(
+        reader,
+        FASTCDC_MINIMUM_SIZE,
+        FASTCDC_TARGET_SIZE,
+        FASTCDC_MAXIMUM_SIZE,
+    );
     let chunks = chunker.as_stream();
     futures::pin_mut!(chunks);
     let mut logical = Sha256::new();

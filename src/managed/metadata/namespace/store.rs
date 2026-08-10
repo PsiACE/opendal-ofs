@@ -17,16 +17,16 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::{
-    ChangeSegmentRef, CheckpointRef, NamespaceChange, StoredChangeSegment, StoredCheckpoint,
-    StoredCommittedResult, StoredNamespaceState, recover_namespace, replay_tail_from,
-    require_request_digest, validate_publication,
+    ChangeSegmentRef, CheckpointRef, NamespaceChange, StoredChangeSegment, StoredCommittedResult,
+    StoredNamespaceState, recover_namespace, replay_tail_from, require_request_digest,
+    validate_publication,
 };
 use crate::filesystem::{
     BranchBinding, BranchId, ChangeCursor, CommitOutcome, OperationId, VolumeError,
     VolumeErrorKind, VolumeId, VolumeSnapshot,
 };
 use crate::managed::error::{conflict, corrupt, invalid, unavailable};
-use crate::managed::format::{LowerHex, RecordDecodeError, RecordEncodeError, V1Record};
+use crate::managed::format::{LowerHex, V1Record};
 use crate::managed::metadata::object::{ensure_immutable, read};
 use crate::managed::metadata::record::{RecordBackend, Revision};
 
@@ -46,21 +46,9 @@ const MAX_CHANGE_SEGMENT_BYTES: usize = 16 * 1024 * 1024;
 const COMPRESSION_LEVEL: i32 = 3;
 
 #[derive(Clone, Debug)]
-pub(crate) struct NamespaceObservation {
-    pub snapshot: VolumeSnapshot,
-    witness: NamespaceWitness,
-}
-
-#[derive(Clone, Debug)]
 pub(crate) struct NamespaceWitness {
-    pub(crate) revision: Revision,
-    pub(crate) head: StoredHead,
-}
-
-impl NamespaceObservation {
-    pub(crate) fn into_parts(self) -> (VolumeSnapshot, NamespaceWitness) {
-        (self.snapshot, self.witness)
-    }
+    revision: Revision,
+    head: StoredHead,
 }
 
 #[derive(Clone)]
@@ -111,21 +99,10 @@ impl NamespaceStore {
         self.binding.as_ref().map(|binding| binding.id)
     }
 
-    pub(crate) async fn observe(&self) -> Result<Option<NamespaceObservation>, VolumeError> {
-        self.observe_from_optional(None).await
-    }
-
-    pub(crate) async fn observe_from(
-        &self,
-        base: &VolumeSnapshot,
-    ) -> Result<Option<NamespaceObservation>, VolumeError> {
-        self.observe_from_optional(Some(base)).await
-    }
-
-    async fn observe_from_optional(
+    pub(crate) async fn observe(
         &self,
         base: Option<&VolumeSnapshot>,
-    ) -> Result<Option<NamespaceObservation>, VolumeError> {
+    ) -> Result<Option<(VolumeSnapshot, NamespaceWitness)>, VolumeError> {
         let Some((head, revision)) = self.read_bound_head("read Managed namespace").await? else {
             return Ok(None);
         };
@@ -136,26 +113,17 @@ impl NamespaceStore {
             && base.volume_id == self.volume_id
             && let Some(snapshot) = replay_tail_from(base, state)?
         {
-            return Ok(Some(NamespaceObservation {
-                snapshot,
-                witness: NamespaceWitness { revision, head },
-            }));
+            return Ok(Some((snapshot, NamespaceWitness { revision, head })));
         }
         if let Some(base) = base
             && base.volume_id == self.volume_id
             && let Some(snapshot) = self.replay_retained_from(base, state).await?
         {
-            return Ok(Some(NamespaceObservation {
-                snapshot,
-                witness: NamespaceWitness { revision, head },
-            }));
+            return Ok(Some((snapshot, NamespaceWitness { revision, head })));
         }
         let checkpoint = self.read_checkpoint(state.checkpoint).await?;
         let snapshot = recover_namespace(checkpoint, state, self.volume_id)?;
-        Ok(Some(NamespaceObservation {
-            snapshot,
-            witness: NamespaceWitness { revision, head },
-        }))
+        Ok(Some((snapshot, NamespaceWitness { revision, head })))
     }
 
     pub(crate) async fn publish(
@@ -173,11 +141,21 @@ impl NamespaceStore {
         let cursor = change.cursor();
         let (request_digest, change_bytes) = change.fingerprint()?;
         let (head, revision, base) = match observed {
-            Some((witness, snapshot)) => (
-                witness.head.clone(),
-                Some(witness.revision.clone()),
-                Some(snapshot),
-            ),
+            Some((witness, snapshot)) => {
+                if witness.head.volume_id != self.volume_id
+                    || witness.head.branch_id != self.branch_id()
+                {
+                    return Err(invalid(
+                        "publish Managed namespace",
+                        "observation belongs to another authority",
+                    ));
+                }
+                (
+                    witness.head.clone(),
+                    Some(witness.revision.clone()),
+                    Some(snapshot),
+                )
+            }
             None if self.branch_id().is_some() => {
                 let (head, revision) = self
                     .read_bound_head("publish Managed namespace")
@@ -227,14 +205,13 @@ impl NamespaceStore {
 
         let state = match &head.state {
             None => {
-                let result = StoredCommittedResult::from_change(&change, request_digest)?;
+                let result = StoredCommittedResult::from_change(&change, request_digest);
                 let target = change.apply_validated(
                     base.cloned(),
                     validated.take().expect("publication was validated above"),
                 );
-                let checkpoint = StoredCheckpoint { snapshot: target };
                 let mut state = StoredNamespaceState {
-                    checkpoint: self.write_checkpoint(&checkpoint).await?,
+                    checkpoint: self.write_checkpoint(&target).await?,
                     checkpoint_cursor: cursor,
                     tail: Vec::new(),
                     segments: Vec::new(),
@@ -256,7 +233,7 @@ impl NamespaceStore {
                     let mut segments = current.segments.clone();
                     let mut archived = current.clone();
                     archived.tail.push(change.clone());
-                    let segment = StoredChangeSegment::new(self.volume_id, &archived)?;
+                    let segment = StoredChangeSegment::new(&archived);
                     segments.push(self.write_change_segment(&segment).await?);
                     let excess = segments
                         .len()
@@ -276,9 +253,8 @@ impl NamespaceStore {
                         base.cloned(),
                         validated.take().expect("publication was validated above"),
                     );
-                    let checkpoint = StoredCheckpoint { snapshot: target };
                     let mut next = StoredNamespaceState {
-                        checkpoint: self.write_checkpoint(&checkpoint).await?,
+                        checkpoint: self.write_checkpoint(&target).await?,
                         checkpoint_cursor: cursor,
                         tail: Vec::new(),
                         segments,
@@ -288,7 +264,7 @@ impl NamespaceStore {
                     next.record_outcome(StoredCommittedResult::from_change(
                         &change,
                         request_digest,
-                    )?);
+                    ));
                     next
                 } else {
                     let mut next = current.clone();
@@ -296,7 +272,7 @@ impl NamespaceStore {
                     next.record_outcome(StoredCommittedResult::from_change(
                         next.tail.last().expect("change was appended above"),
                         request_digest,
-                    )?);
+                    ));
                     next
                 }
             }
@@ -421,7 +397,7 @@ impl NamespaceStore {
         };
         let result: StoredCommittedResult = OPERATION_RECORD
             .decode(&bytes)
-            .map_err(|error| record_decode_error("resolve Managed publication", error))?;
+            .map_err(|error| corrupt("resolve Managed publication", error.message()))?;
         result.validate()?;
         if result.origin_branch != self.branch_id() || result.operation != operation {
             return Err(corrupt(
@@ -435,14 +411,12 @@ impl NamespaceStore {
     async fn write_operation(&self, result: &StoredCommittedResult) -> Result<(), VolumeError> {
         let bytes = OPERATION_RECORD
             .encode(result)
-            .map_err(|error| record_encode_error("record Managed publication", error))?;
+            .map_err(|error| invalid("record Managed publication", error.message()))?;
         ensure_immutable(
             &self.data,
             &self.operation_key(result.operation),
             &bytes,
             "record Managed publication",
-            VolumeErrorKind::Corrupt,
-            "immutable operation receipt changed",
         )
         .await
     }
@@ -471,9 +445,9 @@ impl NamespaceStore {
             result @ (CommitOutcome::Committed(_) | CommitOutcome::Unknown) => Ok(result),
             _ => Ok(CommitOutcome::Conflict {
                 observed: self
-                    .observe()
+                    .observe(None)
                     .await?
-                    .map_or(ChangeCursor::Genesis, |value| value.snapshot.cursor),
+                    .map_or(ChangeCursor::Genesis, |(snapshot, _)| snapshot.cursor),
             }),
         }
     }
@@ -481,7 +455,7 @@ impl NamespaceStore {
     pub(crate) async fn read_checkpoint(
         &self,
         reference: CheckpointRef,
-    ) -> Result<StoredCheckpoint, VolumeError> {
+    ) -> Result<VolumeSnapshot, VolumeError> {
         let encoded_length = usize::try_from(reference.length)
             .ok()
             .filter(|length| *length <= MAX_CHECKPOINT_ENCODED_BYTES)
@@ -518,19 +492,12 @@ impl NamespaceStore {
                 "checkpoint identity is invalid",
             ));
         }
-        let checkpoint = decode_checkpoint(&bytes)?;
-        if checkpoint.snapshot.volume_id != self.volume_id {
-            return Err(corrupt(
-                "read Managed namespace",
-                "checkpoint volume is invalid",
-            ));
-        }
-        Ok(checkpoint)
+        decode_checkpoint(&bytes)
     }
 
     async fn write_checkpoint(
         &self,
-        checkpoint: &StoredCheckpoint,
+        checkpoint: &VolumeSnapshot,
     ) -> Result<CheckpointRef, VolumeError> {
         let bytes = encode_checkpoint(checkpoint)?;
         let reference = CheckpointRef {
@@ -542,8 +509,6 @@ impl NamespaceStore {
             &checkpoint_key(reference.digest),
             &bytes,
             "checkpoint Managed namespace",
-            VolumeErrorKind::Corrupt,
-            "immutable checkpoint changed",
         )
         .await?;
         Ok(reference)
@@ -587,9 +552,9 @@ impl NamespaceStore {
         }
         let segment: StoredChangeSegment = CHANGE_SEGMENT_RECORD
             .decode(&bytes)
-            .map_err(|error| record_decode_error("read Managed change segment", error))?;
+            .map_err(|error| corrupt("read Managed change segment", error.message()))?;
         segment.validate(self.volume_id)?;
-        if segment.checkpoint_cursor != reference.start || segment.cursor() != reference.end {
+        if segment.start() != reference.start || segment.cursor() != reference.end {
             return Err(corrupt(
                 "read Managed change segment",
                 "change segment disagrees with its index",
@@ -604,21 +569,19 @@ impl NamespaceStore {
     ) -> Result<ChangeSegmentRef, VolumeError> {
         let bytes = CHANGE_SEGMENT_RECORD
             .encode(segment)
-            .map_err(|error| record_encode_error("write Managed change segment", error))?;
+            .map_err(|error| invalid("write Managed change segment", error.message()))?;
         let digest: [u8; 32] = Sha256::digest(&bytes).into();
         ensure_immutable(
             &self.data,
             &change_segment_key(digest),
             &bytes,
             "archive Managed changes",
-            VolumeErrorKind::Corrupt,
-            "immutable namespace change segment changed",
         )
         .await?;
         Ok(ChangeSegmentRef {
             digest,
             length: bytes.len() as u64,
-            start: segment.checkpoint_cursor,
+            start: segment.start(),
             end: segment.cursor(),
         })
     }
@@ -639,7 +602,7 @@ impl NamespaceStore {
             return Ok(None);
         };
         let segment = self.read_change_segment(*reference).await?;
-        let length = usize::try_from(sequence - segment.checkpoint_cursor.sequence())
+        let length = usize::try_from(sequence - segment.start().sequence())
             .ok()
             .filter(|length| *length <= segment.changes.len())
             .ok_or_else(|| {
@@ -654,7 +617,7 @@ impl NamespaceStore {
             .filter(|result| result.cursor.sequence() <= sequence);
         Ok(Some(StoredNamespaceState {
             checkpoint: segment.checkpoint,
-            checkpoint_cursor: segment.checkpoint_cursor,
+            checkpoint_cursor: segment.start(),
             tail: segment.changes[..length].to_vec(),
             segments: current.segments[..position].to_vec(),
             operation_prefixes: current.operation_prefixes.clone(),
@@ -676,7 +639,7 @@ impl NamespaceStore {
         let mut snapshot = base.clone();
         for (offset, reference) in state.segments[position..].iter().enumerate() {
             let segment = self.read_change_segment(*reference).await?;
-            let start = if snapshot.cursor == segment.checkpoint_cursor {
+            let start = if snapshot.cursor == segment.start() {
                 Some(0)
             } else if snapshot.cursor == segment.cursor() {
                 Some(segment.changes.len())
@@ -803,7 +766,7 @@ impl StoredHead {
     }
 }
 
-fn encode_checkpoint(checkpoint: &StoredCheckpoint) -> Result<Vec<u8>, VolumeError> {
+fn encode_checkpoint(checkpoint: &VolumeSnapshot) -> Result<Vec<u8>, VolumeError> {
     let mut body = Vec::new();
     ciborium::into_writer(checkpoint, &mut body).map_err(|_| {
         invalid(
@@ -846,7 +809,7 @@ fn encode_checkpoint(checkpoint: &StoredCheckpoint) -> Result<Vec<u8>, VolumeErr
     Ok(bytes)
 }
 
-fn decode_checkpoint(bytes: &[u8]) -> Result<StoredCheckpoint, VolumeError> {
+fn decode_checkpoint(bytes: &[u8]) -> Result<VolumeSnapshot, VolumeError> {
     if bytes.len() > MAX_CHECKPOINT_ENCODED_BYTES {
         return Err(corrupt(
             "read Managed namespace",
@@ -954,25 +917,11 @@ pub(crate) fn decode_head(bytes: &[u8]) -> Result<StoredHead, VolumeError> {
     decode_value(&body)
 }
 
-fn record_encode_error(action: &'static str, error: RecordEncodeError) -> VolumeError {
-    match error {
-        RecordEncodeError::Encode => invalid(action, "record cannot be encoded"),
-        RecordEncodeError::TooLarge => invalid(action, "record exceeds its size limit"),
-    }
-}
-
-fn record_decode_error(action: &'static str, error: RecordDecodeError) -> VolumeError {
-    let message = match error {
-        RecordDecodeError::Envelope => "record format is invalid",
-        RecordDecodeError::Checksum => "record checksum is invalid",
-        RecordDecodeError::Decode => "record cannot be decoded",
-        RecordDecodeError::TrailingBytes => "record has trailing bytes",
-    };
-    corrupt(action, message)
-}
-
 fn committed_result(change: &NamespaceChange) -> Result<StoredCommittedResult, VolumeError> {
-    StoredCommittedResult::from_change(change, change.fingerprint()?.0)
+    Ok(StoredCommittedResult::from_change(
+        change,
+        change.fingerprint()?.0,
+    ))
 }
 
 fn decode_value<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, VolumeError> {
@@ -1005,7 +954,8 @@ mod tests {
 
     use super::*;
     use crate::filesystem::{
-        DirectoryRecord, NodeAttributes, NodeId, NodeKind, NodeRecord, VolumePublication,
+        BranchName, DirectoryRecord, NodeAttributes, NodeId, NodeKind, NodeRecord,
+        VolumePublication,
     };
     use crate::managed::metadata::namespace::managed_generation;
     use crate::managed::metadata::record::RecordBackend;
@@ -1047,22 +997,54 @@ mod tests {
         let operation = OperationId::from_bytes([2; 16]);
         let cursor = ChangeCursor::at(NonZeroU64::MIN, operation);
         let current = checkpoint_snapshot(volume_id, cursor, NodeId::from_bytes([3; 16]));
-        let current_bytes = encode_checkpoint(&StoredCheckpoint {
-            snapshot: current.clone(),
-        })
-        .unwrap();
-        assert_eq!(
-            decode_checkpoint(&current_bytes)
-                .unwrap()
-                .recover(volume_id)
-                .unwrap(),
-            current
-        );
+        let current_bytes = encode_checkpoint(&current).unwrap();
+        assert_eq!(decode_checkpoint(&current_bytes).unwrap(), current);
         let mut corrupt = current_bytes.clone();
         *corrupt.last_mut().unwrap() ^= 1;
         assert_eq!(
             decode_checkpoint(&corrupt).unwrap_err().kind(),
             VolumeErrorKind::Corrupt
+        );
+    }
+
+    #[tokio::test]
+    async fn publication_rejects_another_branch_observation() {
+        let operator = Operator::new(services::Memory::default()).unwrap().finish();
+        let volume_id = VolumeId::from_bytes([4; 16]);
+        let source = BranchId::from_bytes([5; 16]);
+        let target = BranchId::from_bytes([6; 16]);
+        let store = NamespaceStore::branch(
+            volume_id,
+            operator.clone(),
+            RecordBackend::Object(operator),
+            BranchBinding {
+                name: BranchName::parse("target").unwrap(),
+                id: target,
+            },
+            "target-head".to_owned(),
+        );
+        let first = OperationId::from_bytes([1; 16]);
+        let base = checkpoint_snapshot(
+            volume_id,
+            ChangeCursor::at(NonZeroU64::MIN, first),
+            NodeId::from_bytes([7; 16]),
+        );
+        let operation = OperationId::from_bytes([2; 16]);
+        let mut next = base.clone();
+        next.cursor = ChangeCursor::at(NonZeroU64::new(2).unwrap(), operation);
+        let publication = VolumePublication::between(operation, Some(&base), next).unwrap();
+        let change = NamespaceChange::new(publication.mutation().clone(), Some(target));
+        let witness = NamespaceWitness {
+            revision: Revision::Object("shared-etag".to_owned()),
+            head: StoredHead::unborn(volume_id, Some(source)),
+        };
+        assert_eq!(
+            store
+                .publish(Some((&witness, &base)), change)
+                .await
+                .unwrap_err()
+                .kind(),
+            VolumeErrorKind::Invalid
         );
     }
 
@@ -1097,15 +1079,13 @@ mod tests {
             length: 1,
         };
         let segment = StoredChangeSegment {
-            volume_id,
             checkpoint,
-            checkpoint_cursor: retained.cursor,
             changes,
         };
         let reference = store.write_change_segment(&segment).await.unwrap();
         let latest = segment.changes.last().unwrap();
         let request_digest = latest.fingerprint().unwrap().0;
-        let outcome = StoredCommittedResult::from_change(latest, request_digest).unwrap();
+        let outcome = StoredCommittedResult::from_change(latest, request_digest);
         let mut state = StoredNamespaceState {
             checkpoint,
             checkpoint_cursor: segment.cursor(),

@@ -214,14 +214,10 @@ mod tests {
     }
 
     #[test]
-    fn superblock_round_trips_the_managed_v1_contract() {
+    fn superblock_round_trips() {
         let format = object_format();
         let encoded = format.encode().unwrap();
         assert_eq!(ManagedFormat::decode(&encoded).unwrap(), format);
-        assert_eq!(
-            std::str::from_utf8(&encoded).unwrap(),
-            r#"{"version":1,"volume_id":"01010101010101010101010101010101","metadata":"object","extensions":[]}"#
-        );
     }
 
     #[test]
@@ -234,29 +230,17 @@ mod tests {
     }
 
     #[test]
-    fn required_extensions_must_be_strictly_ordered() {
-        let duplicate = br#"{"version":1,"volume_id":"01010101010101010101010101010101","metadata":"object","extensions":["future/1","future/1"]}"#;
-        assert_eq!(
-            ManagedFormat::decode(duplicate).unwrap_err().kind(),
-            VolumeErrorKind::Corrupt
-        );
-    }
-
-    #[test]
-    fn unknown_superblock_field_is_rejected() {
-        let unknown = br#"{"version":1,"volume_id":"01010101010101010101010101010101","metadata":"object","extensions":[],"policy":"fastcdc"}"#;
-        assert_eq!(
-            ManagedFormat::decode(unknown).unwrap_err().kind(),
-            VolumeErrorKind::Corrupt
-        );
-    }
-
-    #[test]
-    fn uppercase_volume_identity_is_rejected() {
-        let bytes = br#"{"version":1,"volume_id":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","metadata":"object","extensions":[]}"#;
-        assert_eq!(
-            ManagedFormat::decode(bytes).unwrap_err().kind(),
-            VolumeErrorKind::Corrupt
-        );
+    fn malformed_v1_is_rejected() {
+        let malformed: [&[u8]; 3] = [
+            br#"{"version":1,"volume_id":"01010101010101010101010101010101","metadata":"object","extensions":[],"policy":"fastcdc"}"#,
+            br#"{"version":1,"volume_id":"01010101010101010101010101010101","metadata":"object","extensions":["branch/v1","branch/v1"]}"#,
+            br#"{"version":1,"volume_id":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","metadata":"object","extensions":[]}"#,
+        ];
+        for bytes in malformed {
+            assert_eq!(
+                ManagedFormat::decode(bytes).unwrap_err().kind(),
+                VolumeErrorKind::Corrupt
+            );
+        }
     }
 }

@@ -29,7 +29,7 @@ schedule=(baseline candidate candidate baseline baseline candidate)
 
 usage() {
   cat <<'EOF'
-Usage: cargo x managed-sync perf [OPTIONS] [OUTPUT]
+Usage: tests/performance/managed-sync/run.sh [OPTIONS] [OUTPUT]
 
 Options:
   --baseline REF_OR_BINARY

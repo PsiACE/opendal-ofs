@@ -32,9 +32,9 @@ pub(crate) fn build_publication<V: Volume>(
 ) -> Result<VolumePublication> {
     let target_manifest = staged.manifest();
     let volume = volume_api.id();
-    let authoritative_snapshot = authoritative.map(SnapshotTree::snapshot);
+    let authoritative_snapshot = authoritative.map(|tree| tree.snapshot);
     let empty_paths = BTreeMap::new();
-    let old_paths = authoritative.map_or(&empty_paths, SnapshotTree::paths);
+    let old_paths = authoritative.map_or(&empty_paths, |tree| &tree.paths);
     let parent = authoritative_snapshot.map_or(ChangeCursor::Genesis, |state| state.cursor);
     if authoritative_snapshot.is_some_and(|state| state.volume_id != volume) {
         bail!("namespace and requested volume disagree");
@@ -49,7 +49,7 @@ pub(crate) fn build_publication<V: Volume>(
     let root = authoritative_snapshot.map_or_else(NodeId::generate, |state| state.root);
     let mut identities = BTreeMap::from([(String::new(), root)]);
     let mut used = BTreeSet::from([root]);
-    for (path, entry) in target_manifest.entries() {
+    for (path, entry) in &target_manifest.entries {
         let kind = node_kind(entry.local.kind);
         let identity = old_paths
             .get(path)
@@ -66,7 +66,7 @@ pub(crate) fn build_publication<V: Volume>(
     let mut file_versions = BTreeMap::new();
     for (path, kind) in std::iter::once(("", NodeKind::Directory)).chain(
         target_manifest
-            .entries()
+            .entries
             .iter()
             .map(|(path, entry)| (path.as_str(), node_kind(entry.local.kind))),
     ) {
@@ -79,7 +79,7 @@ pub(crate) fn build_publication<V: Volume>(
                 .resolve_version(file, authoritative_snapshot)
                 .with_context(|| format!("resolve target file version for {path:?}"))?
                 .clone();
-            let size = target_manifest.entries()[path].local.size;
+            let size = target_manifest.entries[path].local.size;
             if version.logical_size != size {
                 bail!("target file version for {path:?} does not match the local file");
             }
@@ -95,7 +95,7 @@ pub(crate) fn build_publication<V: Volume>(
         };
         let attributes =
             target_manifest
-                .entries()
+                .entries
                 .get(path)
                 .map_or_else(NodeAttributes::default, |entry| NodeAttributes {
                     executable: entry.local.executable,
@@ -118,7 +118,7 @@ pub(crate) fn build_publication<V: Volume>(
     let mut directories = BTreeMap::new();
     for (path, kind) in std::iter::once(("", NodeKind::Directory)).chain(
         target_manifest
-            .entries()
+            .entries
             .iter()
             .map(|(path, entry)| (path.as_str(), node_kind(entry.local.kind))),
     ) {
@@ -179,14 +179,14 @@ fn directory_entries(
 ) -> Result<BTreeMap<String, BTreeMap<String, DirectoryEntry>>> {
     let mut directories = BTreeMap::<String, BTreeMap<String, DirectoryEntry>>::new();
     directories.insert(String::new(), BTreeMap::new());
-    for (path, entry) in target.entries() {
+    for (path, entry) in &target.entries {
         let (parent, name) = split_path(path)?;
         if name.is_empty() {
             bail!("local path {path:?} is invalid");
         }
         if !parent.is_empty()
             && !target
-                .entries()
+                .entries
                 .get(parent)
                 .is_some_and(|entry| entry.local.kind == LocalKind::Directory)
         {

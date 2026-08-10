@@ -44,8 +44,8 @@ pub(crate) struct LocalEntry {
 /// One stable, path-sorted observation of an ordinary directory.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct LocalTree {
-    root: PathBuf,
-    entries: BTreeMap<String, LocalEntry>,
+    pub(super) root: PathBuf,
+    pub(super) entries: BTreeMap<String, LocalEntry>,
 }
 
 impl LocalTree {
@@ -113,28 +113,6 @@ impl LocalTree {
             root: root.to_owned(),
             entries,
         })
-    }
-
-    pub(crate) fn root(&self) -> &Path {
-        &self.root
-    }
-
-    pub(crate) fn entries(&self) -> &BTreeMap<String, LocalEntry> {
-        &self.entries
-    }
-
-    pub(crate) fn operator(&self) -> Result<Operator> {
-        fs_operator(&self.root)
-    }
-
-    pub(crate) fn from_entries(
-        root: impl Into<PathBuf>,
-        entries: BTreeMap<String, LocalEntry>,
-    ) -> Self {
-        Self {
-            root: root.into(),
-            entries,
-        }
     }
 }
 

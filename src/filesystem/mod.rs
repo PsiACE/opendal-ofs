@@ -33,10 +33,11 @@ pub use identity::{ChangeCursor, FileVersionId, Generation, NodeId, OperationId,
 pub use model::VolumeModel;
 pub use namespace::{DirectoryEntry, NodeAttributes, NodeKind};
 pub use publication::CommitOutcome;
+#[cfg(test)]
+pub(crate) use volume::NodePrecondition;
 pub(crate) use volume::VolumeMutation;
 pub(crate) use volume::validate_portable_paths;
 pub use volume::{
-    DirectoryPrecondition, DirectoryRecord, FileVersion, MaterializeRequest, NodePrecondition,
-    NodeRecord, Volume, VolumeError, VolumeErrorKind, VolumeObservation, VolumePublication,
-    VolumeSnapshot,
+    DirectoryRecord, FileVersion, MaterializeRequest, NodeRecord, Volume, VolumeError,
+    VolumeErrorKind, VolumeObservation, VolumePublication, VolumeSnapshot,
 };

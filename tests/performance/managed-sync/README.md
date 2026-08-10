@@ -3,7 +3,7 @@
 Run the comparison with an executable, branch, or commit:
 
 ```shell
-cargo x managed-sync perf \
+tests/performance/managed-sync/run.sh \
   --baseline managed-sync-layers \
   --rounds 20 \
   .local/evidence/managed-sync-ab

@@ -20,6 +20,7 @@ use crate::filesystem::{
     NodeRecord, OperationId, VolumeId, VolumeSnapshot,
 };
 use crate::sync::local::{LocalEntry, LocalKind};
+use crate::sync::path::SnapshotTree;
 use crate::sync::staging::TargetManifest;
 
 const STATE_FORMAT: &str = "ofs-sync-replica";
@@ -84,14 +85,14 @@ impl ReplicaState {
 
     pub(crate) fn at_common(
         identity: AuthorityIdentity,
-        authority: VolumeSnapshot,
+        authority: &SnapshotTree<'_>,
         installed: BTreeMap<String, LocalEntry>,
     ) -> Result<Self> {
-        validate_installed(&authority, &installed)?;
+        validate_installed(authority, &installed)?;
         Ok(Self {
             volume: identity.volume,
             branch: identity.branch,
-            authority: Some(authority),
+            authority: Some(authority.snapshot.clone()),
             installed,
             pending: None,
             conflicts: Vec::new(),
@@ -198,7 +199,7 @@ impl TryFrom<StoredState> for ReplicaState {
             .map(|snapshot| snapshot.into_snapshot(stored.volume))
             .transpose()?;
         if let Some(snapshot) = &authority {
-            validate_installed(snapshot, &stored.installed)?;
+            validate_installed(&SnapshotTree::new(snapshot)?, &stored.installed)?;
         }
         Ok(Self {
             volume: stored.volume,
@@ -257,27 +258,25 @@ impl StoredSnapshot {
             directories,
             file_versions,
         };
-        snapshot
-            .validate_structure()
-            .context("replica authority snapshot is invalid")?;
         Ok(snapshot)
     }
 }
 
 fn validate_installed(
-    snapshot: &VolumeSnapshot,
+    tree: &SnapshotTree<'_>,
     installed: &BTreeMap<String, LocalEntry>,
 ) -> Result<()> {
-    let expected = snapshot.paths()?;
-    if expected.len() != installed.len() {
+    if tree.paths.len() != installed.len() {
         bail!("replica base and authority snapshot contain different paths");
     }
-    for (path, node) in expected {
+    for (path, node) in &tree.paths {
         let saved = installed
-            .get(&path)
+            .get(path)
             .with_context(|| format!("replica base is missing {path:?}"))?;
-        let record = &snapshot.nodes[&node];
-        let version = record.file_version.map(|id| &snapshot.file_versions[&id]);
+        let record = &tree.snapshot.nodes[node];
+        let version = record
+            .file_version
+            .map(|id| &tree.snapshot.file_versions[&id]);
         let kind = match record.kind {
             crate::filesystem::NodeKind::Directory => LocalKind::Directory,
             crate::filesystem::NodeKind::RegularFile => LocalKind::File,

@@ -6,7 +6,7 @@
 // "License"); you may not use this file except in compliance
 // with the License.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -53,14 +53,10 @@ pub(crate) struct TargetEntry {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TargetManifest {
-    entries: BTreeMap<String, TargetEntry>,
+    pub(super) entries: BTreeMap<String, TargetEntry>,
 }
 
 impl TargetManifest {
-    pub(crate) fn entries(&self) -> &BTreeMap<String, TargetEntry> {
-        &self.entries
-    }
-
     pub(crate) fn file(&self, path: &str) -> Option<&TargetFile> {
         self.entries.get(path)?.file.as_ref()
     }
@@ -150,9 +146,9 @@ impl TargetManifest {
 /// Immutable input for a later volume file-version builder.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StagedTree {
-    staging: PathBuf,
-    root: PathBuf,
-    source: TargetManifest,
+    pub(super) staging: PathBuf,
+    pub(super) root: PathBuf,
+    pub(super) source: TargetManifest,
     manifest: Option<TargetManifest>,
     prepared: BTreeMap<FileVersionId, FileVersion>,
     cache: BTreeMap<String, FileVersionId>,
@@ -168,24 +164,14 @@ impl StagedTree {
         concurrency: NonZeroUsize,
     ) -> Result<Self> {
         let staging = root.as_ref();
-        prepare_root(tree.root(), staging).await?;
+        prepare_root(&tree.root, staging).await?;
         let root = staging.join(TREE_DIR);
         let segment_root = staging.join(SEGMENTS_DIR);
-        let source = tree.operator()?;
-        let staged = fs_operator(&root)?;
+        let source = fs_operator(&tree.root)?;
         let segments = fs_operator(&segment_root)?;
 
-        for (path, entry) in tree.entries() {
-            if entry.kind == LocalKind::Directory {
-                staged
-                    .create_dir(&format!("{path}/"))
-                    .await
-                    .with_context(|| format!("create staging directory {path:?}"))?;
-            }
-        }
-
         let changed = tree
-            .entries()
+            .entries
             .iter()
             .filter(|(path, entry)| {
                 entry.kind == LocalKind::File && !known_versions.contains_key(*path)
@@ -201,64 +187,66 @@ impl StagedTree {
         {
             bail!("volume did not prepare every changed file exactly once");
         }
-        let changed = changed.iter().map(String::as_str).collect::<BTreeSet<_>>();
-
-        let mut entries = tree
-            .entries()
-            .iter()
-            .map(|(path, entry)| {
-                (
-                    path.clone(),
-                    TargetEntry {
-                        local: entry.clone(),
-                        file: None,
-                    },
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
+        let staged = fs_operator(&root)?;
+        let mut entries = BTreeMap::new();
         let mut versions = BTreeMap::new();
         let cache = BTreeMap::new();
-        for (path, expected) in tree
-            .entries()
-            .iter()
-            .filter(|(_, entry)| entry.kind == LocalKind::File)
-        {
-            let version = match prepared.get(path) {
-                Some(version) => {
-                    if version.logical_size != expected.size {
-                        bail!("volume returned the wrong size for staged file {path:?}");
-                    }
-                    let after = source
-                        .stat(path)
+        for (path, expected) in &tree.entries {
+            let file = match expected.kind {
+                LocalKind::Directory => {
+                    staged
+                        .create_dir(&format!("{path}/"))
                         .await
-                        .with_context(|| format!("inspect source file {path:?} after staging"))?;
-                    require_same(path, expected.size, &expected.modified, &after)?;
-                    let attributes =
-                        fs::symlink_metadata(tree.root().join(path)).with_context(|| {
-                            format!("inspect source file attributes for {path:?} after staging")
-                        })?;
-                    require_same_file_attributes(path, expected, &attributes)?;
-                    match versions.insert(version.id, version.clone()) {
-                        Some(existing) if existing != *version => {
-                            bail!("volume reused a file version identity for different content")
-                        }
-                        _ => {}
-                    }
-                    version
+                        .with_context(|| format!("create staging directory {path:?}"))?;
+                    require_same_identity(
+                        &tree.root,
+                        path,
+                        expected.kind,
+                        expected.native_identity,
+                    )?;
+                    None
                 }
-                None => known_versions
-                    .get(path)
-                    .with_context(|| format!("unchanged file {path:?} has no known version"))?,
+                LocalKind::File => {
+                    let version = match prepared.get(path) {
+                        Some(version) => {
+                            if version.logical_size != expected.size {
+                                bail!("volume returned the wrong size for staged file {path:?}");
+                            }
+                            if entry_at(&tree.root, path).await? != *expected {
+                                bail!(
+                                    "source file {path:?} changed while preparing publication; retry sync"
+                                );
+                            }
+                            match versions.insert(version.id, version.clone()) {
+                                Some(existing) if existing != *version => bail!(
+                                    "volume reused a file version identity for different content"
+                                ),
+                                _ => {}
+                            }
+                            version
+                        }
+                        None => {
+                            require_same_identity(
+                                &tree.root,
+                                path,
+                                expected.kind,
+                                expected.native_identity,
+                            )?;
+                            known_versions.get(path).with_context(|| {
+                                format!("unchanged file {path:?} has no known version")
+                            })?
+                        }
+                    };
+                    Some(TargetFile::from(version))
+                }
             };
-            entries
-                .get_mut(path)
-                .expect("a staged file is present in the source observation")
-                .file = Some(TargetFile::from(version));
-        }
-        for (path, entry) in tree.entries() {
-            if !changed.contains(path.as_str()) {
-                require_same_identity(tree.root(), path, entry.kind, entry.native_identity)?;
-            }
+            entries.insert(
+                path.clone(),
+                TargetEntry {
+                    local: expected.clone(),
+                    file,
+                },
+            );
         }
         let source = TargetManifest { entries };
         let staged = Self {
@@ -328,14 +316,6 @@ impl StagedTree {
         }
     }
 
-    pub(crate) fn root(&self) -> &Path {
-        &self.root
-    }
-
-    pub(crate) fn staging(&self) -> &Path {
-        &self.staging
-    }
-
     pub(crate) fn segment_operator(&self) -> Result<Operator> {
         fs_operator(&self.staging.join(SEGMENTS_DIR))
     }
@@ -344,19 +324,16 @@ impl StagedTree {
         self.manifest.as_ref().unwrap_or(&self.source)
     }
 
-    pub(crate) fn source(&self) -> &TargetManifest {
-        &self.source
-    }
-
     pub(crate) fn local_tree(&self) -> LocalTree {
-        LocalTree::from_entries(
-            &self.root,
-            self.source
-                .entries()
+        LocalTree {
+            root: self.root.clone(),
+            entries: self
+                .source
+                .entries
                 .iter()
                 .map(|(path, entry)| (path.clone(), entry.local.clone()))
                 .collect(),
-        )
+        }
     }
 
     pub(crate) fn cached(&self, path: &str, version: FileVersionId) -> bool {
@@ -410,10 +387,10 @@ impl StagedTree {
     }
 
     pub(crate) fn matches_source_observation(&self, observed: &LocalTree) -> bool {
-        self.source.entries().len() == observed.entries().len()
-            && self.source.entries().iter().all(|(path, entry)| {
+        self.source.entries.len() == observed.entries.len()
+            && self.source.entries.iter().all(|(path, entry)| {
                 observed
-                    .entries()
+                    .entries
                     .get(path)
                     .is_some_and(|observed| observed == &entry.local)
             })
@@ -443,7 +420,7 @@ impl StagedTree {
 }
 
 fn validate_manifest(manifest: &TargetManifest) -> Result<()> {
-    for (path, entry) in manifest.entries() {
+    for (path, entry) in &manifest.entries {
         if (entry.local.kind == LocalKind::File) != entry.file.is_some() {
             bail!("staged path {path:?} has inconsistent kind and file state");
         }
@@ -465,39 +442,6 @@ fn require_same_identity(
 ) -> Result<()> {
     if native_identity_at(root, path, kind)? != expected {
         bail!("source path {path:?} was replaced while preparing publication; retry sync");
-    }
-    Ok(())
-}
-
-fn require_same_file_attributes(
-    path: &str,
-    expected: &LocalEntry,
-    metadata: &fs::Metadata,
-) -> Result<()> {
-    if !metadata.file_type().is_file() {
-        bail!("source file {path:?} changed kind while preparing publication; retry sync");
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-
-        let identity = Some(NativeIdentity {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        });
-        if identity != expected.native_identity {
-            bail!("source path {path:?} was replaced while preparing publication; retry sync");
-        }
-        if (metadata.permissions().mode() & 0o111 != 0) != expected.executable {
-            bail!(
-                "source file {path:?} changed permissions while preparing publication; retry sync"
-            );
-        }
-    }
-    #[cfg(not(unix))]
-    if expected.native_identity.is_some() || expected.executable {
-        bail!("source file {path:?} changed permissions while preparing publication; retry sync");
     }
     Ok(())
 }
@@ -528,15 +472,4 @@ async fn prepare_root(source: &Path, staging: &Path) -> Result<()> {
     tokio::fs::create_dir(staging.join(SEGMENTS_DIR))
         .await
         .context("create the segment staging directory")
-}
-
-fn require_same(path: &str, size: u64, modified: &str, observed: &opendal::Metadata) -> Result<()> {
-    let observed_modified = observed.last_modified().map(|value| value.to_string());
-    if !observed.mode().is_file()
-        || observed.content_length() != size
-        || observed_modified.as_deref() != Some(modified)
-    {
-        bail!("source file {path:?} changed while preparing publication; retry sync");
-    }
-    Ok(())
 }

@@ -29,7 +29,7 @@ pub(crate) use records::{
     next_managed_generation,
 };
 pub(crate) use state::{
-    ChangeSegmentRef, CheckpointRef, StoredChangeSegment, StoredCheckpoint, StoredCommittedResult,
+    ChangeSegmentRef, CheckpointRef, StoredChangeSegment, StoredCommittedResult,
     StoredNamespaceState, recover_namespace, replay_tail_from, require_request_digest,
 };
 pub(crate) use store::{MAX_HEAD_ENCODED_BYTES, StoredHead, decode_head, encode_head};

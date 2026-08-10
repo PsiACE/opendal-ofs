@@ -198,25 +198,6 @@ fn operation_prefix(operation: OperationId) -> usize {
     ) as usize
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct StoredCheckpoint {
-    pub(crate) snapshot: VolumeSnapshot,
-}
-
-impl StoredCheckpoint {
-    pub(crate) fn recover(self, volume_id: VolumeId) -> Result<VolumeSnapshot, VolumeError> {
-        if self.snapshot.volume_id != volume_id {
-            return Err(corrupt(
-                "read Managed namespace",
-                "checkpoint identity is invalid",
-            ));
-        }
-        super::validate_snapshot(&self.snapshot)?;
-        Ok(self.snapshot)
-    }
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct StoredCommittedResult {
@@ -227,18 +208,13 @@ pub(crate) struct StoredCommittedResult {
 }
 
 impl StoredCommittedResult {
-    pub(crate) fn from_change(
-        change: &NamespaceChange,
-        request_sha256: [u8; 32],
-    ) -> Result<Self, VolumeError> {
-        let result = Self {
+    pub(crate) fn from_change(change: &NamespaceChange, request_sha256: [u8; 32]) -> Self {
+        Self {
             origin_branch: change.origin_branch,
             operation: change.operation(),
             cursor: change.cursor(),
             request_sha256,
-        };
-        result.validate()?;
-        Ok(result)
+        }
     }
 
     pub(crate) fn validate(&self) -> Result<(), VolumeError> {
@@ -255,38 +231,26 @@ impl StoredCommittedResult {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct StoredChangeSegment {
-    pub(crate) volume_id: VolumeId,
     pub(crate) checkpoint: CheckpointRef,
-    pub(crate) checkpoint_cursor: ChangeCursor,
     pub(crate) changes: Vec<NamespaceChange>,
 }
 
 impl StoredChangeSegment {
-    pub(crate) fn new(
-        volume_id: VolumeId,
-        state: &StoredNamespaceState,
-    ) -> Result<Self, VolumeError> {
-        let segment = Self {
-            volume_id,
+    pub(crate) fn new(state: &StoredNamespaceState) -> Self {
+        Self {
             checkpoint: state.checkpoint,
-            checkpoint_cursor: state.checkpoint_cursor,
             changes: state.tail.clone(),
-        };
-        segment.validate(volume_id)?;
-        Ok(segment)
+        }
     }
 
     pub(crate) fn validate(&self, volume_id: VolumeId) -> Result<(), VolumeError> {
-        if self.volume_id != volume_id
-            || self.changes.is_empty()
-            || self.changes.len() > MAX_TAIL_TRANSACTIONS
-        {
+        if self.changes.is_empty() || self.changes.len() > MAX_TAIL_TRANSACTIONS {
             return Err(corrupt(
                 "read Managed change segment",
-                "change segment identity or size is invalid",
+                "change segment size is invalid",
             ));
         }
-        let mut parent = self.checkpoint_cursor;
+        let mut parent = self.start();
         for change in &self.changes {
             change.validate(volume_id)?;
             if change.parent() != parent {
@@ -303,22 +267,30 @@ impl StoredChangeSegment {
     pub(crate) fn cursor(&self) -> ChangeCursor {
         self.changes
             .last()
-            .map_or(self.checkpoint_cursor, NamespaceChange::cursor)
+            .expect("validated change segments are non-empty")
+            .cursor()
+    }
+
+    pub(crate) fn start(&self) -> ChangeCursor {
+        self.changes
+            .first()
+            .expect("validated change segments are non-empty")
+            .parent()
     }
 }
 
 pub(crate) fn recover_namespace(
-    checkpoint: StoredCheckpoint,
+    mut snapshot: VolumeSnapshot,
     state: &StoredNamespaceState,
     volume_id: VolumeId,
 ) -> Result<VolumeSnapshot, VolumeError> {
-    let mut snapshot = checkpoint.recover(volume_id)?;
-    if snapshot.cursor != state.checkpoint_cursor {
+    if snapshot.volume_id != volume_id || snapshot.cursor != state.checkpoint_cursor {
         return Err(corrupt(
             "read Managed namespace",
-            "checkpoint and namespace HEAD disagree",
+            "checkpoint identity disagrees with namespace HEAD",
         ));
     }
+    super::validate_snapshot(&snapshot)?;
     for change in &state.tail {
         snapshot = change.apply(Some(snapshot))?;
     }

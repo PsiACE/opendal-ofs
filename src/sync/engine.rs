@@ -138,7 +138,7 @@ impl<V: Volume> SyncEngine<V> {
         let (local, staging_path, mut staged, operation, mut data_finalized) = match prior_staging {
             Some((staged, operation, data_finalized)) => (
                 staged.local_tree(),
-                staged.staging().to_owned(),
+                staged.staging.clone(),
                 staged,
                 operation,
                 data_finalized,
@@ -148,8 +148,8 @@ impl<V: Volume> SyncEngine<V> {
                 if resolve_paths.is_empty()
                     && state.conflicts.is_empty()
                     && let Some(tree) = remote_tree.as_ref()
-                    && tree.snapshot().cursor == state.common()
-                    && local.entries() == &state.installed
+                    && tree.snapshot.cursor == state.common()
+                    && local.entries == state.installed
                 {
                     return Ok(result(&state, false));
                 }
@@ -168,8 +168,8 @@ impl<V: Volume> SyncEngine<V> {
                 (local, staging_path, staged, operation, false)
             }
         };
-        let source_manifest = staged.source().clone();
-        let mut publish = remote.is_none() && !local.entries().is_empty();
+        let source_manifest = staged.source.clone();
+        let mut publish = remote.is_none() && !local.entries.is_empty();
         let mut conflicts = Vec::new();
         let mut local_renames = BTreeMap::new();
         let mut target_update = None;
@@ -236,13 +236,13 @@ impl<V: Volume> SyncEngine<V> {
         if !publish {
             state.conflicts.clear();
             if let Some(remote_tree) = remote_tree.as_ref() {
-                let remote_advanced = remote_tree.snapshot().cursor != state.common();
+                let remote_advanced = remote_tree.snapshot.cursor != state.common();
                 if remote_advanced && matching_local(replica_path, &local).await?.is_none() {
                     bail!("local replica changed while remote state was being installed");
                 }
                 if remote_advanced {
-                    if state.installed.is_empty() && local.entries().is_empty() {
-                        install_staged_tree(replica_path, staged.root())?;
+                    if state.installed.is_empty() && local.entries.is_empty() {
+                        install_staged_tree(replica_path, &staged.root)?;
                     } else {
                         install_staged_changes(replica_path, &staged, &source_manifest)?;
                     }
@@ -311,7 +311,7 @@ fn result(state: &ReplicaState, published: bool) -> SyncResult {
 
 async fn matching_local(root: &Path, expected: &LocalTree) -> Result<Option<LocalTree>> {
     let observed = LocalTree::scan(root).await?;
-    Ok((observed.entries() == expected.entries()).then_some(observed))
+    Ok((observed.entries == expected.entries).then_some(observed))
 }
 
 async fn apply_target<V: Volume>(
@@ -327,16 +327,16 @@ async fn apply_target<V: Volume>(
         edits,
         ..
     } = plan;
-    let root = staged.root().to_owned();
+    let root = staged.root.clone();
     let target = fs_operator(&root)?;
     let removed = staged
         .manifest()
-        .entries()
+        .entries
         .iter()
         .rev()
         .filter(|(path, entry)| {
             manifest
-                .entries()
+                .entries
                 .get(*path)
                 .is_none_or(|desired| desired.local.kind != entry.local.kind)
         })
@@ -365,7 +365,7 @@ async fn apply_target<V: Volume>(
                 if !reuse_local_file(
                     source_root,
                     &root,
-                    staged.source(),
+                    &staged.source,
                     &manifest,
                     source,
                     path,
@@ -406,7 +406,7 @@ async fn apply_target<V: Volume>(
         .await?;
     for path in &materialize {
         let executable = manifest
-            .entries()
+            .entries
             .get(path)
             .with_context(|| format!("materialization path {path:?} is not in target manifest"))?
             .local
@@ -424,7 +424,7 @@ async fn reuse_local_file(
     source_path: &str,
     target_path: &str,
 ) -> Result<bool> {
-    let Some(source_entry) = source.entries().get(source_path) else {
+    let Some(source_entry) = source.entries.get(source_path) else {
         return Ok(false);
     };
     let (Some(source_file), Some(target_file)) =
@@ -458,7 +458,7 @@ async fn reuse_local_file(
         let _ = tokio::fs::remove_file(destination).await;
         return Ok(false);
     }
-    set_executable(&destination, target.entries()[target_path].local.executable)?;
+    set_executable(&destination, target.entries[target_path].local.executable)?;
     Ok(true)
 }
 
@@ -476,11 +476,7 @@ fn state_from_snapshot(
     local: &LocalTree,
     previous: &ReplicaState,
 ) -> Result<ReplicaState> {
-    ReplicaState::at_common(
-        previous.authority_identity(),
-        tree.snapshot().clone(),
-        local.entries().clone(),
-    )
+    ReplicaState::at_common(previous.authority_identity(), tree, local.entries.clone())
 }
 
 fn known_local_versions(
@@ -492,7 +488,7 @@ fn known_local_versions(
         return BTreeMap::new();
     };
     local
-        .entries()
+        .entries
         .iter()
         .filter_map(|(path, entry)| {
             let base = state.installed.get(path)?;
@@ -512,13 +508,13 @@ fn install_staged_changes(
     before: &TargetManifest,
 ) -> Result<()> {
     let removals = before
-        .entries()
+        .entries
         .iter()
         .rev()
         .filter(|(path, entry)| {
             staged
                 .manifest()
-                .entries()
+                .entries
                 .get(*path)
                 .is_none_or(|desired| desired.local.kind != entry.local.kind)
         })
@@ -535,16 +531,16 @@ fn install_staged_changes(
         sync_parent(&target)?;
     }
 
-    for (path, entry) in staged.manifest().entries() {
+    for (path, entry) in &staged.manifest().entries {
         if entry.local.kind == LocalKind::Directory {
             fs::create_dir_all(replica.join(path))?;
         }
     }
-    for (path, entry) in staged.manifest().entries() {
+    for (path, entry) in &staged.manifest().entries {
         if entry.local.kind != LocalKind::File {
             continue;
         }
-        let same_content = before.entries().get(path).is_some_and(|existing| {
+        let same_content = before.entries.get(path).is_some_and(|existing| {
             existing.local.kind == LocalKind::File
                 && existing.local.size == entry.local.size
                 && before.file(path).map(|file| file.logical_digest)

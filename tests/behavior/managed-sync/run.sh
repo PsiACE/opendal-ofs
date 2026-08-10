@@ -25,7 +25,7 @@ declare -a compose
 
 usage() {
   cat <<'EOF'
-Usage: cargo x managed-sync <COMMAND>
+Usage: tests/behavior/managed-sync/run.sh <COMMAND>
 
 Commands:
   test all
@@ -34,8 +34,6 @@ Commands:
   test staging
   perf [--baseline REF_OR_BINARY] [--candidate REF_OR_BINARY]
        [--rounds N] [OUTPUT]
-  up
-  down
 EOF
 }
 
@@ -82,7 +80,7 @@ fixtures_up() {
   select_compose
   mkdir -p "$audit_root"
   [[ $with_d1 == true ]] && services+=(d1)
-  compose_run up --detach "${services[@]}"
+  compose_run up --detach "${services[@]}" >/dev/null
   wait_for_http "http://127.0.0.1:$minio_port/minio/health/ready"
   if [[ $with_d1 == true ]]; then
     wait_for_http "http://127.0.0.1:$d1_port/health"
@@ -92,13 +90,17 @@ fixtures_up() {
      mc mb --ignore-existing local/managed-sync >/dev/null; \
      mc admin user info local $ofs_access_key >/dev/null 2>&1 || \
        mc admin user add local $ofs_access_key $ofs_secret_key >/dev/null; \
-     mc admin policy attach local readwrite --user $ofs_access_key >/dev/null"
+     mc admin policy attach local readwrite --user $ofs_access_key >/dev/null" \
+    >/dev/null
   printf 'Managed Sync fixtures are ready: MinIO http://127.0.0.1:%s' "$minio_port"
   [[ $with_d1 == true ]] && printf ', D1 http://127.0.0.1:%s/client/v4' "$d1_port"
   printf '.\n'
 }
 
-fixtures_down() { select_compose; compose_run down --volumes --remove-orphans; }
+fixtures_down() {
+  select_compose
+  compose_run down --volumes --remove-orphans >/dev/null 2>&1
+}
 
 cleanup() {
   local status=$?
@@ -137,7 +139,7 @@ run_case() {
     workflow) script="$workspace/tests/behavior/managed-sync/workflow.sh" ;;
     branch) script="$workspace/tests/behavior/managed-branch/workflow.sh" ;;
     staging)
-      script="$workspace/tests/performance/managed-sync/staging.sh"
+      script="$workspace/tests/behavior/managed-sync/staging.sh"
       case_root=$run_root
       ;;
     *) fail "unknown acceptance suite: $suite" ;;
@@ -209,8 +211,6 @@ shift || true
 case $command in
   test) run_tests "$@" ;;
   perf) exec bash "$workspace/tests/performance/managed-sync/run.sh" "$@" ;;
-  up) [[ $# == 0 ]] || fail 'up accepts no arguments'; fixtures_up true ;;
-  down) [[ $# == 0 ]] || fail 'down accepts no arguments'; fixtures_down ;;
   -h|--help) usage ;;
   *) fail "unknown command: $command" ;;
 esac

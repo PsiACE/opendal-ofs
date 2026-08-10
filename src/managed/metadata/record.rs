@@ -257,9 +257,8 @@ impl RecordBackend {
                 if object::create(operator, key, bytes.clone(), action).await? {
                     return Ok(bytes);
                 }
-                object::read_with_revision(operator, key, maximum_bytes, action)
+                object::read(operator, key, maximum_bytes, action)
                     .await?
-                    .map(|(bytes, _)| bytes)
                     .ok_or_else(|| unavailable(action, "Managed record storage is unavailable"))
             }
             Self::D1(backend) => {

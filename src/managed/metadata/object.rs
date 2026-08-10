@@ -18,8 +18,8 @@
 use futures::StreamExt;
 use opendal::{ErrorKind, Operator};
 
-use crate::filesystem::{VolumeError, VolumeErrorKind};
-use crate::managed::error::{corrupt, error, unavailable};
+use crate::filesystem::VolumeError;
+use crate::managed::error::{corrupt, unavailable};
 
 pub(crate) async fn read(
     operator: &Operator,
@@ -128,8 +128,6 @@ pub(crate) async fn ensure_immutable(
     key: &str,
     expected: &[u8],
     action: &'static str,
-    mismatch_kind: VolumeErrorKind,
-    mismatch_message: &'static str,
 ) -> Result<(), VolumeError> {
     match operator
         .write_with(key, expected.to_vec())
@@ -150,7 +148,7 @@ pub(crate) async fn ensure_immutable(
     if observed == expected {
         Ok(())
     } else {
-        Err(error(mismatch_kind, action, mismatch_message))
+        Err(corrupt(action, "immutable object changed"))
     }
 }
 
@@ -159,6 +157,7 @@ mod tests {
     use opendal::services;
 
     use super::*;
+    use crate::filesystem::VolumeErrorKind;
 
     #[tokio::test]
     async fn bounded_record_read_rejects_an_oversized_object() {

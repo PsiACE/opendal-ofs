@@ -19,16 +19,14 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 
-use crate::filesystem::{
-    DirectoryRecord, FileVersion, NodeId, NodeKind, NodeRecord, VolumeSnapshot,
-};
+use crate::filesystem::{DirectoryRecord, FileVersion, NodeId, NodeRecord, VolumeSnapshot};
 
 /// One validated, path-sorted view over an immutable namespace snapshot.
 pub(crate) struct SnapshotTree<'a> {
-    snapshot: &'a VolumeSnapshot,
-    paths: BTreeMap<String, NodeId>,
+    pub(super) snapshot: &'a VolumeSnapshot,
+    pub(super) paths: BTreeMap<String, NodeId>,
 }
 
 #[derive(Clone, Copy)]
@@ -40,31 +38,8 @@ pub(crate) struct SnapshotEntry<'a> {
 
 impl<'a> SnapshotTree<'a> {
     pub(crate) fn new(snapshot: &'a VolumeSnapshot) -> Result<Self> {
-        let paths = snapshot.paths()?;
-        for (path, id) in &paths {
-            let node = snapshot
-                .nodes
-                .get(id)
-                .with_context(|| format!("snapshot path {path:?} references a missing node"))?;
-            match node.kind {
-                NodeKind::Directory if snapshot.directories.contains_key(id) => {}
-                NodeKind::RegularFile
-                    if node
-                        .file_version
-                        .is_some_and(|version| snapshot.file_versions.contains_key(&version)) => {}
-                NodeKind::Directory => bail!("snapshot directory {path:?} has no record"),
-                NodeKind::RegularFile => bail!("snapshot file {path:?} has no version"),
-            }
-        }
+        let paths = snapshot.validated_paths()?;
         Ok(Self { snapshot, paths })
-    }
-
-    pub(crate) fn snapshot(&self) -> &'a VolumeSnapshot {
-        self.snapshot
-    }
-
-    pub(crate) fn paths(&self) -> &BTreeMap<String, NodeId> {
-        &self.paths
     }
 
     pub(crate) fn get(&self, path: &str) -> Option<SnapshotEntry<'a>> {

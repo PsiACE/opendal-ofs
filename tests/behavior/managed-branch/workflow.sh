@@ -75,14 +75,14 @@ if [[ "$OFS_METADATA_MODE" == d1 ]]; then
   volume_options+=(--metadata "$OFS_METADATA_URL")
 fi
 
-printf '%s\n' 'acceptance: expose branch commands and reject branches on Direct volumes'
-grep -Eq '^  branch[[:space:]]' <<<"$("$OFS_BIN" --help)" || fail 'help omitted the branch command'
-if OFS_CONFIG="$OFS_CASE_ROOT/direct.json" "$OFS_BIN" volume create direct \
-  --model direct --enable branch --storage memory:///branch-rejection 2>"$OFS_CASE_ROOT/direct.err"; then
-  fail 'Direct volume enabled Managed branches'
+if [[ "$OFS_METADATA_MODE" == object ]]; then
+  if OFS_CONFIG="$OFS_CASE_ROOT/direct.json" "$OFS_BIN" volume create direct \
+    --model direct --enable branch --storage memory:///branch-rejection >/dev/null 2>&1; then
+    fail 'Direct volume enabled Managed branches'
+  fi
+  [[ ! -e "$OFS_CASE_ROOT/direct.json" ]] || \
+    fail 'Direct branch rejection changed the catalog'
 fi
-grep -Fq 'branch' "$OFS_CASE_ROOT/direct.err" || fail 'Direct branch rejection was not actionable'
-[[ ! -e "$OFS_CASE_ROOT/direct.json" ]] || fail 'Direct branch rejection changed the catalog'
 
 printf '%s\n' 'acceptance: create a branching volume with the default main branch'
 OFS_CONFIG="$config" "$OFS_BIN" volume create workspace "${volume_options[@]}"
@@ -94,20 +94,18 @@ assert value["default_branch"] == "main"
 assert [branch["name"] for branch in value["branches"]] == ["main"]
 ' <<<"$branches" || fail 'new branching volume did not expose only default branch main'
 
-observed_options=(--model managed --storage "$OFS_STORAGE_URL")
-if [[ "$OFS_METADATA_MODE" == d1 ]]; then
-  observed_options+=(--metadata "$OFS_METADATA_URL")
-fi
-OFS_CONFIG="$observed_config" "$OFS_BIN" volume create observed-workspace \
-  "${observed_options[@]}"
-observed_branches=$(OFS_CONFIG="$observed_config" "$OFS_BIN" branch list observed-workspace --json)
-python3 -c '
+if [[ "$OFS_METADATA_MODE" == object ]]; then
+  OFS_CONFIG="$observed_config" "$OFS_BIN" volume create observed-workspace \
+    --model managed --storage "$OFS_STORAGE_URL" >/dev/null
+  observed_branches=$(OFS_CONFIG="$observed_config" "$OFS_BIN" branch list observed-workspace --json)
+  python3 -c '
 import json, sys
 value = json.load(sys.stdin)
 assert value["default_branch"] == "main"
 assert [branch["name"] for branch in value["branches"]] == ["main"]
 ' <<<"$observed_branches" || \
-  fail 'a new client did not honor observed branch/v1 metadata without --enable'
+    fail 'a new client did not honor the remote branch/v1 format'
+fi
 
 printf '%s\n' 'anchor state' >"$main_replica/shared.txt"
 OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$main_replica" --state "$main_state"

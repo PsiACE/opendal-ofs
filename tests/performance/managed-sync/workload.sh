@@ -76,12 +76,8 @@ with path.open("r+b") as output:
 PY
 }
 
-create=("$OFS_BIN" volume create "$volume")
-if "$OFS_BIN" volume create --help 2>&1 | grep -q -- '--model'; then
-  create+=(--model managed)
-fi
-create+=(--storage "$OFS_STORAGE_URL")
-measure init create "$evidence/create.txt" "${create[@]}"
+measure init create "$evidence/create.txt" \
+  "$OFS_BIN" volume create "$volume" --model managed --storage "$OFS_STORAGE_URL"
 
 source_tree="$OFS_RUN_ROOT/replica-source"
 source_state="$OFS_RUN_ROOT/state-source.json"

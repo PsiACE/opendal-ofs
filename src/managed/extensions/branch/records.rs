@@ -69,11 +69,7 @@ impl StoredBranchRegistry {
         Ok(())
     }
 
-    pub(crate) fn branch_id(&self, name: &BranchName) -> Option<BranchId> {
-        self.branches.get(name).copied()
-    }
-
-    pub(crate) fn default_binding(&self) -> Option<BranchBinding> {
+    pub(crate) fn default_binding(&self) -> BranchBinding {
         self.branches
             .iter()
             .find(|(_, id)| **id == self.default_branch)
@@ -81,6 +77,7 @@ impl StoredBranchRegistry {
                 name: name.clone(),
                 id: *id,
             })
+            .expect("validated branch registries contain the default branch")
     }
 }
 

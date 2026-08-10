@@ -84,10 +84,6 @@ pub struct DirectoryRecord {
 }
 
 /// A backend-neutral, complete filesystem observation.
-///
-/// `F` is the volume-owned file-version representation. Access frontends use
-/// the default opaque [`FileVersion`], while a volume implementation may use
-/// its decoded representation internally without copying the namespace model.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct VolumeSnapshot {
@@ -104,7 +100,7 @@ impl VolumeSnapshot {
     ///
     /// Walking also proves that directories form a tree. Regular files may be
     /// linked from more than one directory.
-    pub(crate) fn paths(&self) -> Result<BTreeMap<String, NodeId>, VolumeError> {
+    fn paths(&self) -> Result<BTreeMap<String, NodeId>, VolumeError> {
         let mut paths = BTreeMap::new();
         let mut pending = vec![(String::new(), self.root)];
         let mut expanded = BTreeSet::new();
@@ -112,20 +108,14 @@ impl VolumeSnapshot {
             if !path.is_empty() && paths.insert(path.clone(), node).is_some() {
                 return Err(invalid_snapshot("namespace contains a duplicate path"));
             }
-            let record = self
-                .nodes
-                .get(&node)
-                .ok_or_else(|| invalid_snapshot("namespace references a missing node"))?;
+            let record = &self.nodes[&node];
             if record.kind != NodeKind::Directory {
                 continue;
             }
             if !expanded.insert(node) {
                 return Err(invalid_snapshot("namespace directories do not form a tree"));
             }
-            let directory = self
-                .directories
-                .get(&node)
-                .ok_or_else(|| invalid_snapshot("namespace references a missing directory"))?;
+            let directory = &self.directories[&node];
             for (name, entry) in directory.entries.iter().rev() {
                 let child = if path.is_empty() {
                     name.clone()
@@ -139,7 +129,7 @@ impl VolumeSnapshot {
     }
 
     /// Validate the backend-neutral structure shared by all volume formats.
-    pub(crate) fn validate_structure(&self) -> Result<(), VolumeError> {
+    pub(crate) fn validated_paths(&self) -> Result<BTreeMap<String, NodeId>, VolumeError> {
         let root = self
             .nodes
             .get(&self.root)
@@ -214,7 +204,11 @@ impl VolumeSnapshot {
         if reachable.len() != self.nodes.len() {
             return Err(invalid_snapshot("namespace contains unreachable nodes"));
         }
-        Ok(())
+        Ok(paths)
+    }
+
+    pub(crate) fn validate_structure(&self) -> Result<(), VolumeError> {
+        self.validated_paths().map(drop)
     }
 }
 
@@ -272,14 +266,14 @@ fn invalid_snapshot(message: &'static str) -> VolumeError {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct NodePrecondition {
+pub(crate) struct NodePrecondition {
     pub node: NodeId,
     pub expected_generation: Option<Generation>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct DirectoryPrecondition {
+pub(crate) struct DirectoryPrecondition {
     pub directory: NodeId,
     pub expected_generation: Option<Generation>,
 }

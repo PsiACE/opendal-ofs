@@ -202,13 +202,14 @@ The decoded strict CBOR record contains one complete filesystem
 `VolumeSnapshot`. Managed file-version data remains in each ordinary
 `FileVersion` descriptor; the format does not add another node, directory,
 precondition, or snapshot graph.
-SHA-256 of the complete envelope determines its object key. Mutable namespace
-state references that digest together with the encoded object length, allowing
-one exact bounded range GET without a preceding metadata request; both values
-are verified before decoding.
+SHA-256 of the encoded envelope determines its object key. Mutable namespace
+state references that digest together with the encoded length, allowing one
+bounded range GET without a preceding metadata request. Recovery verifies the
+returned byte count and digest before decoding; bytes outside the referenced
+range are not part of the checkpoint record.
 
 Encoded and decoded checkpoint sizes are each limited to 256 MiB. Recovery
-uses one bounded OpenDAL range read, verifies the complete content identity,
+uses one bounded OpenDAL range read, verifies the referenced content identity,
 requires the exact v1 magic and decoded length, rejects trailing or unknown
 CBOR fields, and validates the volume and snapshot. A checkpoint never depends
 on another checkpoint.
@@ -223,11 +224,12 @@ strict CBOR body              variable
 SHA-256 of magic and body     32 bytes
 ```
 
-The body contains the volume identity, starting checkpoint reference,
-starting cursor, and at most 32 consecutive namespace changes. Its complete
-digest determines the object key. HEAD records the digest, encoded length,
-start cursor, and end cursor, so recovery uses one exact range GET and verifies
-the complete object before decoding. The encoded body is limited to 16 MiB.
+The body contains the starting checkpoint reference and at most 32 consecutive
+namespace changes. The first change's parent is the start cursor; every change
+contains the volume identity and must continue the preceding cursor. HEAD
+records the digest, encoded length, start cursor, and end cursor. Recovery uses
+one bounded range GET, verifies the referenced bytes, then checks the derived
+start and end against HEAD. The encoded body is limited to 16 MiB.
 
 ### Operation receipt
 
