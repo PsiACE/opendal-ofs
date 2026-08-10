@@ -21,7 +21,7 @@ use super::{
     reconcile,
 };
 use crate::filesystem::{
-    ChangeCursor, CommitOutcome, FileVersion, MaterializeRequest, NodeKind, OperationId, Volume,
+    ChangeCursor, CommitOutcome, FileVersionId, MaterializeRequest, NodeKind, OperationId, Volume,
     VolumeObservation,
 };
 use anyhow::{Context, Result, bail};
@@ -146,6 +146,7 @@ impl<V: Volume> SyncEngine<V> {
                     &local,
                     &staging_path,
                     &known_versions,
+                    base.as_ref().map(|tree| tree.snapshot),
                     &self.volume,
                     remote,
                     self.transfer_concurrency,
@@ -429,11 +430,11 @@ async fn reuse_local_file(
     Ok(true)
 }
 
-fn known_local_versions(
-    local: &LocalTree,
+fn known_local_versions<'a>(
+    local: &'a LocalTree,
     state: &ReplicaState,
     tree: Option<&SnapshotTree<'_>>,
-) -> BTreeMap<String, FileVersion> {
+) -> BTreeMap<&'a str, FileVersionId> {
     let Some(tree) = tree else {
         return BTreeMap::new();
     };
@@ -444,7 +445,7 @@ fn known_local_versions(
             let base = state.installed.get(path)?;
             if entry.kind == NodeKind::RegularFile && base == entry {
                 let version = tree.get(path)?.file?;
-                Some((path.clone(), version.clone()))
+                Some((path.as_str(), version.id))
             } else {
                 None
             }

@@ -159,7 +159,8 @@ impl StagedTree {
     pub(crate) async fn prepare_for_publish<V: Volume>(
         tree: &LocalTree,
         root: impl AsRef<Path>,
-        known_versions: &BTreeMap<String, FileVersion>,
+        known_versions: &BTreeMap<&str, FileVersionId>,
+        known_snapshot: Option<&VolumeSnapshot>,
         volume: &V,
         authority: Option<&VolumeSnapshot>,
         concurrency: NonZeroUsize,
@@ -175,7 +176,7 @@ impl StagedTree {
             .entries
             .iter()
             .filter(|(path, entry)| {
-                entry.kind == NodeKind::RegularFile && !known_versions.contains_key(*path)
+                entry.kind == NodeKind::RegularFile && !known_versions.contains_key(path.as_str())
             })
             .map(|(path, _)| path.clone())
             .collect::<Vec<_>>();
@@ -227,9 +228,12 @@ impl StagedTree {
                                 expected.kind,
                                 expected.native_identity,
                             )?;
-                            known_versions.get(path).with_context(|| {
-                                format!("unchanged file {path:?} has no known version")
-                            })?
+                            known_versions
+                                .get(path.as_str())
+                                .and_then(|version| known_snapshot?.file_versions.get(version))
+                                .with_context(|| {
+                                    format!("unchanged file {path:?} has no common version")
+                                })?
                         }
                     };
                     Some(TargetFile::from(version))
