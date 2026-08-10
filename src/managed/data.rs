@@ -149,53 +149,71 @@ impl ManagedVolume {
             .unwrap_or("file");
         let temporary =
             destination.with_file_name(format!(".{name}.{}.tmp", OperationId::generate()));
-        let mut file = File::create(&temporary)
-            .await
-            .map_err(|_| unavailable("materialize Managed file"))?;
-        let mut logical = Hasher::new();
-        let mut logical_size = 0_u64;
-        for segment in descriptor.segments {
-            let bytes = object::read_data(self.operator(), &segment_key(segment.digest)).await?;
-            if bytes.len() as u64 != segment.length {
+        let result = async {
+            let mut file = File::create(&temporary)
+                .await
+                .map_err(|_| unavailable("materialize Managed file"))?;
+            let mut logical = Hasher::new();
+            let mut logical_size = 0_u64;
+            for segment in descriptor.segments {
+                let bytes =
+                    object::read_data(self.operator(), &segment_key(segment.digest)).await?;
+                if bytes.len() as u64 != segment.length {
+                    return Err(corrupt(
+                        "materialize Managed file",
+                        "segment length is invalid",
+                    ));
+                }
+                let mut segment_hash = Hasher::new();
+                for chunk in bytes {
+                    segment_hash.update(&chunk);
+                    logical.update(&chunk);
+                    file.write_all(&chunk)
+                        .await
+                        .map_err(|_| unavailable("materialize Managed file"))?;
+                    logical_size =
+                        logical_size
+                            .checked_add(chunk.len() as u64)
+                            .ok_or_else(|| {
+                                corrupt("materialize Managed file", "file length overflows")
+                            })?;
+                }
+                if segment_hash.finalize().as_bytes() != &segment.digest {
+                    return Err(corrupt(
+                        "materialize Managed file",
+                        "segment checksum is invalid",
+                    ));
+                }
+            }
+            if logical_size != version.logical_size
+                || logical.finalize().as_bytes() != &version.logical_digest
+            {
                 return Err(corrupt(
                     "materialize Managed file",
-                    "segment length is invalid",
+                    "file checksum is invalid",
                 ));
             }
-            let mut segment_hash = Hasher::new();
-            for chunk in bytes {
-                segment_hash.update(&chunk);
-                logical.update(&chunk);
-                file.write_all(&chunk)
-                    .await
-                    .map_err(|_| unavailable("materialize Managed file"))?;
-                logical_size = logical_size
-                    .checked_add(chunk.len() as u64)
-                    .ok_or_else(|| corrupt("materialize Managed file", "file length overflows"))?;
-            }
-            if segment_hash.finalize().as_bytes() != &segment.digest {
-                return Err(corrupt(
-                    "materialize Managed file",
-                    "segment checksum is invalid",
-                ));
+            file.sync_all()
+                .await
+                .map_err(|_| unavailable("materialize Managed file"))?;
+            drop(file);
+            tokio::fs::rename(&temporary, destination)
+                .await
+                .map_err(|_| unavailable("materialize Managed file"))?;
+            std::fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|_| unavailable("materialize Managed file"))?;
+            Ok(())
+        }
+        .await;
+        if result.is_err() {
+            match tokio::fs::remove_file(&temporary).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err(unavailable("clean up Managed file staging")),
             }
         }
-        if logical_size != version.logical_size
-            || logical.finalize().as_bytes() != &version.logical_digest
-        {
-            return Err(corrupt(
-                "materialize Managed file",
-                "file checksum is invalid",
-            ));
-        }
-        file.sync_all()
-            .await
-            .map_err(|_| unavailable("materialize Managed file"))?;
-        drop(file);
-        tokio::fs::rename(&temporary, destination)
-            .await
-            .map_err(|_| unavailable("materialize Managed file"))?;
-        Ok(())
+        result
     }
 }
 

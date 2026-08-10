@@ -39,6 +39,7 @@ pub struct ReplicaState {
     common: VolumeSnapshot,
     remote: ChangeCursor,
     native: BTreeMap<String, NativeIdentity>,
+    installing: bool,
     pending: Option<PendingPublication>,
     conflicts: Vec<ConflictRecord>,
 }
@@ -84,6 +85,7 @@ impl ReplicaState {
             remote: common.cursor,
             common,
             native,
+            installing: false,
             pending: None,
             conflicts: Vec::new(),
         })
@@ -100,7 +102,9 @@ impl ReplicaState {
             return Err(SyncError::new("replica state format is unsupported"));
         }
         state.common.validate()?;
-        validate_native(&state.common, &state.native)?;
+        if !state.installing {
+            validate_native(&state.common, &state.native)?;
+        }
         if state.remote.sequence() < state.common.cursor.sequence() {
             return Err(SyncError::new(
                 "replica remote cursor is behind its common namespace",
@@ -173,13 +177,22 @@ impl ReplicaState {
         self.remote = common.cursor;
         self.common = common;
         self.native = native;
+        self.installing = false;
         self.pending = None;
         self.conflicts.clear();
         Ok(())
     }
 
     pub const fn has_pending(&self) -> bool {
+        self.installing || self.pending.is_some()
+    }
+
+    pub(crate) const fn has_pending_publication(&self) -> bool {
         self.pending.is_some()
+    }
+
+    pub(crate) const fn is_installing(&self) -> bool {
+        self.installing
     }
 
     pub(crate) fn pending_target(&self) -> Option<&VolumeSnapshot> {
@@ -227,6 +240,28 @@ impl ReplicaState {
         self.pending = Some(PendingPublication { expected, target });
         self.conflicts.clear();
         Ok(())
+    }
+
+    pub(crate) fn begin_install(&mut self) {
+        self.installing = true;
+        self.conflicts.clear();
+    }
+
+    pub(crate) fn for_cold_install(
+        root: PathBuf,
+        target: VolumeSnapshot,
+    ) -> Result<Self, SyncError> {
+        target.validate()?;
+        Ok(Self {
+            format: FORMAT.to_owned(),
+            root,
+            remote: target.cursor,
+            common: target,
+            native: BTreeMap::new(),
+            installing: true,
+            pending: None,
+            conflicts: Vec::new(),
+        })
     }
 }
 
