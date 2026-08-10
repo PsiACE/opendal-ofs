@@ -96,6 +96,16 @@ bounded windows. Foyer caches only complete verified segment reads. OpenDAL
 layers provide the storage concurrency and retry policy; individual chains do
 not invent separate limits.
 
+Explicit `ofs volume gc` is the only destructive maintenance path. It fixes
+the authority before marking data: one base HEAD, or the branch registry and
+all registered HEADs. Branch marking deduplicates shared checkpoint and change
+references and retains every file version needed by a current or retained
+branch position. The sweep uses OpenDAL's streaming lister and native deleter;
+normal Sync, materialization, and branch operations never list the segment
+prefix. A failed sweep leaves its durable fence in place, so a new collector
+cannot guess whether deletion completed; `--resume` deliberately takes
+ownership and repeats the safe mark.
+
 ## Sync transaction
 
 One invocation has one forward path:

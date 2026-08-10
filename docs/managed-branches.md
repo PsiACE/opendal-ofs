@@ -36,6 +36,13 @@ Inspect and delete branches with `branch list`, `branch show`, and `branch
 delete`. The default branch cannot be deleted. Both inspection commands accept
 `--json`.
 
+Run destructive reachability maintenance explicitly:
+
+```shell
+ofs volume gc workspace
+ofs volume gc workspace --resume # only after an interrupted collector stopped
+```
+
 Replica state records the branch name and immutable `BranchId`. It cannot move
 between branches. Deleting and recreating a name creates another identity, so
 an old replica cannot attach to the replacement.
@@ -93,13 +100,15 @@ affecting a replacement incarnation.
 | Delete stops after sealing | Retrying removes the registry entry |
 | Commit result is unknown | Resolve the saved operation from HEAD or its receipt |
 | Referenced data is missing or corrupt | Fail closed |
+| Collection stops after fencing authority | New collection conflicts; explicit resume remarks every retained root |
 
 ## Limits
 
 `branch/v1` provides named mutable branches, constant-copy fork of retained
 positions, deletion, and Sync recovery. It does not provide merge, tags,
 reset, unbounded history, automatic garbage collection, Mount, or writer
-leases.
+leases. Explicit volume collection is available; it does not run from Sync or
+as a background service.
 
 Run the Object and D1 acceptance scenarios with:
 

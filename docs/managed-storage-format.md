@@ -179,7 +179,9 @@ SHA-256 of preceding bytes    32 bytes
 ```
 
 The decoded strict CBOR record contains the volume identity, optional branch
-identity, sealed state, and optional namespace state. Namespace state contains
+identity, sealed state, optional namespace state, a monotonic maintenance
+epoch, and an optional collection fence. A fence identifies its owner and the
+exact cursor fixed by that owner. Namespace state contains
 the checkpoint digest and encoded length, checkpoint cursor, an ordered
 transaction tail, up to eight change-segment references, and the most recent
 committed operation result.
@@ -322,9 +324,14 @@ Publication is ordered as follows:
 5. Persist any operation results that are about to leave retained metadata.
 6. Commit with one conditional HEAD replacement or one native transaction.
 
-Segments written before a failed Metadata commit are unreachable. Managed v1
-does not reclaim data segments or immutable metadata objects, so publication
-never races with deletion of a staged or retained object.
+Segments written before a failed Metadata commit are unreachable. Explicit
+`volume gc` maintenance first conditionally fences the base HEAD, or the branch
+registry followed by every registered HEAD. Publication, fork, and deletion
+cannot cross that fence. The collector marks current and retained namespace
+positions, streams the data-segment listing, and submits unreachable keys to
+the native OpenDAL deleter. An interrupted fence remains authoritative until
+an explicit `volume gc --resume` changes its owner and repeats the mark before
+continuing deletion. Managed v1 does not reclaim immutable metadata objects.
 
 ## Validation
 

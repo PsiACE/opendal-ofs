@@ -219,6 +219,12 @@ impl BranchStore {
                 sealed = true;
                 break;
             }
+            if head.maintenance.is_some() {
+                return Err(conflict(
+                    "delete Managed branch",
+                    "data collection is active",
+                ));
+            }
             head.sealed = true;
             let bytes = encode_head(&head)?;
             match self
@@ -259,6 +265,12 @@ impl BranchStore {
         for _ in 0..BRANCH_CAS_ATTEMPTS {
             if registry.branches.get(name).copied() != Some(branch_id) {
                 return Ok(());
+            }
+            if registry.maintenance_owner.is_some() {
+                return Err(conflict(
+                    "delete Managed branch",
+                    "data collection is active",
+                ));
             }
             registry.branches.remove(name);
             let bytes = REGISTRY_RECORD
