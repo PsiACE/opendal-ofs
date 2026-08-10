@@ -230,7 +230,12 @@ impl<V: Volume> SyncEngine<V> {
                         install_staged_changes(replica_path, &staged, &source_manifest)?;
                     }
                 }
-                state = state_from_replica(remote_tree, replica_path, &state).await?;
+                let installed = LocalTree::scan(replica_path).await?;
+                state = ReplicaState::at_common(
+                    state.authority_identity(),
+                    remote_tree,
+                    installed.entries,
+                )?;
             } else {
                 state.pending = None;
             }
@@ -257,11 +262,16 @@ impl<V: Volume> SyncEngine<V> {
                     install_staged_changes(replica_path, &staged, &source_manifest)?;
                 }
                 let committed = SnapshotTree::new(&publication.target)?;
-                state = if requires_materialization {
-                    state_from_replica(&committed, replica_path, &state).await?
+                let installed = if requires_materialization {
+                    LocalTree::scan(replica_path).await?
                 } else {
-                    state_from_snapshot(&committed, &observed_local, &state)?
+                    observed_local
                 };
+                state = ReplicaState::at_common(
+                    state.authority_identity(),
+                    &committed,
+                    installed.entries,
+                )?;
                 state.install(state_path)?;
                 remove_tree(&staging_path)?;
                 Ok(result(&state, true))
@@ -417,23 +427,6 @@ async fn reuse_local_file(
     }
     set_executable(&destination, target.entries[target_path].local.executable)?;
     Ok(true)
-}
-
-async fn state_from_replica(
-    tree: &SnapshotTree<'_>,
-    replica: &Path,
-    previous: &ReplicaState,
-) -> Result<ReplicaState> {
-    let local = LocalTree::scan(replica).await?;
-    state_from_snapshot(tree, &local, previous)
-}
-
-fn state_from_snapshot(
-    tree: &SnapshotTree<'_>,
-    local: &LocalTree,
-    previous: &ReplicaState,
-) -> Result<ReplicaState> {
-    ReplicaState::at_common(previous.authority_identity(), tree, local.entries.clone())
 }
 
 fn known_local_versions(
