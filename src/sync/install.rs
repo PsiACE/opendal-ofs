@@ -230,25 +230,6 @@ fn removal_roots<'a>(
     roots
 }
 
-pub(super) fn install_staged_tree(replica: &Path, staging: &Path) -> Result<()> {
-    let backup = fresh_sibling(replica, "backup");
-    let existed = replica.exists();
-    if existed {
-        fs::rename(replica, &backup).context("move prior replica aside")?;
-    }
-    if let Err(error) = fs::rename(staging, replica) {
-        if existed {
-            let _ = fs::rename(&backup, replica);
-        }
-        return Err(error).context("install staged replica tree");
-    }
-    sync_parent(replica)?;
-    if existed {
-        fs::remove_dir_all(backup).context("remove replaced replica tree")?;
-    }
-    Ok(())
-}
-
 pub(super) fn fresh_sibling(path: &Path, purpose: &str) -> PathBuf {
     let parent = path
         .parent()

@@ -22,8 +22,11 @@ sync_b >/dev/null
 printf '%s\n' 'recovery: rebuild a cold client under another local alias'
 OFS_CONFIG="$cold_config" "$OFS_BIN" volume create "$cold_alias" \
   "${volume_options[@]}" >/dev/null
+cold_root_identity=$(ls -di -- "$cold_replica")
 sync_cold >/dev/null
 diff -ru "$replica_a" "$cold_replica" || fail 'cold replica does not match the published tree'
+[[ "$(ls -di -- "$cold_replica")" == "$cold_root_identity" ]] || \
+  fail 'cold rebuild replaced the replica root'
 if [[ "$(uname -s)" != MINGW* && "$(uname -s)" != MSYS* ]]; then
   [[ -x "$cold_replica/tools/run.sh" ]] || fail 'cold rebuild lost executable bit'
 fi

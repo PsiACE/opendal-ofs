@@ -12,9 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 use std::path::Path;
 
-use super::install::{
-    apply_target, fresh_sibling, install_staged_changes, install_staged_tree, remove_tree,
-};
+use super::install::{apply_target, fresh_sibling, install_staged_changes, remove_tree};
 use super::path::SnapshotTree;
 use super::{ConflictRecord, LocalTree, ReplicaState, StagedTree, build_publication, reconcile};
 use crate::filesystem::{
@@ -221,11 +219,7 @@ impl<V: Volume> SyncEngine<V> {
                     bail!("local replica changed while remote state was being installed");
                 }
                 if remote_advanced {
-                    if state.installed.is_empty() && local.entries.is_empty() {
-                        install_staged_tree(replica_path, &staged.root)?;
-                    } else {
-                        install_staged_changes(replica_path, &staged, &staged.source)?;
-                    }
+                    install_staged_changes(replica_path, &staged, &staged.source)?;
                 }
                 let installed = LocalTree::scan(replica_path).await?;
                 state = ReplicaState::at_common(
