@@ -139,7 +139,8 @@ impl NamespaceStore {
         })?;
         let operation = change.operation();
         let cursor = change.cursor();
-        let (request_digest, change_bytes) = change.fingerprint()?;
+        let request_digest = change.request_sha256()?;
+        let change_bytes = change.encoded_len()?;
         let (head, revision, base) = match observed {
             Some((witness, snapshot)) => {
                 if witness.head.volume_id != self.volume_id
@@ -224,8 +225,8 @@ impl NamespaceStore {
             Some(current) => {
                 let tail_bytes = current.tail.iter().try_fold(0_usize, |total, change| {
                     change
-                        .fingerprint()
-                        .map(|(_, length)| total.saturating_add(length))
+                        .encoded_len()
+                        .map(|length| total.saturating_add(length))
                 })?;
                 if current.tail.len() + 1 >= super::state::MAX_TAIL_TRANSACTIONS
                     || tail_bytes.saturating_add(change_bytes) > super::state::MAX_TAIL_BYTES
@@ -930,7 +931,7 @@ pub(crate) fn decode_head(bytes: &[u8]) -> Result<StoredHead, VolumeError> {
 fn committed_result(change: &NamespaceChange) -> Result<StoredCommittedResult, VolumeError> {
     Ok(StoredCommittedResult::from_change(
         change,
-        change.fingerprint()?.0,
+        change.request_sha256()?,
     ))
 }
 
@@ -1094,7 +1095,7 @@ mod tests {
         };
         let reference = store.write_change_segment(&segment).await.unwrap();
         let latest = segment.changes.last().unwrap();
-        let request_digest = latest.fingerprint().unwrap().0;
+        let request_digest = latest.request_sha256().unwrap();
         let outcome = StoredCommittedResult::from_change(latest, request_digest);
         let mut state = StoredNamespaceState {
             checkpoint,

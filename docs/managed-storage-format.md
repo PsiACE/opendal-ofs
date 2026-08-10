@@ -237,6 +237,48 @@ start and end against HEAD. The encoded body is limited to 16 MiB.
 
 ### Operation receipt
 
+`request_sha256` is SHA-256 of this semantic publication preimage. It does not
+depend on the CBOR representation of a transaction:
+
+```text
+"OFS1REQ1"                              8 bytes
+authority scope                         0x00, or 0x01 || BranchId
+VolumeId                                16 bytes
+OperationId                             16 bytes
+parent cursor
+committed cursor
+root NodeId                             16 bytes
+node preconditions                      counted sequence
+directory preconditions                 counted sequence
+put nodes                               counted sequence
+remove NodeIds                          counted sequence
+put directories                         counted sequence
+remove directory NodeIds                counted sequence
+put FileVersionIds                      counted sequence
+remove FileVersionIds                   counted sequence
+```
+
+All counts and string byte lengths are unsigned 64-bit big-endian integers.
+An optional value is `0x00` when absent and `0x01 || value` when present. A
+cursor is `0x00` for genesis or `0x01 || sequence || OperationId` otherwise,
+where the sequence is unsigned 64-bit big-endian. A Managed generation is its
+non-zero unsigned 64-bit big-endian value. A string is its byte length followed
+by its canonical NFC UTF-8 bytes. A boolean is `0x00` or `0x01`; node kind is
+`0x00` for a directory and `0x01` for a regular file.
+
+A node precondition is `NodeId || optional generation`; a directory
+precondition is `NodeId || optional generation`. A put node is `NodeId ||
+generation || kind || executable || optional FileVersionId`. A put directory
+is `NodeId || generation || removed names || put entries`, where each put entry
+is `name || NodeId || kind`. Each sequence is strictly ordered by its identity
+or name and contains no duplicates; names are ordered by their UTF-8 bytes.
+
+A put file version contributes its 32-byte `FileVersionId`, not its CBOR
+descriptor. Before calculating the request digest, the descriptor MUST decode
+without trailing bytes and MUST match the `FileVersionId` algorithm above.
+Consequently, equivalent descriptor encodings have one publication identity,
+while a malformed descriptor cannot pass operation-idempotency resolution.
+
 An operation receipt uses magic `OFS1OPR1` with the same strict
 `magic || CBOR || SHA-256` envelope and a 4096-byte body limit. Its body stores
 authority scope, `OperationId`, committed cursor, and publication request

@@ -19,10 +19,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use super::file_versions_have_consistent_segments;
 use super::validation::{
     match_preconditions, validate_directory_generation, validate_node_generation,
 };
+use super::{decode_file_version, file_versions_have_consistent_segments};
 use crate::filesystem::{
     BranchId, ChangeCursor, DirectoryRecord, FileVersion, OperationId, VolumeError, VolumeId,
     VolumeMutation, VolumeSnapshot,
@@ -231,8 +231,48 @@ impl NamespaceChange {
                 "read Managed transaction",
                 "transaction ancestry is invalid",
             )
-        })
+        })?;
+        let mutation = &self.mutation;
+        let ordered = strictly_ordered_by(&mutation.expected_nodes, |left, right| {
+            left.node < right.node
+        }) && strictly_ordered_by(&mutation.expected_directories, |left, right| {
+            left.directory < right.directory
+        }) && strictly_ordered_by(&mutation.put_nodes, |left, right| {
+            left.id < right.id
+        }) && strictly_ordered_by(&mutation.remove_nodes, |left, right| left < right)
+            && strictly_ordered_by(&mutation.put_directories, |left, right| {
+                left.node < right.node
+            })
+            && strictly_ordered_by(&mutation.remove_directories, |left, right| left < right)
+            && strictly_ordered_by(&mutation.put_file_versions, |left, right| {
+                left.id < right.id
+            })
+            && strictly_ordered_by(&mutation.remove_file_versions, |left, right| left < right)
+            && mutation.put_directories.iter().all(|directory| {
+                strictly_ordered_by(&directory.remove_entries, |left, right| left < right)
+            });
+        if !ordered {
+            return Err(corrupt(
+                "read Managed transaction",
+                "transaction effects are not strictly ordered",
+            ));
+        }
+        if mutation
+            .put_file_versions
+            .iter()
+            .any(|version| decode_file_version(version).is_err())
+        {
+            return Err(corrupt(
+                "read Managed transaction",
+                "transaction file version is invalid",
+            ));
+        }
+        Ok(())
     }
+}
+
+fn strictly_ordered_by<T>(values: &[T], before: impl Fn(&T, &T) -> bool) -> bool {
+    values.windows(2).all(|pair| before(&pair[0], &pair[1]))
 }
 
 fn validate_records<'a, K, V: 'a>(
