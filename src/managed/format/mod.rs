@@ -61,6 +61,117 @@ pub(crate) struct V1Record {
     maximum_body_bytes: usize,
 }
 
+/// A typed `magic || decoded length || zstd(CBOR) || optional SHA-256`
+/// envelope used by bounded Managed namespace records.
+pub(crate) struct CompressedRecord {
+    magic: [u8; 8],
+    maximum_decoded_bytes: usize,
+    maximum_encoded_bytes: usize,
+    length_bytes: usize,
+    checksum: bool,
+}
+
+impl CompressedRecord {
+    pub(crate) const fn new(
+        magic: [u8; 8],
+        maximum_decoded_bytes: usize,
+        maximum_encoded_bytes: usize,
+        length_bytes: usize,
+        checksum: bool,
+    ) -> Self {
+        Self {
+            magic,
+            maximum_decoded_bytes,
+            maximum_encoded_bytes,
+            length_bytes,
+            checksum,
+        }
+    }
+
+    pub(crate) fn encode<T: Serialize>(&self, value: &T) -> Result<Vec<u8>, RecordEncodeError> {
+        let mut body = Vec::new();
+        ciborium::into_writer(value, &mut body).map_err(|_| RecordEncodeError::Encode)?;
+        if body.len() > self.maximum_decoded_bytes {
+            return Err(RecordEncodeError::TooLarge);
+        }
+        let length = u64::try_from(body.len())
+            .map(u64::to_be_bytes)
+            .map_err(|_| RecordEncodeError::TooLarge)?;
+        let start = 8_usize
+            .checked_sub(self.length_bytes)
+            .ok_or(RecordEncodeError::Encode)?;
+        if length[..start].iter().any(|byte| *byte != 0) {
+            return Err(RecordEncodeError::TooLarge);
+        }
+        let length = length.get(start..).ok_or(RecordEncodeError::Encode)?;
+        let compressed = zstd::bulk::compress(&body, 3).map_err(|_| RecordEncodeError::Encode)?;
+        let encoded_length = self
+            .magic
+            .len()
+            .saturating_add(self.length_bytes)
+            .saturating_add(compressed.len())
+            .saturating_add(if self.checksum { 32 } else { 0 });
+        if encoded_length > self.maximum_encoded_bytes {
+            return Err(RecordEncodeError::TooLarge);
+        }
+        let mut bytes = Vec::with_capacity(encoded_length);
+        bytes.extend_from_slice(&self.magic);
+        bytes.extend_from_slice(length);
+        bytes.extend_from_slice(&compressed);
+        if self.checksum {
+            bytes.extend_from_slice(&Sha256::digest(&bytes));
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn decode<T: DeserializeOwned>(&self, bytes: &[u8]) -> Result<T, RecordDecodeError> {
+        if bytes.len() > self.maximum_encoded_bytes {
+            return Err(RecordDecodeError::Envelope);
+        }
+        let payload = bytes
+            .strip_prefix(&self.magic)
+            .ok_or(RecordDecodeError::Envelope)?;
+        let encoded = if self.checksum {
+            let body = payload
+                .get(
+                    ..payload
+                        .len()
+                        .checked_sub(32)
+                        .ok_or(RecordDecodeError::Envelope)?,
+                )
+                .ok_or(RecordDecodeError::Envelope)?;
+            if Sha256::digest(&bytes[..bytes.len() - 32]).as_slice() != &bytes[bytes.len() - 32..] {
+                return Err(RecordDecodeError::Checksum);
+            }
+            body
+        } else {
+            payload
+        };
+        if self.length_bytes > 8 || encoded.len() < self.length_bytes {
+            return Err(RecordDecodeError::Envelope);
+        }
+        let mut length = [0; 8];
+        length[8 - self.length_bytes..].copy_from_slice(&encoded[..self.length_bytes]);
+        let decoded_length =
+            usize::try_from(u64::from_be_bytes(length)).map_err(|_| RecordDecodeError::Envelope)?;
+        let compressed = &encoded[self.length_bytes..];
+        if decoded_length > self.maximum_decoded_bytes {
+            return Err(RecordDecodeError::Envelope);
+        }
+        let body = zstd::bulk::decompress(compressed, decoded_length)
+            .map_err(|_| RecordDecodeError::Decode)?;
+        if body.len() != decoded_length {
+            return Err(RecordDecodeError::Envelope);
+        }
+        let mut input = Cursor::new(body);
+        let value = ciborium::from_reader(&mut input).map_err(|_| RecordDecodeError::Decode)?;
+        if input.position() != decoded_length as u64 {
+            return Err(RecordDecodeError::TrailingBytes);
+        }
+        Ok(value)
+    }
+}
+
 impl V1Record {
     pub(crate) const fn new(magic: [u8; 8], maximum_body_bytes: usize) -> Self {
         Self {

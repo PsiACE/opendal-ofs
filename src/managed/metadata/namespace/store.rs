@@ -8,14 +8,11 @@
 
 //! One namespace authority state machine over a bound revision-CAS HEAD.
 
-use std::collections::BTreeMap;
-use std::io::Cursor;
-
 use futures::future::try_join_all;
 use opendal::{ErrorKind, Operator};
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use std::collections::BTreeMap;
 
 use super::{
     ChangeSegmentRef, CheckpointRef, NamespaceChange, StoredChangeSegment, StoredCommittedResult,
@@ -27,7 +24,7 @@ use crate::filesystem::{
 };
 use crate::managed::data::RetainedDataRoots;
 use crate::managed::error::{conflict, corrupt, invalid, unavailable};
-use crate::managed::format::{LowerHex, V1Record};
+use crate::managed::format::{CompressedRecord, LowerHex, V1Record};
 use crate::managed::metadata::object::{ensure_immutable, read};
 use crate::managed::metadata::record::{RecordBackend, Revision};
 
@@ -44,7 +41,15 @@ pub(crate) const MAX_HEAD_ENCODED_BYTES: usize = MAX_HEAD_BYTES + 64 * 1024;
 const MAX_CHECKPOINT_ENCODED_BYTES: usize = 256 * 1024 * 1024;
 const MAX_CHECKPOINT_DECODED_BYTES: usize = 256 * 1024 * 1024;
 const MAX_CHANGE_SEGMENT_BYTES: usize = 16 * 1024 * 1024;
-const COMPRESSION_LEVEL: i32 = 3;
+const HEAD_RECORD: CompressedRecord =
+    CompressedRecord::new(*HEAD_MAGIC, MAX_HEAD_BYTES, MAX_HEAD_ENCODED_BYTES, 4, true);
+const CHECKPOINT_RECORD: CompressedRecord = CompressedRecord::new(
+    *CHECKPOINT_MAGIC,
+    MAX_CHECKPOINT_DECODED_BYTES,
+    MAX_CHECKPOINT_ENCODED_BYTES,
+    8,
+    false,
+);
 
 #[derive(Clone, Debug)]
 pub(crate) struct NamespaceWitness {
@@ -1000,154 +1005,27 @@ impl StoredHead {
 }
 
 fn encode_checkpoint(checkpoint: &VolumeSnapshot) -> Result<Vec<u8>, VolumeError> {
-    let mut body = Vec::new();
-    ciborium::into_writer(checkpoint, &mut body).map_err(|_| {
-        invalid(
-            "checkpoint Managed namespace",
-            "checkpoint cannot be encoded",
-        )
-    })?;
-    if body.len() > MAX_CHECKPOINT_DECODED_BYTES {
-        return Err(invalid(
-            "checkpoint Managed namespace",
-            "checkpoint exceeds its decoded size limit",
-        ));
-    }
-    let decoded_length = u64::try_from(body.len()).map_err(|_| {
-        invalid(
-            "checkpoint Managed namespace",
-            "checkpoint exceeds its decoded size limit",
-        )
-    })?;
-    let compressed = zstd::bulk::compress(&body, COMPRESSION_LEVEL).map_err(|_| {
-        invalid(
-            "checkpoint Managed namespace",
-            "checkpoint cannot be compressed",
-        )
-    })?;
-    let encoded_length = CHECKPOINT_MAGIC
-        .len()
-        .saturating_add(8)
-        .saturating_add(compressed.len());
-    if encoded_length > MAX_CHECKPOINT_ENCODED_BYTES {
-        return Err(invalid(
-            "checkpoint Managed namespace",
-            "checkpoint exceeds its encoded size limit",
-        ));
-    }
-    let mut bytes = Vec::with_capacity(encoded_length);
-    bytes.extend_from_slice(CHECKPOINT_MAGIC);
-    bytes.extend_from_slice(&decoded_length.to_be_bytes());
-    bytes.extend_from_slice(&compressed);
-    Ok(bytes)
+    CHECKPOINT_RECORD
+        .encode(checkpoint)
+        .map_err(|error| invalid("checkpoint Managed namespace", error.message()))
 }
 
 fn decode_checkpoint(bytes: &[u8]) -> Result<VolumeSnapshot, VolumeError> {
-    if bytes.len() > MAX_CHECKPOINT_ENCODED_BYTES {
-        return Err(corrupt(
-            "read Managed namespace",
-            "checkpoint exceeds its encoded size limit",
-        ));
-    }
-    let encoded = bytes
-        .strip_prefix(CHECKPOINT_MAGIC)
-        .ok_or_else(|| corrupt("read Managed namespace", "checkpoint format is invalid"))?;
-    let (length, compressed) = encoded
-        .split_first_chunk::<8>()
-        .ok_or_else(|| corrupt("read Managed namespace", "checkpoint length is missing"))?;
-    let decoded_length = usize::try_from(u64::from_be_bytes(*length))
-        .ok()
-        .filter(|length| *length <= MAX_CHECKPOINT_DECODED_BYTES)
-        .ok_or_else(|| {
-            corrupt(
-                "read Managed namespace",
-                "checkpoint decoded size exceeds its limit",
-            )
-        })?;
-    let body = zstd::bulk::decompress(compressed, decoded_length).map_err(|_| {
-        corrupt(
-            "read Managed namespace",
-            "checkpoint compression is invalid",
-        )
-    })?;
-    if body.len() != decoded_length {
-        return Err(corrupt(
-            "read Managed namespace",
-            "checkpoint decoded length does not match",
-        ));
-    }
-    decode_value(&body)
+    CHECKPOINT_RECORD
+        .decode(bytes)
+        .map_err(|error| corrupt("read Managed namespace", error.message()))
 }
 
 pub(crate) fn encode_head(value: &StoredHead) -> Result<Vec<u8>, VolumeError> {
-    let mut body = Vec::new();
-    ciborium::into_writer(value, &mut body)
-        .map_err(|_| invalid("write Managed namespace", "HEAD cannot be encoded"))?;
-    if body.len() > MAX_HEAD_BYTES {
-        return Err(invalid(
-            "write Managed namespace",
-            "HEAD exceeds its decoded size limit",
-        ));
-    }
-    let decoded_length = u32::try_from(body.len()).map_err(|_| {
-        invalid(
-            "write Managed namespace",
-            "HEAD exceeds its decoded size limit",
-        )
-    })?;
-    let compressed = zstd::bulk::compress(&body, COMPRESSION_LEVEL)
-        .map_err(|_| invalid("write Managed namespace", "HEAD cannot be compressed"))?;
-    let mut bytes = Vec::with_capacity(12 + compressed.len() + 32);
-    bytes.extend_from_slice(HEAD_MAGIC);
-    bytes.extend_from_slice(&decoded_length.to_be_bytes());
-    bytes.extend_from_slice(&compressed);
-    let checksum: [u8; 32] = Sha256::digest(&bytes).into();
-    bytes.extend_from_slice(&checksum);
-    if bytes.len() > MAX_HEAD_ENCODED_BYTES {
-        return Err(invalid(
-            "write Managed namespace",
-            "HEAD exceeds its encoded size limit",
-        ));
-    }
-    Ok(bytes)
+    HEAD_RECORD
+        .encode(value)
+        .map_err(|error| invalid("write Managed namespace", error.message()))
 }
 
 pub(crate) fn decode_head(bytes: &[u8]) -> Result<StoredHead, VolumeError> {
-    if bytes.len() > MAX_HEAD_ENCODED_BYTES {
-        return Err(corrupt(
-            "read Managed namespace",
-            "HEAD exceeds its encoded size limit",
-        ));
-    }
-    let encoded = bytes
-        .strip_prefix(HEAD_MAGIC)
-        .and_then(|bytes| bytes.get(..bytes.len().checked_sub(32)?))
-        .ok_or_else(|| corrupt("read Managed namespace", "HEAD format is invalid"))?;
-    if Sha256::digest(&bytes[..bytes.len() - 32]).as_slice() != &bytes[bytes.len() - 32..] {
-        return Err(corrupt(
-            "read Managed namespace",
-            "HEAD checksum does not match",
-        ));
-    }
-    let (length, compressed) = encoded
-        .split_first_chunk::<4>()
-        .ok_or_else(|| corrupt("read Managed namespace", "HEAD length is missing"))?;
-    let decoded_length = u32::from_be_bytes(*length) as usize;
-    if decoded_length > MAX_HEAD_BYTES {
-        return Err(corrupt(
-            "read Managed namespace",
-            "HEAD decoded size exceeds its limit",
-        ));
-    }
-    let body = zstd::bulk::decompress(compressed, decoded_length)
-        .map_err(|_| corrupt("read Managed namespace", "HEAD compression is invalid"))?;
-    if body.len() != decoded_length {
-        return Err(corrupt(
-            "read Managed namespace",
-            "HEAD decoded length does not match",
-        ));
-    }
-    decode_value(&body)
+    HEAD_RECORD
+        .decode(bytes)
+        .map_err(|error| corrupt("read Managed namespace", error.message()))
 }
 
 fn committed_result(change: &NamespaceChange) -> Result<StoredCommittedResult, VolumeError> {
@@ -1155,19 +1033,6 @@ fn committed_result(change: &NamespaceChange) -> Result<StoredCommittedResult, V
         change,
         change.request_sha256()?,
     ))
-}
-
-fn decode_value<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, VolumeError> {
-    let mut input = Cursor::new(bytes);
-    let value = ciborium::from_reader(&mut input)
-        .map_err(|_| corrupt("read Managed namespace", "record cannot be decoded"))?;
-    if input.position() != bytes.len() as u64 {
-        return Err(corrupt(
-            "read Managed namespace",
-            "record has trailing bytes",
-        ));
-    }
-    Ok(value)
 }
 
 pub(crate) fn checkpoint_key(id: [u8; 32]) -> String {
@@ -1236,6 +1101,19 @@ mod tests {
         *corrupt.last_mut().unwrap() ^= 1;
         assert_eq!(
             decode_checkpoint(&corrupt).unwrap_err().kind(),
+            VolumeErrorKind::Corrupt
+        );
+    }
+
+    #[test]
+    fn head_identity_is_durable() {
+        let head = StoredHead::unborn(VolumeId::from_bytes([1; 16]), None);
+        let bytes = encode_head(&head).unwrap();
+        assert_eq!(decode_head(&bytes).unwrap().volume_id, head.volume_id);
+        let mut corrupt = bytes;
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert_eq!(
+            decode_head(&corrupt).unwrap_err().kind(),
             VolumeErrorKind::Corrupt
         );
     }
