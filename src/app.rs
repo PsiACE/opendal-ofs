@@ -384,7 +384,7 @@ fn status(config: &Path, args: StatusArgs) -> Result<()> {
         },
         "common_sequence": state.common().sequence(),
         "common_operation": state.common().operation().map(|operation| operation.to_string()),
-        "pending": state.pending.is_some(),
+        "pending": state.has_pending(),
         "conflicts": state.conflicts.len(),
     });
     if args.json {
@@ -399,7 +399,7 @@ fn status(config: &Path, args: StatusArgs) -> Result<()> {
             "managed sync alias {alias:?} for volume {}{branch} at change {}, {} pending, {} conflict(s)",
             state.volume,
             state.common().sequence(),
-            usize::from(state.pending.is_some()),
+            usize::from(state.has_pending()),
             state.conflicts.len()
         );
     }

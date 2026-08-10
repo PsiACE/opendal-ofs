@@ -18,7 +18,7 @@ mod staging;
 mod state;
 
 pub use engine::{SyncEngine, SyncResult};
-pub use state::{ConflictRecord, PendingIntent, ReplicaState};
+pub use state::{ConflictRecord, ReplicaState};
 
 pub(crate) use local::LocalTree;
 pub(crate) use publication::build_publication;

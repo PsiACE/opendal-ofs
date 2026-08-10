@@ -27,10 +27,10 @@ const STATE_FORMAT: &str = "ofs-sync-replica/1";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct PendingIntent {
-    pub operation: OperationId,
-    pub staging: PathBuf,
-    pub renames: BTreeMap<String, String>,
+pub(crate) struct PendingIntent {
+    pub(crate) operation: OperationId,
+    pub(crate) staging: PathBuf,
+    pub(crate) renames: BTreeMap<String, String>,
     pub(crate) source: TargetManifest,
     pub(crate) prepared: Vec<FileVersion>,
 }
@@ -49,7 +49,7 @@ pub struct ReplicaState {
     pub branch: Option<BranchBinding>,
     pub(crate) authority: Option<VolumeSnapshot>,
     pub(crate) installed: BTreeMap<String, LocalEntry>,
-    pub pending: Option<PendingIntent>,
+    pub(crate) pending: Option<PendingIntent>,
     pub conflicts: Vec<ConflictRecord>,
 }
 
@@ -77,6 +77,10 @@ impl ReplicaState {
             .as_ref()
             .map(|snapshot| snapshot.cursor)
             .unwrap_or(ChangeCursor::Genesis)
+    }
+
+    pub fn has_pending(&self) -> bool {
+        self.pending.is_some()
     }
 
     pub(crate) fn at_common(
