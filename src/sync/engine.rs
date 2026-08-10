@@ -23,7 +23,7 @@ use crate::managed::ManagedVolume;
 
 use super::install::install;
 use super::reconcile::reconcile;
-use super::scan::scan;
+use super::scan::{scan, scan_native};
 use super::{ReplicaState, SyncError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -68,7 +68,9 @@ impl SyncEngine {
             }
             require_empty(&root)?;
             install(&root, None, &observed.snapshot, &self.volume).await?;
-            ReplicaState::new(root, observed.snapshot.clone())?.save_new(state_path)?;
+            let native = scan_native(&root)?;
+            ReplicaState::with_native(root, observed.snapshot.clone(), native)?
+                .save_new(state_path)?;
             return Ok(SyncOutcome {
                 conflicts: 0,
                 published: false,
@@ -92,7 +94,7 @@ impl SyncEngine {
                 .await;
         }
 
-        let local = scan(&root, state.common(), &self.volume).await?;
+        let local = scan(&root, state.common(), state.native(), &self.volume).await?;
         let local_changed = local.snapshot.cursor != state.common().cursor;
         let remote_changed = observed.snapshot.cursor != state.common().cursor;
         match (local_changed, remote_changed) {
@@ -114,7 +116,7 @@ impl SyncEngine {
                 self.volume
                     .publish(&observed, local.snapshot.clone())
                     .await?;
-                state.advance(local.snapshot);
+                state.advance(local.snapshot, local.native)?;
                 state.save(state_path)?;
                 Ok(SyncOutcome {
                     conflicts: 0,
@@ -135,7 +137,7 @@ impl SyncEngine {
                     &self.volume,
                 )
                 .await?;
-                state.advance(observed.snapshot);
+                state.advance(observed.snapshot, scan_native(&root)?)?;
                 state.save(state_path)?;
                 Ok(SyncOutcome {
                     conflicts: 0,
@@ -168,7 +170,7 @@ impl SyncEngine {
                     self.volume.publish(&observed, plan.target.clone()).await?;
                 }
                 install(&root, Some(&local.snapshot), &plan.target, &self.volume).await?;
-                state.advance(plan.target);
+                state.advance(plan.target, scan_native(&root)?)?;
                 state.save(state_path)?;
                 Ok(SyncOutcome {
                     conflicts: 0,
@@ -196,7 +198,7 @@ impl SyncEngine {
             .clone();
         if observed.snapshot.cursor == target.cursor {
             install(root, Some(state.common()), &target, &self.volume).await?;
-            state.advance(target);
+            state.advance(target, scan_native(root)?)?;
             state.save(state_path)?;
             return Ok(SyncOutcome {
                 conflicts: 0,
@@ -212,7 +214,7 @@ impl SyncEngine {
         self.publish_target_files(root, &expected, &target).await?;
         self.volume.publish(&observed, target.clone()).await?;
         install(root, Some(state.common()), &target, &self.volume).await?;
-        state.advance(target);
+        state.advance(target, scan_native(root)?)?;
         state.save(state_path)?;
         Ok(SyncOutcome {
             conflicts: 0,

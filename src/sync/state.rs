@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Cursor;
 use std::io::Write as _;
@@ -22,7 +23,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::filesystem::{OperationId, VolumeId, VolumeSnapshot};
+use crate::filesystem::{NodeKind, OperationId, VolumeId, VolumeSnapshot};
 
 use super::SyncError;
 
@@ -36,6 +37,7 @@ pub struct ReplicaState {
     format: String,
     root: PathBuf,
     common: VolumeSnapshot,
+    native: BTreeMap<String, NativeIdentity>,
     pending: Option<PendingPublication>,
     conflicts: Vec<ConflictRecord>,
 }
@@ -55,13 +57,31 @@ pub struct ConflictRecord {
     pub remote_digest: Option<[u8; 32]>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeIdentity {
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    pub(crate) kind: NodeKind,
+}
+
 impl ReplicaState {
     pub fn new(root: PathBuf, common: VolumeSnapshot) -> Result<Self, SyncError> {
+        Self::with_native(root, common, BTreeMap::new())
+    }
+
+    pub(crate) fn with_native(
+        root: PathBuf,
+        common: VolumeSnapshot,
+        native: BTreeMap<String, NativeIdentity>,
+    ) -> Result<Self, SyncError> {
         common.validate()?;
+        validate_native(&common, &native)?;
         Ok(Self {
             format: FORMAT.to_owned(),
             root,
             common,
+            native,
             pending: None,
             conflicts: Vec::new(),
         })
@@ -78,6 +98,7 @@ impl ReplicaState {
             return Err(SyncError::new("replica state format is unsupported"));
         }
         state.common.validate()?;
+        validate_native(&state.common, &state.native)?;
         Ok(Some(state))
     }
 
@@ -127,10 +148,22 @@ impl ReplicaState {
         &self.common
     }
 
-    pub(crate) fn advance(&mut self, common: VolumeSnapshot) {
+    pub(crate) fn native(&self) -> &BTreeMap<String, NativeIdentity> {
+        &self.native
+    }
+
+    pub(crate) fn advance(
+        &mut self,
+        common: VolumeSnapshot,
+        native: BTreeMap<String, NativeIdentity>,
+    ) -> Result<(), SyncError> {
+        common.validate()?;
+        validate_native(&common, &native)?;
         self.common = common;
+        self.native = native;
         self.pending = None;
         self.conflicts.clear();
+        Ok(())
     }
 
     pub const fn has_pending(&self) -> bool {
@@ -172,6 +205,31 @@ impl ReplicaState {
         self.conflicts.clear();
         Ok(())
     }
+}
+
+fn validate_native(
+    snapshot: &VolumeSnapshot,
+    native: &BTreeMap<String, NativeIdentity>,
+) -> Result<(), SyncError> {
+    let paths = snapshot.paths()?;
+    if paths.len() != native.len()
+        || paths.iter().any(|(path, node)| {
+            native
+                .get(path)
+                .is_none_or(|identity| identity.kind != snapshot.nodes[node].kind)
+        })
+        || native
+            .values()
+            .map(|identity| (identity.device, identity.inode))
+            .collect::<BTreeSet<_>>()
+            .len()
+            != native.len()
+    {
+        return Err(SyncError::new(
+            "replica native identities do not match the common namespace",
+        ));
+    }
+    Ok(())
 }
 
 fn encode(state: &ReplicaState) -> Result<Vec<u8>, SyncError> {

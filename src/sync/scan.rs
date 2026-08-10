@@ -26,20 +26,24 @@ use crate::filesystem::{
 use crate::managed::ManagedVolume;
 
 use super::SyncError;
+use super::state::NativeIdentity;
 
 pub(crate) struct ScannedTree {
     pub(crate) snapshot: VolumeSnapshot,
+    pub(crate) native: BTreeMap<String, NativeIdentity>,
 }
 
 #[derive(Clone, Copy)]
 struct LocalEntry {
     kind: NodeKind,
     executable: bool,
+    native: NativeIdentity,
 }
 
 pub(crate) async fn scan(
     root: &Path,
     base: &VolumeSnapshot,
+    known_native: &BTreeMap<String, NativeIdentity>,
     volume: &ManagedVolume,
 ) -> Result<ScannedTree, SyncError> {
     let local = scan_paths(root)?;
@@ -54,9 +58,14 @@ pub(crate) async fn scan(
 
     let mut ids = BTreeMap::new();
     ids.insert(String::new(), base.root);
+    let known_by_identity = known_native
+        .iter()
+        .map(|(path, identity)| ((identity.device, identity.inode), path))
+        .collect::<BTreeMap<_, _>>();
     for (path, entry) in &local {
-        let node = base_paths
-            .get(path)
+        let node = known_by_identity
+            .get(&(entry.native.device, entry.native.inode))
+            .and_then(|known_path| base_paths.get(*known_path))
             .copied()
             .filter(|node| base.nodes[node].kind == entry.kind)
             .unwrap_or_else(NodeId::generate);
@@ -167,12 +176,27 @@ pub(crate) async fn scan(
     if same_namespace(&snapshot, base) {
         return Ok(ScannedTree {
             snapshot: base.clone(),
+            native: native_map(&local),
         });
     }
 
     let operation = OperationId::generate();
     snapshot.cursor = ChangeCursor::at(next_sequence, operation);
-    Ok(ScannedTree { snapshot })
+    Ok(ScannedTree {
+        snapshot,
+        native: native_map(&local),
+    })
+}
+
+pub(crate) fn scan_native(root: &Path) -> Result<BTreeMap<String, NativeIdentity>, SyncError> {
+    scan_paths(root).map(|entries| native_map(&entries))
+}
+
+fn native_map(local: &BTreeMap<String, LocalEntry>) -> BTreeMap<String, NativeIdentity> {
+    local
+        .iter()
+        .map(|(path, entry)| (path.clone(), entry.native))
+        .collect()
 }
 
 fn same_namespace(left: &VolumeSnapshot, right: &VolumeSnapshot) -> bool {
@@ -236,6 +260,11 @@ fn local_entry(
     Ok(LocalEntry {
         kind,
         executable: kind == NodeKind::RegularFile && metadata.permissions().mode() & 0o111 != 0,
+        native: NativeIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            kind,
+        },
     })
 }
 
