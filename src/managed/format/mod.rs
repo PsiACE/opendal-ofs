@@ -63,27 +63,47 @@ pub(crate) struct V1Record {
 
 /// A typed `magic || decoded length || zstd(CBOR) || optional SHA-256`
 /// envelope used by bounded Managed namespace records.
+#[derive(Clone, Copy)]
+enum LengthEncoding {
+    U32,
+    U64,
+}
+
 pub(crate) struct CompressedRecord {
     magic: [u8; 8],
     maximum_decoded_bytes: usize,
     maximum_encoded_bytes: usize,
-    length_bytes: usize,
+    length: LengthEncoding,
     checksum: bool,
 }
 
 impl CompressedRecord {
-    pub(crate) const fn new(
+    pub(crate) const fn with_u32_length(
         magic: [u8; 8],
         maximum_decoded_bytes: usize,
         maximum_encoded_bytes: usize,
-        length_bytes: usize,
         checksum: bool,
     ) -> Self {
         Self {
             magic,
             maximum_decoded_bytes,
             maximum_encoded_bytes,
-            length_bytes,
+            length: LengthEncoding::U32,
+            checksum,
+        }
+    }
+
+    pub(crate) const fn with_u64_length(
+        magic: [u8; 8],
+        maximum_decoded_bytes: usize,
+        maximum_encoded_bytes: usize,
+        checksum: bool,
+    ) -> Self {
+        Self {
+            magic,
+            maximum_decoded_bytes,
+            maximum_encoded_bytes,
+            length: LengthEncoding::U64,
             checksum,
         }
     }
@@ -94,21 +114,20 @@ impl CompressedRecord {
         if body.len() > self.maximum_decoded_bytes {
             return Err(RecordEncodeError::TooLarge);
         }
-        let length = u64::try_from(body.len())
-            .map(u64::to_be_bytes)
-            .map_err(|_| RecordEncodeError::TooLarge)?;
-        let start = 8_usize
-            .checked_sub(self.length_bytes)
-            .ok_or(RecordEncodeError::Encode)?;
-        if length[..start].iter().any(|byte| *byte != 0) {
-            return Err(RecordEncodeError::TooLarge);
+        let length = match self.length {
+            LengthEncoding::U32 => u32::try_from(body.len())
+                .map(u32::to_be_bytes)
+                .map(Vec::from),
+            LengthEncoding::U64 => u64::try_from(body.len())
+                .map(u64::to_be_bytes)
+                .map(Vec::from),
         }
-        let length = length.get(start..).ok_or(RecordEncodeError::Encode)?;
+        .map_err(|_| RecordEncodeError::TooLarge)?;
         let compressed = zstd::bulk::compress(&body, 3).map_err(|_| RecordEncodeError::Encode)?;
         let encoded_length = self
             .magic
             .len()
-            .saturating_add(self.length_bytes)
+            .saturating_add(length.len())
             .saturating_add(compressed.len())
             .saturating_add(if self.checksum { 32 } else { 0 });
         if encoded_length > self.maximum_encoded_bytes {
@@ -116,7 +135,7 @@ impl CompressedRecord {
         }
         let mut bytes = Vec::with_capacity(encoded_length);
         bytes.extend_from_slice(&self.magic);
-        bytes.extend_from_slice(length);
+        bytes.extend_from_slice(&length);
         bytes.extend_from_slice(&compressed);
         if self.checksum {
             bytes.extend_from_slice(&Sha256::digest(&bytes));
@@ -147,14 +166,22 @@ impl CompressedRecord {
         } else {
             payload
         };
-        if self.length_bytes > 8 || encoded.len() < self.length_bytes {
-            return Err(RecordDecodeError::Envelope);
-        }
-        let mut length = [0; 8];
-        length[8 - self.length_bytes..].copy_from_slice(&encoded[..self.length_bytes]);
-        let decoded_length =
-            usize::try_from(u64::from_be_bytes(length)).map_err(|_| RecordDecodeError::Envelope)?;
-        let compressed = &encoded[self.length_bytes..];
+        let (decoded_length, compressed) = match self.length {
+            LengthEncoding::U32 => {
+                let (length, compressed) = encoded
+                    .split_first_chunk::<4>()
+                    .ok_or(RecordDecodeError::Envelope)?;
+                (u32::from_be_bytes(*length) as usize, compressed)
+            }
+            LengthEncoding::U64 => {
+                let (length, compressed) = encoded
+                    .split_first_chunk::<8>()
+                    .ok_or(RecordDecodeError::Envelope)?;
+                let length = usize::try_from(u64::from_be_bytes(*length))
+                    .map_err(|_| RecordDecodeError::Envelope)?;
+                (length, compressed)
+            }
+        };
         if decoded_length > self.maximum_decoded_bytes {
             return Err(RecordDecodeError::Envelope);
         }

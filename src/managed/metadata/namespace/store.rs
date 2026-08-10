@@ -42,12 +42,11 @@ const MAX_CHECKPOINT_ENCODED_BYTES: usize = 256 * 1024 * 1024;
 const MAX_CHECKPOINT_DECODED_BYTES: usize = 256 * 1024 * 1024;
 const MAX_CHANGE_SEGMENT_BYTES: usize = 16 * 1024 * 1024;
 const HEAD_RECORD: CompressedRecord =
-    CompressedRecord::new(*HEAD_MAGIC, MAX_HEAD_BYTES, MAX_HEAD_ENCODED_BYTES, 4, true);
-const CHECKPOINT_RECORD: CompressedRecord = CompressedRecord::new(
+    CompressedRecord::with_u32_length(*HEAD_MAGIC, MAX_HEAD_BYTES, MAX_HEAD_ENCODED_BYTES, true);
+const CHECKPOINT_RECORD: CompressedRecord = CompressedRecord::with_u64_length(
     *CHECKPOINT_MAGIC,
     MAX_CHECKPOINT_DECODED_BYTES,
     MAX_CHECKPOINT_ENCODED_BYTES,
-    8,
     false,
 );
 
