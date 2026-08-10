@@ -226,15 +226,8 @@ impl BranchStore {
                 ));
             }
             head.sealed = true;
-            let bytes = encode_head(&head)?;
             match self
-                .backend
-                .replace(
-                    &head_key(branch_id),
-                    &revision,
-                    bytes,
-                    "delete Managed branch",
-                )
+                .replace_head(branch_id, &revision, &head, "delete Managed branch")
                 .await
             {
                 Ok(true) => {
@@ -273,17 +266,8 @@ impl BranchStore {
                 ));
             }
             registry.branches.remove(name);
-            let bytes = REGISTRY_RECORD
-                .encode(&registry)
-                .map_err(|error| invalid("delete Managed branch", error.message()))?;
             match self
-                .backend
-                .replace(
-                    REGISTRY_KEY,
-                    &registry_revision,
-                    bytes,
-                    "delete Managed branch",
-                )
+                .replace_registry(&registry_revision, &registry, "delete Managed branch")
                 .await
             {
                 Ok(true) => return Ok(()),
@@ -383,12 +367,8 @@ impl BranchStore {
             ));
         }
         registry.branches.insert(target.clone(), target_id);
-        let bytes = REGISTRY_RECORD
-            .encode(&registry)
-            .map_err(|error| invalid("fork Managed branch", error.message()))?;
         match self
-            .backend
-            .replace(REGISTRY_KEY, &revision, bytes, "fork Managed branch")
+            .replace_registry(&revision, &registry, "fork Managed branch")
             .await
         {
             Ok(true) => {}
@@ -444,15 +424,7 @@ impl BranchStore {
         }
         registry.maintenance_owner = Some(owner);
         if !self
-            .backend
-            .replace(
-                REGISTRY_KEY,
-                &revision,
-                REGISTRY_RECORD
-                    .encode(&registry)
-                    .map_err(|error| invalid("begin Managed data collection", error.message()))?,
-                "begin Managed data collection",
-            )
+            .replace_registry(&revision, &registry, "begin Managed data collection")
             .await?
         {
             return Err(conflict(
@@ -506,15 +478,7 @@ impl BranchStore {
         }
         current.maintenance_owner = None;
         if !self
-            .backend
-            .replace(
-                REGISTRY_KEY,
-                &revision,
-                REGISTRY_RECORD
-                    .encode(&current)
-                    .map_err(|error| invalid("finish Managed data collection", error.message()))?,
-                "finish Managed data collection",
-            )
+            .replace_registry(&revision, &current, "finish Managed data collection")
             .await?
         {
             return Err(conflict(
@@ -556,13 +520,7 @@ impl BranchStore {
             head.maintenance_epoch = epoch;
             head.maintenance = Some(sweep);
             if self
-                .backend
-                .replace(
-                    &head_key(id),
-                    &revision,
-                    encode_head(&head)?,
-                    "begin Managed data collection",
-                )
+                .replace_head(id, &revision, &head, "begin Managed data collection")
                 .await?
             {
                 return Ok((sweep, head.state));
@@ -589,13 +547,7 @@ impl BranchStore {
         }
         head.maintenance = None;
         if self
-            .backend
-            .replace(
-                &head_key(id),
-                &revision,
-                encode_head(&head)?,
-                "finish Managed data collection",
-            )
+            .replace_head(id, &revision, &head, "finish Managed data collection")
             .await?
         {
             Ok(())
@@ -605,6 +557,32 @@ impl BranchStore {
                 "branch HEAD changed",
             ))
         }
+    }
+
+    async fn replace_registry(
+        &self,
+        revision: &Revision,
+        registry: &StoredBranchRegistry,
+        action: &'static str,
+    ) -> Result<bool, VolumeError> {
+        let bytes = REGISTRY_RECORD
+            .encode(registry)
+            .map_err(|error| invalid(action, error.message()))?;
+        self.backend
+            .replace(REGISTRY_KEY, revision, bytes, action)
+            .await
+    }
+
+    async fn replace_head(
+        &self,
+        id: BranchId,
+        revision: &Revision,
+        head: &StoredHead,
+        action: &'static str,
+    ) -> Result<bool, VolumeError> {
+        self.backend
+            .replace(&head_key(id), revision, encode_head(head)?, action)
+            .await
     }
 
     async fn registry(&self) -> Result<(StoredBranchRegistry, Revision), VolumeError> {
