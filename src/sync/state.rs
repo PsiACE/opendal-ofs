@@ -6,7 +6,7 @@
 // "License"); you may not use this file except in compliance
 // with the License.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
@@ -33,9 +33,9 @@ pub struct PendingIntent {
     pub data_finalized: bool,
     pub renames: BTreeMap<String, String>,
     pub(crate) source: TargetManifest,
-    pub(crate) manifest: TargetManifest,
+    pub(crate) manifest: Option<TargetManifest>,
     pub(crate) prepared: Vec<FileVersion>,
-    pub(crate) cache: BTreeMap<String, crate::filesystem::FileVersionId>,
+    pub(crate) cached_paths: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

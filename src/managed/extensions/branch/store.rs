@@ -24,13 +24,19 @@ use crate::filesystem::{
 use crate::managed::ManagedVolume;
 use crate::managed::error::{conflict, corrupt, invalid, unavailable};
 use crate::managed::format::{RecordDecodeError, RecordEncodeError, V1Record};
-use crate::managed::metadata::namespace::{NamespaceStore, StoredHead, decode_head, encode_head};
+use crate::managed::metadata::namespace::{
+    MAX_HEAD_ENCODED_BYTES, NamespaceStore, StoredHead, decode_head, encode_head,
+};
 use crate::managed::metadata::record::{RecordBackend, Revision};
+use futures::{StreamExt, TryStreamExt, stream};
 use opendal::Operator;
 
 const ROOT: &str = ".ofs/managed/metadata/v1/extensions/branch/v1";
 const REGISTRY_KEY: &str = ".ofs/managed/metadata/v1/extensions/branch/v1/registry.ofs";
-const REGISTRY_RECORD: V1Record = V1Record::new(*b"OFS1BRG1", usize::MAX);
+const MAX_REGISTRY_BODY_BYTES: usize = 4 * 1024 * 1024;
+const REGISTRY_RECORD: V1Record = V1Record::new(*b"OFS1BRG1", MAX_REGISTRY_BODY_BYTES);
+const BRANCH_LIST_CONCURRENCY: usize = 8;
+const BRANCH_CAS_ATTEMPTS: usize = 8;
 
 #[derive(Clone)]
 pub struct BranchStore {
@@ -116,13 +122,17 @@ impl BranchStore {
     pub async fn list(&self) -> Result<Vec<BranchInfo>, VolumeError> {
         let (registry, _) = self.registry().await?;
         let default = registry.default_branch;
-        let mut branches = Vec::with_capacity(registry.branches.len());
-        for (name, id) in registry.branches {
-            let (head, _) = self.read_head(id).await?.ok_or_else(|| {
-                corrupt("list Managed branches", "registered branch HEAD is missing")
-            })?;
-            branches.push(info(name, id, &head, default));
-        }
+        let mut branches = stream::iter(registry.branches)
+            .map(|(name, id)| async move {
+                let (head, _) = self.read_head(id).await?.ok_or_else(|| {
+                    corrupt("list Managed branches", "registered branch HEAD is missing")
+                })?;
+                Ok(info(name, id, &head, default))
+            })
+            .buffer_unordered(BRANCH_LIST_CONCURRENCY)
+            .try_collect::<Vec<_>>()
+            .await?;
+        branches.sort_by(|left, right| left.binding.name.cmp(&right.binding.name));
         Ok(branches)
     }
 
@@ -181,7 +191,8 @@ impl BranchStore {
             ));
         }
 
-        loop {
+        let mut sealed = false;
+        for _ in 0..BRANCH_CAS_ATTEMPTS {
             let Some((mut head, revision)) = self.read_head(branch_id).await? else {
                 return Err(corrupt(
                     "delete Managed branch",
@@ -189,6 +200,7 @@ impl BranchStore {
                 ));
             };
             if head.sealed {
+                sealed = true;
                 break;
             }
             head.sealed = true;
@@ -203,22 +215,32 @@ impl BranchStore {
                 )
                 .await
             {
-                Ok(true) => break,
-                Ok(false) => continue,
+                Ok(true) => {
+                    sealed = true;
+                    break;
+                }
+                Ok(false) => tokio::task::yield_now().await,
                 Err(error) => {
                     if self
                         .read_head(branch_id)
                         .await?
                         .is_some_and(|(head, _)| head.sealed)
                     {
+                        sealed = true;
                         break;
                     }
                     return Err(error);
                 }
             }
         }
+        if !sealed {
+            return Err(conflict(
+                "delete Managed branch",
+                "branch HEAD changed concurrently",
+            ));
+        }
 
-        loop {
+        for _ in 0..BRANCH_CAS_ATTEMPTS {
             let (mut registry, revision) = self.registry().await?;
             if registry.branch_id(name) != Some(branch_id) {
                 return Ok(());
@@ -233,7 +255,7 @@ impl BranchStore {
                 .await
             {
                 Ok(true) => return Ok(()),
-                Ok(false) => continue,
+                Ok(false) => tokio::task::yield_now().await,
                 Err(error) => {
                     let (current, _) = self.registry().await?;
                     return if current.branch_id(name) == Some(branch_id) {
@@ -244,6 +266,10 @@ impl BranchStore {
                 }
             }
         }
+        Err(conflict(
+            "delete Managed branch",
+            "branch registry changed concurrently",
+        ))
     }
 
     pub async fn fork(
@@ -282,22 +308,15 @@ impl BranchStore {
         let state = match (point, source_head.state) {
             (ForkPoint::Head, state) => state,
             (ForkPoint::Sequence(0), _) => None,
-            (ForkPoint::Sequence(sequence), Some(current)) => {
-                if let Some(state) = current.at_sequence(sequence) {
-                    Some(state)
-                } else {
-                    self.namespace(BranchBinding {
-                        name: source.clone(),
-                        id: source_id,
-                    })
-                    .find_history_state(current.previous_history, sequence)
-                    .await?
-                    .ok_or_else(|| {
-                        invalid("fork Managed branch", "branch position is not retained")
-                    })?
-                    .into()
-                }
-            }
+            (ForkPoint::Sequence(sequence), Some(current)) => self
+                .namespace(BranchBinding {
+                    name: source.clone(),
+                    id: source_id,
+                })
+                .state_at_sequence(&current, sequence)
+                .await?
+                .ok_or_else(|| invalid("fork Managed branch", "branch position is not retained"))?
+                .into(),
             (ForkPoint::Sequence(_), None) => {
                 return Err(invalid(
                     "fork Managed branch",
@@ -305,6 +324,10 @@ impl BranchStore {
                 ));
             }
         };
+        let state = state.map(|mut state| {
+            state.reset_outcomes();
+            state
+        });
         let target_id = BranchId::generate();
         let target_head = StoredHead {
             branch_id: Some(target_id),
@@ -365,7 +388,11 @@ impl BranchStore {
     async fn read_registry(&self) -> Result<Option<(StoredBranchRegistry, Revision)>, VolumeError> {
         let Some((bytes, revision)) = self
             .backend
-            .read(REGISTRY_KEY, "read Managed branches")
+            .read(
+                REGISTRY_KEY,
+                REGISTRY_RECORD.maximum_encoded_bytes(),
+                "read Managed branches",
+            )
             .await?
         else {
             return Ok(None);
@@ -383,7 +410,11 @@ impl BranchStore {
     ) -> Result<Option<(StoredHead, Revision)>, VolumeError> {
         let Some((bytes, revision)) = self
             .backend
-            .read(&head_key(branch_id), "read Managed branch")
+            .read(
+                &head_key(branch_id),
+                MAX_HEAD_ENCODED_BYTES,
+                "read Managed branch",
+            )
             .await?
         else {
             return Ok(None);

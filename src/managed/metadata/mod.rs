@@ -27,7 +27,7 @@ pub use superblock::{ManagedExtension, ManagedFormat, MetadataFormat};
 use namespace::NamespaceStore;
 use opendal::Operator;
 use record::RecordBackend;
-use superblock::SUPERBLOCK_KEY;
+use superblock::{MAX_SUPERBLOCK_BYTES, SUPERBLOCK_KEY};
 
 use super::ManagedVolume;
 use super::error::{invalid, unavailable};
@@ -62,7 +62,12 @@ impl ManagedMetadata {
         self.require_backend_format(desired)?;
         let observed = self
             .backend
-            .create_or_read(SUPERBLOCK_KEY, desired.encode()?, "create Managed format")
+            .create_or_read(
+                SUPERBLOCK_KEY,
+                desired.encode()?,
+                MAX_SUPERBLOCK_BYTES,
+                "create Managed format",
+            )
             .await
             .and_then(|bytes| ManagedFormat::decode(&bytes))?;
         self.require_backend_format(&observed)?;
@@ -72,7 +77,7 @@ impl ManagedMetadata {
     pub async fn read_format(&self) -> Result<ManagedFormat, VolumeError> {
         let (bytes, _) = self
             .backend
-            .read(SUPERBLOCK_KEY, "read Managed format")
+            .read(SUPERBLOCK_KEY, MAX_SUPERBLOCK_BYTES, "read Managed format")
             .await?
             .ok_or_else(|| unavailable("read Managed format", "Managed format does not exist"))?;
         let format = ManagedFormat::decode(&bytes)?;

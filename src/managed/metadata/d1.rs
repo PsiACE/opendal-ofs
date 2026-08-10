@@ -23,6 +23,8 @@ use serde_json::Value;
 use crate::filesystem::VolumeError;
 use crate::managed::error::{corrupt, invalid, unavailable};
 
+const MAX_D1_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
 /// Connection scope for the D1 Query API.
 #[derive(Clone)]
 pub struct D1Config {
@@ -112,7 +114,7 @@ impl D1Session {
             self.config.account_id,
             self.config.database_id
         );
-        let response = self
+        let mut response = self
             .client
             .post(endpoint)
             .bearer_auth(&self.config.token)
@@ -123,9 +125,24 @@ impl D1Session {
         if !response.status().is_success() {
             return Err(unavailable(action, "D1 metadata is unavailable"));
         }
-        let reply: D1Reply = response
-            .json()
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_D1_RESPONSE_BYTES as u64)
+        {
+            return Err(corrupt(action, "D1 response exceeds its size limit"));
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
+            .map_err(|_| unavailable(action, "D1 metadata is unavailable"))?
+        {
+            if body.len().saturating_add(chunk.len()) > MAX_D1_RESPONSE_BYTES {
+                return Err(corrupt(action, "D1 response exceeds its size limit"));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let reply: D1Reply = serde_json::from_slice(&body)
             .map_err(|_| corrupt(action, "D1 returned an invalid response"))?;
         if !reply.success
             || reply

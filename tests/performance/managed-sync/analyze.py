@@ -10,6 +10,7 @@
 """Summarize release A/B evidence and enforce user-visible performance gates."""
 
 import argparse
+import hashlib
 import json
 import math
 import statistics
@@ -65,7 +66,7 @@ def request_phase(event_ns: int, intervals) -> str:
     for interval in intervals:
         if interval["start_ns"] <= event_ns <= interval["end_ns"]:
             return interval["metric"]
-    return "outside_measured_phase"
+    return "unattributed"
 
 
 def audit_time_ns(value: str) -> int:
@@ -84,20 +85,18 @@ def object_class(path: str) -> str:
     return "control"
 
 
-def load_audit(path: Path, intervals):
+def load_audit(path: Path, intervals, access_key: str):
     distribution = defaultdict(lambda: {"count": 0, "bytes_in": 0, "bytes_out": 0})
-    observed_runs = set()
-    noop_data_puts = []
+    noop_data_puts = 0
     for line in path.open(encoding="utf-8"):
         event = json.loads(line)
-        if " mc/" in event.get("userAgent", ""):
+        if event.get("accessKey") != access_key:
             continue
         api = event["api"]
         decoded_path = unquote(event["requestPath"])
         run = next((name for name in intervals if f"/ab/{name}" in decoded_path), None)
         if run is None:
             continue
-        observed_runs.add(run)
         phase = request_phase(audit_time_ns(event["time"]), intervals[run])
         classification = object_class(decoded_path)
         is_range = "Range" in event.get("requestHeader", {})
@@ -107,7 +106,7 @@ def load_audit(path: Path, intervals):
         distribution[key]["bytes_out"] += api["tx"]
         if api["name"] == "PutObject" and classification == "segment_data":
             if phase == "noop":
-                noop_data_puts.append(event)
+                noop_data_puts += 1
     rows = [
         {
             "run": key[0],
@@ -120,31 +119,32 @@ def load_audit(path: Path, intervals):
         }
         for key, values in sorted(distribution.items())
     ]
-    return rows, observed_runs, noop_data_puts
+    return rows, noop_data_puts
 
 
-def load_object_inventory(directory: Path, inputs):
-    inventories = []
-    for run, values in sorted(inputs.items()):
-        totals = defaultdict(lambda: {"objects": 0, "bytes": 0})
+def load_object_totals(directory: Path, inputs):
+    result = {}
+    for run in sorted(inputs):
+        classes = defaultdict(lambda: {"objects": 0, "bytes": 0})
         path = directory / "runs" / run / "objects.jsonl"
         for line in path.open(encoding="utf-8"):
             record = json.loads(line)
             if record.get("status") != "success" or record.get("type") != "file":
                 continue
             classification = object_class(record["key"])
-            totals[classification]["objects"] += 1
-            totals[classification]["bytes"] += int(record["size"])
-        for classification, total in sorted(totals.items()):
-            inventories.append(
-                {
-                    "run": run,
-                    "release": values["release"],
-                    "object_class": classification,
-                    **total,
-                }
-            )
-    return inventories
+            classes[classification]["objects"] += 1
+            classes[classification]["bytes"] += int(record["size"])
+        metadata = [classes[name] for name in ("format", "metadata")]
+        data = classes["segment_data"]
+        result[run] = {
+            "metadata_objects": sum(value["objects"] for value in metadata),
+            "metadata_bytes": sum(value["bytes"] for value in metadata),
+            "data_objects": data["objects"],
+            "data_bytes": data["bytes"],
+            "total_objects": sum(value["objects"] for value in classes.values()),
+            "total_bytes": sum(value["bytes"] for value in classes.values()),
+        }
+    return result
 
 
 def load_inputs(path: Path):
@@ -155,21 +155,26 @@ def load_inputs(path: Path):
     return dict(values)
 
 
-def logical_equality(directory: Path, inputs) -> tuple[bool, dict[str, list[dict]]]:
-    manifests = {
-        run: json.loads((directory / "runs" / run / "logical-tree.json").read_text())
+def logical_equality(directory: Path, inputs) -> tuple[bool, dict[str, str]]:
+    digests = {
+        run: hashlib.sha256(
+            (directory / "runs" / run / "logical-tree.json").read_bytes()
+        ).hexdigest()
         for run in sorted(inputs)
     }
-    values = list(manifests.values())
-    return bool(values) and all(manifest == values[0] for manifest in values[1:]), manifests
+    values = list(digests.values())
+    return bool(values) and all(digest == values[0] for digest in values[1:]), digests
 
 
-def comparison_summary(samples, requests, inventories, inputs, equal):
+def comparison_summary(statistics_by_metric, requests, object_totals, inputs, equal):
+    product_phases = {"cold_restore", "incremental_catchup", "publication", "noop"}
     request_totals = defaultdict(lambda: {"count": 0, "request_bytes": 0, "response_bytes": 0})
     request_operations = defaultdict(lambda: defaultdict(int))
     range_gets = defaultdict(int)
-    catchup_segment_gets = defaultdict(int)
+    segment_gets = defaultdict(lambda: defaultdict(int))
     for row in requests:
+        if row["phase"] not in product_phases:
+            continue
         total = request_totals[row["run"]]
         total["count"] += row["count"]
         total["request_bytes"] += row["bytes_in"]
@@ -177,35 +182,8 @@ def comparison_summary(samples, requests, inventories, inputs, equal):
         request_operations[row["run"]][row["operation"]] += row["count"]
         if row["operation"] == "GetObject" and row["range"]:
             range_gets[row["run"]] += row["count"]
-        if (
-            row["phase"] == "catchup"
-            and row["operation"] == "GetObject"
-            and row["object_class"] == "segment_data"
-        ):
-            catchup_segment_gets[row["run"]] += row["count"]
-
-    object_totals = defaultdict(
-        lambda: {
-            "metadata_objects": 0,
-            "metadata_bytes": 0,
-            "data_objects": 0,
-            "data_bytes": 0,
-            "total_objects": 0,
-            "total_bytes": 0,
-        }
-    )
-    metadata_classes = {"format", "metadata"}
-    data_classes = {"segment_data"}
-    for row in inventories:
-        total = object_totals[row["run"]]
-        total["total_objects"] += row["objects"]
-        total["total_bytes"] += row["bytes"]
-        if row["object_class"] in metadata_classes:
-            total["metadata_objects"] += row["objects"]
-            total["metadata_bytes"] += row["bytes"]
-        elif row["object_class"] in data_classes:
-            total["data_objects"] += row["objects"]
-            total["data_bytes"] += row["bytes"]
+        if row["operation"] == "GetObject" and row["object_class"] == "segment_data":
+            segment_gets[row["run"]][row["phase"]] += row["count"]
 
     releases = sorted({values["release"] for values in inputs.values()})
     operations = sorted({row["operation"] for row in requests})
@@ -230,8 +208,11 @@ def comparison_summary(samples, requests, inventories, inputs, equal):
                 "range_get_count_median": statistics.median(
                     range_gets[run] for run in runs
                 ),
-                "catchup_segment_get_count_median": statistics.median(
-                    catchup_segment_gets[run] for run in runs
+                "cold_restore_segment_get_count_median": statistics.median(
+                    segment_gets[run]["cold_restore"] for run in runs
+                ),
+                "incremental_catchup_segment_get_count_median": statistics.median(
+                    segment_gets[run]["incremental_catchup"] for run in runs
                 ),
             },
             "remote_objects": {
@@ -245,15 +226,17 @@ def comparison_summary(samples, requests, inventories, inputs, equal):
                     "total_bytes",
                 )
             },
-            "latency": summarize(
-                [sample for sample in samples if sample["release"] == release]
-            ),
+            "latency": {
+                key: value
+                for key, value in statistics_by_metric.items()
+                if key.startswith(f"{release}.")
+            },
         }
     return result
 
 
 def relative_gate(name: str, baseline: float, candidate: float, limit: float):
-    delta = candidate / baseline - 1
+    delta = candidate / baseline - 1 if baseline else (0 if candidate == 0 else math.inf)
     return {
         "name": name,
         "baseline": baseline,
@@ -267,97 +250,106 @@ def relative_gate(name: str, baseline: float, candidate: float, limit: float):
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("directory", type=Path)
+    parser.add_argument("--access-key", required=True)
     arguments = parser.parse_args()
     directory = arguments.directory
     samples, intervals = load_metrics(directory / "samples.tsv")
     statistics_by_metric = summarize(samples)
-    requests, observed_runs, noop_data_puts = load_audit(
-        directory / "audit.jsonl", intervals
+    requests, noop_data_puts = load_audit(
+        directory / "audit.jsonl", intervals, arguments.access_key
     )
     inputs = load_inputs(directory / "inputs.tsv")
-    object_inventory = load_object_inventory(directory, inputs)
-    equal, manifests = logical_equality(directory, inputs)
+    object_totals = load_object_totals(directory, inputs)
+    equal, manifest_digests = logical_equality(directory, inputs)
     context = {key: value for key, value in read_tsv(directory / "context.tsv")}
-    summary = comparison_summary(samples, requests, object_inventory, inputs, equal)
+    summary = comparison_summary(
+        statistics_by_metric, requests, object_totals, inputs, equal
+    )
     baseline_summary = summary["releases"]["baseline"]
     candidate_summary = summary["releases"]["candidate"]
+    latency_specs = (
+        ("lifecycle_median", "lifecycle", "median_ms", 0.10),
+        ("publication_p95", "publication", "p95_ms", 0.15),
+        ("cold_restore_p95", "cold_restore", "p95_ms", 0.15),
+        ("incremental_catchup_p95", "incremental_catchup", "p95_ms", 0.15),
+    )
+    request_specs = (
+        "count_median",
+        "cold_restore_segment_get_count_median",
+        "incremental_catchup_segment_get_count_median",
+    )
     gates = [
         relative_gate(
-            "lifecycle_median",
-            statistics_by_metric["baseline.lifecycle"]["median_ms"],
-            statistics_by_metric["candidate.lifecycle"]["median_ms"],
-            0.10,
-        ),
-        relative_gate(
-            "publication_p95",
-            statistics_by_metric["baseline.publication"]["p95_ms"],
-            statistics_by_metric["candidate.publication"]["p95_ms"],
-            0.15,
-        ),
-        relative_gate(
-            "catchup_p95",
-            statistics_by_metric["baseline.catchup"]["p95_ms"],
-            statistics_by_metric["candidate.catchup"]["p95_ms"],
-            0.15,
-        ),
-        relative_gate(
-            "request_count_median",
-            baseline_summary["requests"]["count_median"],
-            candidate_summary["requests"]["count_median"],
-            0.10,
-        ),
-        relative_gate(
-            "catchup_segment_get_count_median",
-            baseline_summary["requests"]["catchup_segment_get_count_median"],
-            candidate_summary["requests"]["catchup_segment_get_count_median"],
-            0.10,
-        ),
-        relative_gate(
-            "transferred_bytes_median",
-            baseline_summary["requests"]["request_bytes_median"]
-            + baseline_summary["requests"]["response_bytes_median"],
-            candidate_summary["requests"]["request_bytes_median"]
-            + candidate_summary["requests"]["response_bytes_median"],
-            0.10,
-        ),
-        relative_gate(
-            "stored_bytes_median",
-            baseline_summary["remote_objects"]["total_bytes_median"],
-            candidate_summary["remote_objects"]["total_bytes_median"],
-            0.10,
-        ),
-        {
-            "name": "noop_requests_observed",
-            "passed": {s["run"] for s in samples if s["metric"] == "noop"} <= observed_runs,
-        },
-        {
-            "name": "noop_has_no_data_put",
-            "count": len(noop_data_puts),
-            "passed": not noop_data_puts,
-        },
-        {
-            "name": "object_inventory_observed",
-            "passed": set(inputs)
-            <= {row["run"] for row in object_inventory},
-        },
-        {
-            "name": "logical_trees_are_equal",
-            "passed": equal,
-        },
+            name,
+            statistics_by_metric[f"baseline.{metric}"][aggregate],
+            statistics_by_metric[f"candidate.{metric}"][aggregate],
+            limit,
+        )
+        for name, metric, aggregate, limit in latency_specs
     ]
+    gates.extend(
+        relative_gate(
+            "request_count_median" if name == "count_median" else name,
+            baseline_summary["requests"][name],
+            candidate_summary["requests"][name],
+            0.10,
+        )
+        for name in request_specs
+    )
+    gates.extend(
+        [
+            relative_gate(
+                "transferred_bytes_median",
+                baseline_summary["requests"]["request_bytes_median"]
+                + baseline_summary["requests"]["response_bytes_median"],
+                candidate_summary["requests"]["request_bytes_median"]
+                + candidate_summary["requests"]["response_bytes_median"],
+                0.10,
+            ),
+            relative_gate(
+                "stored_bytes_median",
+                baseline_summary["remote_objects"]["total_bytes_median"],
+                candidate_summary["remote_objects"]["total_bytes_median"],
+                0.10,
+            ),
+            {
+                "name": "noop_phase_covered",
+                "passed": set(inputs)
+                <= {sample["run"] for sample in samples if sample["metric"] == "noop"},
+            },
+            {
+                "name": "noop_has_no_data_put",
+                "count": noop_data_puts,
+                "passed": noop_data_puts == 0,
+            },
+            {
+                "name": "object_inventory_observed",
+                "passed": all(
+                    object_totals.get(run, {}).get("total_objects", 0) > 0
+                    for run in inputs
+                ),
+            },
+            {
+                "name": "logical_trees_are_equal",
+                "passed": equal,
+            },
+        ]
+    )
     verdict = "pass" if all(gate["passed"] for gate in gates) else "fail"
     report = {
         "format": "ofs-managed-sync-performance",
         "version": 1,
         "verdict": verdict,
         "context": context,
-        "order": [values["release"] for values in inputs.values()],
-        "inputs_and_storage": inputs,
-        "samples": samples,
-        "statistics": statistics_by_metric,
+        "evidence": {
+            "audit": "audit.jsonl",
+            "commands": "commands.tsv",
+            "inputs": "inputs.tsv",
+            "runs": "runs/",
+            "samples": "samples.tsv",
+        },
         "audit_distribution": requests,
-        "object_inventory": object_inventory,
-        "logical_manifests": manifests,
+        "logical_manifest_sha256": manifest_digests,
         "summary": summary,
         "gates": gates,
     }

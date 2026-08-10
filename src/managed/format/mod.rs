@@ -49,6 +49,13 @@ impl V1Record {
         }
     }
 
+    pub(crate) const fn maximum_encoded_bytes(&self) -> usize {
+        self.magic
+            .len()
+            .saturating_add(self.maximum_body_bytes)
+            .saturating_add(32)
+    }
+
     pub(crate) fn encode<T: Serialize>(&self, value: &T) -> Result<Vec<u8>, RecordEncodeError> {
         let mut body = Vec::new();
         ciborium::into_writer(value, &mut body).map_err(|_| RecordEncodeError::Encode)?;

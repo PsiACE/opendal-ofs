@@ -137,7 +137,7 @@ impl<V: Volume> SyncEngine<V> {
         let (local, staging_path, mut staged, operation, mut data_finalized) = match prior_staging {
             Some((staged, operation, data_finalized)) => (
                 staged.local_tree(),
-                staged.root().to_owned(),
+                staged.staging().to_owned(),
                 staged,
                 operation,
                 data_finalized,
@@ -200,9 +200,6 @@ impl<V: Volume> SyncEngine<V> {
             return Ok(result(&state, false));
         }
 
-        let target_changes_staging = target_update
-            .as_ref()
-            .is_some_and(|plan| plan.target != *staged.manifest() || !plan.edits.is_empty());
         if target_update.is_some() || publish {
             let pending = staged.pending(operation, data_finalized, local_renames.clone());
             let changed = state.pending.as_ref() != Some(&pending) || !state.conflicts.is_empty();
@@ -214,16 +211,13 @@ impl<V: Volume> SyncEngine<V> {
         }
 
         if publish && !data_finalized {
-            let staging = fs_operator(staged.root())?;
+            let segment_staging = staged.segment_operator()?;
             self.volume
-                .finalize_staged_files(&staging, staged.prepared_files()?, remote)
+                .finalize_staged_files(&segment_staging, self.transfer_concurrency)
                 .await?;
-            if target_changes_staging {
-                data_finalized = true;
-                state.pending =
-                    Some(staged.pending(operation, data_finalized, local_renames.clone()));
-                state.install(state_path)?;
-            }
+            data_finalized = true;
+            state.pending = Some(staged.pending(operation, true, local_renames.clone()));
+            state.install(state_path)?;
         }
 
         if let Some(plan) = target_update {
@@ -233,7 +227,6 @@ impl<V: Volume> SyncEngine<V> {
                 replica_path,
                 remote,
                 plan,
-                state.installed.is_empty() && local.entries().is_empty(),
                 self.transfer_concurrency,
             )
             .await?;
@@ -243,17 +236,17 @@ impl<V: Volume> SyncEngine<V> {
             state.conflicts.clear();
             if let Some(remote_tree) = remote_tree.as_ref() {
                 let remote_advanced = remote_tree.snapshot().cursor != state.common();
-                if remote_advanced && !matches_local(replica_path, &local).await? {
+                if remote_advanced && matching_local(replica_path, &local).await?.is_none() {
                     bail!("local replica changed while remote state was being installed");
                 }
                 if remote_advanced {
                     if state.installed.is_empty() && local.entries().is_empty() {
-                        install_staged_tree(replica_path, &staging_path)?;
+                        install_staged_tree(replica_path, staged.root())?;
                     } else {
                         install_staged_changes(replica_path, &staged, &source_manifest)?;
                     }
                 }
-                state = state_from_snapshot(remote_tree, replica_path, &state).await?;
+                state = state_from_replica(remote_tree, replica_path, &state).await?;
             } else {
                 state.pending = None;
             }
@@ -280,15 +273,18 @@ impl<V: Volume> SyncEngine<V> {
         }
         match self.volume.publish(observed.as_ref(), &publication).await? {
             CommitOutcome::Committed(committed) if committed == publication.target.cursor => {
-                let unchanged = matches_local(replica_path, &local).await?;
-                if !unchanged {
+                let Some(observed_local) = matching_local(replica_path, &local).await? else {
                     return Ok(result(&state, false));
-                }
+                };
                 if requires_materialization {
                     install_staged_changes(replica_path, &staged, &source_manifest)?;
                 }
                 let committed = SnapshotTree::new(&publication.target)?;
-                state = state_from_snapshot(&committed, replica_path, &state).await?;
+                state = if requires_materialization {
+                    state_from_replica(&committed, replica_path, &state).await?
+                } else {
+                    state_from_snapshot(&committed, &observed_local, &state)?
+                };
                 state.install(state_path)?;
                 remove_tree(&staging_path)?;
                 Ok(result(&state, true))
@@ -312,8 +308,9 @@ fn result(state: &ReplicaState, published: bool) -> SyncResult {
     }
 }
 
-async fn matches_local(root: &Path, expected: &LocalTree) -> Result<bool> {
-    Ok(LocalTree::scan(root).await?.entries() == expected.entries())
+async fn matching_local(root: &Path, expected: &LocalTree) -> Result<Option<LocalTree>> {
+    let observed = LocalTree::scan(root).await?;
+    Ok((observed.entries() == expected.entries()).then_some(observed))
 }
 
 async fn apply_target<V: Volume>(
@@ -322,7 +319,6 @@ async fn apply_target<V: Volume>(
     source_root: &Path,
     authority: Option<&crate::filesystem::VolumeSnapshot>,
     plan: ReconcilePlan,
-    full_tree: bool,
     transfer_concurrency: NonZeroUsize,
 ) -> Result<()> {
     let ReconcilePlan {
@@ -398,8 +394,14 @@ async fn apply_target<V: Volume>(
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    let segment_staging = staged.segment_operator()?;
     volume
-        .materialize(&target, requests, full_tree, transfer_concurrency)
+        .materialize(
+            &target,
+            Some(&segment_staging),
+            requests,
+            transfer_concurrency,
+        )
         .await?;
     for path in &materialize {
         let executable = manifest
@@ -459,12 +461,20 @@ async fn reuse_local_file(
     Ok(true)
 }
 
-async fn state_from_snapshot(
+async fn state_from_replica(
     tree: &SnapshotTree<'_>,
     replica: &Path,
     previous: &ReplicaState,
 ) -> Result<ReplicaState> {
     let local = LocalTree::scan(replica).await?;
+    state_from_snapshot(tree, &local, previous)
+}
+
+fn state_from_snapshot(
+    tree: &SnapshotTree<'_>,
+    local: &LocalTree,
+    previous: &ReplicaState,
+) -> Result<ReplicaState> {
     ReplicaState::at_common(
         previous.authority_identity(),
         tree.snapshot().clone(),

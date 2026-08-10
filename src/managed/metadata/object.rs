@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use futures::StreamExt;
 use opendal::{ErrorKind, Operator};
 use sha2::{Digest as _, Sha256};
 
@@ -24,35 +25,64 @@ use crate::managed::error::{corrupt, error, unavailable};
 pub(crate) async fn read(
     operator: &Operator,
     key: &str,
+    maximum_bytes: usize,
     action: &'static str,
 ) -> Result<Option<Vec<u8>>, VolumeError> {
-    match operator.read(key).await {
-        Ok(bytes) => Ok(Some(bytes.to_bytes().to_vec())),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-        Err(_) => Err(unavailable(action, "object metadata is unavailable")),
-    }
+    read_object(operator, key, maximum_bytes, action)
+        .await
+        .map(|value| value.map(|(bytes, _)| bytes))
 }
 
 pub(crate) async fn read_with_revision(
     operator: &Operator,
     key: &str,
+    maximum_bytes: usize,
     action: &'static str,
 ) -> Result<Option<(Vec<u8>, String)>, VolumeError> {
+    read_object(operator, key, maximum_bytes, action)
+        .await?
+        .map(|(bytes, revision)| {
+            revision
+                .ok_or_else(|| unavailable(action, "object metadata is unavailable"))
+                .map(|revision| (bytes, revision))
+        })
+        .transpose()
+}
+
+async fn read_object(
+    operator: &Operator,
+    key: &str,
+    maximum_bytes: usize,
+    action: &'static str,
+) -> Result<Option<(Vec<u8>, Option<String>)>, VolumeError> {
     let reader = match operator.reader(key).await {
         Ok(reader) => reader,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(unavailable(action, "object metadata is unavailable")),
     };
-    let bytes = match reader.read(..).await {
-        Ok(bytes) => bytes.to_bytes().to_vec(),
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err(unavailable(action, "object metadata is unavailable")),
-    };
-    let revision = reader
+    let metadata = reader.clone();
+    let mut stream = reader
+        .into_stream(..)
+        .await
+        .map_err(|_| unavailable(action, "object metadata is unavailable"))?;
+    let mut bytes = Vec::with_capacity(maximum_bytes.min(64 * 1024));
+    while let Some(buffer) = stream.next().await {
+        let buffer = match buffer {
+            Ok(buffer) => buffer,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(unavailable(action, "object metadata is unavailable")),
+        };
+        for chunk in buffer {
+            if bytes.len().saturating_add(chunk.len()) > maximum_bytes {
+                return Err(corrupt(action, "object metadata exceeds its size limit"));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+    }
+    let revision = metadata
         .metadata()
         .and_then(|metadata| metadata.etag())
-        .ok_or_else(|| unavailable(action, "object metadata is unavailable"))?
-        .to_owned();
+        .map(str::to_owned);
     Ok(Some((bytes, revision)))
 }
 
@@ -60,11 +90,12 @@ pub(crate) async fn read_content_addressed(
     operator: &Operator,
     key: &str,
     expected: &[u8; 32],
+    maximum_bytes: usize,
     action: &'static str,
     missing: &'static str,
     invalid: &'static str,
 ) -> Result<Vec<u8>, VolumeError> {
-    let bytes = read(operator, key, action)
+    let bytes = read(operator, key, maximum_bytes, action)
         .await?
         .ok_or_else(|| corrupt(action, missing))?;
     if Sha256::digest(&bytes).as_slice() != expected {
@@ -119,20 +150,46 @@ pub(crate) async fn ensure_immutable(
     mismatch_kind: VolumeErrorKind,
     mismatch_message: &'static str,
 ) -> Result<(), VolumeError> {
-    if operator
+    match operator
         .write_with(key, expected.to_vec())
         .if_not_exists(true)
         .await
-        .is_ok()
     {
-        return Ok(());
+        Ok(_) => return Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::AlreadyExists | ErrorKind::ConditionNotMatch
+            ) => {}
+        Err(_) => return Err(unavailable(action, "storage operation failed")),
     }
-    let observed = read(operator, key, action)
+    let observed = read(operator, key, expected.len(), action)
         .await?
         .ok_or_else(|| unavailable(action, "object metadata is unavailable"))?;
     if observed == expected {
         Ok(())
     } else {
         Err(error(mismatch_kind, action, mismatch_message))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use opendal::services;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn bounded_record_read_rejects_an_oversized_object() {
+        let operator = Operator::new(services::Memory::default()).unwrap().finish();
+        operator.write("record", vec![1, 2]).await.unwrap();
+
+        assert_eq!(
+            read(&operator, "record", 1, "read bounded record")
+                .await
+                .unwrap_err()
+                .kind(),
+            VolumeErrorKind::Corrupt
+        );
     }
 }

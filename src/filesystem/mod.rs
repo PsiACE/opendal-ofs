@@ -33,6 +33,7 @@ pub use identity::{ChangeCursor, FileVersionId, Generation, NodeId, OperationId,
 pub use model::VolumeModel;
 pub use namespace::{DirectoryEntry, NodeAttributes, NodeKind};
 pub use publication::CommitOutcome;
+pub(crate) use volume::VolumeMutation;
 pub use volume::{
     DirectoryPrecondition, DirectoryRecord, FileVersion, MaterializeRequest, NodePrecondition,
     NodeRecord, Volume, VolumeError, VolumeErrorKind, VolumeObservation, VolumePublication,

@@ -30,12 +30,10 @@ services:
   minio:
     image: quay.io/minio/minio:RELEASE.2024-09-22T00-33-43Z
     command: server /data
-    depends_on:
-      - audit
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
-      MINIO_AUDIT_WEBHOOK_ENABLE_HARNESS: "on"
+      MINIO_AUDIT_WEBHOOK_ENABLE_HARNESS: ${OFS_MANAGED_SYNC_AUDIT_ENABLED:-off}
       MINIO_AUDIT_WEBHOOK_ENDPOINT_HARNESS: http://audit:8080
       MINIO_AUDIT_WEBHOOK_BATCH_SIZE_HARNESS: "1"
       NO_PROXY: audit,localhost,127.0.0.1

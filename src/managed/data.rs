@@ -19,7 +19,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
-use std::ops::Range;
 use std::sync::Arc;
 
 use fastcdc::v2020::AsyncStreamCDC;
@@ -32,13 +31,14 @@ use tokio::sync::{OnceCell, mpsc, oneshot};
 
 use super::error::{corrupt, invalid, unavailable};
 use crate::filesystem::{VolumeError, VolumeErrorKind};
-use crate::managed::format::{ContentRef, Extent, ExtentMap, LowerHex, SegmentRef};
+use crate::managed::format::{ContentRef, Extent, ExtentMap, LowerHex, SegmentRef, V1Record};
 use crate::managed::metadata::namespace::FileVersionRecord;
 use crate::managed::metadata::object::ensure_immutable;
 
 const SEGMENT_ROOT: &str = ".ofs/managed/data/v1/segments/sha256";
-const REQUEST_EQUIVALENT_BYTES: u64 = 4 * 1024;
-const RANGE_FETCH_GAP: usize = REQUEST_EQUIVALENT_BYTES as usize;
+const STAGING_PLAN_KEY: &str = "plan.ofs";
+const STAGING_PLAN_RECORD: V1Record = V1Record::new(*b"OFS1DSP1", 64 * 1024 * 1024);
+const RANGE_FETCH_GAP: usize = 64 * 1024;
 // Placement policy. These values are not part of the durable format.
 const TARGET_SEGMENT_SIZE: u64 = 16 * 1024 * 1024;
 const MATERIALIZE_WINDOW_BYTES: u64 = TARGET_SEGMENT_SIZE;
@@ -59,7 +59,6 @@ struct StoredContent {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct AuthorityKnownContent {
     contents: BTreeMap<ContentRef, StoredContent>,
-    segments: BTreeSet<SegmentRef>,
 }
 
 impl AuthorityKnownContent {
@@ -77,17 +76,12 @@ impl AuthorityKnownContent {
                     segment: extent.segment,
                     offset: extent.segment_offset,
                 });
-            self.segments.insert(extent.segment);
         }
         Ok(())
     }
 
     fn get(&self, content: &ContentRef) -> Option<StoredContent> {
         self.contents.get(content).copied()
-    }
-
-    fn contains_segment(&self, segment: &SegmentRef) -> bool {
-        self.segments.contains(segment)
     }
 }
 
@@ -129,13 +123,6 @@ struct SealedSegment {
     locations: BTreeMap<ContentRef, StoredContent>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct SegmentSource {
-    path: String,
-    logical_offset: u64,
-    content: ContentRef,
-}
-
 type DemandKey = (u64, u64, ContentRef);
 type SegmentDemand = BTreeSet<DemandKey>;
 type FetchedContent = BTreeMap<ContentRef, Buffer>;
@@ -166,7 +153,7 @@ impl ManagedData {
     pub(crate) async fn stage_files(
         &self,
         source: &Operator,
-        staging: &Operator,
+        segment_staging: &Operator,
         paths: Vec<String>,
         known: &AuthorityKnownContent,
         concurrency: NonZeroUsize,
@@ -182,12 +169,11 @@ impl ManagedData {
         let mut prepared_streams = Vec::with_capacity(paths.len());
         for path in paths {
             let source = source.clone();
-            let staging = staging.clone();
             let producer_path = path.clone();
             let (sender, chunks) = mpsc::channel(2);
             let (complete, completion) = oneshot::channel();
             producer_tasks.push(async move {
-                let result = stream_file(&source, &staging, &producer_path, &sender).await;
+                let result = stream_file(&source, &producer_path, &sender).await;
                 drop(sender);
                 let _ = complete.send(result);
                 Ok::<(), VolumeError>(())
@@ -243,7 +229,7 @@ impl ManagedData {
                         pending_bytes -= contents.keys().map(|content| content.length).sum::<u64>();
                         let segment = seal_segment(contents)?;
                         debug_assert_eq!(segment.reference.length, segment.bytes.len() as u64);
-                        created.extend(segment.locations);
+                        created.extend(stage_segment(segment_staging, segment).await?);
                     }
                 }
                 let (logical_size, logical_digest) =
@@ -264,8 +250,14 @@ impl ManagedData {
                 let contents = take_segment_contents(&mut new_content)?;
                 let segment = seal_segment(contents)?;
                 debug_assert_eq!(segment.reference.length, segment.bytes.len() as u64);
-                created.extend(segment.locations);
+                created.extend(stage_segment(segment_staging, segment).await?);
             }
+
+            let segments = created
+                .values()
+                .map(|stored| stored.segment)
+                .collect::<BTreeSet<_>>();
+            write_staging_plan(segment_staging, &segments).await?;
 
             files
                 .into_iter()
@@ -313,132 +305,80 @@ impl ManagedData {
         Ok(files)
     }
 
-    /// Rebuild prepared segments from the frozen source tree and publish them.
-    ///
-    /// The live files have already been read, chunked, and hashed by `stage_files`.
-    /// This pass uses the persisted extent plan, so memory is bounded by one
-    /// placement-sized segment and a crash can retry without consulting live paths.
+    /// Publish the immutable segments frozen by `stage_files`.
     pub(crate) async fn finalize_staged_files(
         &self,
-        staging: &Operator,
-        files: Vec<(String, FileVersionRecord)>,
-        known: &AuthorityKnownContent,
+        segment_staging: &Operator,
+        concurrency: NonZeroUsize,
     ) -> Result<(), VolumeError> {
-        let mut segments = BTreeMap::<SegmentRef, BTreeMap<u64, SegmentSource>>::new();
-        for (path, version) in files {
-            if !version.is_valid() {
-                return Err(corrupt(
-                    "finalize Managed files",
-                    "prepared file version is invalid",
-                ));
-            }
-            for extent in version.extent_map.extents {
-                if known.contains_segment(&extent.segment) {
-                    continue;
-                }
-                let source = SegmentSource {
-                    path: path.clone(),
-                    logical_offset: extent.logical_offset,
-                    content: extent.content,
-                };
-                match segments
-                    .entry(extent.segment)
-                    .or_default()
-                    .entry(extent.segment_offset)
-                {
-                    std::collections::btree_map::Entry::Vacant(entry) => {
-                        entry.insert(source);
-                    }
-                    std::collections::btree_map::Entry::Occupied(entry)
-                        if entry.get().content != source.content =>
-                    {
-                        return Err(corrupt(
-                            "finalize Managed files",
-                            "prepared segment has conflicting contents",
-                        ));
-                    }
-                    std::collections::btree_map::Entry::Occupied(_) => {}
-                }
-            }
-        }
+        let segments = read_staging_plan(segment_staging).await?;
 
-        for (reference, sources) in segments {
-            if !complete_segment_sources(reference, &sources) {
-                let bytes = self
-                    .operator
-                    .read(&segment_key(reference))
-                    .await
-                    .map_err(|error| {
-                        referenced_segment_error("verify prepared data segment", error)
-                    })?;
-                verify_complete_segment(reference, &bytes)?;
-                continue;
-            }
-
-            let capacity = usize::try_from(reference.length).map_err(|_| {
-                corrupt(
-                    "finalize Managed files",
-                    "prepared segment is too large for this client",
+        // Every job retains at most one placement-sized segment. The same
+        // storage execution width bounds both preparation and immutable writes.
+        stream::iter(segments)
+            .map(|reference| async move {
+                let key = segment_key(reference);
+                let segment = segment_staging.read(&key).await.map_err(|error| {
+                    if error.kind() == ErrorKind::NotFound {
+                        corrupt("finalize Managed files", "staged data segment is missing")
+                    } else {
+                        unavailable("finalize Managed files", "storage operation failed")
+                    }
+                })?;
+                verify_complete_segment(reference, &segment)?;
+                ensure_immutable(
+                    &self.operator,
+                    &key,
+                    &segment.to_bytes(),
+                    "create data segment",
+                    VolumeErrorKind::Corrupt,
+                    "immutable data segment changed",
                 )
-            })?;
-            let mut segment = Vec::with_capacity(capacity);
-            for (source, bytes) in sources
-                .values()
-                .zip(fetch_segment_sources(staging, sources.values()).await?)
-            {
-                if buffer_content_ref(&bytes) != source.content {
-                    return Err(corrupt(
-                        "finalize Managed files",
-                        "frozen content does not match its prepared extent",
-                    ));
-                }
-                for chunk in bytes {
-                    segment.extend_from_slice(&chunk);
-                }
-            }
-            if segment.len() as u64 != reference.length
-                || <[u8; 32]>::from(Sha256::digest(&segment)) != reference.digest
-            {
-                return Err(corrupt(
-                    "finalize Managed files",
-                    "rebuilt data segment does not match its reference",
-                ));
-            }
-            ensure_immutable(
-                &self.operator,
-                &segment_key(reference),
-                &segment,
-                "create data segment",
-                VolumeErrorKind::Corrupt,
-                "immutable data segment changed",
-            )
-            .await?;
-        }
-        Ok(())
+                .await
+            })
+            .buffer_unordered(concurrency.get())
+            .try_for_each(|()| async { Ok(()) })
+            .await
     }
 
     pub(crate) async fn materialize(
         &self,
         target: &Operator,
+        segment_staging: Option<&Operator>,
         requests: Vec<(String, FileVersionRecord)>,
-        full_tree: bool,
         concurrency: NonZeroUsize,
     ) -> Result<(), VolumeError> {
+        let staged_segments = match segment_staging {
+            Some(staging) => read_staging_plan(staging).await?,
+            None => BTreeSet::new(),
+        };
         let mut batch = Vec::new();
         let mut batch_bytes = 0_u64;
         for request in requests {
             let size = request.1.logical_size;
             if !batch.is_empty() && batch_bytes.saturating_add(size) > MATERIALIZE_BATCH_BYTES {
-                self.materialize_batch(target, std::mem::take(&mut batch), full_tree, concurrency)
-                    .await?;
+                self.materialize_batch(
+                    target,
+                    segment_staging,
+                    &staged_segments,
+                    std::mem::take(&mut batch),
+                    concurrency,
+                )
+                .await?;
                 batch_bytes = 0;
             }
             batch_bytes = batch_bytes.saturating_add(size);
             batch.push(request);
         }
         if !batch.is_empty() {
-            self.materialize_batch(target, batch, full_tree, concurrency)
-                .await?;
+            self.materialize_batch(
+                target,
+                segment_staging,
+                &staged_segments,
+                batch,
+                concurrency,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -446,15 +386,23 @@ impl ManagedData {
     async fn materialize_batch(
         &self,
         target: &Operator,
+        segment_staging: Option<&Operator>,
+        staged_segments: &BTreeSet<SegmentRef>,
         requests: Vec<(String, FileVersionRecord)>,
-        full_tree: bool,
         concurrency: NonZeroUsize,
     ) -> Result<(), VolumeError> {
         if let [(path, version)] = requests.as_slice()
             && version.logical_size > MATERIALIZE_BATCH_BYTES
         {
             return self
-                .materialize_large_file(target, path, version, full_tree, concurrency)
+                .materialize_large_file(
+                    target,
+                    segment_staging,
+                    staged_segments,
+                    path,
+                    version,
+                    concurrency,
+                )
                 .await;
         }
 
@@ -463,19 +411,23 @@ impl ManagedData {
                 .iter()
                 .flat_map(|(_, version)| version.extent_map.extents.iter()),
         );
-        let complete = complete_segments(
-            &demands,
-            full_tree,
-            self.operator.info().full_capability().stat,
-            &BTreeSet::new(),
-        );
+        // One fetch already deduplicates a segment within this batch. Foyer is
+        // reserved for complete segments reused by separate fetch windows.
+        let complete = BTreeSet::new();
         let cached = if complete.is_empty() {
             None
         } else {
             Some(self.cached_operator().await?)
         };
         let fetched = self
-            .fetch_segments(&demands, &complete, &demands, cached.as_ref(), concurrency)
+            .fetch_segments(
+                &demands,
+                &complete,
+                segment_staging,
+                staged_segments,
+                cached.as_ref(),
+                concurrency,
+            )
             .await?;
 
         stream::iter(requests)
@@ -518,24 +470,13 @@ impl ManagedData {
     async fn materialize_large_file(
         &self,
         target: &Operator,
+        segment_staging: Option<&Operator>,
+        staged_segments: &BTreeSet<SegmentRef>,
         path: &str,
         version: &FileVersionRecord,
-        full_tree: bool,
         concurrency: NonZeroUsize,
     ) -> Result<(), VolumeError> {
-        let all_demands = segment_demands(version.extent_map.extents.iter());
-        let complete = complete_segments(
-            &all_demands,
-            full_tree,
-            self.operator.info().full_capability().stat,
-            &segments_in_multiple_windows(&version.extent_map.extents),
-        );
-        let cached = if complete.is_empty() {
-            None
-        } else {
-            Some(self.cached_operator().await?)
-        };
-        let mut verified = BTreeSet::new();
+        let cache_complete_segments = self.operator.info().full_capability().stat;
         let mut writer = target
             .writer(path)
             .await
@@ -543,18 +484,26 @@ impl ManagedData {
         let mut logical = Sha256::new();
         let mut written = 0_u64;
         let extents = &version.extent_map.extents;
+        let reusable = segments_in_multiple_windows(extents);
         let mut start = 0;
         while start < extents.len() {
             let end = extent_window_end(extents, start);
             let demands = segment_demands(extents[start..end].iter());
-            let verify = demands
-                .keys()
-                .copied()
-                .filter(|segment| complete.contains(segment) && !verified.contains(segment))
-                .map(|segment| (segment, all_demands[&segment].clone()))
-                .collect();
+            let complete = complete_segments(&demands, cache_complete_segments, &reusable);
+            let cached = if complete.is_empty() {
+                None
+            } else {
+                Some(self.cached_operator().await?)
+            };
             let fetched = match self
-                .fetch_segments(&demands, &complete, &verify, cached.as_ref(), concurrency)
+                .fetch_segments(
+                    &demands,
+                    &complete,
+                    segment_staging,
+                    staged_segments,
+                    cached.as_ref(),
+                    concurrency,
+                )
                 .await
             {
                 Ok(fetched) => fetched,
@@ -563,7 +512,6 @@ impl ManagedData {
                     return Err(error);
                 }
             };
-            verified.extend(verify.keys().copied());
             if let Err(error) = write_extents(
                 &mut writer,
                 &extents[start..end],
@@ -585,31 +533,49 @@ impl ManagedData {
         &self,
         demands: &BTreeMap<SegmentRef, SegmentDemand>,
         complete: &BTreeSet<SegmentRef>,
-        verify: &BTreeMap<SegmentRef, SegmentDemand>,
+        segment_staging: Option<&Operator>,
+        staged_segments: &BTreeSet<SegmentRef>,
         cached: Option<&Operator>,
         concurrency: NonZeroUsize,
     ) -> Result<FetchedContent, VolumeError> {
-        futures::future::try_join_all(demands.iter().map(|(segment, demands)| async move {
-            let segment = *segment;
-            let bytes = if complete.contains(&segment) {
-                let cached = cached.expect("complete segment reads have a Foyer operator");
-                let bytes = cached
-                    .read(&segment_key(segment))
-                    .await
-                    .map_err(|error| referenced_segment_error("read data segment", error))?;
-                if let Some(demands) = verify.get(&segment) {
+        // Schedule at the segment boundary. Reader::fetch owns range merging;
+        // the outer bound gives concurrency one meaning across the data plane.
+        stream::iter(demands.iter())
+            .map(|(segment, demands)| async move {
+                let segment = *segment;
+                if staged_segments.contains(&segment) {
+                    let staging =
+                        segment_staging.expect("staged segment references have a local operator");
+                    let bytes = staging.read(&segment_key(segment)).await.map_err(|error| {
+                        if error.kind() == ErrorKind::NotFound {
+                            corrupt("read data segment", "staged data segment is missing")
+                        } else {
+                            unavailable("read data segment", "storage operation failed")
+                        }
+                    })?;
                     verify_complete_demands(segment, &bytes, demands)?;
+                    return demands
+                        .iter()
+                        .map(|demand| slice_demand(&bytes, *demand).map(|bytes| (demand.2, bytes)))
+                        .collect::<Result<Vec<_>, VolumeError>>();
                 }
-                demands
-                    .iter()
-                    .map(|demand| slice_demand(&bytes, *demand).map(|bytes| (demand.2, bytes)))
-                    .collect::<Result<Vec<_>, VolumeError>>()?
-            } else {
+                if complete.contains(&segment) {
+                    let cached = cached.expect("complete segment reads have a Foyer operator");
+                    let bytes = cached
+                        .read(&segment_key(segment))
+                        .await
+                        .map_err(|error| referenced_segment_error("read data segment", error))?;
+                    verify_complete_demands(segment, &bytes, demands)?;
+                    return demands
+                        .iter()
+                        .map(|demand| slice_demand(&bytes, *demand).map(|bytes| (demand.2, bytes)))
+                        .collect::<Result<Vec<_>, VolumeError>>();
+                }
+
                 let reader = self
                     .operator
                     .reader_with(&segment_key(segment))
                     .gap(RANGE_FETCH_GAP)
-                    .concurrent(concurrency.get())
                     .content_length_hint(segment.length)
                     .await
                     .map_err(|error| referenced_segment_error("read data segment", error))?;
@@ -636,12 +602,14 @@ impl ManagedData {
                         verify_range_demand(&bytes, demand)?;
                         Ok((demand.2, bytes))
                     })
-                    .collect::<Result<Vec<_>, VolumeError>>()?
-            };
-            Ok(bytes)
-        }))
-        .await
-        .map(|segments| segments.into_iter().flatten().collect())
+                    .collect::<Result<Vec<_>, VolumeError>>()
+            })
+            .buffer_unordered(concurrency.get())
+            .try_fold(BTreeMap::new(), |mut fetched, segment| async move {
+                fetched.extend(segment);
+                Ok(fetched)
+            })
+            .await
     }
 }
 
@@ -660,18 +628,19 @@ fn segment_demands<'a>(
 
 fn complete_segments(
     demands: &BTreeMap<SegmentRef, SegmentDemand>,
-    full_tree: bool,
     cache_complete_segments: bool,
-    forced: &BTreeSet<SegmentRef>,
+    reusable: &BTreeSet<SegmentRef>,
 ) -> BTreeSet<SegmentRef> {
+    // A full Foyer read is useful only when another fetch window will reuse it.
+    // Sparse and one-shot reads stay with native Reader::fetch.
     demands
         .iter()
         .filter(|(segment, segment_demands)| {
             cache_complete_segments
+                && reusable.contains(segment)
                 && usize::try_from(segment.length)
                     .is_ok_and(|length| length <= MATERIALIZE_CACHE_BYTES)
-                && (prefer_complete_segment(**segment, segment_demands, full_tree)
-                    || forced.contains(segment))
+                && demands_cover_segment(**segment, segment_demands)
         })
         .map(|(segment, _)| *segment)
         .collect()
@@ -695,6 +664,20 @@ fn segments_in_multiple_windows(extents: &[Extent]) -> BTreeSet<SegmentRef> {
         start = end;
     }
     repeated
+}
+
+fn demands_cover_segment(segment: SegmentRef, demands: &SegmentDemand) -> bool {
+    let mut covered = 0_u64;
+    for (offset, length, _) in demands {
+        if *offset > covered {
+            return false;
+        }
+        let Some(end) = offset.checked_add(*length) else {
+            return false;
+        };
+        covered = covered.max(end);
+    }
+    covered == segment.length
 }
 
 async fn materialize_file(
@@ -836,7 +819,7 @@ fn slice_demand(bytes: &Buffer, demand: DemandKey) -> Result<Buffer, VolumeError
         .checked_add(length)
         .filter(|end| *end <= bytes.len())
         .ok_or_else(|| corrupt("read data segment", "extent exceeds data segment"))?;
-    Ok(Buffer::from(bytes.slice(start..end).to_bytes().to_vec()))
+    Ok(bytes.slice(start..end))
 }
 
 fn buffer_content_ref(bytes: &Buffer) -> ContentRef {
@@ -850,42 +833,8 @@ fn buffer_content_ref(bytes: &Buffer) -> ContentRef {
     }
 }
 
-fn prefer_complete_segment(segment: SegmentRef, demands: &SegmentDemand, full_tree: bool) -> bool {
-    let mut requests = 0_u64;
-    let mut transferred = 0_u64;
-    let mut span: Option<Range<u64>> = None;
-    for (offset, length, _) in demands {
-        let range = *offset..*offset + *length;
-        match span.as_mut() {
-            Some(current) if range.start.saturating_sub(current.end) <= RANGE_FETCH_GAP as u64 => {
-                current.end = current.end.max(range.end);
-            }
-            Some(current) => {
-                requests += 1;
-                transferred = transferred.saturating_add(current.end - current.start);
-                *current = range;
-            }
-            None => span = Some(range),
-        }
-    }
-    if let Some(current) = span {
-        requests += 1;
-        transferred = transferred.saturating_add(current.end - current.start);
-    }
-    // A cold Foyer miss performs one stat and one full read. Sparse ranges are
-    // preferable unless the complete read removes at least one remote request.
-    if requests <= 2 {
-        return false;
-    }
-
-    let saved_requests = requests - 2;
-    let byte_budget = REQUEST_EQUIVALENT_BYTES * if full_tree { 4 } else { 1 };
-    segment.length.saturating_sub(transferred) <= saved_requests.saturating_mul(byte_budget)
-}
-
 async fn stream_file(
     source: &Operator,
-    staging: &Operator,
     path: &str,
     sender: &mpsc::Sender<PreparedChunk>,
 ) -> Result<(u64, [u8; 32]), VolumeError> {
@@ -898,10 +847,6 @@ async fn stream_file(
     }
     let size = metadata.content_length();
     if size == 0 {
-        staging
-            .write(path, Vec::<u8>::new())
-            .await
-            .map_err(|_| unavailable("write frozen file", "storage operation failed"))?;
         return Ok((size, Sha256::digest([]).into()));
     }
     if size < FASTCDC_MINIMUM_FILE_SIZE {
@@ -917,10 +862,6 @@ async fn stream_file(
                 "frozen input changed while it was being staged",
             ));
         }
-        staging
-            .write(path, bytes.clone())
-            .await
-            .map_err(|_| unavailable("write frozen file", "storage operation failed"))?;
         let content = content_ref(&bytes);
         sender
             .send(PreparedChunk {
@@ -937,7 +878,6 @@ async fn stream_file(
 
     let digest = stream_fastcdc(
         source,
-        staging,
         path,
         size,
         FastCdcSizes {
@@ -953,7 +893,6 @@ async fn stream_file(
 
 async fn stream_fastcdc(
     source: &Operator,
-    staging: &Operator,
     path: &str,
     size: u64,
     sizes: FastCdcSizes,
@@ -966,37 +905,12 @@ async fn stream_fastcdc(
         .into_bytes_stream(..)
         .await
         .map_err(|_| unavailable("read frozen file", "storage operation failed"))?;
-    let writer = staging
-        .writer(path)
-        .await
-        .map_err(|_| unavailable("write frozen file", "storage operation failed"))?;
     let reader: std::pin::Pin<Box<dyn futures::Stream<Item = std::io::Result<Vec<u8>>> + Send>> =
-        Box::pin(stream::try_unfold(
-            (Box::pin(reader), Some(writer)),
-            |(mut reader, mut writer)| async move {
-                match reader.next().await {
-                    Some(Ok(buffer)) => {
-                        writer
-                            .as_mut()
-                            .expect("writer remains open while input has data")
-                            .write(buffer.clone())
-                            .await
-                            .map_err(std::io::Error::other)?;
-                        Ok(Some((buffer.to_vec(), (reader, writer))))
-                    }
-                    Some(Err(error)) => Err(std::io::Error::other(error)),
-                    None => {
-                        writer
-                            .take()
-                            .expect("writer closes exactly once")
-                            .close()
-                            .await
-                            .map_err(std::io::Error::other)?;
-                        Ok(None)
-                    }
-                }
-            },
-        ));
+        Box::pin(reader.map(|result| {
+            result
+                .map(|buffer| buffer.to_vec())
+                .map_err(std::io::Error::other)
+        }));
     let reader = reader.into_async_read();
     let mut chunker = AsyncStreamCDC::new(reader, sizes.minimum, sizes.target, sizes.maximum);
     let chunks = chunker.as_stream();
@@ -1057,75 +971,6 @@ fn take_segment_contents(
     Ok(batch)
 }
 
-fn complete_segment_sources(reference: SegmentRef, sources: &BTreeMap<u64, SegmentSource>) -> bool {
-    let mut expected = 0_u64;
-    for (offset, source) in sources {
-        if *offset != expected {
-            return false;
-        }
-        let Some(end) = expected.checked_add(source.content.length) else {
-            return false;
-        };
-        if end > reference.length {
-            return false;
-        }
-        expected = end;
-    }
-    expected == reference.length
-}
-
-async fn fetch_segment_sources<'a>(
-    staging: &Operator,
-    sources: impl ExactSizeIterator<Item = &'a SegmentSource>,
-) -> Result<Vec<Buffer>, VolumeError> {
-    let mut requests = BTreeMap::<&str, Vec<(usize, Range<u64>)>>::new();
-    let count = sources.len();
-    for (index, source) in sources.enumerate() {
-        let end = source
-            .logical_offset
-            .checked_add(source.content.length)
-            .ok_or_else(|| corrupt("finalize Managed files", "prepared source range overflows"))?;
-        requests
-            .entry(&source.path)
-            .or_default()
-            .push((index, source.logical_offset..end));
-    }
-
-    let mut fetched = std::iter::repeat_with(|| None)
-        .take(count)
-        .collect::<Vec<Option<Buffer>>>();
-    for (path, ranges) in requests {
-        let reader = staging.reader(path).await.map_err(|_| {
-            unavailable(
-                "read frozen file for publication",
-                "storage operation failed",
-            )
-        })?;
-        let bytes = reader
-            .fetch(ranges.iter().map(|(_, range)| range.clone()).collect())
-            .await
-            .map_err(|_| {
-                unavailable(
-                    "read frozen file for publication",
-                    "storage operation failed",
-                )
-            })?;
-        if bytes.len() != ranges.len() {
-            return Err(corrupt(
-                "finalize Managed files",
-                "frozen range fetch returned an unexpected result count",
-            ));
-        }
-        for ((index, _), bytes) in ranges.into_iter().zip(bytes) {
-            fetched[index] = Some(bytes);
-        }
-    }
-    Ok(fetched
-        .into_iter()
-        .map(|bytes| bytes.expect("every prepared source range was fetched"))
-        .collect())
-}
-
 fn seal_segment(contents: BTreeMap<ContentRef, Vec<u8>>) -> Result<SealedSegment, VolumeError> {
     // Segment v1 is the stable ContentRef ordering of its raw contents. The
     // descriptor owns offsets; SegmentRef authenticates the complete object.
@@ -1172,6 +1017,49 @@ fn seal_segment(contents: BTreeMap<ContentRef, Vec<u8>>) -> Result<SealedSegment
     })
 }
 
+async fn stage_segment(
+    staging: &Operator,
+    segment: SealedSegment,
+) -> Result<BTreeMap<ContentRef, StoredContent>, VolumeError> {
+    let SealedSegment {
+        reference,
+        bytes,
+        locations,
+    } = segment;
+    staging
+        .write(&segment_key(reference), bytes)
+        .await
+        .map_err(|_| unavailable("stage data segment", "storage operation failed"))?;
+    Ok(locations)
+}
+
+async fn write_staging_plan(
+    staging: &Operator,
+    segments: &BTreeSet<SegmentRef>,
+) -> Result<(), VolumeError> {
+    let bytes = STAGING_PLAN_RECORD
+        .encode(segments)
+        .map_err(|_| invalid("stage Managed files", "segment plan cannot be encoded"))?;
+    staging
+        .write(STAGING_PLAN_KEY, bytes)
+        .await
+        .map(|_| ())
+        .map_err(|_| unavailable("stage Managed files", "storage operation failed"))
+}
+
+async fn read_staging_plan(staging: &Operator) -> Result<BTreeSet<SegmentRef>, VolumeError> {
+    let bytes = staging.read(STAGING_PLAN_KEY).await.map_err(|error| {
+        if error.kind() == ErrorKind::NotFound {
+            corrupt("finalize Managed files", "staged segment plan is missing")
+        } else {
+            unavailable("finalize Managed files", "storage operation failed")
+        }
+    })?;
+    STAGING_PLAN_RECORD
+        .decode(&bytes.to_bytes())
+        .map_err(|_| corrupt("finalize Managed files", "staged segment plan is invalid"))
+}
+
 fn verify_complete_segment(reference: SegmentRef, bytes: &Buffer) -> Result<(), VolumeError> {
     if bytes.len() as u64 != reference.length
         || buffer_content_ref(bytes).digest != reference.digest
@@ -1216,7 +1104,7 @@ mod tests {
     #[tokio::test]
     async fn stages_and_materializes_whole_and_chunked_files() {
         let source = memory();
-        let staging = memory();
+        let segment_staging = memory();
         let storage = memory();
         let target = memory();
         let small = b"portable segment".to_vec();
@@ -1230,47 +1118,20 @@ mod tests {
         let staged = data
             .stage_files(
                 &source,
-                &staging,
+                &segment_staging,
                 vec!["small".to_owned(), "large".to_owned()],
                 &AuthorityKnownContent::default(),
                 NonZeroUsize::new(2).unwrap(),
             )
             .await
             .unwrap();
-        let small_segment = staged["small"].extent_map.extents[0].segment;
-        assert!(
-            staged["large"]
-                .extent_map
-                .extents
-                .iter()
-                .any(|extent| extent.segment == small_segment),
-            "the regression fixture must exercise one segment packed across files"
-        );
-        assert!(
-            storage
-                .stat(&segment_key(small_segment))
-                .await
-                .is_err_and(|error| error.kind() == ErrorKind::NotFound),
-            "staging must not publish data before reconciliation"
-        );
-        data.finalize_staged_files(
-            &staging,
-            staged
-                .iter()
-                .map(|(path, version)| (path.clone(), version.clone()))
-                .collect(),
-            &AuthorityKnownContent::default(),
-        )
-        .await
-        .unwrap();
-        assert!(
-            storage.stat(&segment_key(small_segment)).await.is_ok(),
-            "finalization must publish prepared data"
-        );
+        data.finalize_staged_files(&segment_staging, NonZeroUsize::new(2).unwrap())
+            .await
+            .unwrap();
         data.materialize(
             &target,
+            Some(&segment_staging),
             staged.into_iter().collect(),
-            false,
             NonZeroUsize::new(2).unwrap(),
         )
         .await
@@ -1317,8 +1178,8 @@ mod tests {
             .unwrap()
             .materialize(
                 &target,
+                None,
                 vec![("output".to_owned(), version)],
-                false,
                 NonZeroUsize::new(2).unwrap(),
             )
             .await

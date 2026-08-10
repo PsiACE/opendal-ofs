@@ -53,6 +53,7 @@ impl D1Backend {
     async fn read(
         &self,
         key: &str,
+        maximum_bytes: usize,
         action: &'static str,
     ) -> Result<Option<(Vec<u8>, u64)>, VolumeError> {
         let results = self
@@ -77,7 +78,7 @@ impl D1Backend {
                 let revision = row
                     .revision
                     .ok_or_else(|| corrupt(action, "D1 returned an invalid Managed revision"))?;
-                Ok(Some((decode_hex(value, action)?, revision)))
+                Ok(Some((decode_hex(value, maximum_bytes, action)?, revision)))
             }
             _ => Err(corrupt(action, "D1 returned duplicate Managed records")),
         }
@@ -110,6 +111,7 @@ impl D1Backend {
         &self,
         key: &str,
         bytes: Vec<u8>,
+        maximum_bytes: usize,
         action: &'static str,
     ) -> Result<Vec<u8>, VolumeError> {
         let mut params = self.params(key);
@@ -148,7 +150,7 @@ impl D1Backend {
             .value_hex
             .as_deref()
             .ok_or_else(|| corrupt(action, "D1 returned an invalid Managed record"))?;
-        decode_hex(value, action)
+        decode_hex(value, maximum_bytes, action)
     }
 
     async fn replace(
@@ -215,14 +217,17 @@ impl RecordBackend {
     pub(crate) async fn read(
         &self,
         key: &str,
+        maximum_bytes: usize,
         action: &'static str,
     ) -> Result<Option<(Vec<u8>, Revision)>, VolumeError> {
         match self {
-            Self::Object(operator) => object::read_with_revision(operator, key, action)
-                .await
-                .map(|value| value.map(|(bytes, revision)| (bytes, Revision::Object(revision)))),
+            Self::Object(operator) => {
+                object::read_with_revision(operator, key, maximum_bytes, action)
+                    .await
+                    .map(|value| value.map(|(bytes, revision)| (bytes, Revision::Object(revision))))
+            }
             Self::D1(backend) => backend
-                .read(key, action)
+                .read(key, maximum_bytes, action)
                 .await
                 .map(|value| value.map(|(bytes, revision)| (bytes, Revision::D1(revision)))),
         }
@@ -244,6 +249,7 @@ impl RecordBackend {
         &self,
         key: &str,
         bytes: Vec<u8>,
+        maximum_bytes: usize,
         action: &'static str,
     ) -> Result<Vec<u8>, VolumeError> {
         match self {
@@ -251,12 +257,16 @@ impl RecordBackend {
                 if object::create(operator, key, bytes.clone(), action).await? {
                     return Ok(bytes);
                 }
-                object::read_with_revision(operator, key, action)
+                object::read_with_revision(operator, key, maximum_bytes, action)
                     .await?
                     .map(|(bytes, _)| bytes)
                     .ok_or_else(|| unavailable(action, "Managed record storage is unavailable"))
             }
-            Self::D1(backend) => backend.create_or_read(key, bytes, action).await,
+            Self::D1(backend) => {
+                backend
+                    .create_or_read(key, bytes, maximum_bytes, action)
+                    .await
+            }
         }
     }
 
@@ -300,6 +310,13 @@ fn changed(result: &D1Result, action: &'static str) -> Result<bool, VolumeError>
     }
 }
 
-fn decode_hex(value: &str, action: &'static str) -> Result<Vec<u8>, VolumeError> {
+fn decode_hex(
+    value: &str,
+    maximum_bytes: usize,
+    action: &'static str,
+) -> Result<Vec<u8>, VolumeError> {
+    if value.len() > maximum_bytes.saturating_mul(2) {
+        return Err(corrupt(action, "D1 Managed value exceeds its size limit"));
+    }
     LowerHex::decode(value).ok_or_else(|| corrupt(action, "D1 returned an invalid Managed value"))
 }

@@ -15,10 +15,13 @@ compose_file="$workspace/fixtures/managed-sync/compose.yaml"
 project=${OFS_MANAGED_SYNC_PROJECT:-opendal-ofs-managed-sync}
 minio_port=${OFS_MANAGED_SYNC_MINIO_PORT:-19000}
 d1_port=${OFS_MANAGED_SYNC_D1_PORT:-19001}
+ofs_access_key=ofs-managed-sync
+ofs_secret_key=ofs-managed-sync-password
 binary="$workspace/target/debug/ofs"
 fixtures_started=false
 audit_root=${OFS_MANAGED_SYNC_AUDIT_DIR:-$workspace/.local/managed-sync-audit}
 audit_owned=false
+audit_enabled=off
 declare -a compose
 
 usage() {
@@ -31,7 +34,7 @@ Commands:
   test branch <object|d1>
   test staging
   perf [--baseline REF_OR_BINARY] [--candidate REF_OR_BINARY]
-       [--rounds N] [--profile standard|agent-home] [OUTPUT]
+       [--rounds N] [OUTPUT]
   up
   down
 EOF
@@ -62,6 +65,7 @@ select_compose() {
 compose_run() {
   OFS_MANAGED_SYNC_MINIO_PORT="$minio_port" OFS_MANAGED_SYNC_D1_PORT="$d1_port" \
     OFS_MANAGED_SYNC_AUDIT_DIR="$audit_root" \
+    OFS_MANAGED_SYNC_AUDIT_ENABLED="$audit_enabled" \
     "${compose[@]}" --project-name "$project" --file "$compose_file" "$@"
 }
 
@@ -75,16 +79,36 @@ wait_for_http() {
 }
 
 fixtures_up() {
+  local with_d1=${1:-true} with_audit=${2:-true}
+  local -a services=(minio)
   select_compose
-  mkdir -p "$audit_root"
-  : >"$audit_root/audit.jsonl"
-  compose_run up --detach audit minio d1
+  audit_enabled=off
+  if [[ $with_audit == true ]]; then
+    mkdir -p "$audit_root"
+    : >"$audit_root/audit.jsonl"
+    audit_enabled=on
+    compose_run up --detach audit
+    for _ in $(seq 1 100); do
+      compose_run exec -T audit test -s /tmp/audit.ready && break
+      sleep 0.05
+    done
+    compose_run exec -T audit test -s /tmp/audit.ready
+  fi
+  [[ $with_d1 == true ]] && services+=(d1)
+  compose_run up --detach "${services[@]}"
   wait_for_http "http://127.0.0.1:$minio_port/minio/health/ready"
-  wait_for_http "http://127.0.0.1:$d1_port/health"
+  if [[ $with_d1 == true ]]; then
+    wait_for_http "http://127.0.0.1:$d1_port/health"
+  fi
   compose_run run --rm -T minio-client \
-    'mc alias set local http://minio:9000 minioadmin minioadmin >/dev/null; mc mb --ignore-existing local/managed-sync >/dev/null; mc stat local/managed-sync >/dev/null'
-  printf 'Managed Sync fixtures are ready: MinIO http://127.0.0.1:%s, D1 http://127.0.0.1:%s/client/v4.\n' \
-    "$minio_port" "$d1_port"
+    "mc alias set local http://minio:9000 minioadmin minioadmin >/dev/null; \
+     mc mb --ignore-existing local/managed-sync >/dev/null; \
+     mc admin user info local $ofs_access_key >/dev/null 2>&1 || \
+       mc admin user add local $ofs_access_key $ofs_secret_key >/dev/null; \
+     mc admin policy attach local readwrite --user $ofs_access_key >/dev/null"
+  printf 'Managed Sync fixtures are ready: MinIO http://127.0.0.1:%s' "$minio_port"
+  [[ $with_d1 == true ]] && printf ', D1 http://127.0.0.1:%s/client/v4' "$d1_port"
+  printf '.\n'
 }
 
 fixtures_down() { select_compose; compose_run down --volumes --remove-orphans; }
@@ -105,7 +129,8 @@ case_environment() {
   local root=$1 storage=$2 metadata=$3
   export OFS_BIN="$binary" OFS_CASE_ROOT="$root" OFS_STORAGE_URL="$storage"
   export OFS_METADATA_MODE="$metadata"
-  export AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin AWS_REGION=us-east-1
+  export AWS_ACCESS_KEY_ID="$ofs_access_key" AWS_SECRET_ACCESS_KEY="$ofs_secret_key"
+  export AWS_REGION=us-east-1
   unset OFS_METADATA_URL OFS_D1_TOKEN OFS_AUDIT_LOG
   if [[ $metadata == d1 ]]; then
     local case_id api_base
@@ -165,8 +190,12 @@ run_tests() {
   audit_owned=true
   fixtures_started=true
   trap cleanup EXIT
-  fixtures_up
-  local item
+  local needs_d1=false needs_audit=false item
+  for item in "${cases[@]}"; do
+    [[ ${item##*:} == d1 ]] && needs_d1=true
+    [[ ${item%%:*} == staging ]] && needs_audit=true
+  done
+  fixtures_up "$needs_d1" "$needs_audit"
   for item in "${cases[@]}"; do
     run_case "${item%%:*}" "${item##*:}"
   done
@@ -177,7 +206,7 @@ shift || true
 case $command in
   test) run_tests "$@" ;;
   perf) exec bash "$workspace/tests/performance/managed-sync/run.sh" "$@" ;;
-  up) [[ $# == 0 ]] || fail 'up accepts no arguments'; fixtures_up ;;
+  up) [[ $# == 0 ]] || fail 'up accepts no arguments'; fixtures_up true true ;;
   down) [[ $# == 0 ]] || fail 'down accepts no arguments'; fixtures_down ;;
   -h|--help) usage ;;
   *) fail "unknown command: $command" ;;

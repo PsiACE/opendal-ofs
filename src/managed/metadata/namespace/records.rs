@@ -125,9 +125,6 @@ fn encode_content(encoded: &mut Vec<u8>, content: &ContentRef) {
 }
 
 pub(crate) type NamespaceSnapshot = crate::filesystem::VolumeSnapshot<FileVersionRecord>;
-pub(crate) type NodePrecondition = crate::filesystem::NodePrecondition;
-pub(crate) type DirectoryPrecondition = crate::filesystem::DirectoryPrecondition;
-pub(crate) type NamespacePublication = crate::filesystem::VolumePublication<FileVersionRecord>;
 
 pub(crate) fn managed_generation(value: u64) -> Generation {
     Generation::from_bytes(value.to_be_bytes().to_vec())

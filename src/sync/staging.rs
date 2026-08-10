@@ -12,14 +12,18 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use opendal::Operator;
 use serde::{Deserialize, Serialize};
 
 use super::local::{
     LocalEntry, LocalKind, LocalTree, NativeIdentity, entry_at, fs_operator, native_identity_at,
-    set_executable,
 };
+use super::path::descendants;
 use super::state::PendingIntent;
 use crate::filesystem::{FileVersion, FileVersionId, OperationId, Volume, VolumeSnapshot};
+
+const TREE_DIR: &str = "tree";
+const SEGMENTS_DIR: &str = "segments";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -121,11 +125,7 @@ impl TargetManifest {
 
     pub(crate) fn remove(&mut self, path: &str) {
         self.entries.remove(path);
-        let prefix = format!("{path}/");
-        let descendants = self
-            .entries
-            .range(prefix.clone()..)
-            .take_while(|(candidate, _)| candidate.starts_with(&prefix))
+        let descendants = descendants(&self.entries, path)
             .map(|(candidate, _)| candidate.clone())
             .collect::<Vec<_>>();
         for descendant in descendants {
@@ -150,9 +150,10 @@ impl TargetManifest {
 /// Immutable input for a later volume file-version builder.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StagedTree {
+    staging: PathBuf,
     root: PathBuf,
     source: TargetManifest,
-    manifest: TargetManifest,
+    manifest: Option<TargetManifest>,
     prepared: BTreeMap<FileVersionId, FileVersion>,
     cache: BTreeMap<String, FileVersionId>,
 }
@@ -166,10 +167,13 @@ impl StagedTree {
         authority: Option<&VolumeSnapshot>,
         concurrency: NonZeroUsize,
     ) -> Result<Self> {
-        let root = root.as_ref();
-        prepare_root(tree.root(), root).await?;
+        let staging = root.as_ref();
+        prepare_root(tree.root(), staging).await?;
+        let root = staging.join(TREE_DIR);
+        let segment_root = staging.join(SEGMENTS_DIR);
         let source = tree.operator()?;
-        let staged = fs_operator(root)?;
+        let staged = fs_operator(&root)?;
+        let segments = fs_operator(&segment_root)?;
 
         for (path, entry) in tree.entries() {
             if entry.kind == LocalKind::Directory {
@@ -189,7 +193,7 @@ impl StagedTree {
             .map(|(path, _)| path.clone())
             .collect::<Vec<_>>();
         let prepared = volume
-            .stage_files(&source, &staged, changed.clone(), authority, concurrency)
+            .stage_files(&source, &segments, changed.clone(), authority, concurrency)
             .await
             .map_err(anyhow::Error::new)?;
         if prepared.len() != changed.len()
@@ -212,7 +216,7 @@ impl StagedTree {
             })
             .collect::<BTreeMap<_, _>>();
         let mut versions = BTreeMap::new();
-        let mut cache = BTreeMap::new();
+        let cache = BTreeMap::new();
         for (path, expected) in tree
             .entries()
             .iter()
@@ -233,24 +237,12 @@ impl StagedTree {
                             format!("inspect source file attributes for {path:?} after staging")
                         })?;
                     require_same_file_attributes(path, expected, &attributes)?;
-                    set_executable(&root.join(path), expected.executable)
-                        .with_context(|| format!("preserve executable bit for {path:?}"))?;
-                    let staged_metadata = staged
-                        .stat(path)
-                        .await
-                        .with_context(|| format!("verify staging file {path:?}"))?;
-                    if !staged_metadata.is_file()
-                        || staged_metadata.content_length() != expected.size
-                    {
-                        bail!("staging file {path:?} is incomplete; retry sync");
-                    }
                     match versions.insert(version.id, version.clone()) {
                         Some(existing) if existing != *version => {
                             bail!("volume reused a file version identity for different content")
                         }
                         _ => {}
                     }
-                    cache.insert(path.clone(), version.id);
                     version
                 }
                 None => known_versions
@@ -267,8 +259,9 @@ impl StagedTree {
         }
         let source = TargetManifest { entries };
         let staged = Self {
-            root: root.to_owned(),
-            manifest: source.clone(),
+            staging: staging.to_owned(),
+            root,
+            manifest: None,
             source,
             prepared: versions,
             cache,
@@ -277,8 +270,9 @@ impl StagedTree {
     }
 
     pub(crate) fn recover(intent: &PendingIntent) -> Result<Self> {
-        let root = &intent.staging;
-        if !root.is_dir() {
+        let staging = &intent.staging;
+        let root = staging.join(TREE_DIR);
+        if !root.is_dir() || !staging.join(SEGMENTS_DIR).is_dir() {
             bail!("staging cache is missing");
         }
         let prepared = intent
@@ -290,12 +284,24 @@ impl StagedTree {
         if prepared.len() != intent.prepared.len() {
             bail!("pending staging repeats a prepared file version");
         }
+        let target = intent.manifest.as_ref().unwrap_or(&intent.source);
+        let cache = intent
+            .cached_paths
+            .iter()
+            .map(|path| {
+                target
+                    .file(path)
+                    .map(|file| (path.clone(), file.id))
+                    .with_context(|| format!("cached path {path:?} is not a target file"))
+            })
+            .collect::<Result<_>>()?;
         let staged = Self {
-            root: root.to_owned(),
+            staging: staging.to_owned(),
+            root,
             source: intent.source.clone(),
             manifest: intent.manifest.clone(),
             prepared,
-            cache: intent.cache.clone(),
+            cache,
         };
         staged.validate()?;
         Ok(staged)
@@ -309,13 +315,13 @@ impl StagedTree {
     ) -> PendingIntent {
         PendingIntent {
             operation,
-            staging: self.root.clone(),
+            staging: self.staging.clone(),
             data_finalized,
             renames,
             source: self.source.clone(),
             manifest: self.manifest.clone(),
             prepared: self.prepared.values().cloned().collect(),
-            cache: self.cache.clone(),
+            cached_paths: self.cache.keys().cloned().collect(),
         }
     }
 
@@ -323,8 +329,16 @@ impl StagedTree {
         &self.root
     }
 
+    pub(crate) fn staging(&self) -> &Path {
+        &self.staging
+    }
+
+    pub(crate) fn segment_operator(&self) -> Result<Operator> {
+        fs_operator(&self.staging.join(SEGMENTS_DIR))
+    }
+
     pub(crate) fn manifest(&self) -> &TargetManifest {
-        &self.manifest
+        self.manifest.as_ref().unwrap_or(&self.source)
     }
 
     pub(crate) fn source(&self) -> &TargetManifest {
@@ -340,30 +354,6 @@ impl StagedTree {
                 .map(|(path, entry)| (path.clone(), entry.local.clone()))
                 .collect(),
         )
-    }
-
-    pub(crate) fn prepared_files(&self) -> Result<Vec<(String, FileVersion)>> {
-        let mut sources = BTreeMap::new();
-        for (path, id) in &self.cache {
-            if self.prepared.contains_key(id) {
-                sources.entry(*id).or_insert_with(|| path.clone());
-            }
-        }
-        if sources.len() != self.prepared.len() {
-            bail!("a prepared file version has no frozen source path");
-        }
-        Ok(sources
-            .into_iter()
-            .map(|(id, path)| {
-                (
-                    path,
-                    self.prepared
-                        .get(&id)
-                        .expect("prepared source identity was checked above")
-                        .clone(),
-                )
-            })
-            .collect())
     }
 
     pub(crate) fn cached(&self, path: &str, version: FileVersionId) -> bool {
@@ -409,12 +399,10 @@ impl StagedTree {
             }
             entry.local = local;
         }
-        self.manifest = manifest;
-        self.cache.retain(|path, version| {
-            self.manifest
-                .file(path)
-                .is_some_and(|file| file.id == *version)
-        });
+        self.manifest = (manifest != self.source).then_some(manifest);
+        let target = self.manifest.as_ref().unwrap_or(&self.source);
+        self.cache
+            .retain(|path, version| target.file(path).is_some_and(|file| file.id == *version));
         self.validate()
     }
 
@@ -430,10 +418,12 @@ impl StagedTree {
 
     fn validate(&self) -> Result<()> {
         validate_manifest(&self.source)?;
-        validate_manifest(&self.manifest)?;
+        if let Some(manifest) = &self.manifest {
+            validate_manifest(manifest)?;
+        }
+        let target = self.manifest.as_ref().unwrap_or(&self.source);
         for (path, version) in &self.cache {
-            let file = self
-                .manifest
+            let file = target
                 .file(path)
                 .with_context(|| format!("cached path {path:?} is not a target file"))?;
             if file.id != *version {
@@ -528,7 +518,13 @@ async fn prepare_root(source: &Path, staging: &Path) -> Result<()> {
     }
     tokio::fs::create_dir(staging)
         .await
-        .context("create a fresh staging directory")
+        .context("create a fresh staging directory")?;
+    tokio::fs::create_dir(staging.join(TREE_DIR))
+        .await
+        .context("create the staging tree")?;
+    tokio::fs::create_dir(staging.join(SEGMENTS_DIR))
+        .await
+        .context("create the segment staging directory")
 }
 
 fn require_same(path: &str, size: u64, modified: &str, observed: &opendal::Metadata) -> Result<()> {

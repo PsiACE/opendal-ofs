@@ -17,38 +17,24 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::StoredChange;
 use super::records::{
-    DirectoryRecord, NamespacePublication, NamespaceSnapshot, NodeRecord, managed_generation,
-    managed_generation_number, next_managed_generation,
+    DirectoryRecord, NamespaceSnapshot, NodeRecord, managed_generation, managed_generation_number,
+    next_managed_generation,
 };
-use crate::filesystem::{
-    BranchId, ChangeCursor, FileVersionId, Generation, NodeAttributes, NodeId, NodeKind,
-    VolumeError,
-};
+use super::{StoredChange, ValidatedChange};
+use crate::filesystem::{FileVersionId, Generation, NodeAttributes, NodeId, NodeKind, VolumeError};
 use crate::managed::error::invalid;
 
 pub(crate) fn validate_publication(
-    publication: &NamespacePublication,
+    change: &StoredChange,
     base: Option<&NamespaceSnapshot>,
-    origin_branch: Option<BranchId>,
-) -> Result<(bool, StoredChange), VolumeError> {
-    if publication.target.cursor.operation() != Some(publication.operation)
-        || publication.parent.sequence().checked_add(1)
-            != Some(publication.target.cursor.sequence())
-        || base.is_some_and(|state| {
-            state.volume_id != publication.target.volume_id || state.cursor != publication.parent
-        })
-        || base.is_none() && publication.parent != ChangeCursor::Genesis
-    {
-        return Err(invalid(
+) -> Result<Option<ValidatedChange>, VolumeError> {
+    change.validate_against(base).map_err(|_| {
+        invalid(
             "publish Managed namespace",
-            "publication ancestry is invalid",
-        ));
-    }
-    validate_snapshot(&publication.target)?;
-    let change = StoredChange::from_publication(publication, base, origin_branch);
-    Ok((change.validate_against(base)?, change))
+            "publication mutation is invalid",
+        )
+    })
 }
 
 pub(crate) fn validate_snapshot(snapshot: &NamespaceSnapshot) -> Result<(), VolumeError> {
@@ -161,7 +147,7 @@ mod tests {
     use std::num::NonZeroU64;
 
     use super::*;
-    use crate::filesystem::{NodePrecondition, OperationId, VolumeId};
+    use crate::filesystem::{ChangeCursor, OperationId, VolumeId};
 
     const ROOT: NodeId = NodeId::from_bytes([1; 16]);
 
@@ -204,17 +190,21 @@ mod tests {
         let base = base_snapshot();
         let mut target = base.clone();
         target.cursor = cursor(2);
-        let stale_node = NamespacePublication {
-            operation: OperationId::from_bytes([2; 16]),
-            parent: base.cursor,
-            expected_nodes: vec![NodePrecondition {
-                node: ROOT,
-                expected_generation: Some(managed_generation(2)),
-            }],
-            expected_directories: Vec::new(),
+        let publication = crate::filesystem::VolumePublication::between(
+            OperationId::from_bytes([2; 16]),
+            Some(&base),
             target,
-        };
-        let (valid, _) = validate_publication(&stale_node, Some(&base), None).unwrap();
-        assert!(!valid);
+        )
+        .unwrap();
+        let mut change = StoredChange::new(publication.mutation().clone(), None);
+        change.mutation.expected_nodes = vec![crate::filesystem::NodePrecondition {
+            node: ROOT,
+            expected_generation: Some(managed_generation(2)),
+        }];
+        assert!(
+            validate_publication(&change, Some(&base))
+                .unwrap()
+                .is_none()
+        );
     }
 }

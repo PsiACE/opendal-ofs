@@ -11,8 +11,9 @@ set -euo pipefail
 
 : "${OFS_BIN:?}" "${OFS_RUN_ROOT:?}" "${OFS_STORAGE_URL:?}" "${OFS_METRICS:?}"
 : "${OFS_INPUTS:?}" "${OFS_COMMANDS:?}" "${OFS_RELEASE:?}" "${OFS_RUN_ID:?}"
+: "${OFS_PERF_ROUNDS:?}"
 
-rounds=${OFS_PERF_ROUNDS:-12}
+rounds=$OFS_PERF_ROUNDS
 volume=performance-volume
 catalog="$OFS_RUN_ROOT/catalog.json"
 evidence="$OFS_RUN_ROOT/evidence"
@@ -81,7 +82,7 @@ if "$OFS_BIN" volume create --help 2>&1 | grep -q -- '--model'; then
   create+=(--model managed)
 fi
 create+=(--storage "$OFS_STORAGE_URL")
-run_command "$evidence/create.txt" "${create[@]}"
+measure init create "$evidence/create.txt" "${create[@]}"
 
 source_tree="$OFS_RUN_ROOT/replica-source"
 source_state="$OFS_RUN_ROOT/state-source.json"
@@ -98,9 +99,9 @@ for group in $(seq 0 7); do
   done
 done
 
-run_command "$evidence/initial-publication.txt" \
+measure init initial-publication "$evidence/initial-publication.txt" \
   "$OFS_BIN" sync "$volume" "$source_tree" --state "$source_state"
-run_command "$evidence/initial-catchup.txt" \
+measure cold_restore initial "$evidence/initial-catchup.txt" \
   "$OFS_BIN" sync "$volume" "$lagging_tree" --state "$lagging_state"
 diff -qr "$source_tree" "$lagging_tree" >/dev/null
 
@@ -111,7 +112,7 @@ for round in $(seq 1 "$rounds"); do
   next_tree="$OFS_RUN_ROOT/replica-$round"
   next_state="$OFS_RUN_ROOT/state-$round.json"
   mkdir "$next_tree"
-  measure catchup "$round" "$evidence/catchup-$round.txt" \
+  measure cold_restore "$round" "$evidence/catchup-$round.txt" \
     "$OFS_BIN" sync "$volume" "$next_tree" --state "$next_state"
   diff -qr "$current_tree" "$next_tree" >/dev/null
   rewrite_window \
@@ -134,7 +135,7 @@ for round in $(seq 1 "$rounds"); do
   current_state=$next_state
 done
 
-measure catchup lagging "$evidence/catchup-lagging.txt" \
+measure incremental_catchup lagging "$evidence/catchup-lagging.txt" \
   "$OFS_BIN" sync "$volume" "$lagging_tree" --state "$lagging_state"
 diff -qr "$current_tree" "$lagging_tree" >/dev/null
 lifecycle_ended_ns=$(date +%s%N)

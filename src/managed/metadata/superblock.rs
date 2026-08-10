@@ -22,6 +22,7 @@ use crate::managed::error::{corrupt, invalid, unsupported};
 use crate::managed::format::LowerHex;
 
 pub(crate) const SUPERBLOCK_KEY: &str = ".ofs/managed/metadata/v1/superblock.json";
+pub(crate) const MAX_SUPERBLOCK_BYTES: usize = 64 * 1024;
 
 const VERSION: u8 = 1;
 
@@ -118,11 +119,24 @@ impl ManagedFormat {
     }
 
     pub(crate) fn encode(&self) -> Result<Vec<u8>, VolumeError> {
-        serde_json::to_vec(&SuperblockWire::from(self))
-            .map_err(|_| invalid("create Managed volume", "superblock cannot be encoded"))
+        let bytes = serde_json::to_vec(&SuperblockWire::from(self))
+            .map_err(|_| invalid("create Managed volume", "superblock cannot be encoded"))?;
+        if bytes.len() > MAX_SUPERBLOCK_BYTES {
+            return Err(invalid(
+                "create Managed volume",
+                "superblock exceeds its size limit",
+            ));
+        }
+        Ok(bytes)
     }
 
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, VolumeError> {
+        if bytes.len() > MAX_SUPERBLOCK_BYTES {
+            return Err(corrupt(
+                "read Managed superblock",
+                "superblock exceeds its size limit",
+            ));
+        }
         let wire: SuperblockWire = serde_json::from_slice(bytes).map_err(|_| {
             corrupt(
                 "read Managed superblock",

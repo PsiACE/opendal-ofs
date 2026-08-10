@@ -23,16 +23,16 @@ mod state;
 mod store;
 mod validation;
 
-pub(crate) use change::NamespaceChange;
+pub(crate) use change::{NamespaceChange, ValidatedChange};
 pub(crate) use records::{
-    DirectoryPrecondition, DirectoryRecord, FileVersionRecord, NamespacePublication,
-    NamespaceSnapshot, NodePrecondition, NodeRecord, managed_generation, next_managed_generation,
+    DirectoryRecord, FileVersionRecord, NamespaceSnapshot, managed_generation,
+    next_managed_generation,
 };
 pub(crate) use state::{
-    CheckpointRef, StoredChange, StoredCheckpoint, StoredCommittedResult, StoredHistory,
-    StoredNamespaceState, StoredResults, recover_namespace, replay_tail_from,
-    require_request_digest, results_for_rotation,
+    ChangeSegmentRef, CheckpointRef, StoredChange, StoredChangeSegment, StoredCheckpoint,
+    StoredCommittedResult, StoredNamespaceState, recover_namespace, replay_tail_from,
+    require_request_digest,
 };
+pub(crate) use store::{MAX_HEAD_ENCODED_BYTES, StoredHead, decode_head, encode_head};
 pub(crate) use store::{NamespaceStore, NamespaceWitness};
-pub(crate) use store::{StoredHead, decode_head, encode_head};
 pub(crate) use validation::{validate_publication, validate_snapshot};

@@ -9,7 +9,7 @@
 
 set -euo pipefail
 
-baseline_sha=${OFS_PERF_BASELINE:-af448ae}
+baseline_sha=${OFS_PERF_BASELINE:-}
 baseline_binary=${OFS_PERF_BASELINE_BIN:-}
 workspace=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
 suite="$workspace/tests/performance/managed-sync"
@@ -17,10 +17,11 @@ candidate_sha=${OFS_PERF_CANDIDATE:-$(git -C "$workspace" rev-parse HEAD)}
 candidate_binary=${OFS_PERF_CANDIDATE_BIN:-}
 output=
 rounds=${OFS_PERF_ROUNDS:-12}
-profile=${OFS_PERF_PROFILE:-standard}
 bucket=ofs-managed-performance
 access_key=ofs-performance
 secret_key=ofs-performance-password
+admin_access_key=ofs-performance-admin
+admin_secret_key=ofs-performance-admin-password
 minio_image=${MINIO_IMAGE:-quay.io/minio/minio:RELEASE.2024-09-22T00-33-43Z}
 mc_image=${MC_IMAGE:-quay.io/minio/mc:RELEASE.2024-09-16T17-43-14Z}
 audit_image=${AUDIT_IMAGE:-python:3.13.7-alpine3.22}
@@ -34,7 +35,6 @@ Options:
   --baseline REF_OR_BINARY
   --candidate REF_OR_BINARY
   --rounds N
-  --profile standard|agent-home
 EOF
 }
 
@@ -61,7 +61,7 @@ select_source() {
 
 while (($#)); do
   case $1 in
-    --baseline|--candidate|--rounds|--profile)
+    --baseline|--candidate|--rounds)
       (($# >= 2)) || { printf '%s requires a value\n' "$1" >&2; exit 2; }
       option=$1
       value=$2
@@ -70,7 +70,6 @@ while (($#)); do
         --baseline) select_source baseline "$value" ;;
         --candidate) select_source candidate "$value" ;;
         --rounds) rounds=$value ;;
-        --profile) profile=$value ;;
       esac
       ;;
     -h|--help) usage; exit ;;
@@ -83,13 +82,13 @@ while (($#)); do
   esac
 done
 [[ $rounds =~ ^[1-9][0-9]*$ ]] || { printf '--rounds must be greater than zero\n' >&2; exit 2; }
+[[ -n $baseline_sha || -n $baseline_binary ]] || {
+  printf 'a baseline is required; pass --baseline REF_OR_BINARY\n' >&2
+  exit 2
+}
 output=${output:-$workspace/.local/performance/managed-sync-ab-$(date -u +%Y%m%dT%H%M%SZ)}
 
-case $profile in
-  standard) workload="$suite/workload.sh" ;;
-  agent-home) workload="$suite/agent-home-workload.sh" ;;
-  *) printf 'unknown workload profile: %s\n' "$profile" >&2; exit 2 ;;
-esac
+workload="$suite/workload.sh"
 
 if [[ -n ${OFS_CONTAINER_RUNTIME:-} ]]; then
   runtime=$OFS_CONTAINER_RUNTIME
@@ -176,7 +175,7 @@ done
 "$runtime" run -d --rm --name "$container" --network "$network" \
   --network-alias minio -p 127.0.0.1::9000 \
   -e NO_PROXY=audit,localhost,127.0.0.1 -e no_proxy=audit,localhost,127.0.0.1 \
-  -e "MINIO_ROOT_USER=$access_key" -e "MINIO_ROOT_PASSWORD=$secret_key" \
+  -e "MINIO_ROOT_USER=$admin_access_key" -e "MINIO_ROOT_PASSWORD=$admin_secret_key" \
   -e MINIO_AUDIT_WEBHOOK_ENABLE_HARNESS=on \
   -e MINIO_AUDIT_WEBHOOK_ENDPOINT_HARNESS=http://audit:8080 \
   -e MINIO_AUDIT_WEBHOOK_BATCH_SIZE_HARNESS=1 \
@@ -188,7 +187,9 @@ for _ in $(seq 1 100); do
 done
 curl -fsS "http://127.0.0.1:$minio_port/minio/health/ready" >/dev/null
 
-mc_run() {
+mc_run_as() {
+  local user=$1 password=$2
+  shift 2
   # shellcheck disable=SC2016
   "$runtime" run --rm --network "$network" \
     -e NO_PROXY=minio,localhost,127.0.0.1 -e no_proxy=minio,localhost,127.0.0.1 \
@@ -198,9 +199,12 @@ mc_run() {
     shift 3
     mc alias set performance "$endpoint" "$user" "$password" >/dev/null
     exec mc "$@"
-  ' shell http://minio:9000 "$access_key" "$secret_key" "$@"
+  ' shell http://minio:9000 "$user" "$password" "$@"
 }
+mc_run() { mc_run_as "$admin_access_key" "$admin_secret_key" "$@"; }
 mc_run mb --ignore-existing "performance/$bucket" >/dev/null
+mc_run admin user add performance "$access_key" "$secret_key" >/dev/null
+mc_run admin policy attach performance readwrite --user "$access_key" >/dev/null
 
 : >"$output/samples.tsv"
 : >"$output/inputs.tsv"
@@ -211,13 +215,9 @@ mc_run mb --ignore-existing "performance/$bucket" >/dev/null
   printf 'rustc\t%s\n' "$(rustc --version)"
   printf 'kernel\t%s\n' "$(uname -srmo)"
   printf 'container_runtime\t%s\n' "$runtime"
-  if [[ $profile == agent-home ]]; then
-    printf 'agent_image\t%s\n' "${OFS_AGENT_IMAGE:-quay.io/fedora/fedora:44}"
-  fi
   printf 'minio_image\t%s\n' "$minio_image"
   printf 'audit_image\t%s\n' "$audit_image"
   printf 'rounds\t%s\n' "$rounds"
-  printf 'profile\t%s\n' "$profile"
 } >"$output/context.tsv"
 
 for index in "${!schedule[@]}"; do
@@ -235,22 +235,35 @@ for index in "${!schedule[@]}"; do
 
   mc_run ls --recursive --json "performance/$bucket/$object_root" \
     >"$run_root/objects.jsonl"
+  find "$run_root" -mindepth 1 -maxdepth 1 \
+    ! -name evidence ! -name logical-tree.json ! -name objects.jsonl \
+    -exec rm -rf -- {} +
 done
 
-previous_size=-1
-stable_checks=0
-for _ in $(seq 1 100); do
-  current_size=$(wc -c <"$output/audit.jsonl")
-  if [[ $current_size == "$previous_size" ]]; then
-    stable_checks=$((stable_checks + 1))
-    ((stable_checks >= 5)) && break
-  else
-    stable_checks=0
-    previous_size=$current_size
-  fi
-  sleep 0.05
-done
+barrier_key="audit-barrier/${container}.txt"
+printf '%s\n' "$container" | \
+  mc_run_as "$access_key" "$secret_key" pipe "performance/$bucket/$barrier_key" >/dev/null
+python3 - "$output/audit.jsonl" "$access_key" "/$bucket/$barrier_key" <<'PY'
+import json
+import pathlib
+import sys
+import time
 
-python3 "$suite/analyze.py" "$output"
-rm "$output/context.tsv" "$output/inputs.tsv" "$output/samples.tsv"
+log = pathlib.Path(sys.argv[1])
+access_key = sys.argv[2]
+request_path = sys.argv[3]
+deadline = time.monotonic() + 10
+while time.monotonic() < deadline:
+    for line in log.read_text(encoding="utf-8").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("accessKey") == access_key and event.get("requestPath") == request_path:
+            raise SystemExit(0)
+    time.sleep(0.05)
+raise SystemExit("MinIO native audit barrier was not delivered")
+PY
+
+python3 "$suite/analyze.py" --access-key "$access_key" "$output"
 printf 'canonical evidence: %s\n' "$output/results.json"

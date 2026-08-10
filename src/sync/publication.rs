@@ -15,8 +15,8 @@ use super::LocalKind;
 use super::path::SnapshotTree;
 use super::staging::{StagedTree, TargetManifest};
 use crate::filesystem::{
-    ChangeCursor, DirectoryEntry, DirectoryPrecondition, DirectoryRecord, NodeAttributes, NodeId,
-    NodeKind, NodePrecondition, NodeRecord, OperationId, Volume, VolumePublication, VolumeSnapshot,
+    ChangeCursor, DirectoryEntry, DirectoryRecord, NodeAttributes, NodeId, NodeKind, NodeRecord,
+    OperationId, Volume, VolumePublication, VolumeSnapshot,
 };
 
 /// Build one complete volume namespace target from a stable local observation.
@@ -160,13 +160,7 @@ pub(crate) fn build_publication<V: Volume>(
         directories,
         file_versions,
     };
-    Ok(VolumePublication {
-        operation,
-        parent,
-        expected_nodes: node_preconditions(authoritative_snapshot, &target),
-        expected_directories: directory_preconditions(authoritative_snapshot, &target),
-        target,
-    })
+    VolumePublication::between(operation, authoritative_snapshot, target).map_err(Into::into)
 }
 
 fn directory_entries(
@@ -270,42 +264,4 @@ fn next_directory_generation<V: Volume>(
             .next_generation(&previous.generation)
             .context("directory generation overflow")
     }
-}
-
-fn node_preconditions(
-    authoritative: Option<&VolumeSnapshot>,
-    target: &VolumeSnapshot,
-) -> Vec<NodePrecondition> {
-    let empty = BTreeMap::new();
-    let old = authoritative.map_or(&empty, |state| &state.nodes);
-    old.keys()
-        .chain(target.nodes.keys())
-        .copied()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .filter(|id| old.get(id) != target.nodes.get(id))
-        .map(|node| NodePrecondition {
-            node,
-            expected_generation: old.get(&node).map(|record| record.generation.clone()),
-        })
-        .collect()
-}
-
-fn directory_preconditions(
-    authoritative: Option<&VolumeSnapshot>,
-    target: &VolumeSnapshot,
-) -> Vec<DirectoryPrecondition> {
-    let empty = BTreeMap::new();
-    let old = authoritative.map_or(&empty, |state| &state.directories);
-    old.keys()
-        .chain(target.directories.keys())
-        .copied()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .filter(|id| old.get(id) != target.directories.get(id))
-        .map(|directory| DirectoryPrecondition {
-            directory,
-            expected_generation: old.get(&directory).map(|record| record.generation.clone()),
-        })
-        .collect()
 }

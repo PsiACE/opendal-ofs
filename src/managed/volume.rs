@@ -24,13 +24,13 @@ use opendal::Operator;
 
 use super::format::ExtentMap;
 use super::metadata::namespace::{
-    FileVersionRecord, NamespacePublication, NamespaceSnapshot, NamespaceStore, NamespaceWitness,
+    FileVersionRecord, NamespaceChange, NamespaceSnapshot, NamespaceStore, NamespaceWitness,
 };
 use super::{AuthorityKnownContent, ManagedData};
 use crate::filesystem::{AuthorityIdentity, CommitOutcome, OperationId, VolumeId};
 use crate::filesystem::{
-    FileVersion, MaterializeRequest, Volume, VolumeError, VolumeObservation, VolumePublication,
-    VolumeSnapshot,
+    FileVersion, MaterializeRequest, Volume, VolumeError, VolumeMutation, VolumeObservation,
+    VolumePublication, VolumeSnapshot,
 };
 use crate::managed::error::{corrupt, invalid};
 
@@ -43,6 +43,7 @@ pub struct ManagedVolume {
 #[derive(Clone, Debug)]
 pub struct ManagedObservation {
     witness: NamespaceWitness,
+    managed_snapshot: NamespaceSnapshot,
     filesystem_snapshot: VolumeSnapshot,
 }
 
@@ -76,18 +77,13 @@ impl ManagedVolume {
     async fn publish(
         &self,
         observed: Option<&ManagedObservation>,
-        publication: &NamespacePublication,
+        mutation: VolumeMutation<FileVersionRecord>,
     ) -> Result<CommitOutcome, VolumeError> {
-        let base = observed
-            .map(|observed| to_managed_snapshot(&observed.filesystem_snapshot))
-            .transpose()?;
-        let observed = observed.map(|observed| {
-            (
-                &observed.witness,
-                base.as_ref().expect("an observation was decoded above"),
-            )
-        });
-        self.namespace.publish(observed, publication).await
+        let observed = observed.map(|observed| (&observed.witness, &observed.managed_snapshot));
+        let origin_branch = self.namespace.binding().map(|binding| binding.id);
+        self.namespace
+            .publish(observed, NamespaceChange::new(mutation, origin_branch))
+            .await
     }
 }
 
@@ -138,7 +134,7 @@ impl Volume for ManagedVolume {
     async fn stage_files(
         &self,
         source: &Operator,
-        staging: &Operator,
+        segment_staging: &Operator,
         paths: Vec<String>,
         authority: Option<&VolumeSnapshot>,
         concurrency: NonZeroUsize,
@@ -148,7 +144,7 @@ impl Volume for ManagedVolume {
             .transpose()?
             .unwrap_or_default();
         self.data
-            .stage_files(source, staging, paths, &known, concurrency)
+            .stage_files(source, segment_staging, paths, &known, concurrency)
             .await?
             .into_iter()
             .map(|(path, version)| Ok((path, encode_file_version(&version)?)))
@@ -157,20 +153,11 @@ impl Volume for ManagedVolume {
 
     async fn finalize_staged_files(
         &self,
-        staging: &Operator,
-        files: Vec<(String, FileVersion)>,
-        authority: Option<&VolumeSnapshot>,
+        segment_staging: &Operator,
+        concurrency: NonZeroUsize,
     ) -> Result<(), VolumeError> {
-        let known = authority
-            .map(authority_known_content)
-            .transpose()?
-            .unwrap_or_default();
-        let files = files
-            .into_iter()
-            .map(|(path, version)| Ok((path, decode_file_version(&version)?)))
-            .collect::<Result<Vec<_>, VolumeError>>()?;
         self.data
-            .finalize_staged_files(staging, files, &known)
+            .finalize_staged_files(segment_staging, concurrency)
             .await
     }
 
@@ -179,8 +166,7 @@ impl Volume for ManagedVolume {
         observed: Option<&Self::Observation>,
         publication: &VolumePublication,
     ) -> Result<CommitOutcome, VolumeError> {
-        let publication = to_managed_publication(publication)?;
-        ManagedVolume::publish(self, observed, &publication).await
+        ManagedVolume::publish(self, observed, to_managed_mutation(publication.mutation())?).await
     }
 
     async fn resolve(&self, operation: OperationId) -> Result<CommitOutcome, VolumeError> {
@@ -190,8 +176,8 @@ impl Volume for ManagedVolume {
     async fn materialize(
         &self,
         target: &Operator,
+        segment_staging: Option<&Operator>,
         requests: Vec<MaterializeRequest>,
-        full_tree: bool,
         concurrency: NonZeroUsize,
     ) -> Result<(), VolumeError> {
         let decoded = requests
@@ -199,7 +185,7 @@ impl Volume for ManagedVolume {
             .map(|request| Ok((request.path, decode_file_version(&request.version)?)))
             .collect::<Result<Vec<_>, VolumeError>>()?;
         self.data
-            .materialize(target, decoded, full_tree, concurrency)
+            .materialize(target, segment_staging, decoded, concurrency)
             .await
     }
 }
@@ -228,9 +214,10 @@ fn managed_observation(
     snapshot: NamespaceSnapshot,
     witness: NamespaceWitness,
 ) -> Result<ManagedObservation, VolumeError> {
-    let filesystem_snapshot = to_volume_snapshot(snapshot)?;
+    let filesystem_snapshot = to_volume_snapshot(&snapshot)?;
     Ok(ManagedObservation {
         witness,
+        managed_snapshot: snapshot,
         filesystem_snapshot,
     })
 }
@@ -262,17 +249,17 @@ fn decode_file_version(version: &FileVersion) -> Result<FileVersionRecord, Volum
     Ok(decoded)
 }
 
-fn to_volume_snapshot(snapshot: NamespaceSnapshot) -> Result<VolumeSnapshot, VolumeError> {
+fn to_volume_snapshot(snapshot: &NamespaceSnapshot) -> Result<VolumeSnapshot, VolumeError> {
     Ok(VolumeSnapshot {
         volume_id: snapshot.volume_id,
         cursor: snapshot.cursor,
         root: snapshot.root,
-        nodes: snapshot.nodes,
-        directories: snapshot.directories,
+        nodes: snapshot.nodes.clone(),
+        directories: snapshot.directories.clone(),
         file_versions: snapshot
             .file_versions
-            .into_iter()
-            .map(|(id, version)| Ok((id, encode_file_version(&version)?)))
+            .iter()
+            .map(|(id, version)| Ok((*id, encode_file_version(version)?)))
             .collect::<Result<_, VolumeError>>()?,
     })
 }
@@ -292,14 +279,26 @@ fn to_managed_snapshot(snapshot: &VolumeSnapshot) -> Result<NamespaceSnapshot, V
     })
 }
 
-fn to_managed_publication(
-    publication: &VolumePublication,
-) -> Result<NamespacePublication, VolumeError> {
-    Ok(NamespacePublication {
-        operation: publication.operation,
-        parent: publication.parent,
-        expected_nodes: publication.expected_nodes.clone(),
-        expected_directories: publication.expected_directories.clone(),
-        target: to_managed_snapshot(&publication.target)?,
+fn to_managed_mutation(
+    mutation: &VolumeMutation,
+) -> Result<VolumeMutation<FileVersionRecord>, VolumeError> {
+    Ok(VolumeMutation {
+        volume_id: mutation.volume_id,
+        operation: mutation.operation,
+        parent: mutation.parent,
+        cursor: mutation.cursor,
+        root: mutation.root,
+        expected_nodes: mutation.expected_nodes.clone(),
+        expected_directories: mutation.expected_directories.clone(),
+        put_nodes: mutation.put_nodes.clone(),
+        remove_nodes: mutation.remove_nodes.clone(),
+        put_directories: mutation.put_directories.clone(),
+        remove_directories: mutation.remove_directories.clone(),
+        put_file_versions: mutation
+            .put_file_versions
+            .iter()
+            .map(decode_file_version)
+            .collect::<Result<_, _>>()?,
+        remove_file_versions: mutation.remove_file_versions.clone(),
     })
 }

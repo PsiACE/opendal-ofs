@@ -233,14 +233,215 @@ pub struct DirectoryPrecondition {
     pub expected_generation: Option<Generation>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DirectoryMutation {
+    pub(crate) node: NodeId,
+    pub(crate) generation: Generation,
+    pub(crate) put_entries: BTreeMap<String, DirectoryEntry>,
+    pub(crate) remove_entries: Vec<String>,
+}
+
+impl DirectoryMutation {
+    fn between(target: &DirectoryRecord, base: Option<&DirectoryRecord>) -> Self {
+        Self {
+            node: target.node,
+            generation: target.generation.clone(),
+            put_entries: target
+                .entries
+                .iter()
+                .filter(|(name, entry)| {
+                    base.and_then(|base| base.entries.get(*name)) != Some(*entry)
+                })
+                .map(|(name, entry)| (name.clone(), *entry))
+                .collect(),
+            remove_entries: base
+                .into_iter()
+                .flat_map(|base| {
+                    base.entries
+                        .keys()
+                        .filter(|name| !target.entries.contains_key(*name))
+                        .cloned()
+                })
+                .collect(),
+        }
+    }
+
+    pub(crate) fn apply(
+        &self,
+        base: Option<&DirectoryRecord>,
+    ) -> Result<DirectoryRecord, VolumeError> {
+        let mut directory = base.cloned().unwrap_or(DirectoryRecord {
+            node: self.node,
+            generation: self.generation.clone(),
+            entries: BTreeMap::new(),
+        });
+        if directory.node != self.node {
+            return Err(invalid_mutation("directory delta identity is invalid"));
+        }
+        directory.generation = self.generation.clone();
+        let mut changed = BTreeSet::new();
+        for name in &self.remove_entries {
+            if !changed.insert(name.clone()) || directory.entries.remove(name).is_none() {
+                return Err(invalid_mutation("directory entry removal is invalid"));
+            }
+        }
+        for (name, entry) in &self.put_entries {
+            if !changed.insert(name.clone()) {
+                return Err(invalid_mutation("directory entry update is invalid"));
+            }
+            directory.entries.insert(name.clone(), *entry);
+        }
+        Ok(directory)
+    }
+}
+
+/// The changed records in one generation-checked publication.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct VolumeMutation<F = FileVersion> {
+    pub(crate) volume_id: VolumeId,
+    pub(crate) operation: OperationId,
+    pub(crate) parent: ChangeCursor,
+    pub(crate) cursor: ChangeCursor,
+    pub(crate) root: NodeId,
+    pub(crate) expected_nodes: Vec<NodePrecondition>,
+    pub(crate) expected_directories: Vec<DirectoryPrecondition>,
+    pub(crate) put_nodes: Vec<NodeRecord>,
+    pub(crate) remove_nodes: Vec<NodeId>,
+    pub(crate) put_directories: Vec<DirectoryMutation>,
+    pub(crate) remove_directories: Vec<NodeId>,
+    pub(crate) put_file_versions: Vec<F>,
+    pub(crate) remove_file_versions: Vec<FileVersionId>,
+}
+
+impl<F: Clone + Eq> VolumeMutation<F> {
+    fn between(
+        operation: OperationId,
+        base: Option<&VolumeSnapshot<F>>,
+        target: &VolumeSnapshot<F>,
+    ) -> Self {
+        let empty_nodes = BTreeMap::new();
+        let empty_directories = BTreeMap::new();
+        let empty_versions = BTreeMap::new();
+        let base_nodes = base.map_or(&empty_nodes, |snapshot| &snapshot.nodes);
+        let base_directories = base.map_or(&empty_directories, |snapshot| &snapshot.directories);
+        let base_versions = base.map_or(&empty_versions, |snapshot| &snapshot.file_versions);
+        let expected_nodes = changed_keys(base_nodes, &target.nodes)
+            .map(|node| NodePrecondition {
+                node,
+                expected_generation: base_nodes
+                    .get(&node)
+                    .map(|record| record.generation.clone()),
+            })
+            .collect();
+        let expected_directories = changed_keys(base_directories, &target.directories)
+            .map(|directory| DirectoryPrecondition {
+                directory,
+                expected_generation: base_directories
+                    .get(&directory)
+                    .map(|record| record.generation.clone()),
+            })
+            .collect();
+        Self {
+            volume_id: target.volume_id,
+            operation,
+            parent: base.map_or(ChangeCursor::Genesis, |snapshot| snapshot.cursor),
+            cursor: target.cursor,
+            root: target.root,
+            expected_nodes,
+            expected_directories,
+            put_nodes: target
+                .nodes
+                .iter()
+                .filter(|(id, record)| base_nodes.get(id) != Some(record))
+                .map(|(_, record)| record.clone())
+                .collect(),
+            remove_nodes: base_nodes
+                .keys()
+                .filter(|id| !target.nodes.contains_key(id))
+                .copied()
+                .collect(),
+            put_directories: target
+                .directories
+                .iter()
+                .filter(|(id, record)| base_directories.get(id) != Some(record))
+                .map(|(id, record)| DirectoryMutation::between(record, base_directories.get(id)))
+                .collect(),
+            remove_directories: base_directories
+                .keys()
+                .filter(|id| !target.directories.contains_key(id))
+                .copied()
+                .collect(),
+            put_file_versions: target
+                .file_versions
+                .iter()
+                .filter(|(id, record)| base_versions.get(id) != Some(record))
+                .map(|(_, record)| record.clone())
+                .collect(),
+            remove_file_versions: base_versions
+                .keys()
+                .filter(|id| !target.file_versions.contains_key(id))
+                .copied()
+                .collect(),
+        }
+    }
+
+    pub(crate) fn validate_ancestry(&self, volume_id: VolumeId) -> Result<(), VolumeError> {
+        if self.volume_id != volume_id
+            || self.cursor.operation() != Some(self.operation)
+            || self.parent.sequence().checked_add(1) != Some(self.cursor.sequence())
+        {
+            return Err(invalid_mutation("mutation ancestry is invalid"));
+        }
+        Ok(())
+    }
+}
+
+fn changed_keys<'a, K: Copy + Ord, V: PartialEq>(
+    base: &'a BTreeMap<K, V>,
+    target: &'a BTreeMap<K, V>,
+) -> impl Iterator<Item = K> + 'a {
+    base.keys()
+        .chain(target.keys())
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|key| base.get(key) != target.get(key))
+}
+
+fn invalid_mutation(message: &'static str) -> VolumeError {
+    VolumeError::new(VolumeErrorKind::Invalid, message)
+}
+
 /// One generation-checked filesystem publication.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VolumePublication<F = FileVersion> {
-    pub operation: OperationId,
-    pub parent: ChangeCursor,
-    pub expected_nodes: Vec<NodePrecondition>,
-    pub expected_directories: Vec<DirectoryPrecondition>,
     pub target: VolumeSnapshot<F>,
+    mutation: VolumeMutation<F>,
+}
+
+impl<F: Clone + Eq> VolumePublication<F> {
+    pub(crate) fn between(
+        operation: OperationId,
+        base: Option<&VolumeSnapshot<F>>,
+        target: VolumeSnapshot<F>,
+    ) -> Result<Self, VolumeError> {
+        target.validate_structure()?;
+        let parent = base.map_or(ChangeCursor::Genesis, |snapshot| snapshot.cursor);
+        if target.cursor.operation() != Some(operation)
+            || parent.sequence().checked_add(1) != Some(target.cursor.sequence())
+            || base.is_some_and(|base| base.volume_id != target.volume_id)
+        {
+            return Err(invalid_mutation("publication ancestry is invalid"));
+        }
+        let mutation = VolumeMutation::between(operation, base, &target);
+        Ok(Self { target, mutation })
+    }
+
+    pub(crate) fn mutation(&self) -> &VolumeMutation<F> {
+        &self.mutation
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -320,25 +521,30 @@ pub trait Volume: Clone + Send + Sync {
         base: Option<&VolumeSnapshot>,
     ) -> Result<Option<Self::Observation>, VolumeError>;
 
+    /// Freeze changed files and prepare every new immutable data object locally.
+    ///
+    /// `segment_staging` is private to the volume implementation and survives
+    /// with the pending intent so that a retry never has to read or reconstruct
+    /// data from the live source tree.
     async fn stage_files(
         &self,
         source: &Operator,
-        staging: &Operator,
+        segment_staging: &Operator,
         paths: Vec<String>,
         authority: Option<&VolumeSnapshot>,
         concurrency: NonZeroUsize,
     ) -> Result<BTreeMap<String, FileVersion>, VolumeError>;
 
-    /// Make every data object referenced by locally prepared file versions durable.
+    /// Make every locally prepared immutable data object durable.
     ///
     /// Sync persists its pending intent before calling this method and does not
     /// publish namespace metadata until it succeeds. Implementations must make
-    /// retries idempotent and must not depend on the live source tree.
+    /// retries idempotent and must use only `segment_staging`, never the live or
+    /// user-visible frozen source tree.
     async fn finalize_staged_files(
         &self,
-        staging: &Operator,
-        files: Vec<(String, FileVersion)>,
-        authority: Option<&VolumeSnapshot>,
+        segment_staging: &Operator,
+        concurrency: NonZeroUsize,
     ) -> Result<(), VolumeError>;
 
     async fn publish(
@@ -352,8 +558,8 @@ pub trait Volume: Clone + Send + Sync {
     async fn materialize(
         &self,
         target: &Operator,
+        segment_staging: Option<&Operator>,
         requests: Vec<MaterializeRequest>,
-        full_tree: bool,
         concurrency: NonZeroUsize,
     ) -> Result<(), VolumeError>;
 }

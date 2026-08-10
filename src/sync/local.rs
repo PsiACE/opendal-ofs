@@ -11,6 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use futures::TryStreamExt as _;
 use opendal::{EntryMode, Operator, services};
 use serde::{Deserialize, Serialize};
 
@@ -49,14 +50,18 @@ impl LocalTree {
     pub(crate) async fn scan(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
         let operator = fs_operator(root)?;
-        let listed = operator
-            .list_with("")
+        let mut listed = operator
+            .lister_with("")
             .recursive(true)
             .await
             .context("scan local replica through OpenDAL fs")?;
         let mut entries = BTreeMap::new();
         let mut file_identities = BTreeMap::new();
-        for entry in listed {
+        while let Some(entry) = listed
+            .try_next()
+            .await
+            .context("scan local replica through OpenDAL fs")?
+        {
             let path = entry.path().trim_end_matches('/');
             if path.is_empty() {
                 continue;
