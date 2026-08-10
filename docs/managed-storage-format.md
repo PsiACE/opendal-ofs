@@ -53,10 +53,10 @@ copy to equivalent storage does not change its `VolumeId`.
 
 ## Superblock
 
-Object Metadata stores the superblock at:
+Object Metadata stores the superblock at the stable discovery key:
 
 ```text
-.ofs/managed/metadata/v1/superblock.json
+.ofs/managed/superblock.json
 ```
 
 Transactional Metadata stores the same bytes under the same logical key in its
@@ -65,21 +65,22 @@ object:
 
 ```json
 {
-  "version": 1,
+  "format": "managed/1",
   "volume_id": "00112233445566778899aabbccddeeff",
-  "metadata": "object",
   "extensions": []
 }
 ```
 
 `volume_id` is 16 bytes encoded as 32 lowercase hexadecimal characters.
-`metadata` is `object` or `transactional`. `extensions` MUST be strictly
-ordered without duplicates. Readers reject another version, unknown fields,
-metadata identifiers, and required extensions.
+`extensions` contains required built-in format extensions and MUST be strictly
+ordered by identifier without duplicates. Readers reject another format,
+unknown fields, and unknown required extensions before mutation. The stable key
+is not versioned: a client must discover and reject an unsupported format
+instead of creating another superblock under a version-specific key.
 
-The optional required extension `branch/v1` replaces the single namespace
-authority with durable named authorities. Its format and lifecycle rules are
-described in [Managed branches](managed-branches.md).
+The built-in `branch/v1` extension replaces the single namespace authority with
+durable named authorities. Its format and lifecycle rules are described in
+[Managed branches](managed-branches.md).
 
 The superblock does not contain credentials, endpoints, local paths,
 client-local aliases, index inventory, or policy settings.
@@ -154,7 +155,7 @@ extent ranges from the file version and verifies each returned `ContentRef`.
 Object Metadata uses these keys:
 
 ```text
-.ofs/managed/metadata/v1/superblock.json
+.ofs/managed/superblock.json
 .ofs/managed/metadata/v1/head.ofs
 .ofs/managed/metadata/v1/checkpoints/sha256/<digest>.ofs
 .ofs/managed/metadata/v1/changes/sha256/<digest>.ofs
@@ -258,7 +259,7 @@ The primary key is `(store_key, record_key)`. Each row contains those two text
 fields, an integer CAS `revision`, and the encoded bytes in lowercase
 `value_hex`. `store_key` is the configured physical authority scope;
 `record_key` is exactly the logical key used by Object Metadata, including the
-superblock, base HEAD, and extension registry and heads. `VolumeId` is verified
+superblock, base HEAD, and branch registry and heads. `VolumeId` is verified
 from the stored value instead of being duplicated in the table schema.
 Immutable checkpoints, change segments, and operation receipts for both base
 and branch authorities remain in the configured OpenDAL storage. The

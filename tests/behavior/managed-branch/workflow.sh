@@ -104,7 +104,7 @@ value = json.load(sys.stdin)
 assert value["default_branch"] == "main"
 assert [branch["name"] for branch in value["branches"]] == ["main"]
 ' <<<"$observed_branches" || \
-    fail 'a new client did not honor the remote branch/v1 format'
+    fail 'a new client did not honor the remote branch/v1 format extension'
 fi
 
 printf '%s\n' 'anchor state' >"$main_replica/shared.txt"

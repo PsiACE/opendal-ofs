@@ -19,9 +19,11 @@
 
 # Managed acceptance
 
-`workflow.sh` is the public Managed Sync contract. It invokes only the `ofs`
-CLI and inspects ordinary replica files plus `ofs status`. Object metadata and
-D1 metadata run the same workflow; the fixture changes only the environment.
+The five Managed Sync acceptance scripts are independent user journeys. Each
+starts with a fresh case root, invokes only the `ofs` CLI, and inspects ordinary
+replica files plus `ofs status`. Object metadata and D1 metadata run the same
+scripts; the fixture changes only the environment. `common.sh` contains only
+their environment, fixture, and CLI-driving helpers.
 
 The harness must provide a fresh `OFS_CASE_ROOT`, a built `OFS_BIN`, and a
 credential-free `OFS_STORAGE_URL`. Credentials belong in provider environment
@@ -38,25 +40,47 @@ OFS_METADATA_URL=<credential-free D1 URL>
 must not appear in JSON status output. The script deliberately leaves its case
 directory intact on failure so the caller can inspect the user-visible state.
 
-The workflow accepts registration of one remote volume under different
-client-local aliases, explicit publication from those clients, empty and cold
-materialization, disjoint merge, retained conflict candidates, explicit
-resolution, no-op sync, structured status, and absence of credentials. It does
-not inspect object keys, metadata rows, state-file contents, private call order,
-or implementation-specific errors.
+The scenarios divide the public contract by user journey:
 
-`../managed-branch/workflow.sh` is the corresponding user-visible `branch/v1`
+- `admission` accepts supported volume registration and rejects unsupported
+  access or built-in extension combinations.
+- `smoke` publishes and materializes representative files and validates the
+  portable namespace contract.
+- `reconcile` merges independent changes, applies replacements and moves, and
+  retains conflicts until explicit resolution.
+- `recovery` rebuilds a cold client, verifies no-op behavior, publishes from the
+  recovered client, and checks structured status without credentials.
+- `scale` catches a replica up after a long publication history.
+
+They do not inspect object keys, metadata rows, state-file contents, private
+call order, or implementation-specific errors.
+
+`../managed-branch/workflow.sh` is the corresponding user-visible branched mode
 contract. It covers the default branch, current, historical, and genesis forks,
 independent publication, deletion and name reuse, stale replica fencing,
 historical branch materialization and a retained large-namespace parent. It uses
 the same provider inputs and likewise inspects only CLI output and ordinary
 replica files.
 
-Run the complete provider matrix and the staging/cache-loss regression with:
+Run one scenario against either metadata authority with:
+
+```text
+tests/behavior/managed-sync/run.sh test reconcile object
+tests/behavior/managed-sync/run.sh test reconcile d1
+```
+
+Run the complete scenario and provider matrix, the Managed Branch workflow, and
+the staging recovery regression with:
 
 ```text
 tests/behavior/managed-sync/run.sh test all
 ```
+
+The staging regression interrupts a sync after public status reports a durable
+pending operation, restarts it, and verifies convergence. It also restores an
+earlier durable pending state after the publication has committed and history
+has advanced. The regression deliberately treats staging paths and byte layout
+as private implementation details.
 
 The performance command uses MinIO's native audit webhook as its request and
 transfer-byte authority. It attributes operations to cold restore,

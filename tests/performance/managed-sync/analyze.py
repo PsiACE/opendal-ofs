@@ -92,7 +92,7 @@ def object_class(path: str) -> str:
     decoded = "/" + unquote(path).lstrip("/")
     if "/.ofs/managed/data/v1/segments/sha256/" in decoded:
         return "segment_data"
-    if decoded.endswith("/.ofs/managed/metadata/v1/superblock.json"):
+    if decoded.endswith("/.ofs/managed/superblock.json"):
         return "format"
     if "/.ofs/managed/metadata/v1/" in decoded or "/metadata/" in decoded:
         return "metadata"

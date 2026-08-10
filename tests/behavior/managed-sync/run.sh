@@ -29,7 +29,7 @@ Usage: tests/behavior/managed-sync/run.sh <COMMAND>
 
 Commands:
   test all
-  test workflow <object|d1>
+  test <admission|smoke|reconcile|recovery|scale> <object|d1>
   test branch <object|d1>
   test staging
   perf [--baseline REF_OR_BINARY] [--candidate REF_OR_BINARY]
@@ -136,7 +136,9 @@ run_case() {
   case_id=$(basename "$run_root")
   case_root="$run_root/case"
   case $suite in
-    workflow) script="$workspace/tests/behavior/managed-sync/workflow.sh" ;;
+    admission|smoke|reconcile|recovery|scale)
+      script="$workspace/tests/behavior/managed-sync/${suite}.sh"
+      ;;
     branch) script="$workspace/tests/behavior/managed-branch/workflow.sh" ;;
     staging)
       script="$workspace/tests/behavior/managed-sync/staging.sh"
@@ -180,8 +182,14 @@ run_tests() {
   shift || true
   local -a cases
   case $kind in
-    all) cases=(workflow:object workflow:d1 branch:object branch:d1 staging:object) ;;
-    workflow|branch)
+    all)
+      cases=(
+        admission:object smoke:object reconcile:object recovery:object scale:object
+        admission:d1 smoke:d1 reconcile:d1 recovery:d1 scale:d1
+        branch:object branch:d1 staging:object
+      )
+      ;;
+    admission|smoke|reconcile|recovery|scale|branch)
       [[ $# == 1 && $1 =~ ^(object|d1)$ ]] || fail "$kind requires object or d1 metadata"
       cases=("$kind:$1")
       ;;
@@ -189,7 +197,9 @@ run_tests() {
       [[ $# == 0 ]] || fail 'test staging accepts no arguments'
       cases=(staging:object)
       ;;
-    *) fail 'expected test all, test workflow|branch object|d1, or test staging' ;;
+    *)
+      fail 'expected test all, test admission|smoke|reconcile|recovery|scale|branch object|d1, or test staging'
+      ;;
   esac
   cargo build --locked
   audit_root=$(mktemp -d "${TMPDIR:-/tmp}/ofs-managed-audit.XXXXXX")

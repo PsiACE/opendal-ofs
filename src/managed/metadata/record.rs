@@ -21,11 +21,11 @@ use opendal::Operator;
 use serde_json::Value;
 
 use crate::filesystem::VolumeError;
+use crate::managed::D1Config;
 use crate::managed::error::{corrupt, invalid, unavailable};
 use crate::managed::format::LowerHex;
 use crate::managed::metadata::d1::{D1Result, D1Session, D1Statement};
 use crate::managed::metadata::object;
-use crate::managed::{D1Config, MetadataFormat};
 
 const RECORDS: &str = "ofs_managed_v1_authority_records";
 
@@ -205,13 +205,6 @@ impl RecordBackend {
 
     pub(crate) fn d1(config: D1Config) -> Result<Self, VolumeError> {
         D1Backend::new(config).map(Self::D1)
-    }
-
-    pub(crate) const fn metadata_format(&self) -> MetadataFormat {
-        match self {
-            Self::Object(_) => MetadataFormat::ObjectV1,
-            Self::D1(_) => MetadataFormat::TransactionalV1,
-        }
     }
 
     pub(crate) async fn read(

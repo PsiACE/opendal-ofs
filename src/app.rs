@@ -15,7 +15,7 @@ use ofs::catalog::{Catalog, VolumeDefinition};
 use ofs::filesystem::BranchName;
 use ofs::filesystem::{Volume, VolumeId, VolumeModel};
 use ofs::managed::extensions::branch::{BranchInfo, ForkPoint};
-use ofs::managed::{D1Config, ManagedFormat, ManagedMetadata, ManagedVolume};
+use ofs::managed::{D1Config, ManagedExtension, ManagedFormat, ManagedMetadata, ManagedVolume};
 use ofs::sync::{ReplicaState, SyncEngine};
 use opendal::Operator;
 use opendal::layers::{ConcurrentLimitLayer, RetryLayer};
@@ -154,7 +154,7 @@ async fn open_managed_volume(
         data,
         metadata,
     } = open_managed_context(config, alias, transfer_concurrency).await?;
-    if format.requires_extension(ofs::managed::ManagedExtension::BranchV1) {
+    if format.requires_extension(ManagedExtension::BranchV1) {
         let branches = metadata.branches(&format, data)?;
         let volume = match branch {
             Some(name) => branches.open(&parse_branch_name(name)?).await?,
@@ -235,9 +235,9 @@ async fn create_volume(config: &Path, mut args: VolumeCreateArgs) -> Result<()> 
     }
     let data = open_operator(&args.storage, NonZeroUsize::MIN)?;
     let metadata = open_metadata(data.clone(), args.metadata.as_ref())?;
-    let desired = ManagedFormat::v1(provisional_id, metadata.metadata_format());
+    let desired = ManagedFormat::v1(provisional_id);
     let desired = if branch_enabled {
-        desired.with_extension(ofs::managed::ManagedExtension::BranchV1)
+        desired.with_extension(ManagedExtension::BranchV1)
     } else {
         desired
     };
@@ -252,10 +252,10 @@ async fn create_volume(config: &Path, mut args: VolumeCreateArgs) -> Result<()> 
     {
         bail!("volume catalog and Managed format v1 binding disagree");
     }
-    if branch_enabled && !format.requires_extension(ofs::managed::ManagedExtension::BranchV1) {
+    if branch_enabled && !format.requires_extension(ManagedExtension::BranchV1) {
         bail!("existing Managed volume does not enable requested extension branch/v1");
     }
-    if format.requires_extension(ofs::managed::ManagedExtension::BranchV1) {
+    if format.requires_extension(ManagedExtension::BranchV1) {
         metadata
             .branches(&format, data.clone())?
             .initialize(BranchName::parse("main").expect("main is a valid branch name"))

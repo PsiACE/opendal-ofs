@@ -22,7 +22,7 @@ pub(crate) mod record;
 mod superblock;
 
 pub use d1::D1Config;
-pub use superblock::{ManagedExtension, ManagedFormat, MetadataFormat};
+pub use superblock::{ManagedExtension, ManagedFormat};
 
 use namespace::NamespaceStore;
 use opendal::Operator;
@@ -51,17 +51,11 @@ impl ManagedMetadata {
         })
     }
 
-    pub const fn metadata_format(&self) -> MetadataFormat {
-        self.backend.metadata_format()
-    }
-
     pub async fn create_format(
         &self,
         desired: &ManagedFormat,
     ) -> Result<ManagedFormat, VolumeError> {
-        self.require_backend_format(desired)?;
-        let observed = self
-            .backend
+        self.backend
             .create_or_read(
                 SUPERBLOCK_KEY,
                 desired.encode()?,
@@ -69,9 +63,7 @@ impl ManagedMetadata {
                 "create Managed format",
             )
             .await
-            .and_then(|bytes| ManagedFormat::decode(&bytes))?;
-        self.require_backend_format(&observed)?;
-        Ok(observed)
+            .and_then(|bytes| ManagedFormat::decode(&bytes))
     }
 
     pub async fn read_format(&self) -> Result<ManagedFormat, VolumeError> {
@@ -80,9 +72,7 @@ impl ManagedMetadata {
             .read(SUPERBLOCK_KEY, MAX_SUPERBLOCK_BYTES, "read Managed format")
             .await?
             .ok_or_else(|| unavailable("read Managed format", "Managed format does not exist"))?;
-        let format = ManagedFormat::decode(&bytes)?;
-        self.require_backend_format(&format)?;
-        Ok(format)
+        ManagedFormat::decode(&bytes)
     }
 
     pub fn open_volume(
@@ -90,7 +80,6 @@ impl ManagedMetadata {
         format: ManagedFormat,
         data: Operator,
     ) -> Result<ManagedVolume, VolumeError> {
-        self.require_backend_format(&format)?;
         if !format.required_extensions().is_empty() {
             return Err(invalid(
                 "open Managed volume",
@@ -107,7 +96,6 @@ impl ManagedMetadata {
         format: &ManagedFormat,
         data: Operator,
     ) -> Result<BranchStore, VolumeError> {
-        self.require_backend_format(format)?;
         if !format.requires_extension(ManagedExtension::BranchV1) {
             return Err(invalid(
                 "open Managed branches",
@@ -117,15 +105,57 @@ impl ManagedMetadata {
         let volume_id = format.volume_id();
         Ok(BranchStore::new(volume_id, data, self.backend.clone()))
     }
+}
 
-    fn require_backend_format(&self, format: &ManagedFormat) -> Result<(), VolumeError> {
-        if format.metadata_format() == self.metadata_format() {
-            Ok(())
-        } else {
-            Err(invalid(
-                "open Managed metadata",
-                "superblock metadata format does not match its authority",
-            ))
+#[cfg(test)]
+mod tests {
+    use opendal::services;
+
+    use super::*;
+    use crate::filesystem::{VolumeErrorKind, VolumeId};
+
+    fn memory() -> Operator {
+        Operator::new(services::Memory::default())
+            .expect("memory operator must build")
+            .finish()
+    }
+
+    fn object_metadata(operator: Operator) -> ManagedMetadata {
+        ManagedMetadata {
+            backend: RecordBackend::Object(operator),
         }
+    }
+
+    #[tokio::test]
+    async fn existing_remote_format_wins_during_alias_creation() {
+        let data = memory();
+        let metadata = object_metadata(data);
+        let current = ManagedFormat::v1(VolumeId::from_bytes([1; 16]))
+            .with_extension(ManagedExtension::BranchV1);
+        metadata.create_format(&current).await.unwrap();
+
+        let provisional = ManagedFormat::v1(VolumeId::from_bytes([2; 16]));
+        assert_eq!(metadata.create_format(&provisional).await.unwrap(), current);
+    }
+
+    #[test]
+    fn open_rejects_extension_mismatches() {
+        let data = memory();
+        let metadata = object_metadata(data.clone());
+        let base = ManagedFormat::v1(VolumeId::from_bytes([1; 16]));
+        let branched = base.clone().with_extension(ManagedExtension::BranchV1);
+
+        assert_eq!(
+            metadata.branches(&base, data.clone()).err().unwrap().kind(),
+            VolumeErrorKind::Invalid
+        );
+        assert_eq!(
+            metadata
+                .open_volume(branched, data.clone())
+                .err()
+                .unwrap()
+                .kind(),
+            VolumeErrorKind::Invalid
+        );
     }
 }

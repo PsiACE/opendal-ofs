@@ -1,6 +1,7 @@
 # Managed branches
 
-`branch/v1` adds durable named namespace authorities to a Managed volume.
+The built-in `branch/v1` extension adds durable named namespace authorities to
+a `managed/1` volume.
 Branches share immutable checkpoints, file versions, and data segments. A fork
 creates metadata references, not copies of file bytes or another filesystem
 model.
