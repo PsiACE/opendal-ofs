@@ -8,8 +8,8 @@
 
 //! Immutable checkpoints and retained namespace history.
 
+use blake3::hash;
 use opendal::ErrorKind;
-use sha2::{Digest as _, Sha256};
 
 use super::{
     CHANGE_SEGMENT_RECORD, CHANGE_SEGMENT_ROOT, CHECKPOINT_RECORD, CHECKPOINT_ROOT,
@@ -47,7 +47,7 @@ impl NamespaceStore {
                 ));
             }
         };
-        if <[u8; 32]>::from(Sha256::digest(&bytes)) != reference.digest {
+        if <[u8; 32]>::from(hash(&bytes)) != reference.digest {
             return Err(corrupt(
                 "read Managed namespace",
                 "checkpoint identity is invalid",
@@ -98,7 +98,7 @@ impl NamespaceStore {
                 }
             })?
             .to_bytes();
-        if Sha256::digest(&bytes).as_slice() != reference.digest {
+        if *hash(&bytes).as_bytes() != reference.digest {
             return Err(corrupt(
                 "read Managed change segment",
                 "namespace change segment identity is invalid",
@@ -124,7 +124,7 @@ impl NamespaceStore {
         let bytes = CHANGE_SEGMENT_RECORD
             .encode(segment)
             .map_err(|error| invalid("write Managed change segment", error))?;
-        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        let digest: [u8; 32] = hash(&bytes).into();
         let length = bytes.len() as u64;
         ensure_immutable(
             &self.data,

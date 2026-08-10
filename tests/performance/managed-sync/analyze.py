@@ -74,7 +74,7 @@ def audit_time_ns(value: str) -> int:
 
 def object_class(path: str) -> str:
     decoded = "/" + unquote(path).lstrip("/")
-    if "/.ofs/managed/data/v1/segments/sha256/" in decoded:
+    if "/.ofs/managed/data/v1/segments/blake3/" in decoded:
         return "segment_data"
     if decoded.endswith("/.ofs/managed/superblock.json"):
         return "format"

@@ -19,19 +19,19 @@
 
 use std::io::Cursor;
 
+use blake3::hash;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 
 type RecordError = &'static str;
 
-/// The stable `magic || CBOR || SHA-256` envelope used by Managed v1 records.
+/// The stable `magic || CBOR || BLAKE3` envelope used by Managed v1 records.
 pub(crate) struct V1Record {
     magic: [u8; 8],
     maximum_body_bytes: usize,
 }
 
-/// A typed `magic || decoded length || zstd(CBOR) || optional SHA-256`
+/// A typed `magic || decoded length || zstd(CBOR) || optional BLAKE3`
 /// envelope used by bounded Managed namespace records.
 #[derive(Clone, Copy)]
 enum LengthEncoding {
@@ -108,7 +108,7 @@ impl CompressedRecord {
         bytes.extend_from_slice(&length);
         bytes.extend_from_slice(&compressed);
         if self.checksum {
-            bytes.extend_from_slice(&Sha256::digest(&bytes));
+            bytes.extend_from_slice(hash(&bytes).as_bytes());
         }
         Ok(bytes)
     }
@@ -129,7 +129,7 @@ impl CompressedRecord {
                         .ok_or("record format is invalid")?,
                 )
                 .ok_or("record format is invalid")?;
-            if Sha256::digest(&bytes[..bytes.len() - 32]).as_slice() != &bytes[bytes.len() - 32..] {
+            if hash(&bytes[..bytes.len() - 32]).as_bytes() != &bytes[bytes.len() - 32..] {
                 return Err("record checksum is invalid");
             }
             body
@@ -193,7 +193,7 @@ impl V1Record {
         let mut bytes = Vec::with_capacity(self.magic.len() + body.len() + 32);
         bytes.extend_from_slice(&self.magic);
         bytes.extend_from_slice(&body);
-        bytes.extend_from_slice(&Sha256::digest(&bytes));
+        bytes.extend_from_slice(hash(&bytes).as_bytes());
         Ok(bytes)
     }
 
@@ -203,7 +203,7 @@ impl V1Record {
             .and_then(|bytes| bytes.get(..bytes.len().checked_sub(32)?))
             .ok_or("record format is invalid")?;
         if body.len() > self.maximum_body_bytes
-            || Sha256::digest(&bytes[..bytes.len() - 32]).as_slice() != &bytes[bytes.len() - 32..]
+            || hash(&bytes[..bytes.len() - 32]).as_bytes() != &bytes[bytes.len() - 32..]
         {
             return Err("record checksum is invalid");
         }

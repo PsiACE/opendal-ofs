@@ -20,8 +20,8 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use blake3::Hasher;
 use opendal::{Buffer, ErrorKind, Operator};
-use sha2::{Digest as _, Sha256};
 use tokio::sync::OnceCell;
 
 use super::error::{corrupt, invalid, unavailable};
@@ -36,7 +36,7 @@ pub(crate) use gc::RetainedDataRoots;
 pub use gc::SegmentGcMaintenance;
 pub(crate) use stage::AuthorityKnownContent;
 
-const SEGMENT_ROOT: &str = ".ofs/managed/data/v1/segments/sha256";
+const SEGMENT_ROOT: &str = ".ofs/managed/data/v1/segments/blake3";
 const STAGING_PLAN_KEY: &str = "plan.ofs";
 const STAGING_PLAN_RECORD: V1Record = V1Record::new(*b"OFS1DSP1", 64 * 1024 * 1024);
 // Placement policy. These values are not part of the durable format.
@@ -66,7 +66,7 @@ impl ManagedData {
 }
 
 fn buffer_content_ref(bytes: &Buffer) -> ContentRef {
-    let mut digest = Sha256::new();
+    let mut digest = Hasher::new();
     for chunk in bytes.clone() {
         digest.update(&chunk);
     }
@@ -103,7 +103,7 @@ fn verify_complete_segment(reference: SegmentRef, bytes: &Buffer) -> Result<(), 
 
 fn content_ref(bytes: &[u8]) -> ContentRef {
     ContentRef {
-        digest: Sha256::digest(bytes).into(),
+        digest: blake3::hash(bytes).into(),
         length: bytes.len() as u64,
     }
 }

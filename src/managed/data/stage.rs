@@ -20,10 +20,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 
+use blake3::{Hasher, hash};
 use fastcdc::v2020::AsyncStreamCDC;
 use futures::{StreamExt as _, TryStreamExt as _, stream};
 use opendal::{Buffer, ErrorKind, Operator};
-use sha2::{Digest as _, Sha256};
 use tokio::sync::{mpsc, oneshot};
 
 use super::{
@@ -288,7 +288,7 @@ async fn stream_file(
     }
     let size = metadata.content_length();
     if size == 0 {
-        return Ok((size, Sha256::digest([]).into()));
+        return Ok((size, hash(&[]).into()));
     }
     if size < FASTCDC_MINIMUM_FILE_SIZE {
         let bytes = source
@@ -334,7 +334,7 @@ async fn stream_fastcdc(
     );
     let chunks = chunker.as_stream();
     futures::pin_mut!(chunks);
-    let mut logical = Sha256::new();
+    let mut logical = Hasher::new();
     let mut observed = 0_u64;
     while let Some(chunk) = chunks.next().await {
         let chunk =
@@ -391,7 +391,7 @@ fn seal_segment(contents: BTreeMap<ContentRef, Buffer>) -> Result<SealedSegment,
     // Segment v1 is the stable ContentRef ordering of its raw contents. The
     // descriptor owns offsets; SegmentRef authenticates the complete object.
     let mut chunks = Vec::with_capacity(contents.len());
-    let mut digest = Sha256::new();
+    let mut digest = Hasher::new();
     let mut length = 0_u64;
     let mut offsets = BTreeMap::new();
     for (content, bytes) in contents {

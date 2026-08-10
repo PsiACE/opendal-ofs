@@ -87,9 +87,9 @@ client-local aliases, index inventory, or policy settings.
 ## Identities and references
 
 - `VolumeId`, `NodeId`, `OperationId`, and `BranchId` are 16 opaque bytes.
-- `ContentRef` contains a SHA-256 digest and the length of one raw content
+- `ContentRef` contains a BLAKE3 digest and the length of one raw content
   extent.
-- `SegmentRef` contains a SHA-256 digest and the total encoded segment length.
+- `SegmentRef` contains a BLAKE3 digest and the total encoded segment length.
 - `ChangeCursor` contains an ordered sequence and the operation identity for a
   committed namespace position.
 - `FileVersionId` binds the logical file identity and its physical extent map.
@@ -103,7 +103,7 @@ before allocation or I/O.
 A file version contains:
 
 - the logical file length;
-- SHA-256 of the complete logical byte sequence;
+- BLAKE3 of the complete logical byte sequence;
 - an ordered extent map.
 
 The ordinary filesystem `FileVersion` record stores `id`, `logical_size`,
@@ -120,7 +120,7 @@ concatenation MUST cover the declared file length. Every occurrence of one
 segment digest MUST declare the same total segment length. An empty file has no
 extents.
 
-`FileVersionId` is SHA-256 over this byte sequence:
+`FileVersionId` is BLAKE3 over this byte sequence:
 
 ```text
 "OFS-FILE-V1\0"
@@ -144,13 +144,13 @@ algorithm or its parameters.
 Segments are stored at:
 
 ```text
-.ofs/managed/data/v1/segments/sha256/<first-two-hex>/<64-hex>.seg
+.ofs/managed/data/v1/segments/blake3/<first-two-hex>/<64-hex>.seg
 ```
 
 The directory partition is derived from the segment digest. It is not a second
 identity. A segment is the raw content bytes concatenated in `ContentRef`
 order. The extent map owns every offset and length; there is no second index or
-footer in the segment. SHA-256 and the length of the complete object form its
+footer in the segment. BLAKE3 and the length of the complete object form its
 `SegmentRef` and determine its key.
 
 A complete read verifies the segment length and digest before slicing the
@@ -164,8 +164,8 @@ Object Metadata uses these keys:
 ```text
 .ofs/managed/superblock.json
 .ofs/managed/metadata/v1/head.ofs
-.ofs/managed/metadata/v1/checkpoints/sha256/<digest>.ofs
-.ofs/managed/metadata/v1/changes/sha256/<digest>.ofs
+.ofs/managed/metadata/v1/checkpoints/blake3/<digest>.ofs
+.ofs/managed/metadata/v1/changes/blake3/<digest>.ofs
 .ofs/managed/metadata/v1/operations/<base-or-branch-id>/<operation-id>.ofs
 ```
 
@@ -209,7 +209,7 @@ HEAD has this envelope:
 "OFS1HDZ1"                    8 bytes
 decoded CBOR length           u32
 zstd frame                    variable
-SHA-256 of preceding bytes    32 bytes
+BLAKE3 of preceding bytes     32 bytes
 ```
 
 The decoded strict CBOR record contains the volume identity, optional branch
@@ -240,7 +240,7 @@ The exact Managed v1 HEAD fields are:
 | checkpoint reference | `digest`, `length` |
 | change-segment reference | `digest`, `length`, `start`, `end` |
 | namespace change | `origin_branch`, `mutation` |
-| committed result | `origin_branch`, `cursor`, `request_sha256` |
+| committed result | `origin_branch`, `cursor`, `request_digest` |
 
 `operation_prefixes` is exactly 1024 unsigned 64-bit words. Bit `n` records
 that some committed `OperationId` began with the big-endian 16-bit value `n`.
@@ -262,7 +262,7 @@ The decoded strict CBOR record contains one complete filesystem
 `VolumeSnapshot`. Managed file-version data remains in each ordinary
 `FileVersion` descriptor; the format does not add another node, directory,
 precondition, or snapshot graph.
-SHA-256 of the encoded envelope determines its object key. Mutable namespace
+BLAKE3 of the encoded envelope determines its object key. Mutable namespace
 state references that digest together with the encoded length, allowing one
 bounded range GET without a preceding metadata request. Recovery verifies the
 returned byte count and digest before decoding; bytes outside the referenced
@@ -281,7 +281,7 @@ A change segment uses the common Managed v1 envelope:
 ```text
 "OFS1CHG1"                    8 bytes
 strict CBOR body              variable
-SHA-256 of magic and body     32 bytes
+BLAKE3 of magic and body      32 bytes
 ```
 
 The body contains the starting checkpoint reference and at most 32 consecutive
@@ -298,7 +298,7 @@ a retained position without first fetching every change object.
 
 ### Operation receipt
 
-`request_sha256` is SHA-256 of this semantic publication preimage. It does not
+`request_digest` is BLAKE3 of this semantic publication preimage. It does not
 depend on the CBOR representation of a transaction:
 
 ```text
@@ -340,13 +340,13 @@ Consequently, equivalent descriptor encodings have one publication identity,
 while a malformed descriptor cannot pass operation-idempotency resolution.
 
 An operation receipt uses magic `OFS1OPR1` with the same strict
-`magic || CBOR || SHA-256` envelope and a 4096-byte body limit. Its body stores
+`magic || CBOR || BLAKE3` envelope and a 4096-byte body limit. Its body stores
 authority scope, committed cursor, and publication request digest. The
 committed cursor contains the `OperationId`; the deterministic key is scoped
 by `base` or the lowercase branch id.
 
 The exact receipt fields are `origin_branch`, `cursor`, and
-`request_sha256`. There is no separate operation field: it is derived from the
+`request_digest`. There is no separate operation field: it is derived from the
 non-genesis committed cursor.
 
 HEAD stores the most recent committed result and a fixed operation-prefix

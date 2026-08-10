@@ -18,8 +18,8 @@
 use std::collections::BTreeMap;
 use std::io::Cursor;
 
+use blake3::{Hasher, hash};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 
 use crate::filesystem::{FileVersion, FileVersionId, Generation, VolumeError};
 use crate::managed::error::{corrupt, invalid};
@@ -54,7 +54,7 @@ impl DecodedFileVersion {
 
 fn extent_map_valid(size: u64, digest: &[u8; 32], extent_map: &ExtentMap) -> bool {
     if size == 0 {
-        let empty: [u8; 32] = Sha256::digest([]).into();
+        let empty: [u8; 32] = hash(&[]).into();
         return *digest == empty && extent_map.extents.is_empty();
     }
     if let [extent] = extent_map.extents.as_slice()
@@ -90,17 +90,17 @@ fn canonical_file_version_id(
     digest: &[u8; 32],
     extent_map: &ExtentMap,
 ) -> Option<FileVersionId> {
-    let mut identity = Sha256::new();
+    let mut identity = Hasher::new();
     identity.update(b"OFS-FILE-V1\0");
-    identity.update(size.to_be_bytes());
+    identity.update(&size.to_be_bytes());
     identity.update(digest);
-    identity.update(u64::try_from(extent_map.extents.len()).ok()?.to_be_bytes());
+    identity.update(&u64::try_from(extent_map.extents.len()).ok()?.to_be_bytes());
     for extent in &extent_map.extents {
-        identity.update(extent.content.digest);
-        identity.update(extent.content.length.to_be_bytes());
-        identity.update(extent.segment.digest);
-        identity.update(extent.segment.length.to_be_bytes());
-        identity.update(extent.segment_offset.to_be_bytes());
+        identity.update(&extent.content.digest);
+        identity.update(&extent.content.length.to_be_bytes());
+        identity.update(&extent.segment.digest);
+        identity.update(&extent.segment.length.to_be_bytes());
+        identity.update(&extent.segment_offset.to_be_bytes());
     }
     Some(FileVersionId::from_bytes(identity.finalize().into()))
 }
@@ -184,7 +184,7 @@ mod tests {
 
     #[test]
     fn file_version_descriptors_have_one_identity() {
-        let empty_digest = Sha256::digest([]).into();
+        let empty_digest = hash(&[]).into();
         let empty = DecodedFileVersion::from_extents(
             0,
             empty_digest,

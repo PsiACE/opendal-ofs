@@ -10,8 +10,8 @@
 
 use std::collections::BTreeSet;
 
+use blake3::hash;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 
 use super::NamespaceChange;
 use crate::filesystem::{
@@ -34,7 +34,7 @@ pub(crate) struct CheckpointRef {
 impl CheckpointRef {
     pub(crate) fn from_encoded(bytes: &[u8]) -> Self {
         Self {
-            digest: Sha256::digest(bytes).into(),
+            digest: hash(bytes).into(),
             length: bytes.len() as u64,
         }
     }
@@ -193,7 +193,7 @@ fn operation_prefix(operation: OperationId) -> usize {
 pub(crate) struct StoredCommittedResult {
     pub(crate) origin_branch: Option<BranchId>,
     pub(crate) cursor: ChangeCursor,
-    pub(crate) request_sha256: [u8; 32],
+    pub(crate) request_digest: [u8; 32],
 }
 
 impl StoredCommittedResult {
@@ -201,11 +201,11 @@ impl StoredCommittedResult {
         self.cursor.operation()
     }
 
-    pub(crate) fn from_change(change: &NamespaceChange, request_sha256: [u8; 32]) -> Self {
+    pub(crate) fn from_change(change: &NamespaceChange, request_digest: [u8; 32]) -> Self {
         Self {
             origin_branch: change.origin_branch,
             cursor: change.cursor(),
-            request_sha256,
+            request_digest,
         }
     }
 }

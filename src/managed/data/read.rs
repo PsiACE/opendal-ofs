@@ -20,11 +20,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 
+use blake3::Hasher;
 use foyer::HybridCacheBuilder;
 use futures::{StreamExt as _, TryStreamExt as _, stream};
 use opendal::layers::{FoyerKey, FoyerLayer, FoyerValue};
 use opendal::{Buffer, ErrorKind, Operator, Writer};
-use sha2::{Digest as _, Sha256};
 
 use super::{
     ManagedData, buffer_content_ref, read_staging_plan, referenced_segment_error, segment_key,
@@ -180,7 +180,7 @@ impl ManagedData {
             .writer(path)
             .await
             .map_err(|_| unavailable("write materialized file", "storage operation failed"))?;
-        let mut logical = Sha256::new();
+        let mut logical = Hasher::new();
         let mut written = 0_u64;
         let extents = &version.extent_map.extents;
         let reusable = segments_in_multiple_windows(extents);
@@ -390,7 +390,7 @@ async fn write_extents(
     writer: &mut Writer,
     extents: &[Extent],
     fetched: &FetchedContent,
-    logical: &mut Sha256,
+    logical: &mut Hasher,
     written: &mut u64,
 ) -> Result<(), VolumeError> {
     for extent in extents {
@@ -415,7 +415,7 @@ async fn write_extents(
 async fn finish_materialized_file(
     mut writer: Writer,
     version: &DecodedFileVersion,
-    logical: Sha256,
+    logical: Hasher,
     written: u64,
 ) -> Result<(), VolumeError> {
     let content = ContentRef {
@@ -514,7 +514,7 @@ mod tests {
         let other = content_ref(b"other");
         let mut bytes = b"firstother".to_vec();
         let segment = SegmentRef {
-            digest: Sha256::digest(&bytes).into(),
+            digest: blake3::hash(&bytes).into(),
             length: bytes.len() as u64,
         };
         assert!(verify_complete_segment(segment, &Buffer::from(bytes.clone())).is_ok());

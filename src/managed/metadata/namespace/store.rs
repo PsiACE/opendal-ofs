@@ -35,8 +35,8 @@ use super::{CheckpointRef, StoredChangeSegment};
 use history::{decode_checkpoint, encode_checkpoint};
 
 const BASE_HEAD_KEY: &str = ".ofs/managed/metadata/v1/head.ofs";
-const CHECKPOINT_ROOT: &str = ".ofs/managed/metadata/v1/checkpoints/sha256";
-const CHANGE_SEGMENT_ROOT: &str = ".ofs/managed/metadata/v1/changes/sha256";
+const CHECKPOINT_ROOT: &str = ".ofs/managed/metadata/v1/checkpoints/blake3";
+const CHANGE_SEGMENT_ROOT: &str = ".ofs/managed/metadata/v1/changes/blake3";
 const OPERATION_ROOT: &str = ".ofs/managed/metadata/v1/operations";
 const HEAD_MAGIC: &[u8; 8] = b"OFS1HDZ1";
 const CHECKPOINT_MAGIC: &[u8; 8] = b"OFS1CKZ1";
@@ -272,7 +272,7 @@ pub(crate) fn decode_head(bytes: &[u8]) -> Result<StoredHead, VolumeError> {
 fn committed_result(change: &NamespaceChange) -> Result<StoredCommittedResult, VolumeError> {
     Ok(StoredCommittedResult::from_change(
         change,
-        change.request_sha256()?,
+        change.request_digest()?,
     ))
 }
 
@@ -428,7 +428,7 @@ mod tests {
         };
         let reference = store.write_change_segment(&segment).await.unwrap();
         let latest = segment.changes.last().unwrap();
-        let request_digest = latest.request_sha256().unwrap();
+        let request_digest = latest.request_digest().unwrap();
         let outcome = StoredCommittedResult::from_change(latest, request_digest);
         let mut state = StoredNamespaceState {
             checkpoint,
@@ -449,6 +449,6 @@ mod tests {
             .resolve(None, OperationId::from_bytes([33; 16]))
             .unwrap();
         assert_eq!(resolved.cursor, outcome.cursor);
-        assert_eq!(resolved.request_sha256, outcome.request_sha256);
+        assert_eq!(resolved.request_digest, outcome.request_digest);
     }
 }

@@ -17,8 +17,8 @@
 
 use std::collections::BTreeMap;
 
+use blake3::Hasher;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 
 use super::records::managed_generation_number;
 use super::validation::{validate_generation, validate_node_generation};
@@ -58,13 +58,15 @@ impl NamespaceChange {
         self.mutation.cursor
     }
 
-    pub(crate) fn request_sha256(&self) -> Result<[u8; 32], VolumeError> {
-        let mut digest = Sha256::new();
+    pub(crate) fn request_digest(&self) -> Result<[u8; 32], VolumeError> {
+        let mut digest = Hasher::new();
         digest.update(b"OFS1REQ1");
         match self.origin_branch {
-            None => digest.update([0]),
+            None => {
+                digest.update(&[0]);
+            }
             Some(branch) => {
-                digest.update([1]);
+                digest.update(&[1]);
                 digest.update(branch.as_bytes());
             }
         }
@@ -80,16 +82,20 @@ impl NamespaceChange {
             digest.update(change.node.as_bytes());
             hash_optional_generation(&mut digest, change.expected_generation.as_ref())?;
             match &change.target {
-                None => digest.update([0]),
+                None => {
+                    digest.update(&[0]);
+                }
                 Some(node) => {
-                    digest.update([1]);
+                    digest.update(&[1]);
                     hash_generation(&mut digest, &node.generation)?;
                     hash_kind(&mut digest, node.kind);
-                    digest.update([u8::from(node.attributes.executable)]);
+                    digest.update(&[u8::from(node.attributes.executable)]);
                     match node.file_version {
-                        None => digest.update([0]),
+                        None => {
+                            digest.update(&[0]);
+                        }
                         Some(version) => {
-                            digest.update([1]);
+                            digest.update(&[1]);
                             digest.update(version.as_bytes());
                         }
                     }
@@ -101,9 +107,11 @@ impl NamespaceChange {
             digest.update(change.directory.as_bytes());
             hash_optional_generation(&mut digest, change.expected_generation.as_ref())?;
             match &change.target {
-                None => digest.update([0]),
+                None => {
+                    digest.update(&[0]);
+                }
                 Some(directory) => {
-                    digest.update([1]);
+                    digest.update(&[1]);
                     hash_generation(&mut digest, &directory.generation)?;
                     hash_len(&mut digest, directory.remove_entries.len())?;
                     for name in &directory.remove_entries {
@@ -121,7 +129,7 @@ impl NamespaceChange {
         hash_len(&mut digest, mutation.file_versions.len())?;
         for change in &mutation.file_versions {
             digest.update(change.version.as_bytes());
-            digest.update([u8::from(change.target.is_some())]);
+            digest.update(&[u8::from(change.target.is_some())]);
         }
         Ok(digest.finalize().into())
     }
@@ -351,64 +359,68 @@ fn strictly_ordered_by<T>(values: &[T], before: impl Fn(&T, &T) -> bool) -> bool
     values.windows(2).all(|pair| before(&pair[0], &pair[1]))
 }
 
-fn hash_len(digest: &mut Sha256, length: usize) -> Result<(), VolumeError> {
+fn hash_len(digest: &mut Hasher, length: usize) -> Result<(), VolumeError> {
     let length = u64::try_from(length).map_err(|_| {
         corrupt(
             "read Managed transaction",
             "transaction request length overflows",
         )
     })?;
-    digest.update(length.to_be_bytes());
+    digest.update(&length.to_be_bytes());
     Ok(())
 }
 
-fn hash_cursor(digest: &mut Sha256, cursor: ChangeCursor) {
+fn hash_cursor(digest: &mut Hasher, cursor: ChangeCursor) {
     match cursor {
-        ChangeCursor::Genesis => digest.update([0]),
+        ChangeCursor::Genesis => {
+            digest.update(&[0]);
+        }
         ChangeCursor::At {
             sequence,
             operation,
         } => {
-            digest.update([1]);
-            digest.update(sequence.get().to_be_bytes());
+            digest.update(&[1]);
+            digest.update(&sequence.get().to_be_bytes());
             digest.update(operation.as_bytes());
         }
     }
 }
 
-fn hash_generation(digest: &mut Sha256, generation: &Generation) -> Result<(), VolumeError> {
+fn hash_generation(digest: &mut Hasher, generation: &Generation) -> Result<(), VolumeError> {
     let generation = managed_generation_number(generation).ok_or_else(|| {
         corrupt(
             "read Managed transaction",
             "transaction generation is invalid",
         )
     })?;
-    digest.update(generation.to_be_bytes());
+    digest.update(&generation.to_be_bytes());
     Ok(())
 }
 
 fn hash_optional_generation(
-    digest: &mut Sha256,
+    digest: &mut Hasher,
     generation: Option<&Generation>,
 ) -> Result<(), VolumeError> {
     match generation {
-        None => digest.update([0]),
+        None => {
+            digest.update(&[0]);
+        }
         Some(generation) => {
-            digest.update([1]);
+            digest.update(&[1]);
             hash_generation(digest, generation)?;
         }
     }
     Ok(())
 }
 
-fn hash_kind(digest: &mut Sha256, kind: NodeKind) {
-    digest.update([match kind {
+fn hash_kind(digest: &mut Hasher, kind: NodeKind) {
+    digest.update(&[match kind {
         NodeKind::Directory => 0,
         NodeKind::RegularFile => 1,
     }]);
 }
 
-fn hash_name(digest: &mut Sha256, name: &str) -> Result<(), VolumeError> {
+fn hash_name(digest: &mut Hasher, name: &str) -> Result<(), VolumeError> {
     hash_len(digest, name.len())?;
     digest.update(name.as_bytes());
     Ok(())
@@ -429,7 +441,7 @@ mod tests {
     };
 
     #[test]
-    fn operation_request_sha256_is_interoperable() {
+    fn operation_request_digest_is_interoperable() {
         let volume = VolumeId::from_bytes([1; 16]);
         let branch = BranchId::from_bytes([2; 16]);
         let prior = OperationId::from_bytes([3; 16]);
@@ -511,8 +523,8 @@ mod tests {
         change.validate(volume).unwrap();
 
         assert_eq!(
-            hex::encode(change.request_sha256().unwrap()),
-            "627df8be759f08e34a61ffd1af19f5aedb3f50044639621181fad5bebaca088c"
+            hex::encode(change.request_digest().unwrap()),
+            "4d75cd4110f8b5475649adcce62a38ccdd801151f2fd76685060b75cb1752926"
         );
     }
 }

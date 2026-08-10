@@ -41,14 +41,14 @@ impl NamespaceStore {
         expected: Option<[u8; 32]>,
     ) -> Result<CommitOutcome, VolumeError> {
         if let Some(result) = state.resolve(self.branch_id(), operation) {
-            require_request_digest(expected, result.request_sha256)?;
+            require_request_digest(expected, result.request_digest)?;
             return Ok(CommitOutcome::Committed(result.cursor));
         }
         if !state.maybe_contains(operation) {
             return Ok(CommitOutcome::Absent);
         }
         if let Some(result) = find_committed_result(&state.tail, self.branch_id(), operation)? {
-            require_request_digest(expected, result.request_sha256)?;
+            require_request_digest(expected, result.request_digest)?;
             return Ok(CommitOutcome::Committed(result.cursor));
         }
         let Some(result) = self.read_operation(operation).await? else {
@@ -57,13 +57,13 @@ impl NamespaceStore {
                 if let Some(result) =
                     find_committed_result(&segment.changes, self.branch_id(), operation)?
                 {
-                    require_request_digest(expected, result.request_sha256)?;
+                    require_request_digest(expected, result.request_digest)?;
                     return Ok(CommitOutcome::Committed(result.cursor));
                 }
             }
             return Ok(CommitOutcome::Absent);
         };
-        require_request_digest(expected, result.request_sha256)?;
+        require_request_digest(expected, result.request_digest)?;
         Ok(CommitOutcome::Committed(result.cursor))
     }
 

@@ -32,7 +32,7 @@ impl NamespaceStore {
         })?;
         let operation = change.operation();
         let cursor = change.cursor();
-        let request_digest = change.request_sha256()?;
+        let request_digest = change.request_digest()?;
         let change_bytes = change.encoded_len()?;
         let (mut head, revision, base) = match observed {
             Some((witness, snapshot)) => {
@@ -76,7 +76,7 @@ impl NamespaceStore {
             .as_ref()
             .and_then(|state| state.resolve(self.branch_id(), operation))
         {
-            require_request_digest(Some(request_digest), result.request_sha256)?;
+            require_request_digest(Some(request_digest), result.request_digest)?;
             return Ok(CommitOutcome::Committed(result.cursor));
         }
         let mut validated = change.validate_against(base).map_err(|_| {
