@@ -182,12 +182,11 @@ impl NamespaceStore {
                 }
                 (head, Some(revision), None)
             }
-            None => {
-                if self.read_raw_head().await?.is_some() {
-                    return self.outcome_after_race(operation, request_digest).await;
-                }
-                (StoredHead::unborn(self.volume_id, None), None, None)
-            }
+            None => match self.read_raw_head().await? {
+                Some((head, revision)) if head.state.is_none() => (head, Some(revision), None),
+                Some(_) => return self.outcome_after_race(operation, request_digest).await,
+                None => (StoredHead::unborn(self.volume_id, None), None, None),
+            },
         };
         if head.maintenance.is_some() {
             return Ok(CommitOutcome::Conflict {

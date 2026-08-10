@@ -12,7 +12,16 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 printf '%s\n' 'smoke: first publication and empty-replica materialization'
-establish_pair
+register_pair
+empty_collection=$(OFS_CONFIG="$config" "$OFS_BIN" volume gc workspace)
+grep -Fq 'scanned=0 deleted=0 bytes=0' <<<"$empty_collection" || \
+  fail 'an unpublished volume was not an empty collection'
+printf '%s\n' 'private before sync' >"$replica_a/first.txt"
+sync_b >/dev/null
+sync_a >/dev/null
+sync_b >/dev/null
+cmp "$replica_a/first.txt" "$replica_b/first.txt" || \
+  fail 'first publication failed after empty collection'
 
 printf '%s\n' 'smoke: reject hard links before publication'
 printf '%s\n' 'must remain local' >"$replica_a/hard-link-source.txt"
