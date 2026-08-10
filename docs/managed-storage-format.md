@@ -207,8 +207,10 @@ transaction tail, up to eight change-segment references, and the most recent
 committed operation result.
 
 Transactions in the tail contain the operation identity, parent and committed
-cursors, resulting root, generation preconditions, and ordered node,
-directory, directory-entry, and file-version effects. The chain MUST be
+cursors, resulting root, and ordered node, directory, and file-version
+changes. Each node or directory change binds one identity, its generation
+precondition, and exactly one put or remove effect. Each file-version change
+likewise binds one identity to one put or remove effect. The chain MUST be
 consecutive from the checkpoint cursor to the current cursor. The tail has at
 most 32 transactions. Writers checkpoint before appending a change would make
 the encoded transaction bodies exceed 128 KiB; this byte threshold is
@@ -270,14 +272,9 @@ OperationId                             16 bytes
 parent cursor
 committed cursor
 root NodeId                             16 bytes
-node preconditions                      counted sequence
-directory preconditions                 counted sequence
-put nodes                               counted sequence
-remove NodeIds                          counted sequence
-put directories                         counted sequence
-remove directory NodeIds                counted sequence
-put FileVersionIds                      counted sequence
-remove FileVersionIds                   counted sequence
+node changes                            counted sequence
+directory changes                       counted sequence
+file-version changes                    counted sequence
 ```
 
 All counts and string byte lengths are unsigned 64-bit big-endian integers.
@@ -288,16 +285,20 @@ non-zero unsigned 64-bit big-endian value. A string is its byte length followed
 by its canonical NFC UTF-8 bytes. A boolean is `0x00` or `0x01`; node kind is
 `0x00` for a directory and `0x01` for a regular file.
 
-A node precondition is `NodeId || optional generation`; a directory
-precondition is `NodeId || optional generation`. A put node is `NodeId ||
-generation || kind || executable || optional FileVersionId`. A put directory
-is `NodeId || generation || removed names || put entries`, where each put entry
-is `name || NodeId || kind`. Each sequence is strictly ordered by its identity
-or name and contains no duplicates; names are ordered by their UTF-8 bytes.
+A node change is `NodeId || optional expected generation || effect`. A remove
+effect is `0x00`; a put effect is `0x01 || generation || kind || executable ||
+optional FileVersionId`. A directory change starts with `NodeId || optional
+expected generation || effect`. Its put effect is `0x01 || generation ||
+removed names || put entries`, where each put entry is `name || NodeId ||
+kind`; its remove effect is `0x00`. A file-version change is `FileVersionId ||
+effect tag`, with `0x00` for removal and `0x01` for put. Each change sequence is
+strictly ordered by identity and contains no duplicates. Directory names are
+strictly ordered by their UTF-8 bytes.
 
-A put file version contributes its 32-byte `FileVersionId`, not its CBOR
-descriptor. Before calculating the request digest, the descriptor MUST decode
-without trailing bytes and MUST match the `FileVersionId` algorithm above.
+A file-version put contributes its 32-byte `FileVersionId` and effect tag, not
+its CBOR descriptor. Before calculating the request digest, the descriptor
+MUST decode without trailing bytes and MUST match the `FileVersionId` algorithm
+above.
 Consequently, equivalent descriptor encodings have one publication identity,
 while a malformed descriptor cannot pass operation-idempotency resolution.
 
