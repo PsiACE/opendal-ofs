@@ -32,6 +32,8 @@ static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub(crate) struct OfsTestContext {
     pub mount_point: TempDir,
+    #[allow(dead_code)]
+    pub backend: Operator,
     // Keep the temporary backend root alive when no test service is configured.
     _backend_root: Option<TempDir>,
     // This is a false positive, the field is used in the test.
@@ -62,6 +64,7 @@ impl TestContext for OfsTestContext {
 
         let mount_point = tempfile::tempdir().unwrap();
         let mount_point_str = mount_point.path().to_string_lossy().to_string();
+        let mounted_backend = backend.clone();
         let mount_handle = RUNTIME
             .get_or_init(|| {
                 runtime::Builder::new_multi_thread()
@@ -78,7 +81,7 @@ impl TestContext for OfsTestContext {
                     let uid = nix::unistd::getuid().into();
                     mount_options.uid(uid);
 
-                    let fs = fuse3_opendal::Filesystem::new(backend, uid, gid);
+                    let fs = fuse3_opendal::Filesystem::new(mounted_backend, uid, gid);
                     fuse3::path::Session::new(mount_options)
                         .mount_with_unprivileged(fs, mount_point_str)
                         .await
@@ -88,6 +91,7 @@ impl TestContext for OfsTestContext {
 
         OfsTestContext {
             mount_point,
+            backend,
             _backend_root: backend_root,
             capability,
             mount_handle,

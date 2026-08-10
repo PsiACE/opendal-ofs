@@ -17,11 +17,36 @@
 
 #![cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
 
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use fuse3::path::prelude::*;
+use futures::TryStreamExt;
+use opendal::Error;
 use opendal::Operator;
+use opendal::layers::{LoggingInterceptor, LoggingLayer};
+use opendal::raw::{AccessorInfo, Operation};
 use opendal::services;
+
+#[derive(Clone, Debug, Default)]
+struct ListAudit(Arc<AtomicUsize>);
+
+impl LoggingInterceptor for ListAudit {
+    fn log(
+        &self,
+        _info: &AccessorInfo,
+        operation: Operation,
+        _context: &[(&str, &str)],
+        message: &str,
+        _error: Option<&Error>,
+    ) {
+        if operation == Operation::List && message == "started" {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
 
 #[tokio::test]
 async fn test_release_commits_pending_write() {
@@ -92,4 +117,83 @@ async fn test_flush_keeps_file_handle_open() {
         .release(Request::default(), Some(path), opened.fh, flags, 0, false)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn test_directory_offsets_resume_without_losing_entries() {
+    let audit = ListAudit::default();
+    let operator = Operator::new(services::Memory::default())
+        .unwrap()
+        .layer(LoggingLayer::new(audit.clone()))
+        .finish();
+    let expected = (0..300)
+        .map(|index| format!("entry-{index:04}"))
+        .collect::<BTreeSet<_>>();
+    for name in &expected {
+        operator.write(name, "").await.unwrap();
+    }
+
+    let filesystem = fuse3_opendal::Filesystem::new(operator, 0, 0);
+    let root = OsStr::new("");
+    let opened = filesystem
+        .opendir(Request::default(), root, libc::O_RDONLY as u32)
+        .await
+        .unwrap();
+
+    let initial = filesystem
+        .readdir(Request::default(), root, opened.fh, 0)
+        .await
+        .unwrap()
+        .entries
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let retried = filesystem
+        .readdir(Request::default(), root, opened.fh, 0)
+        .await
+        .unwrap()
+        .entries
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(initial, retried);
+    assert!(initial.len() < expected.len());
+
+    let mut offset = 0;
+    let mut actual = BTreeSet::new();
+    for _ in 0..100 {
+        let entries = filesystem
+            .readdir(Request::default(), root, opened.fh, offset)
+            .await
+            .unwrap()
+            .entries
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        if entries.is_empty() {
+            break;
+        }
+
+        // Model a kernel reply buffer that accepts only a prefix. The next
+        // callback acknowledges exactly the last offset it received.
+        for entry in entries.iter().take(11) {
+            if entry.name != OsStr::new(".") && entry.name != OsStr::new("..") {
+                assert!(actual.insert(entry.name.to_string_lossy().into_owned()));
+            }
+            offset = entry.offset;
+        }
+    }
+    assert_eq!(actual, expected);
+    assert_eq!(audit.0.load(Ordering::Relaxed), 1);
+
+    filesystem
+        .releasedir(Request::default(), root, opened.fh, libc::O_RDONLY as u32)
+        .await
+        .unwrap();
+    assert!(
+        filesystem
+            .readdir(Request::default(), root, opened.fh, 0)
+            .await
+            .is_err()
+    );
 }

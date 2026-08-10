@@ -19,9 +19,12 @@
 
 mod common;
 
+use std::collections::BTreeSet;
 use std::fs;
 
 use common::OfsTestContext;
+use futures::StreamExt;
+use futures::stream;
 use test_context::test_context;
 use walkdir::WalkDir;
 
@@ -72,4 +75,43 @@ fn test_path(ctx: &mut OfsTestContext) {
             })
             .collect::<Vec<_>>()
     );
+}
+
+#[test_context(OfsTestContext)]
+#[test]
+fn test_large_directory(ctx: &mut OfsTestContext) {
+    let expected = (0..1_000)
+        .map(|index| format!("entry-{index:04}-{}", "x".repeat(96)))
+        .collect::<BTreeSet<_>>();
+    let backend = ctx.backend.clone();
+    runtime().block_on(async {
+        backend.create_dir("large/").await.unwrap();
+        stream::iter(expected.iter().cloned())
+            .for_each_concurrent(32, |name| {
+                let backend = backend.clone();
+                async move {
+                    backend.write(&format!("large/{name}"), "").await.unwrap();
+                }
+            })
+            .await;
+    });
+
+    let actual = fs::read_dir(ctx.mount_point.path().join("large"))
+        .unwrap()
+        .map(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .into_string()
+                .expect("portable file name")
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(actual, expected);
+}
+
+fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
 }

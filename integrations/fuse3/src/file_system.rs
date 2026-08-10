@@ -33,10 +33,10 @@ use opendal::EntryMode;
 use opendal::ErrorKind;
 use opendal::Metadata;
 use opendal::Operator;
-use opendal::raw::normalize_path;
 use sharded_slab::Slab;
 use tokio::sync::Mutex;
 
+use super::directory::OpenedDirectory;
 use super::file::FileKey;
 use super::file::InnerWriter;
 use super::file::OpenedFile;
@@ -88,6 +88,7 @@ pub struct Filesystem {
     uid: u32,
 
     opened_files: Slab<OpenedFile>,
+    opened_directories: Slab<Arc<OpenedDirectory>>,
 }
 
 impl Filesystem {
@@ -98,6 +99,7 @@ impl Filesystem {
             uid,
             gid,
             opened_files: Slab::new(),
+            opened_directories: Slab::new(),
         }
     }
 
@@ -155,6 +157,18 @@ impl Filesystem {
         }
 
         Ok(file)
+    }
+
+    fn get_opened_directory(&self, key: FileKey, path: &OsStr) -> Result<Arc<OpenedDirectory>> {
+        let directory = self
+            .opened_directories
+            .get(key.0)
+            .ok_or(Errno::from(libc::ENOENT))?
+            .clone();
+        if !directory.matches(path) {
+            Err(Errno::from(libc::EBADF))?;
+        }
+        Ok(directory)
     }
 
     async fn finish_writer(inner_writer: Option<Arc<Mutex<InnerWriter>>>) -> Result<()> {
@@ -355,7 +369,14 @@ impl PathFilesystem for Filesystem {
 
     async fn opendir(&self, _req: Request, path: &OsStr, flags: u32) -> Result<ReplyOpen> {
         log::debug!("opendir(path={path:?}, flags=0x{flags:x})");
-        Ok(ReplyOpen { fh: 0, flags })
+        let key = self
+            .opened_directories
+            .insert(Arc::new(OpenedDirectory::new(path)))
+            .ok_or(Errno::from(libc::EBUSY))?;
+        Ok(ReplyOpen {
+            fh: FileKey(key).to_fh(),
+            flags,
+        })
     }
 
     async fn open(&self, _req: Request, path: &OsStr, flags: u32) -> Result<ReplyOpen> {
@@ -551,51 +572,47 @@ impl PathFilesystem for Filesystem {
         offset: i64,
     ) -> Result<ReplyDirectory<Self::DirEntryStream<'a>>> {
         log::debug!("readdir(path={path:?}, fh={fh}, offset={offset})");
-
-        let mut current_dir = PathBuf::from(path);
-        current_dir.push(""); // ref https://users.rust-lang.org/t/trailing-in-paths/43166
-        let path = current_dir.to_string_lossy().to_string();
-        let children = self
-            .op
-            .lister(&current_dir.to_string_lossy())
+        let offset = u64::try_from(offset).map_err(|_| Errno::from(libc::EINVAL))?;
+        let directory = self.get_opened_directory(FileKey::try_from(fh)?, path)?;
+        let children = directory
+            .entries(&self.op, offset)
             .await
-            .map_err(opendal_error2errno)?
-            .filter_map(move |entry| {
-                let dir = normalize_path(path.as_str());
-                async move {
-                    match entry {
-                        Ok(e) if e.path() == dir => None,
-                        _ => Some(entry),
-                    }
-                }
-            })
-            .enumerate()
-            .map(|(i, entry)| {
-                entry
-                    .map(|e| DirectoryEntry {
-                        kind: entry_mode2file_type(e.metadata().mode()),
-                        name: e.name().trim_matches('/').into(),
-                        offset: (i + 3) as i64,
-                    })
-                    .map_err(opendal_error2errno)
-            });
-
-        let relative_paths = stream::iter([
-            Result::Ok(DirectoryEntry {
+            .map_err(opendal_error2errno)?;
+        let child = offset.saturating_sub(2);
+        let mut entries = Vec::with_capacity(children.len() + 2);
+        if offset == 0 {
+            entries.push(Ok(DirectoryEntry {
                 kind: FileType::Directory,
                 name: ".".into(),
                 offset: 1,
-            }),
-            Result::Ok(DirectoryEntry {
+            }));
+        }
+        if offset <= 1 {
+            entries.push(Ok(DirectoryEntry {
                 kind: FileType::Directory,
                 name: "..".into(),
                 offset: 2,
-            }),
-        ]);
+            }));
+        }
+        entries.extend(children.into_iter().enumerate().map(|(index, entry)| {
+            Ok(DirectoryEntry {
+                kind: entry_mode2file_type(entry.metadata().mode()),
+                name: entry.name().trim_matches('/').into(),
+                offset: directory_entry_offset(child, index)?,
+            })
+        }));
 
         Ok(ReplyDirectory {
-            entries: relative_paths.chain(children).skip(offset as usize).boxed(),
+            entries: stream::iter(entries).boxed(),
         })
+    }
+
+    async fn releasedir(&self, _req: Request, path: &OsStr, fh: u64, _flags: u32) -> Result<()> {
+        log::debug!("releasedir(path={path:?}, fh={fh})");
+        let key = FileKey::try_from(fh)?;
+        self.get_opened_directory(key, path)?;
+        self.opened_directories.take(key.0);
+        Ok(())
     }
 
     async fn access(&self, _req: Request, path: &OsStr, mask: u32) -> Result<()> {
@@ -672,67 +689,53 @@ impl PathFilesystem for Filesystem {
         _lock_owner: u64,
     ) -> Result<ReplyDirectoryPlus<Self::DirEntryPlusStream<'a>>> {
         log::debug!("readdirplus(parent={parent:?}, fh={fh}, offset={offset})");
-
+        if offset > i64::MAX as u64 {
+            Err(Errno::from(libc::EOVERFLOW))?;
+        }
         let now = SystemTime::now();
-        let mut current_dir = PathBuf::from(parent);
-        current_dir.push(""); // ref https://users.rust-lang.org/t/trailing-in-paths/43166
         let uid = self.uid;
         let gid = self.gid;
-
-        let path = current_dir.to_string_lossy().to_string();
-        let children = self
-            .op
-            .lister_with(&path)
+        let directory = self.get_opened_directory(FileKey::try_from(fh)?, parent)?;
+        let children = directory
+            .entries(&self.op, offset)
             .await
-            .map_err(opendal_error2errno)?
-            .filter_map(move |entry| {
-                let dir = normalize_path(path.as_str());
-                async move {
-                    match entry {
-                        Ok(e) if e.path() == dir => None,
-                        _ => Some(entry),
-                    }
-                }
-            })
-            .enumerate()
-            .map(move |(i, entry)| {
-                entry
-                    .map(|e| {
-                        let metadata = e.metadata();
-                        DirectoryEntryPlus {
-                            kind: entry_mode2file_type(metadata.mode()),
-                            name: e.name().trim_matches('/').into(),
-                            offset: (i + 3) as i64,
-                            attr: metadata2file_attr(metadata, now, uid, gid),
-                            entry_ttl: TTL,
-                            attr_ttl: TTL,
-                        }
-                    })
-                    .map_err(opendal_error2errno)
-            });
-
+            .map_err(opendal_error2errno)?;
+        let child = offset.saturating_sub(2);
+        let mut entries = Vec::with_capacity(children.len() + 2);
         let relative_path_attr = dummy_file_attr(FileType::Directory, now, uid, gid);
-        let relative_paths = stream::iter([
-            Result::Ok(DirectoryEntryPlus {
+        if offset == 0 {
+            entries.push(Ok(DirectoryEntryPlus {
                 kind: FileType::Directory,
                 name: ".".into(),
                 offset: 1,
                 attr: relative_path_attr,
                 entry_ttl: TTL,
                 attr_ttl: TTL,
-            }),
-            Result::Ok(DirectoryEntryPlus {
+            }));
+        }
+        if offset <= 1 {
+            entries.push(Ok(DirectoryEntryPlus {
                 kind: FileType::Directory,
                 name: "..".into(),
                 offset: 2,
                 attr: relative_path_attr,
                 entry_ttl: TTL,
                 attr_ttl: TTL,
-            }),
-        ]);
+            }));
+        }
+        entries.extend(children.into_iter().enumerate().map(|(index, entry)| {
+            Ok(DirectoryEntryPlus {
+                kind: entry_mode2file_type(entry.metadata().mode()),
+                name: entry.name().trim_matches('/').into(),
+                offset: directory_entry_offset(child, index)?,
+                attr: metadata2file_attr(entry.metadata(), now, uid, gid),
+                entry_ttl: TTL,
+                attr_ttl: TTL,
+            })
+        }));
 
         Ok(ReplyDirectoryPlus {
-            entries: relative_paths.chain(children).skip(offset as usize).boxed(),
+            entries: stream::iter(entries).boxed(),
         })
     }
 
@@ -793,6 +796,14 @@ impl PathFilesystem for Filesystem {
             frsize: 0,
         })
     }
+}
+
+fn directory_entry_offset(base: u64, index: usize) -> Result<i64> {
+    let index = u64::try_from(index).map_err(|_| Errno::from(libc::EOVERFLOW))?;
+    base.checked_add(index)
+        .and_then(|offset| offset.checked_add(3))
+        .and_then(|offset| i64::try_from(offset).ok())
+        .ok_or_else(|| Errno::from(libc::EOVERFLOW))
 }
 
 const fn entry_mode2file_type(mode: EntryMode) -> FileType {
