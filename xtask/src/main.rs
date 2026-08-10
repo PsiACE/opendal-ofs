@@ -103,6 +103,7 @@ struct CommandManagedSyncBehavior {
         long,
         value_parser = [
             "admission",
+            "gc",
             "growing",
             "history",
             "reconcile",

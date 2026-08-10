@@ -41,6 +41,7 @@ pub(crate) fn run_fixture(keep: bool, case: Option<&str>) {
     fixture.create_bucket();
     match case {
         Some("admission") => admission(&fixture),
+        Some("gc") => gc(&fixture),
         Some("growing") => growing(&fixture),
         Some("history") => history(&fixture),
         Some("reconcile") => reconcile(&fixture),
@@ -54,9 +55,70 @@ pub(crate) fn run_fixture(keep: bool, case: Option<&str>) {
             rename(&fixture);
             history(&fixture);
             growing(&fixture);
+            gc(&fixture);
         }
     }
     println!("Managed Sync behavior passed: {}", case.unwrap_or("all"));
+}
+
+fn gc(fixture: &Fixture) {
+    let root = CaseRoot::new();
+    let replica_a = root.path.join("replica-a");
+    let replica_b = root.path.join("replica-b");
+    let state_a = root.path.join("state-a");
+    let state_b = root.path.join("state-b");
+    fs::create_dir_all(&replica_a).expect("create GC replica A");
+    fs::create_dir_all(&replica_b).expect("create GC replica B");
+    let storage = fixture.storage_url("gc");
+
+    run_ofs_success(
+        ofs_sync(&replica_a, &state_a, &storage, true),
+        "initialize GC replica",
+    );
+    fs::write(
+        replica_a.join("changing.bin"),
+        deterministic_bytes(512 * 1024, 11),
+    )
+    .expect("write initial GC content");
+    fs::write(
+        replica_a.join("live.bin"),
+        deterministic_bytes(512 * 1024, 29),
+    )
+    .expect("write live GC content");
+    run_ofs_success(
+        ofs_sync(&replica_a, &state_a, &storage, false),
+        "publish initial GC tree",
+    );
+    fs::write(
+        replica_a.join("changing.bin"),
+        deterministic_bytes(512 * 1024, 73),
+    )
+    .expect("replace GC content");
+    run_ofs_success(
+        ofs_sync(&replica_a, &state_a, &storage, false),
+        "publish replacement before GC",
+    );
+
+    let collected = run_ofs_success(ofs_gc(&storage, false), "collect unreachable segments");
+    let collected = output_text(&collected.stdout);
+    assert!(
+        !collected.contains("deleted 0 segment"),
+        "collection removes data unreachable from the current namespace: {collected}"
+    );
+    run_ofs_success(
+        ofs_sync(&replica_b, &state_b, &storage, false),
+        "cold restore after collection",
+    );
+    assert_eq!(
+        tree_fingerprint(&replica_a),
+        tree_fingerprint(&replica_b),
+        "collection preserves every segment needed for cold restore"
+    );
+    let repeated = run_ofs_success(ofs_gc(&storage, false), "repeat completed collection");
+    assert!(
+        output_text(&repeated.stdout).contains("deleted 0 segment"),
+        "a repeated collection is a no-op"
+    );
 }
 
 fn history(fixture: &Fixture) {
@@ -609,6 +671,15 @@ fn ofs_status(replica: &Path, state: &Path) -> Command {
         .arg("--state")
         .arg(state)
         .arg("--json");
+    command
+}
+
+fn ofs_gc(storage: &str, resume: bool) -> Command {
+    let mut command = ofs_command();
+    command.arg("gc").arg("--storage").arg(storage);
+    if resume {
+        command.arg("--resume");
+    }
     command
 }
 
