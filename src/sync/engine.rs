@@ -329,25 +329,11 @@ async fn apply_target<V: Volume>(
     } = plan;
     let root = staged.root.clone();
     let target = fs_operator(&root)?;
-    let removed = staged
-        .manifest()
-        .entries
-        .iter()
-        .rev()
-        .filter(|(path, entry)| {
-            manifest
-                .entries
-                .get(*path)
-                .is_none_or(|desired| desired.local.kind != entry.local.kind)
-        })
-        .map(|(path, entry)| (path.clone(), entry.local.kind))
-        .collect::<Vec<_>>();
-    for (path, kind) in removed {
-        let target_path = match kind {
-            NodeKind::Directory => format!("{path}/"),
-            NodeKind::RegularFile => path,
-        };
-        target.delete(&target_path).await?;
+    for (path, kind) in removal_roots(staged.manifest(), &manifest) {
+        match kind {
+            NodeKind::Directory => target.delete_with(path).recursive(true).await?,
+            NodeKind::RegularFile => target.delete(path).await?,
+        }
     }
     for (path, edit) in &edits {
         if matches!(edit, TargetEdit::Directory) {
@@ -507,20 +493,7 @@ fn install_staged_changes(
     staged: &StagedTree,
     before: &TargetManifest,
 ) -> Result<()> {
-    let removals = before
-        .entries
-        .iter()
-        .rev()
-        .filter(|(path, entry)| {
-            staged
-                .manifest()
-                .entries
-                .get(*path)
-                .is_none_or(|desired| desired.local.kind != entry.local.kind)
-        })
-        .map(|(path, _)| path.clone())
-        .collect::<Vec<_>>();
-    for path in removals {
+    for (path, _) in removal_roots(before, staged.manifest()) {
         let target = replica.join(path);
         match fs::symlink_metadata(&target) {
             Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(&target)?,
@@ -580,6 +553,28 @@ fn install_staged_changes(
         }
     }
     Ok(())
+}
+
+fn removal_roots<'a>(
+    before: &'a TargetManifest,
+    after: &TargetManifest,
+) -> Vec<(&'a str, NodeKind)> {
+    let mut roots = Vec::<(&str, NodeKind)>::new();
+    for (path, entry) in &before.entries {
+        if after
+            .entries
+            .get(path)
+            .is_some_and(|desired| desired.local.kind == entry.local.kind)
+            || roots.last().is_some_and(|(parent, _)| {
+                path.strip_prefix(parent)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+            })
+        {
+            continue;
+        }
+        roots.push((path, entry.local.kind));
+    }
+    roots
 }
 
 fn install_staged_tree(replica: &Path, staging: &Path) -> Result<()> {
