@@ -74,6 +74,13 @@ extension over the one namespace implementation, not a Layer that rewrites
 arbitrary storage calls. Managed Mount, if added, should expose an Accessor
 instead of hiding namespace transactions inside a Layer.
 
+Object data and Object Metadata both use the composed OpenDAL operator. D1 is
+an explicit metadata-authority exception, not another data store: OpenDAL 0.57's
+D1 service does not expose the revision conditional writes required by the
+namespace contract, so its Query API adapter remains behind the same
+`RecordBackend` CAS boundary. It can move to an OpenDAL Accessor only after that
+Accessor preserves revision creation and replacement atomically.
+
 ## Namespace and publication
 
 A snapshot contains stable node identities, node generations, directory
