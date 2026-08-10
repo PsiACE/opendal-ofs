@@ -7,37 +7,12 @@
 # with the License.
 
 services:
-  audit:
-    image: python:3.13.7-alpine3.22
-    command:
-      - python
-      - /fixture/minio-audit.py
-      - --host
-      - 0.0.0.0
-      - --port
-      - "8080"
-      - --log
-      - /evidence/audit.jsonl
-      - --ready
-      - /tmp/audit.ready
-    environment:
-      PYTHONDONTWRITEBYTECODE: "1"
-    stop_grace_period: 1s
-    volumes:
-      - ../../tests/performance/managed-sync/minio-audit.py:/fixture/minio-audit.py:ro,Z
-      - ${OFS_MANAGED_SYNC_AUDIT_DIR:-../../.local/managed-sync-audit}:/evidence:Z
-
   minio:
     image: quay.io/minio/minio:RELEASE.2024-09-22T00-33-43Z
     command: server /data
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
-      MINIO_AUDIT_WEBHOOK_ENABLE_HARNESS: ${OFS_MANAGED_SYNC_AUDIT_ENABLED:-off}
-      MINIO_AUDIT_WEBHOOK_ENDPOINT_HARNESS: http://audit:8080
-      MINIO_AUDIT_WEBHOOK_BATCH_SIZE_HARNESS: "1"
-      NO_PROXY: audit,localhost,127.0.0.1
-      no_proxy: audit,localhost,127.0.0.1
     ports:
       - "127.0.0.1:${OFS_MANAGED_SYNC_MINIO_PORT:-19000}:9000"
     volumes:
@@ -65,6 +40,8 @@ services:
       - /data
       - --token
       - local-d1-token
+      - --audit-log
+      - /evidence/d1.jsonl
     environment:
       PYTHONDONTWRITEBYTECODE: "1"
     ports:
@@ -72,6 +49,7 @@ services:
     stop_grace_period: 1s
     volumes:
       - ./d1-query-api.py:/fixture/d1-query-api.py:ro,Z
+      - ${OFS_MANAGED_SYNC_AUDIT_DIR:-../../.local/managed-sync-audit}:/evidence:Z
       - d1-data:/data
 
 volumes:

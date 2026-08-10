@@ -10,32 +10,34 @@
 
 use std::io::Cursor;
 
+use futures::future::try_join_all;
 use opendal::{ErrorKind, Operator};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::{
-    ChangeSegmentRef, CheckpointRef, NamespaceChange, NamespaceSnapshot, StoredChangeSegment,
-    StoredCheckpoint, StoredCommittedResult, StoredNamespaceState, recover_namespace,
-    replay_tail_from, require_request_digest, validate_publication,
+    ChangeSegmentRef, CheckpointRef, NamespaceChange, StoredChangeSegment, StoredCheckpoint,
+    StoredCommittedResult, StoredNamespaceState, recover_namespace, replay_tail_from,
+    require_request_digest, validate_publication,
 };
 use crate::filesystem::{
     BranchBinding, BranchId, ChangeCursor, CommitOutcome, OperationId, VolumeError,
-    VolumeErrorKind, VolumeId,
+    VolumeErrorKind, VolumeId, VolumeSnapshot,
 };
 use crate::managed::error::{conflict, corrupt, invalid, unavailable};
 use crate::managed::format::{LowerHex, RecordDecodeError, RecordEncodeError, V1Record};
-use crate::managed::metadata::object::ensure_immutable;
-use crate::managed::metadata::object::read_content_addressed;
+use crate::managed::metadata::object::{ensure_immutable, read};
 use crate::managed::metadata::record::{RecordBackend, Revision};
 
 const BASE_HEAD_KEY: &str = ".ofs/managed/metadata/v1/head.ofs";
 const CHECKPOINT_ROOT: &str = ".ofs/managed/metadata/v1/checkpoints/sha256";
 const CHANGE_SEGMENT_ROOT: &str = ".ofs/managed/metadata/v1/changes/sha256";
+const OPERATION_ROOT: &str = ".ofs/managed/metadata/v1/operations";
 const HEAD_MAGIC: &[u8; 8] = b"OFS1HDZ1";
 const CHECKPOINT_MAGIC: &[u8; 8] = b"OFS1CKZ1";
 const CHANGE_SEGMENT_RECORD: V1Record = V1Record::new(*b"OFS1CHG1", MAX_CHANGE_SEGMENT_BYTES);
+const OPERATION_RECORD: V1Record = V1Record::new(*b"OFS1OPR1", 4096);
 const MAX_HEAD_BYTES: usize = 256 * 1024;
 pub(crate) const MAX_HEAD_ENCODED_BYTES: usize = MAX_HEAD_BYTES + 64 * 1024;
 const MAX_CHECKPOINT_ENCODED_BYTES: usize = 256 * 1024 * 1024;
@@ -45,7 +47,7 @@ const COMPRESSION_LEVEL: i32 = 3;
 
 #[derive(Clone, Debug)]
 pub(crate) struct NamespaceObservation {
-    pub snapshot: NamespaceSnapshot,
+    pub snapshot: VolumeSnapshot,
     witness: NamespaceWitness,
 }
 
@@ -56,7 +58,7 @@ pub(crate) struct NamespaceWitness {
 }
 
 impl NamespaceObservation {
-    pub(crate) fn into_parts(self) -> (NamespaceSnapshot, NamespaceWitness) {
+    pub(crate) fn into_parts(self) -> (VolumeSnapshot, NamespaceWitness) {
         (self.snapshot, self.witness)
     }
 }
@@ -115,14 +117,14 @@ impl NamespaceStore {
 
     pub(crate) async fn observe_from(
         &self,
-        base: &NamespaceSnapshot,
+        base: &VolumeSnapshot,
     ) -> Result<Option<NamespaceObservation>, VolumeError> {
         self.observe_from_optional(Some(base)).await
     }
 
     async fn observe_from_optional(
         &self,
-        base: Option<&NamespaceSnapshot>,
+        base: Option<&VolumeSnapshot>,
     ) -> Result<Option<NamespaceObservation>, VolumeError> {
         let Some((head, revision)) = self.read_bound_head("read Managed namespace").await? else {
             return Ok(None);
@@ -158,7 +160,7 @@ impl NamespaceStore {
 
     pub(crate) async fn publish(
         &self,
-        observed: Option<(&NamespaceWitness, &NamespaceSnapshot)>,
+        observed: Option<(&NamespaceWitness, &VolumeSnapshot)>,
         change: NamespaceChange,
     ) -> Result<CommitOutcome, VolumeError> {
         change.validate(self.volume_id).map_err(|_| {
@@ -193,6 +195,14 @@ impl NamespaceStore {
                 (StoredHead::unborn(self.volume_id, None), None, None)
             }
         };
+        if let Some(result) = head
+            .state
+            .as_ref()
+            .and_then(|state| state.resolve(self.branch_id(), operation))
+        {
+            require_request_digest(Some(request_digest), result.request_sha256)?;
+            return Ok(CommitOutcome::Committed(result.cursor));
+        }
         let mut validated = validate_publication(&change, base)?;
         if validated.is_none() {
             if matches!(
@@ -205,6 +215,15 @@ impl NamespaceStore {
                 observed: base.map_or(ChangeCursor::Genesis, |snapshot| snapshot.cursor),
             });
         }
+        if head
+            .state
+            .as_ref()
+            .is_some_and(|state| state.maybe_contains(operation))
+            && let outcome = self.resolve_known(operation, Some(request_digest)).await?
+            && let CommitOutcome::Committed(cursor) = outcome
+        {
+            return Ok(CommitOutcome::Committed(cursor));
+        }
 
         let state = match &head.state {
             None => {
@@ -214,14 +233,16 @@ impl NamespaceStore {
                     validated.take().expect("publication was validated above"),
                 );
                 let checkpoint = StoredCheckpoint { snapshot: target };
-                StoredNamespaceState {
+                let mut state = StoredNamespaceState {
                     checkpoint: self.write_checkpoint(&checkpoint).await?,
                     checkpoint_cursor: cursor,
                     tail: Vec::new(),
                     segments: Vec::new(),
-                    outcomes: vec![result],
-                    outcomes_complete: true,
-                }
+                    operation_prefixes: StoredNamespaceState::empty_operation_index(),
+                    outcome: None,
+                };
+                state.record_outcome(result);
+                state
             }
             Some(current) => {
                 let tail_bytes = current.tail.iter().try_fold(0_usize, |total, change| {
@@ -240,6 +261,16 @@ impl NamespaceStore {
                     let excess = segments
                         .len()
                         .saturating_sub(super::state::MAX_CHANGE_SEGMENTS);
+                    for reference in &segments[..excess] {
+                        let segment = self.read_change_segment(*reference).await?;
+                        let results = segment
+                            .changes
+                            .iter()
+                            .map(committed_result)
+                            .collect::<Result<Vec<_>, _>>()?;
+                        try_join_all(results.iter().map(|result| self.write_operation(result)))
+                            .await?;
+                    }
                     segments.drain(..excess);
                     let target = change.apply_validated(
                         base.cloned(),
@@ -251,8 +282,8 @@ impl NamespaceStore {
                         checkpoint_cursor: cursor,
                         tail: Vec::new(),
                         segments,
-                        outcomes: current.outcomes.clone(),
-                        outcomes_complete: current.outcomes_complete,
+                        operation_prefixes: current.operation_prefixes.clone(),
+                        outcome: current.outcome.clone(),
                     };
                     next.record_outcome(StoredCommittedResult::from_change(
                         &change,
@@ -271,6 +302,14 @@ impl NamespaceStore {
             }
         };
         let mut next = head;
+        if let Some(result) = next
+            .state
+            .as_ref()
+            .filter(|state| !state.outcome_is_retained())
+            .and_then(|state| state.outcome.as_ref())
+        {
+            self.write_operation(result).await?;
+        }
         next.state = Some(state);
         let bytes = encode_head(&next)?;
         let replaced = match revision {
@@ -323,15 +362,100 @@ impl NamespaceStore {
         let Some(state) = head.state else {
             return Ok(CommitOutcome::Absent);
         };
-        let Some(result) = state.resolve(self.branch_id(), operation)? else {
-            return Ok(if state.outcomes_complete {
-                CommitOutcome::Absent
-            } else {
-                CommitOutcome::Unknown
-            });
+        if let Some(result) = state.resolve(self.branch_id(), operation) {
+            require_request_digest(expected, result.request_sha256)?;
+            return Ok(CommitOutcome::Committed(result.cursor));
+        }
+        if !state.maybe_contains(operation) {
+            return Ok(CommitOutcome::Absent);
+        }
+        if let Some(result) = state
+            .tail
+            .iter()
+            .rev()
+            .find(|change| {
+                change.origin_branch == self.branch_id() && change.operation() == operation
+            })
+            .map(committed_result)
+            .transpose()?
+        {
+            require_request_digest(expected, result.request_sha256)?;
+            return Ok(CommitOutcome::Committed(result.cursor));
+        }
+        let Some(result) = self.read_operation(operation).await? else {
+            for reference in state.segments.iter().rev() {
+                let segment = self.read_change_segment(*reference).await?;
+                if let Some(result) = segment
+                    .changes
+                    .iter()
+                    .rev()
+                    .find(|change| {
+                        change.origin_branch == self.branch_id() && change.operation() == operation
+                    })
+                    .map(committed_result)
+                    .transpose()?
+                {
+                    require_request_digest(expected, result.request_sha256)?;
+                    return Ok(CommitOutcome::Committed(result.cursor));
+                }
+            }
+            return Ok(CommitOutcome::Absent);
         };
         require_request_digest(expected, result.request_sha256)?;
         Ok(CommitOutcome::Committed(result.cursor))
+    }
+
+    async fn read_operation(
+        &self,
+        operation: OperationId,
+    ) -> Result<Option<StoredCommittedResult>, VolumeError> {
+        let Some(bytes) = read(
+            &self.data,
+            &self.operation_key(operation),
+            OPERATION_RECORD.maximum_encoded_bytes(),
+            "resolve Managed publication",
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+        let result: StoredCommittedResult = OPERATION_RECORD
+            .decode(&bytes)
+            .map_err(|error| record_decode_error("resolve Managed publication", error))?;
+        result.validate()?;
+        if result.origin_branch != self.branch_id() || result.operation != operation {
+            return Err(corrupt(
+                "resolve Managed publication",
+                "operation receipt identity is invalid",
+            ));
+        }
+        Ok(Some(result))
+    }
+
+    async fn write_operation(&self, result: &StoredCommittedResult) -> Result<(), VolumeError> {
+        let bytes = OPERATION_RECORD
+            .encode(result)
+            .map_err(|error| record_encode_error("record Managed publication", error))?;
+        ensure_immutable(
+            &self.data,
+            &self.operation_key(result.operation),
+            &bytes,
+            "record Managed publication",
+            VolumeErrorKind::Corrupt,
+            "immutable operation receipt changed",
+        )
+        .await
+    }
+
+    fn operation_key(&self, operation: OperationId) -> String {
+        let scope = self.branch_id().map_or_else(
+            || "base".to_owned(),
+            |branch| LowerHex::encode(branch.as_bytes()),
+        );
+        format!(
+            "{OPERATION_ROOT}/{scope}/{}.ofs",
+            LowerHex::encode(operation.as_bytes())
+        )
     }
 
     async fn outcome_after_race(
@@ -429,19 +553,41 @@ impl NamespaceStore {
         &self,
         reference: ChangeSegmentRef,
     ) -> Result<StoredChangeSegment, VolumeError> {
-        let bytes = read_content_addressed(
-            &self.data,
-            &change_segment_key(reference.digest),
-            &reference.digest,
-            CHANGE_SEGMENT_RECORD.maximum_encoded_bytes(),
-            "read Managed change segment",
-            "namespace change segment is missing",
-            "namespace change segment identity is invalid",
-        )
-        .await?;
+        let encoded_length = usize::try_from(reference.length)
+            .ok()
+            .filter(|length| *length <= CHANGE_SEGMENT_RECORD.maximum_encoded_bytes())
+            .ok_or_else(|| {
+                corrupt(
+                    "read Managed change segment",
+                    "namespace change segment exceeds its size limit",
+                )
+            })?;
+        let bytes = self
+            .data
+            .read_with(&change_segment_key(reference.digest))
+            .range(0..reference.length)
+            .content_length_hint(reference.length)
+            .await
+            .map_err(|error| {
+                if error.kind() == ErrorKind::NotFound {
+                    corrupt(
+                        "read Managed change segment",
+                        "namespace change segment is missing",
+                    )
+                } else {
+                    unavailable("read Managed change segment", "storage operation failed")
+                }
+            })?
+            .to_bytes();
+        if bytes.len() != encoded_length || Sha256::digest(&bytes).as_slice() != reference.digest {
+            return Err(corrupt(
+                "read Managed change segment",
+                "namespace change segment identity is invalid",
+            ));
+        }
         let segment: StoredChangeSegment = CHANGE_SEGMENT_RECORD
             .decode(&bytes)
-            .map_err(change_segment_decode_error)?;
+            .map_err(|error| record_decode_error("read Managed change segment", error))?;
         segment.validate(self.volume_id)?;
         if segment.checkpoint_cursor != reference.start || segment.cursor() != reference.end {
             return Err(corrupt(
@@ -458,7 +604,7 @@ impl NamespaceStore {
     ) -> Result<ChangeSegmentRef, VolumeError> {
         let bytes = CHANGE_SEGMENT_RECORD
             .encode(segment)
-            .map_err(change_segment_encode_error)?;
+            .map_err(|error| record_encode_error("write Managed change segment", error))?;
         let digest: [u8; 32] = Sha256::digest(&bytes).into();
         ensure_immutable(
             &self.data,
@@ -471,6 +617,7 @@ impl NamespaceStore {
         .await?;
         Ok(ChangeSegmentRef {
             digest,
+            length: bytes.len() as u64,
             start: segment.checkpoint_cursor,
             end: segment.cursor(),
         })
@@ -501,23 +648,25 @@ impl NamespaceStore {
                     "requested sequence is not in the change segment",
                 )
             })?;
-        let mut outcomes = current.outcomes.clone();
-        outcomes.retain(|result| result.cursor.sequence() <= sequence);
+        let outcome = current
+            .outcome
+            .clone()
+            .filter(|result| result.cursor.sequence() <= sequence);
         Ok(Some(StoredNamespaceState {
             checkpoint: segment.checkpoint,
             checkpoint_cursor: segment.checkpoint_cursor,
             tail: segment.changes[..length].to_vec(),
             segments: current.segments[..position].to_vec(),
-            outcomes,
-            outcomes_complete: current.outcomes_complete,
+            operation_prefixes: current.operation_prefixes.clone(),
+            outcome,
         }))
     }
 
     async fn replay_retained_from(
         &self,
-        base: &NamespaceSnapshot,
+        base: &VolumeSnapshot,
         state: &StoredNamespaceState,
-    ) -> Result<Option<NamespaceSnapshot>, VolumeError> {
+    ) -> Result<Option<VolumeSnapshot>, VolumeError> {
         let Some(position) = state.segments.iter().position(|segment| {
             segment.start.sequence() <= base.cursor.sequence()
                 && base.cursor.sequence() <= segment.end.sequence()
@@ -805,33 +954,25 @@ pub(crate) fn decode_head(bytes: &[u8]) -> Result<StoredHead, VolumeError> {
     decode_value(&body)
 }
 
-fn change_segment_encode_error(error: RecordEncodeError) -> VolumeError {
+fn record_encode_error(action: &'static str, error: RecordEncodeError) -> VolumeError {
     match error {
-        RecordEncodeError::Encode => {
-            invalid("write Managed change segment", "record cannot be encoded")
-        }
-        RecordEncodeError::TooLarge => invalid(
-            "write Managed change segment",
-            "record exceeds its size limit",
-        ),
+        RecordEncodeError::Encode => invalid(action, "record cannot be encoded"),
+        RecordEncodeError::TooLarge => invalid(action, "record exceeds its size limit"),
     }
 }
 
-fn change_segment_decode_error(error: RecordDecodeError) -> VolumeError {
-    match error {
-        RecordDecodeError::Envelope => {
-            corrupt("read Managed change segment", "record format is invalid")
-        }
-        RecordDecodeError::Checksum => {
-            corrupt("read Managed change segment", "record checksum is invalid")
-        }
-        RecordDecodeError::Decode => {
-            corrupt("read Managed change segment", "record cannot be decoded")
-        }
-        RecordDecodeError::TrailingBytes => {
-            corrupt("read Managed change segment", "record has trailing bytes")
-        }
-    }
+fn record_decode_error(action: &'static str, error: RecordDecodeError) -> VolumeError {
+    let message = match error {
+        RecordDecodeError::Envelope => "record format is invalid",
+        RecordDecodeError::Checksum => "record checksum is invalid",
+        RecordDecodeError::Decode => "record cannot be decoded",
+        RecordDecodeError::TrailingBytes => "record has trailing bytes",
+    };
+    corrupt(action, message)
+}
+
+fn committed_result(change: &NamespaceChange) -> Result<StoredCommittedResult, VolumeError> {
+    StoredCommittedResult::from_change(change, change.fingerprint()?.0)
 }
 
 fn decode_value<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, VolumeError> {
@@ -873,8 +1014,8 @@ mod tests {
         volume_id: VolumeId,
         cursor: ChangeCursor,
         root: NodeId,
-    ) -> NamespaceSnapshot {
-        NamespaceSnapshot {
+    ) -> VolumeSnapshot {
+        VolumeSnapshot {
             volume_id,
             cursor,
             root,
@@ -965,14 +1106,15 @@ mod tests {
         let latest = segment.changes.last().unwrap();
         let request_digest = latest.fingerprint().unwrap().0;
         let outcome = StoredCommittedResult::from_change(latest, request_digest).unwrap();
-        let state = StoredNamespaceState {
+        let mut state = StoredNamespaceState {
             checkpoint,
             checkpoint_cursor: segment.cursor(),
             tail: Vec::new(),
             segments: vec![reference],
-            outcomes: vec![outcome.clone()],
-            outcomes_complete: true,
+            operation_prefixes: StoredNamespaceState::empty_operation_index(),
+            outcome: None,
         };
+        state.record_outcome(outcome.clone());
         let caught_up = store
             .replay_retained_from(&retained, &state)
             .await
@@ -981,7 +1123,6 @@ mod tests {
         assert_eq!(caught_up.cursor.sequence(), 33);
         let resolved = state
             .resolve(None, OperationId::from_bytes([33; 16]))
-            .unwrap()
             .unwrap();
         assert_eq!(resolved.cursor, outcome.cursor);
         assert_eq!(resolved.request_sha256, outcome.request_sha256);

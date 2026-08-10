@@ -43,9 +43,9 @@ The implementation follows four constraints:
 2. `managed/1` owns durable compatibility. Chunk sizes, segment packing,
    request coalescing, caches, and concurrency are policies and never become
    serialized requirements.
-3. Each filesystem fact has one in-memory model. Managed parameterizes the
-   shared snapshot and publication types with its decoded file-version record;
-   it does not maintain a parallel node, directory, or precondition graph.
+3. Each filesystem fact has one in-memory model. Managed stores the shared
+   `VolumeSnapshot` and `VolumeMutation` directly. Only an opaque
+   `FileVersion` descriptor crosses into the decoded extent-map data plane.
 4. Orchestration remains readable in execution order. Helpers isolate an
    actual capability or format boundary; they do not turn a linear command
    into a framework.
@@ -59,7 +59,7 @@ The implementation follows four constraints:
 | Metadata | Nodes, directory entries, generations, file versions, snapshots, publication results | File bytes or local replica state |
 | Data | Immutable segments, physical verification, materialization, reachability | Namespace authority |
 | Sync | Common base, pending operation, conflicts, staging, local installation | Remote format selection |
-| OpenDAL | Provider I/O, retries, concurrency limits, range fetching, conditional writes, bulk deletion | Filesystem merge or publication semantics |
+| OpenDAL | Provider I/O, retries, concurrency limits, range fetching, and conditional writes | Filesystem merge or publication semantics |
 
 Credentials, endpoints, local paths, and Sync state never enter the Managed
 storage format. The catalog stores a credential-free volume binding. Runtime
@@ -113,19 +113,19 @@ committed operation returns its committed cursor. Reusing the same identity
 for another payload is a conflict.
 
 At the `Volume` boundary, an observation retains one RFC 016 `VolumeSnapshot`
-and a small metadata CAS witness. The decoded Managed snapshot is consumed
-while constructing that value rather than retained as a second namespace
-graph. Data staging decodes only the reachable file-version descriptors needed
-for content reuse, while publication decodes the complete Managed snapshot.
-Neither path clones the namespace merely to select a metadata backend.
+and a small metadata CAS witness. Metadata stores that same snapshot; it does
+not decode or clone descriptors into a second namespace graph. Data staging
+decodes reachable descriptors only when changed files need authority-known
+content. A no-change pass does not scan every live file version.
 
 ## Data path
 
-Sync reads each changed live file once. The same bounded stream writes the
-reconstructable local cache and feeds the volume-owned file-version builder.
-The builder returns an opaque descriptor containing the logical digest and
-extent plan; Sync persists that descriptor in the pending replica state. A
-retry or process restart therefore does not read and hash the cached file again.
+Sync reads each changed live file once. The same bounded stream calculates its
+whole-file digest, feeds FastCDC, packs immutable segments, and writes those
+segments to local staging. The builder returns an opaque descriptor containing
+the logical digest and extent plan; Sync persists that descriptor in the
+pending replica state. A retry uploads already sealed segments instead of
+rereading or rehashing the source file.
 Namespace publication never depends on a live path that may change or
 disappear. Files below the chunking threshold produce one content extent.
 Larger files use FastCDC. These are placement policies, not different storage
@@ -133,8 +133,7 @@ formats.
 
 Staging performs the following work:
 
-1. Concurrent readers tee source bytes to local staging and stream chunks into
-   a bounded channel.
+1. Concurrent readers stream source chunks through bounded channels.
 2. One segment builder reuses content referenced by the fixed authority
    snapshot and deduplicates new content across the publication.
 3. The builder seals each placement-sized segment to calculate its identity
@@ -144,12 +143,11 @@ Staging performs the following work:
    maps, which the pending replica state stores without interpreting.
 
 After reconciliation has no unresolved conflict, Sync durably records its
-pending intent. The Volume then rebuilds each new segment from bounded ranges
-of the frozen files, verifies every content reference and the complete segment,
-and uploads it with create-only semantics. Only after that succeeds may Sync
-materialize a different target tree and publish namespace metadata. A durable
-finalization marker makes retries independent of paths changed by target
-materialization.
+pending intent. The Volume reads each sealed segment from local staging,
+verifies its complete identity, and uploads it with create-only semantics.
+Only after that succeeds may Sync materialize a different target tree and
+publish namespace metadata. A durable finalization marker makes retries
+independent of paths changed by target materialization.
 
 Backpressure bounds buffered file data to the active segment, the channel, and
 at most one chunk held by each reader; only the resulting extent metadata grows
@@ -165,7 +163,7 @@ layer merges concurrent cold reads and handles eviction. Backends without
 `stat` use the coalesced-range path instead. Each sparse range is fetched once,
 shared by every planned consumer across file windows, and released after its
 last consumer. Sparse segment ranges are submitted together through OpenDAL
-`Reader::fetch`; OpenDAL removes overlap, coalesces nearby ranges with a 512 KiB
+`Reader::fetch`; OpenDAL removes overlap, coalesces nearby ranges with a 64 KiB
 gap, and returns zero-copy slices. File writes remain windowed at 16 MiB.
 The operator's OpenDAL concurrency and retry layers govern remote transfers.
 OFS verifies segment structure, every returned content digest, logical length,
@@ -186,10 +184,11 @@ Opening and observing a volume has one provider-independent shape:
 The registry resolves a branch incarnation; it does not pre-read mutable HEAD
 state that observation will immediately read again. A checkpoint is loaded
 only for a cold replica or after its common cursor has fallen behind the
-retained tail. Checkpoint receipts are loaded lazily when tail
-rotation actually needs them. Normal publication does not issue an operation
-receipt lookup before CAS. Receipt resolution belongs only to pending-intent
-recovery, invalid retries, CAS races, and unknown commit results.
+retained tail. Change segments are loaded only when the common cursor has
+fallen behind the current checkpoint. A normal publication performs one
+deterministic receipt lookup to reject reuse of an older `OperationId`.
+Pending recovery checks the latest HEAD result first and reads a receipt only
+for an older operation.
 
 Tail replay applies each stored delta to one next snapshot. Validation borrows
 the old and next snapshots; the enclosing HEAD validates cursor ancestry once,
@@ -209,19 +208,28 @@ Sync engine do not dispatch on provider types.
 
 ### Object Metadata
 
-Object Metadata has one mutable `head.ofs` and immutable checkpoints. HEAD
-contains the current cursor, a checkpoint reference, an ordered
-tail of committed namespace changes.
+Object Metadata has one mutable `head.ofs` plus immutable checkpoints, change
+segments, and operation receipts. HEAD contains the current cursor, checkpoint
+reference, ordered transaction tail, retained change-segment index, and latest
+committed operation result.
 
 Publication writes immutable data first. It writes new checkpoint objects only
 when checkpoint policy requires them, then replaces HEAD with an ETag
 precondition. The conditional replacement is the namespace commit point.
 
-Each checkpoint is one complete snapshot and its operation receipts encoded as
-strict CBOR, compressed, bounded, and stored as one content-addressed OpenDAL
-object. There is no checkpoint-only filesystem model, delta table, part index,
-or tombstone layer. A failed conditional HEAD replacement may leave an
-unreferenced immutable checkpoint, but it cannot expose a partial checkpoint.
+Each checkpoint is one complete filesystem snapshot encoded as strict CBOR,
+compressed, bounded, and stored as one content-addressed OpenDAL object. There
+is no checkpoint-only filesystem model, delta table, part index, or tombstone
+layer. Change segments use a strict checksummed v1 record and carry an exact
+encoded length. A failed conditional HEAD replacement may leave an
+unreferenced immutable object, but it cannot expose a partial checkpoint.
+
+HEAD, its tail, and retained change segments resolve recent operations. The
+initial checkpoint result is persisted when first displaced, and every result
+in a change segment is persisted before that segment leaves the retained
+index. A compact prefix filter skips receipt lookups for definitely new
+operations. This ordering keeps exact idempotency without an outcome window or
+an ever-growing result map in HEAD.
 
 An established replica reuses its verified common snapshot when its cursor is
 still covered by the HEAD tail. A cold reader loads the checkpoint with one
@@ -325,20 +333,31 @@ reuse those indexes. Canonical `/`-separated descendants form a bounded
 `BTreeMap` range, so subtree lookup does not rescan the namespace and reverse
 iteration gives children-before-parent deletion without a second depth sort.
 
+Native identity may initially detect every descendant of a moved directory,
+but reconciliation compacts matching mappings into non-overlapping subtree
+roots. Validation and publication expand each root through one bounded path
+range, so pending state grows with independent moves rather than subtree size.
+
+The portable naming policy is shared by local admission and authoritative
+snapshot validation. Names must be NFC, fit the component and path bounds,
+avoid Windows-reserved characters and device names, and remain unique after
+full Unicode case folding within a directory. Sync currently requires Unix
+native identity and executable attributes; another platform is rejected at
+the Sync boundary instead of silently weakening those semantics.
+
 ## Extensions
 
 A Managed extension adds authority semantics without adding another filesystem
-model. A branch binding wraps a backend-native authority behind one
-`BoundNamespace` state machine before Sync calls the same `Volume` contract.
+model. A branch binding selects a backend-native authority in one
+`NamespaceStore` state machine before Sync calls the same `Volume` contract.
 Base and branch expose the same observation, CAS publication, receipt
 resolution, bounded-tail, and unknown-commit behavior. Object and D1 implement
 the same small revision-CAS record operations. Base and branch checkpoints use
 one content-addressed object codec, and branch snapshots and publications use
 the shared node, directory, precondition, and Managed file-version records.
 
-The branch feature controls commands and extension code only. It does not
-change `managed/1` base-volume readability or create an alternate data plane.
-Segments remain shared immutable content.
+The required extension controls commands and authority binding only. It does
+not create an alternate data plane. Segments remain shared immutable content.
 
 ## Acceptance and regression coverage
 
@@ -365,8 +384,8 @@ persistence, or public API contract.
 
 A Managed Sync change is complete when a fresh client can register or create a
 volume, converge local and remote changes, recover an interrupted publication,
-materialize verified bytes, and collect only unreachable data through each
-enabled metadata authority. The same stored volume remains readable by its
+and materialize verified bytes through each enabled metadata authority. The
+same stored volume remains readable by its
 declared `managed/1` format, buffered file data remains bounded by configured
 concurrency and placement windows rather than dataset size, and every supported
 Cargo feature combination builds.

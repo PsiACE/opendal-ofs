@@ -17,17 +17,18 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::records::{
-    DirectoryRecord, NamespaceSnapshot, NodeRecord, managed_generation, managed_generation_number,
-    next_managed_generation,
+use super::decode_file_version;
+use super::records::{managed_generation, managed_generation_number, next_managed_generation};
+use super::{NamespaceChange, ValidatedChange};
+use crate::filesystem::{
+    DirectoryRecord, FileVersionId, Generation, NodeAttributes, NodeId, NodeKind, NodeRecord,
+    VolumeError, VolumeSnapshot,
 };
-use super::{StoredChange, ValidatedChange};
-use crate::filesystem::{FileVersionId, Generation, NodeAttributes, NodeId, NodeKind, VolumeError};
 use crate::managed::error::invalid;
 
 pub(crate) fn validate_publication(
-    change: &StoredChange,
-    base: Option<&NamespaceSnapshot>,
+    change: &NamespaceChange,
+    base: Option<&VolumeSnapshot>,
 ) -> Result<Option<ValidatedChange>, VolumeError> {
     change.validate_against(base).map_err(|_| {
         invalid(
@@ -37,7 +38,7 @@ pub(crate) fn validate_publication(
     })
 }
 
-pub(crate) fn validate_snapshot(snapshot: &NamespaceSnapshot) -> Result<(), VolumeError> {
+pub(crate) fn validate_snapshot(snapshot: &VolumeSnapshot) -> Result<(), VolumeError> {
     snapshot
         .validate_structure()
         .map_err(|_| invalid("read Managed namespace", "namespace structure is invalid"))?;
@@ -55,7 +56,7 @@ pub(crate) fn validate_snapshot(snapshot: &NamespaceSnapshot) -> Result<(), Volu
         }
     }
     for (id, version) in &snapshot.file_versions {
-        if *id != version.id || !version.is_valid() {
+        if *id != version.id || decode_file_version(version).is_err() {
             return Err(invalid("read Managed namespace", "file version is invalid"));
         }
     }
@@ -158,8 +159,8 @@ mod tests {
         )
     }
 
-    fn base_snapshot() -> NamespaceSnapshot {
-        NamespaceSnapshot {
+    fn base_snapshot() -> VolumeSnapshot {
+        VolumeSnapshot {
             volume_id: VolumeId::from_bytes([7; 16]),
             cursor: cursor(1),
             root: ROOT,
@@ -196,7 +197,7 @@ mod tests {
             target,
         )
         .unwrap();
-        let mut change = StoredChange::new(publication.mutation().clone(), None);
+        let mut change = NamespaceChange::new(publication.mutation().clone(), None);
         change.mutation.expected_nodes = vec![crate::filesystem::NodePrecondition {
             node: ROOT,
             expected_generation: Some(managed_generation(2)),

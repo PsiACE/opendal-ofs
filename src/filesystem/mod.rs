@@ -34,6 +34,7 @@ pub use model::VolumeModel;
 pub use namespace::{DirectoryEntry, NodeAttributes, NodeKind};
 pub use publication::CommitOutcome;
 pub(crate) use volume::VolumeMutation;
+pub(crate) use volume::validate_portable_paths;
 pub use volume::{
     DirectoryPrecondition, DirectoryRecord, FileVersion, MaterializeRequest, NodePrecondition,
     NodeRecord, Volume, VolumeError, VolumeErrorKind, VolumeObservation, VolumePublication,

@@ -32,7 +32,7 @@ use tokio::sync::{OnceCell, mpsc, oneshot};
 use super::error::{corrupt, invalid, unavailable};
 use crate::filesystem::{VolumeError, VolumeErrorKind};
 use crate::managed::format::{ContentRef, Extent, ExtentMap, LowerHex, SegmentRef, V1Record};
-use crate::managed::metadata::namespace::FileVersionRecord;
+use crate::managed::metadata::namespace::DecodedFileVersion;
 use crate::managed::metadata::object::ensure_immutable;
 
 const SEGMENT_ROOT: &str = ".ofs/managed/data/v1/segments/sha256";
@@ -62,7 +62,7 @@ pub(crate) struct AuthorityKnownContent {
 }
 
 impl AuthorityKnownContent {
-    pub(crate) fn include(&mut self, version: &FileVersionRecord) -> Result<(), VolumeError> {
+    pub(crate) fn include(&mut self, version: &DecodedFileVersion) -> Result<(), VolumeError> {
         if !version.is_valid() {
             return Err(corrupt(
                 "derive authority-known content",
@@ -157,7 +157,7 @@ impl ManagedData {
         paths: Vec<String>,
         known: &AuthorityKnownContent,
         concurrency: NonZeroUsize,
-    ) -> Result<BTreeMap<String, FileVersionRecord>, VolumeError> {
+    ) -> Result<BTreeMap<String, DecodedFileVersion>, VolumeError> {
         let mut paths = paths;
         paths.sort();
         if paths.windows(2).any(|pair| pair[0] == pair[1]) {
@@ -285,7 +285,7 @@ impl ManagedData {
                             })
                             .collect::<Result<Vec<_>, VolumeError>>()?,
                     };
-                    let version = FileVersionRecord::from_extents(
+                    let version = DecodedFileVersion::from_extents(
                         file.logical_size,
                         file.logical_digest,
                         extent_map,
@@ -345,7 +345,7 @@ impl ManagedData {
         &self,
         target: &Operator,
         segment_staging: Option<&Operator>,
-        requests: Vec<(String, FileVersionRecord)>,
+        requests: Vec<(String, DecodedFileVersion)>,
         concurrency: NonZeroUsize,
     ) -> Result<(), VolumeError> {
         let staged_segments = match segment_staging {
@@ -388,7 +388,7 @@ impl ManagedData {
         target: &Operator,
         segment_staging: Option<&Operator>,
         staged_segments: &BTreeSet<SegmentRef>,
-        requests: Vec<(String, FileVersionRecord)>,
+        requests: Vec<(String, DecodedFileVersion)>,
         concurrency: NonZeroUsize,
     ) -> Result<(), VolumeError> {
         if let [(path, version)] = requests.as_slice()
@@ -473,7 +473,7 @@ impl ManagedData {
         segment_staging: Option<&Operator>,
         staged_segments: &BTreeSet<SegmentRef>,
         path: &str,
-        version: &FileVersionRecord,
+        version: &DecodedFileVersion,
         concurrency: NonZeroUsize,
     ) -> Result<(), VolumeError> {
         let cache_complete_segments = self.operator.info().full_capability().stat;
@@ -683,7 +683,7 @@ fn demands_cover_segment(segment: SegmentRef, demands: &SegmentDemand) -> bool {
 async fn materialize_file(
     target: &Operator,
     path: &str,
-    version: &FileVersionRecord,
+    version: &DecodedFileVersion,
     fetched: &FetchedContent,
 ) -> Result<(), VolumeError> {
     let mut writer = target
@@ -735,7 +735,7 @@ async fn write_extents(
 
 async fn finish_materialized_file(
     mut writer: Writer,
-    version: &FileVersionRecord,
+    version: &DecodedFileVersion,
     logical: Sha256,
     written: u64,
 ) -> Result<(), VolumeError> {
@@ -1152,7 +1152,7 @@ mod tests {
         let key = segment_key(reference);
         storage.write(&key, segment.bytes).await.unwrap();
         let logical = [bytes.as_slice(), bytes.as_slice()].concat();
-        let version = FileVersionRecord::from_extents(
+        let version = DecodedFileVersion::from_extents(
             logical.len() as u64,
             Sha256::digest(&logical).into(),
             ExtentMap {

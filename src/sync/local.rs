@@ -15,6 +15,8 @@ use futures::TryStreamExt as _;
 use opendal::{EntryMode, Operator, services};
 use serde::{Deserialize, Serialize};
 
+use crate::filesystem::validate_portable_paths;
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum LocalKind {
@@ -104,6 +106,9 @@ impl LocalTree {
                 },
             );
         }
+        validate_portable_paths(entries.keys().map(String::as_str))
+            .map_err(anyhow::Error::new)
+            .context("local replica contains a non-portable path")?;
         Ok(Self {
             root: root.to_owned(),
             entries,
@@ -192,8 +197,10 @@ fn native_attributes_at(
     }
     #[cfg(not(unix))]
     {
-        let _ = (root, path);
-        Ok((None, false, 1))
+        let _ = (root, path, kind);
+        bail!(
+            "Managed Sync requires native file identity and executable attributes on this platform"
+        )
     }
 }
 
@@ -211,7 +218,19 @@ pub(crate) fn set_executable(path: &Path, executable: bool) -> Result<()> {
         fs::set_permissions(path, permissions)?;
     }
     #[cfg(not(unix))]
-    let _ = (path, executable);
+    {
+        let _ = (path, executable);
+        bail!("Managed Sync requires executable attribute support on this platform");
+    }
+    Ok(())
+}
+
+pub(crate) fn require_native_capabilities() -> Result<()> {
+    #[cfg(not(unix))]
+    bail!(
+        "Managed Sync is unavailable because this platform cannot preserve native identity and executable attributes"
+    );
+    #[cfg(unix)]
     Ok(())
 }
 

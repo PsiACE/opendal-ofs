@@ -1,491 +1,207 @@
 # Managed branches
 
-Define `branch/v1` as an optional Managed-volume extension for durable named
-filesystem branches. A branch is a small mutable authority record over shared
-immutable namespace checkpoints, history, file versions, and data segments.
-Forking does not copy the namespace or file data.
+`branch/v1` is a required Managed-format extension for durable named namespace
+authorities. Branches share immutable file versions, checkpoints, change
+segments, and data segments. Forking changes metadata roots; it does not copy
+file bytes or create another filesystem model.
 
-The implementation is isolated behind the Cargo feature `managed-branch` and
-the Managed-format requirement `branch/v1`. It behaves like a layer at the
-metadata binding boundary:
+## Use branches
 
-```text
-Managed metadata + branch/v1
-    -> bind BranchName
-    -> branch-bound Namespace
-    -> existing ManagedVolume
-    -> Sync
-```
+Enable branches when creating a Managed volume:
 
-A future Managed Mount can consume the same bound `ManagedVolume`.
-
-Branching does not wrap OpenDAL storage operations. It changes which metadata
-authority owns the namespace, so an `opendal::Layer` would be the wrong
-boundary. The data plane, filesystem core, and publication contract remain
-unchanged after a branch has been bound.
-
-`branch/v1` provides a linear history per branch, fork from the current head
-or any retained sequence, and deletion with safe name reuse. It does not
-provide merge, tags, branch reset, automatic
-history expiry, a mounted filesystem, or a per-filesystem-call event log.
-
-# Why branches belong in Managed metadata
-
-Agents, tests, and data jobs need isolated filesystem states without copying a
-complete tree. They also need durable resume on another host and a way to
-recover an earlier state without moving or destroying the current state.
-
-Managed volumes already provide the expensive pieces:
-
-- stable node and directory identities;
-- immutable file versions and data segments;
-- immutable namespace checkpoints;
-- ordered, generation-checked publications;
-- bounded change tails; and
-- operation identities for retry recovery.
-
-Adding another commit graph, copying every metadata record, or reference
-counting every shared segment would duplicate those mechanisms. The missing
-pieces are named authorities and retained tails after checkpoint rotation.
-
-The extension reuses the common namespace snapshot, change, validation,
-publication, file-version, data-segment, and checkpoint models. Only
-the registry, branch heads, retained history, and lifecycle are extension-owned.
-
-The extension boundary keeps these rules out of base Managed volumes. The base
-and extension formats may share code, but they do not share mutable authority
-records. A build that cannot preserve branch roots must reject `branch/v1`
-before mutation.
-
-# Use managed branches
-
-## Create and use branches
-
-Branches are enabled when a Managed volume is created:
-
-```text
+```shell
 ofs volume create workspace \
   --model managed \
   --enable branch \
   --storage <storage-url>
 ```
 
-Creation records `branch/v1` in the Managed superblock and creates the default
-branch `main`. Direct volumes reject `--enable branch` before changing the
-catalog or storage.
+The superblock records `branch/v1`, and initialization creates the default
+branch `main`. A client opening an existing volume observes this requirement
+from the superblock even if its `volume create` command omits `--enable`.
 
-The remote Managed format is authoritative when another client registers the
-same volume. A client may omit `--enable branch` and still open an existing
-`branch/v1` volume. An explicit extension request against an existing base
-volume fails before the local catalog or branch metadata is changed. Repeating
-creation also completes an interrupted default-branch initialization.
+Sync uses the default branch unless another name is selected:
 
-The default branch needs no additional Sync option:
-
-```text
-ofs sync workspace ./workspace --state ./workspace.state
+```shell
+ofs sync workspace ./main --state ./main.state
+ofs sync workspace ./experiment --branch experiment --state ./experiment.state
 ```
 
-Another branch is selected explicitly:
+Replica state stores the branch name and immutable `BranchId`. A state file
+cannot move between branches. Deleting and recreating a name produces another
+`BranchId`, so an old replica cannot attach to the replacement.
 
-```text
-ofs sync workspace ./experiment \
-  --branch experiment \
-  --state ./experiment.state
-```
+Create a branch from the current default head, another branch, or a retained
+sequence:
 
-Replica state stores both `VolumeId` and the stable branch identity. Reusing a
-state file with another branch fails before the local tree is scanned or
-changed. Deleting and recreating the same display name creates a new identity,
-so an old replica cannot attach to the replacement.
-
-## Fork current or retained state
-
-Fork the current default branch:
-
-```text
+```shell
 ofs branch create workspace experiment
-```
-
-Select another source, or a retained branch-local sequence:
-
-```text
 ofs branch create workspace retry --from experiment
 ofs branch create workspace rewind --from main --at 42
 ```
 
-The source remains unchanged. The new branch receives a new `BranchId` and
-reuses the selected immutable checkpoint, history, file versions, and data
-segments. Fork cost does not scale with the number or size of files, although
-finding an old sequence can require walking retained history.
+Inspect and delete branches with:
 
-Sequences are meaningful only with their branch ancestry. Two branches may
-both publish sequence 43 after forking from sequence 42.
-
-`branch/v1` does not move an existing branch backward. Creating a new branch
-from an old sequence keeps current replicas valid and makes the retained state
-explicit.
-
-## Inspect and delete branches
-
-```text
+```shell
 ofs branch list workspace
 ofs branch show workspace experiment
 ofs branch delete workspace experiment
 ```
 
-The default branch cannot be deleted. Deletion seals the current incarnation
-before its name becomes reusable. Shared data is not removed synchronously.
+The default branch cannot be deleted. `--json` reports branch name, identity,
+sequence, default status, and lifecycle without exposing physical metadata
+keys or backend revisions.
 
-`--json` output contains stable user-facing fields such as branch name,
-identity, sequence, default status, and lifecycle. It does not expose object
-keys, SQL revisions, provider errors, or credentials.
+## Authority boundary
 
-## Capability coverage
-
-The extension deliberately covers storage history, not every workflow offered
-by the systems that informed it:
-
-| Capability | `branch/v1` with Sync | lakeFS | JuiceFS clone | Overeasy |
-| --- | --- | --- | --- | --- |
-| Named mutable branches | Yes | Yes | Clone namespace | Yes |
-| Fork without copying file data | Yes | Yes | Yes | Yes |
-| Fork independent of namespace size | Yes | Yes | No | Yes |
-| Fork retained history | Sequence | Commit | Not its clone contract | Timestamp |
-| Durable cross-host resume | After publication | Yes | Yes | Yes |
-| Merge and tags | No | Yes | No | No |
-| Mounted filesystem | Not yet | Gateway-dependent | Yes | Yes |
-| Per-filesystem-call durable log | No | No | Metadata transactions | Yes |
-
-The remaining gap to Overeasy is mainly the access contract. `branch/v1` plus
-Sync provides durable published states, current and historical fork, and
-shared storage. Its checkpoint repository also avoids one-value snapshot
-limits, but it is not a lakeFS-style range index. A Managed Mount can reuse the
-same branch authority. Matching Overeasy's eager filesystem recovery still
-requires Mount writeback, session, and journal rules.
-
-# Design and storage semantics
-
-## Feature and module boundary
-
-The implementation lives under:
+Branching binds one authority before constructing the existing
+`ManagedVolume`:
 
 ```text
-managed::extensions::branch
+superblock requires branch/v1
+        |
+registry resolves BranchName -> BranchId
+        |
+NamespaceStore binds that branch HEAD
+        |
+ManagedVolume -> Sync
 ```
 
-The Cargo feature `managed-branch` owns the branch lifecycle API, history
-codec, and branch-bound `ManagedVolume` adapter. Default builds enable the
-feature. Builds can exclude it and still compile the base Object and D1
-Managed paths. Object and D1 differ only at the shared revision-CAS record
+The extension lives in `managed::extensions::branch`; it is not a Cargo
+feature and has no alternate implementation graph. Base and branch authorities
+use the same namespace state machine, checkpoint codec, publication
+validation, operation receipts, file-version descriptors, and data plane.
+Object and D1 metadata differ only through the shared revision-CAS record
 backend.
 
-A small amount of negotiation plumbing remains unconditional:
-
-- `BranchName`, `BranchId`, and `BranchBinding`;
-- `AuthorityIdentity`; and
-- the optional branch binding in Sync replica state.
-
-These values are part of the common authority and compatibility boundary, not
-the extension implementation. Keeping them unconditional lets feature-on and
-feature-off binaries read the same base replica-state format. A feature-off
-binary rejects a superblock requiring `branch/v1` before opening its namespace.
-
-The superblock stores required extension identifiers in strict sorted order.
-Duplicates, unknown identifiers, and malformed records fail closed. Base
-Managed constructors reject non-empty extension sets, while branch constructors
-require `branch/v1` and a matching `VolumeId` and metadata format.
-
-## Authority model
-
-The logical registry is:
-
-```text
-BranchRegistry {
-    volume_id
-    default_branch: BranchId
-    branches: BranchName -> BranchId
-}
-```
-
 The registry is authoritative for branch existence and name reuse. Ordinary
-publication does not update it, so unrelated branches do not contend on a
-global record.
+publication changes only the selected branch HEAD, so unrelated branches do
+not contend on the registry.
 
-Each registration points to one mutable head:
+## Registry and heads
 
-```text
-BranchHead {
-    volume_id
-    branch_id
-    lifecycle: active | sealed
-    state: unborn | NamespaceState
-}
-
-NamespaceState {
-    checkpoint
-    checkpoint_cursor
-    bounded_tail
-    previous_history
-}
-```
-
-An unborn head represents an empty branch. The first publication creates its
-checkpoint. An active head accepts publication. A sealed head never becomes
-active again.
-
-`BranchName` is case-sensitive and 1 to 63 ASCII bytes. It starts with an
-ASCII letter or digit; remaining bytes may also contain `.`, `_`, and `-`.
-Names are data inside the registry and are never interpolated into object keys
-or SQL identifiers.
-
-`BranchId` is a random 128-bit identity for one incarnation. A durable position
-is therefore:
+The registry contains:
 
 ```text
-(VolumeId, BranchId, ChangeCursor)
+volume_id
+default_branch: BranchId
+branches: BranchName -> BranchId
 ```
 
-Backend revisions are compare-and-swap tokens, not persistent logical
-identities.
+`BranchName` is case-sensitive ASCII, 1 to 63 bytes. It starts with an ASCII
+letter or digit; later bytes may also contain `.`, `_`, and `-`. Names are
+stored as registry data and are never interpolated into object keys or SQL
+identifiers.
 
-## History and operation identity
-
-A head tail is consecutive from `checkpoint_cursor` to the current cursor. On
-rotation, metadata stores the old checkpoint and tail in an immutable history
-record, writes the new immutable checkpoint, and conditionally replaces the
-head. A failed head replacement can leave unreachable immutable records but
-cannot expose a partial namespace.
-
-Historical fork locates the requested sequence in the current tail or walks
-the history chain. The target head references the matching checkpoint, tail
-prefix, and older history. Namespace and data records are not copied.
-
-Committed operation results are scoped by both origin branch and operation:
+Each `BranchId` selects one HEAD:
 
 ```text
-(BranchId, OperationId) -> committed ChangeCursor
+volume_id
+branch_id
+sealed
+state: unborn | NamespaceState
 ```
 
-Forked checkpoints may contain results created by an ancestor. The origin
-scope prevents a pending operation from one branch resolving as committed in
-another. Reusing an operation in its origin branch with a different request
-digest is a conflict.
+An unborn HEAD represents an empty branch. An active HEAD accepts a
+generation-checked publication. A sealed HEAD can only complete deletion.
 
-## Bind once, then use the existing Volume contract
-
-Branch control and namespace publication are separate:
-
-```text
-BranchStore
-    initialize(default)
-    list()
-    get(name)
-    fork(source, point, target)
-    delete(name)
-    bind(name) -> Namespace
-
-Namespace
-    observe_from(base)
-    publish(observation, publication)
-    resolve(operation)
-```
-
-`bind` fixes one `BranchId`. The resulting namespace is composed with the
-existing `ManagedData` implementation and exposed as the existing `Volume`
-contract. Branch parameters do not leak into file staging, materialization,
-filesystem validation, or every Volume method.
-
-This is the same structural idea as an OpenDAL layer, applied one level above
-OpenDAL. The composition changes metadata authority; it does not intercept
-storage requests.
-
-## Publication
-
-Publication remains data before metadata:
-
-```text
-observe bound branch
-    -> prepare file versions in local staging
-    -> validate generations against the observation
-    -> upload and verify immutable segments
-    -> prepare checkpoint or history if needed
-    -> conditionally replace that branch head
-    -> acknowledge the branch position
-```
-
-The head revision is checked at commit. A concurrent publication or deletion
-causes a conflict rather than a last-writer-wins update.
-
-## Object Metadata representation
-
-Object Metadata uses an extension-owned prefix:
+Object metadata uses:
 
 ```text
 .ofs/managed/metadata/v1/extensions/branch/v1/registry.ofs
 .ofs/managed/metadata/v1/extensions/branch/v1/heads/<branch-id>.ofs
-.ofs/managed/metadata/v1/checkpoints/sha256/<digest>.ofs
-.ofs/managed/metadata/v1/extensions/branch/v1/history/sha256/<digest>.ofs
 ```
 
-The registry and heads are mutable conditional-write objects. A checkpoint is
-one bounded, compressed, content-addressed OpenDAL object containing the shared
-namespace snapshot and operation receipts. History is also immutable and
-content-addressed. The base Managed `head.ofs` is not read or mirrored for a
-branching volume.
+D1 stores the same logical record keys in
+`ofs_managed_v1_authority_records`. Checkpoints, change segments, operation
+receipts, file versions, and data segments remain in the configured OpenDAL
+storage for both metadata authorities.
 
-Base and branch namespaces share the checkpoint builder and recovery
-validation. One record backend contains the complete Object/D1 dispatch and
-provides native read, create, and revision-CAS replace operations. Namespace
-and branch layers do not branch on providers.
+## Retained sequences
 
-Opening Object metadata requires OpenDAL capabilities for read, create-only
-write, and conditional replace.
+Each namespace state has one checkpoint, a current change tail, and up to
+eight immutable change segments. A change segment contains its starting
+checkpoint reference and at most 32 consecutive changes. The HEAD indexes
+each segment by its start cursor, end cursor, digest, and encoded length.
 
-## D1 representation
+Forking at a retained sequence selects the checkpoint and change prefix that
+reconstruct that position. The new branch receives a new HEAD and reuses the
+immutable records already referenced by the source. It does not copy namespace
+records or data segments. A sequence older than the retained segment window is
+rejected; `branch/v1` does not promise unbounded history.
 
-D1 uses the Managed record table shared by base and extension authorities:
+Sequences are branch-local positions. Two branches may both publish sequence
+43 after forking from sequence 42.
+
+## Operation identity
+
+A committed operation is scoped by its origin authority:
 
 ```text
-ofs_managed_v1_authority_records
+(base | BranchId, OperationId) -> ChangeCursor, request digest
 ```
 
-Rows are scoped by the existing D1 store key and the same logical record key
-used by Object Metadata. The stored superblock and authority values carry and
-validate `VolumeId`; the table does not duplicate it. Lifecycle and publication
-use revision predicates. Immutable checkpoints and history remain in the
-configured OpenDAL storage and are verified by their complete content
-identities.
+HEAD stores the most recent result and a fixed operation-prefix filter. Recent
+results remain in its tail or retained change segments. Publication persists
+the initial checkpoint result when displaced and persists a segment's results
+before evicting that segment. Every committed operation is therefore in HEAD,
+retained history, or an immutable receipt; results do not expire.
 
-The registry remains one small mutable authority record. D1's value limit and
-the selected Object provider's conditional-write limit are its real
-boundaries. Very large branch registries need a different authority
-representation, not an arbitrary format cutoff.
+A fork clears the source's latest result from the target HEAD. Ancestor
+operations therefore never resolve as operations committed by the new branch.
+Reusing an operation identity with another publication payload is a conflict.
 
 ## Fork and deletion linearization
 
-Fork prepares a new head with a new `BranchId`, then conditionally adds its
-name to the observed registry. The registry update is the existence
-linearization point. A source publication can order before or after the fork;
-an existing target name or source deletion prevents the registry update.
+Fork writes a new HEAD with a new `BranchId`, then conditionally adds the
+name-to-id mapping to the observed registry. The registry update is the branch
+creation linearization point. A concurrent source publication orders before or
+after the fork.
 
-Deletion first seals the exact registered head, then conditionally removes
-that exact name-to-id mapping. A crash between those operations leaves a sealed
-branch that a repeated delete can finish. Publication either wins the head
-update before the seal or conflicts with it.
+Deletion first seals the exact registered HEAD, then conditionally removes its
+exact name-to-id mapping. A retry can finish a crash between those steps.
+Publication either replaces the active HEAD before sealing or conflicts with
+the sealed incarnation.
 
-Name reuse is safe because deletion compares the registered `BranchId`. A
-retry for an old incarnation never removes a replacement with the same name.
-
-## Sync and future Mount
-
-Sync owns replica state, local conflict retention, and the local durability
-boundary. The branch binding is validated before replica directory creation,
-scan, materialization, or state update. State format 1 records an optional
-branch binding and a relative pending-cache name. Development-time layouts are
-not compatibility formats and are rejected.
-
-The pending staging tree is a cache, not authority. If it is missing or
-damaged before publication, Sync rebuilds it from the current replica. If the
-operation already committed, Sync rebuilds from the authoritative snapshot
-when that cannot overwrite a local change. This permits moving a state file
-with its replica and recovering after local cache cleanup.
-
-Mount will consume the same bound `Volume` and can reuse branch selection,
-publication, history, and data staging. Mount still needs its own
-contract for handle lifetime, cache coherence, writeback, `flush`, `fsync`,
-writer sessions, and any eager journal. Those concerns do not belong in the
-branch metadata extension.
+Name reuse is safe because deletion compares `BranchId`, not only display
+name. A retry for an old incarnation cannot remove its replacement.
 
 ## Failure behavior
 
 | Failure or race | Result |
 | --- | --- |
-| Immutable preparation succeeds, head CAS fails | Unreachable immutable record; retry from the new head |
-| Head update result is unknown | Resolve by `(BranchId, OperationId)` |
-| Fork or delete result is unknown | Re-read the exact name-to-identity mapping before reporting failure |
-| Source publishes during fork | Fork orders before or after that publication |
-| Target names race | One new incarnation is registered |
-| Publication races with deletion | Publication or seal wins; never both |
-| Delete crashes after Object head seal | Repeated delete completes registry removal |
-| Deleted name is reused | Old replica fails branch identity validation |
-| Retained record is missing or corrupt | Fail closed; do not synthesize state |
+| Immutable preparation succeeds and HEAD CAS loses | Unreachable immutable object; reconcile from the new HEAD |
+| HEAD update result is unknown | Resolve the saved operation against HEAD or its receipt |
+| Source publishes during fork | Fork orders before or after the publication |
+| Two creators choose one name | One `BranchId` is registered |
+| Publication races with deletion | Publication or sealing wins |
+| Delete stops after sealing | Repeating delete removes the registry entry |
+| A deleted name is reused | Old replica fails branch-incarnation validation |
+| A referenced record is missing or corrupt | Fail closed |
 
-# Acceptance and regression coverage
+## Limits
 
-One CLI acceptance workflow runs unchanged against Object and D1 metadata:
+`branch/v1` provides named mutable branches, constant-copy fork of a retained
+position, safe deletion, and cross-host Sync recovery. It does not provide
+merge, tags, reset, unbounded history, automatic garbage collection, Mount,
+writer leases, or a per-filesystem-call journal.
 
-```text
-cargo x managed-sync test all
-```
+The registry is one bounded mutable record. Namespace checkpoints are bounded
+compressed objects recovered into one in-memory snapshot. Those choices keep
+the authority and recovery rules small and predictable; a range-indexed
+namespace or another retention policy would require a later format design.
 
-It covers Direct rejection before mutation, remote extension negotiation,
-default branch creation, current fork, independent divergence, historical
-fork after a long history, deletion and name reuse, stale replica rejection
-without local mutation, cold historical materialization, a large namespace
-publication with a retained parent, and stable JSON status.
+## Verification
 
-Regression tests cover mistakes that would silently violate durable behavior:
+`cargo x managed-sync test all` runs the same branch behavior against Object
+and D1 metadata. It covers initialization, current and retained fork,
+independent publication, deletion, name reuse, stale-replica rejection, cold
+materialization, and large namespace publication. Tests assert those visible
+and durable contracts rather than SQL layout, object request order, or helper
+structure.
 
-- every cursor remains recoverable across checkpoint rotation;
-- committed operations are scoped to their origin branch;
-- deleting an old incarnation cannot remove a recreated name.
+## Related documents
 
-Tests do not constrain buffer allocation, SQL statement layout, object-key
-call order, private error variants, or other implementation details users
-cannot observe.
-
-# Drawbacks and limits
-
-Retaining every historical position retains its metadata and referenced data.
-`branch/v1` has no pruning policy, immutable tag, or trash interval.
-
-Historical lookup is linear in the number of archived history segments. A
-disposable index may improve lookup without becoming authority.
-
-Checkpoint storage is one bounded compressed object and recovery constructs one
-in-memory `NamespaceSnapshot`. This is suitable for Sync, but it is below
-lakeFS's range-indexed metadata lookup for very large namespaces. An indexed
-checkpoint would be a later format change without changing registry, head,
-history, or branch binding semantics.
-
-The registry is a single mutable record. Branch lifecycle is therefore atomic
-and simple, but the practical branch count remains bounded by the selected
-backend. A content-addressed branch index behind the mutable root is a later
-format change if that limit becomes material.
-
-There is no merge, tag, branch reset, mounted frontend, writer lease, or
-filesystem-operation journal. These are separate capabilities and should not
-be hidden behind the branch flag.
-
-# Rationale and prior art
-
-[lakeFS](https://github.com/treeverse/lakeFS) separates immutable commits and
-metadata ranges from small mutable branch references. That separation,
-optimistic branch updates, and multi-root retention inform `branch/v1`.
-lakeFS merge, tags, staging tokens, and object-key namespace semantics are not
-required here.
-
-[JuiceFS](https://github.com/juicedata/juicefs) separates transactional
-filesystem metadata from immutable object data. Its clone shares data slices
-but copies namespace metadata, so clone work scales with the tree. Its
-sessions, trash, and delayed cleanup inform future Mount and retention work.
-OFS instead reuses immutable whole-namespace checkpoints.
-
-[Overeasy](https://github.com/modal-labs/overeasy) combines a copy-on-write
-FUSE session with an append-only event stream, checkpoint barriers, and fork
-from current or earlier time. `branch/v1` reuses its useful storage semantics
-without putting a FUSE session or event-log contract into Managed metadata.
-Matching its interactive filesystem experience requires the later Managed
-Mount and journal work described above.
-
-A lakeFS-style commit object for every publication would prepare for merge and
-tags, but would duplicate the existing checkpoint and change-tail model.
-Copying every namespace record, as in a metadata clone, would lose constant
-size fork. Exact storage reference counts would make Object Metadata recovery
-and fork more complex and could fail dangerously by undercounting. Tracing
-from immutable roots is slower but fails safely by retaining data.
-
-Branches also cannot be modeled as separate volumes. That would duplicate
-catalog entries and superblocks. They are independent namespace authorities
-inside one Managed volume.
+- [Managed Sync architecture](managed-sync-architecture.md)
+- [Managed storage format](managed-storage-format.md)
+- [RFC 016](../rfcs/0016_filesystem_architecture.md)

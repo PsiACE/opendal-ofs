@@ -62,3 +62,15 @@ Run the complete provider matrix and the staging/cache-loss regression with:
 ```text
 cargo x managed-sync test all
 ```
+
+The performance command uses MinIO's native audit webhook as its request and
+transfer-byte authority. It attributes operations to cold restore,
+publication, incremental catch-up, and no-op phases, inventories remote data
+and metadata objects separately, records command peak RSS and replica-state
+size, and checks logical tree equality. The local D1 query fixture records
+native HTTP request count, request bytes, response bytes, and SQL statement
+count without logging credentials or query parameters.
+
+```text
+cargo x managed-sync perf --baseline <commit-or-binary>
+```

@@ -21,7 +21,6 @@ binary="$workspace/target/debug/ofs"
 fixtures_started=false
 audit_root=${OFS_MANAGED_SYNC_AUDIT_DIR:-$workspace/.local/managed-sync-audit}
 audit_owned=false
-audit_enabled=off
 declare -a compose
 
 usage() {
@@ -65,7 +64,6 @@ select_compose() {
 compose_run() {
   OFS_MANAGED_SYNC_MINIO_PORT="$minio_port" OFS_MANAGED_SYNC_D1_PORT="$d1_port" \
     OFS_MANAGED_SYNC_AUDIT_DIR="$audit_root" \
-    OFS_MANAGED_SYNC_AUDIT_ENABLED="$audit_enabled" \
     "${compose[@]}" --project-name "$project" --file "$compose_file" "$@"
 }
 
@@ -79,21 +77,10 @@ wait_for_http() {
 }
 
 fixtures_up() {
-  local with_d1=${1:-true} with_audit=${2:-true}
+  local with_d1=${1:-true}
   local -a services=(minio)
   select_compose
-  audit_enabled=off
-  if [[ $with_audit == true ]]; then
-    mkdir -p "$audit_root"
-    : >"$audit_root/audit.jsonl"
-    audit_enabled=on
-    compose_run up --detach audit
-    for _ in $(seq 1 100); do
-      compose_run exec -T audit test -s /tmp/audit.ready && break
-      sleep 0.05
-    done
-    compose_run exec -T audit test -s /tmp/audit.ready
-  fi
+  mkdir -p "$audit_root"
   [[ $with_d1 == true ]] && services+=(d1)
   compose_run up --detach "${services[@]}"
   wait_for_http "http://127.0.0.1:$minio_port/minio/health/ready"
@@ -142,7 +129,7 @@ case_environment() {
 }
 
 run_case() {
-  local suite=$1 metadata=$2 run_root case_id endpoint storage script case_root
+  local suite=$1 metadata=$2 run_root case_id endpoint storage script case_root d1_before=0
   run_root=$(mktemp -d "${TMPDIR:-/tmp}/ofs-managed-${suite}.XXXXXX")
   case_id=$(basename "$run_root")
   case_root="$run_root/case"
@@ -158,10 +145,27 @@ run_case() {
   endpoint="http%3A%2F%2F127.0.0.1%3A${minio_port}"
   storage="s3://managed-sync/${case_id}?endpoint=${endpoint}&region=us-east-1"
   case_environment "$case_root" "$storage" "$metadata"
-  if [[ $suite == staging ]]; then
-    export OFS_AUDIT_LOG="$audit_root/audit.jsonl"
+  if [[ $metadata == d1 ]]; then
+    d1_before=$(wc -l <"$audit_root/d1.jsonl")
   fi
   if bash "$script"; then
+    if [[ $metadata == d1 ]]; then
+      python3 - "$audit_root/d1.jsonl" "$d1_before" <<'PY'
+import json
+import pathlib
+import sys
+
+events = [json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text().splitlines()]
+events = events[int(sys.argv[2]):]
+print(
+    "D1 native HTTP audit: "
+    f"requests={len(events)} "
+    f"request_bytes={sum(event['request_bytes'] for event in events)} "
+    f"response_bytes={sum(event['response_bytes'] for event in events)} "
+    f"statements={sum(event['statements'] for event in events)}"
+)
+PY
+    fi
     rm -rf -- "$run_root"
   else
     printf 'Managed %s evidence retained at %s\n' "$suite" "$run_root" >&2
@@ -190,12 +194,11 @@ run_tests() {
   audit_owned=true
   fixtures_started=true
   trap cleanup EXIT
-  local needs_d1=false needs_audit=false item
+  local needs_d1=false item
   for item in "${cases[@]}"; do
     [[ ${item##*:} == d1 ]] && needs_d1=true
-    [[ ${item%%:*} == staging ]] && needs_audit=true
   done
-  fixtures_up "$needs_d1" "$needs_audit"
+  fixtures_up "$needs_d1"
   for item in "${cases[@]}"; do
     run_case "${item%%:*}" "${item##*:}"
   done
@@ -206,7 +209,7 @@ shift || true
 case $command in
   test) run_tests "$@" ;;
   perf) exec bash "$workspace/tests/performance/managed-sync/run.sh" "$@" ;;
-  up) [[ $# == 0 ]] || fail 'up accepts no arguments'; fixtures_up true true ;;
+  up) [[ $# == 0 ]] || fail 'up accepts no arguments'; fixtures_up true ;;
   down) [[ $# == 0 ]] || fail 'down accepts no arguments'; fixtures_down ;;
   -h|--help) usage ;;
   *) fail "unknown command: $command" ;;

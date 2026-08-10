@@ -10,8 +10,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, bail};
 
-use super::path::{SnapshotEntry, SnapshotTree, descendants, subtree};
-use super::staging::TargetFile;
+use super::path::{SnapshotEntry, SnapshotTree, subtree};
+use super::staging::{TargetEntry, TargetFile};
 use super::{ConflictRecord, ReplicaState, StagedTree, TargetManifest};
 use crate::filesystem::{NodeId, NodeKind};
 
@@ -366,47 +366,42 @@ fn reconcile_local_renames(
         }
     }
 
-    let targets = renames.values().collect::<BTreeSet<_>>();
-    if targets.len() != renames.len() {
-        bail!("remembered local renames contain more than one source for a target");
-    }
-    validate_subtree_renames(base, local_paths, &renames)?;
+    let renames = compact_renames(renames)?;
+    validate_subtree_renames(replica, base, local_paths, &renames)?;
 
     for (from, path) in &renames {
-        if handled.contains(from) && handled.contains(path) {
-            continue;
-        }
-        let base_entry = base
-            .and_then(|tree| tree.get(from))
-            .with_context(|| format!("remembered rename source {from:?} is not in the base"))?;
-        if !local_paths.contains_key(path) {
-            bail!("remembered rename target {path:?} is not staged");
-        }
-        if local_paths.contains_key(from) || replica.installed.contains_key(path) {
-            bail!("remembered rename {from:?} to {path:?} no longer describes the local tree");
-        }
-        let remote_source = remote.get(from);
-        let remote_target = remote.get(path);
-        if remote_source.is_some_and(|entry| remote_matches_base(entry, base_entry))
-            && remote_target.is_none()
+        for (source, target) in
+            rename_subtree(base.expect("a remembered rename has a base"), from, path)?
         {
-            handled.insert(from.clone());
-            handled.insert(path.clone());
-            *publish = true;
-        } else if remote_target.is_some_and(|entry| entry.node.id == base_entry.node.id)
-            && remote_source.is_none()
-            && remote_target.is_some_and(|entry| local_matches_remote(local, path, entry))
-        {
-            handled.insert(from.clone());
-            handled.insert(path.clone());
-        } else {
-            handled.insert(from.clone());
-            handled.insert(path.clone());
-            conflicts.push(ConflictRecord {
-                path: path.clone(),
-                local_digest: local.source().file(path).map(|file| file.logical_digest),
-                remote_digest: remote_target.or(remote_source).and_then(digest),
-            });
+            if handled.contains(&source) && handled.contains(&target) {
+                continue;
+            }
+            let base_entry = base
+                .and_then(|tree| tree.get(&source))
+                .expect("validated rename source is in the base");
+            let remote_source = remote.get(&source);
+            let remote_target = remote.get(&target);
+            if remote_source.is_some_and(|entry| remote_matches_base(entry, base_entry))
+                && remote_target.is_none()
+            {
+                handled.insert(source);
+                handled.insert(target);
+                *publish = true;
+            } else if remote_target.is_some_and(|entry| entry.node.id == base_entry.node.id)
+                && remote_source.is_none()
+                && remote_target.is_some_and(|entry| local_matches_remote(local, &target, entry))
+            {
+                handled.insert(source);
+                handled.insert(target);
+            } else {
+                handled.insert(source);
+                handled.insert(target.clone());
+                conflicts.push(ConflictRecord {
+                    path: target.clone(),
+                    local_digest: local.source().file(&target).map(|file| file.logical_digest),
+                    remote_digest: remote_target.or(remote_source).and_then(digest),
+                });
+            }
         }
     }
 
@@ -414,41 +409,92 @@ fn reconcile_local_renames(
     Ok(renames)
 }
 
-fn validate_subtree_renames<V>(
+fn compact_renames(renames: BTreeMap<String, String>) -> Result<BTreeMap<String, String>> {
+    let mut roots = BTreeMap::new();
+    for (source, target) in renames {
+        if let Some((ancestor, mapped)) = covering_mapping(&roots, &source) {
+            if mapped_path(ancestor, mapped, &source) != target {
+                bail!("local directory rename overlaps another local move");
+            }
+            continue;
+        }
+        roots.insert(source, target);
+    }
+    let mut targets = BTreeMap::new();
+    for (source, target) in &roots {
+        if covering_mapping(&targets, target).is_some() {
+            bail!("remembered local renames overlap at their targets");
+        }
+        if targets.insert(target.clone(), source.clone()).is_some() {
+            bail!("remembered local renames contain more than one source for a target");
+        }
+    }
+    Ok(roots)
+}
+
+fn validate_subtree_renames(
+    replica: &ReplicaState,
     base: Option<&SnapshotTree<'_>>,
-    local: &BTreeMap<String, V>,
+    local: &BTreeMap<String, TargetEntry>,
     renames: &BTreeMap<String, String>,
 ) -> Result<()> {
     for (from, path) in renames {
-        let entry = base
-            .and_then(|tree| tree.get(from))
+        let tree = base.context("remembered local rename has no common base")?;
+        tree.get(from)
             .with_context(|| format!("remembered rename source {from:?} is not in the base"))?;
-        if kind(entry) == super::LocalKind::File {
-            continue;
-        }
-        let target_prefix = format!("{path}/");
-        for (child_from, _) in
-            descendants(base.expect("a remembered rename has a base").paths(), from)
-        {
-            let suffix = &child_from[from.len() + 1..];
-            let child_path = format!("{target_prefix}{suffix}");
-            if local.contains_key(&child_path)
-                && renames.get(child_from).map(String::as_str) != Some(child_path.as_str())
+        for (source, target) in rename_subtree(tree, from, path)? {
+            let installed = replica
+                .installed
+                .get(&source)
+                .with_context(|| format!("remembered rename source {source:?} is not installed"))?;
+            let current = local
+                .get(&target)
+                .with_context(|| format!("remembered rename target {target:?} is not staged"))?;
+            if local.contains_key(&source) || replica.installed.contains_key(&target) {
+                bail!(
+                    "remembered rename {source:?} to {target:?} no longer describes the local tree"
+                );
+            }
+            let current = &current.local;
+            if installed.native_identity.is_none()
+                || installed.native_identity != current.native_identity
+                || installed.kind != current.kind
             {
                 bail!("local directory subtree was copied without stable identity");
             }
         }
-        let source_prefix = format!("{from}/");
-        for (child_from, child_path) in renames {
-            let Some(suffix) = child_from.strip_prefix(&source_prefix) else {
-                continue;
-            };
-            if child_path != &format!("{target_prefix}{suffix}") {
-                bail!("local directory rename overlaps another local move");
-            }
-        }
     }
     Ok(())
+}
+
+fn rename_subtree<'a>(
+    base: &'a SnapshotTree<'a>,
+    source: &'a str,
+    target: &'a str,
+) -> Result<impl Iterator<Item = (String, String)> + 'a> {
+    if base.get(source).is_none() {
+        bail!("remembered rename source {source:?} is not in the base");
+    }
+    Ok(subtree(base.paths(), source)
+        .map(move |(path, _)| (path.clone(), mapped_path(source, target, path))))
+}
+
+fn covering_mapping<'a>(
+    mappings: &'a BTreeMap<String, String>,
+    path: &str,
+) -> Option<(&'a str, &'a str)> {
+    let mut parent = path;
+    while let Some((next, _)) = parent.rsplit_once('/') {
+        parent = next;
+        if let Some((source, target)) = mappings.get_key_value(parent) {
+            return Some((source, target));
+        }
+    }
+    None
+}
+
+fn mapped_path(source: &str, target: &str, path: &str) -> String {
+    format!("{target}{}", &path[source.len()..])
 }
 
 fn remote_matches_base(remote: SnapshotEntry<'_>, base: SnapshotEntry<'_>) -> bool {

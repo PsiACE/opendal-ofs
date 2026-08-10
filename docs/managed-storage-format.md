@@ -27,7 +27,8 @@ policy and are not stored in the superblock.
 | --- | --- | --- |
 | Superblock | Metadata | Immutable for the volume lifetime |
 | Namespace HEAD | Object Metadata | Mutable commit point |
-| Checkpoint | OpenDAL data storage | Immutable while referenced |
+| Checkpoint and change segment | OpenDAL data storage | Immutable |
+| Operation receipt | OpenDAL data storage | Immutable |
 | Authority record | Metadata | Mutable through native revision CAS |
 | File version and extent map | Metadata | Immutable logical file version |
 | Segment | Data | Immutable until unreachable |
@@ -156,10 +157,13 @@ Object Metadata uses these keys:
 .ofs/managed/metadata/v1/superblock.json
 .ofs/managed/metadata/v1/head.ofs
 .ofs/managed/metadata/v1/checkpoints/sha256/<digest>.ofs
+.ofs/managed/metadata/v1/changes/sha256/<digest>.ofs
+.ofs/managed/metadata/v1/operations/<base-or-branch-id>/<operation-id>.ofs
 ```
 
 `head.ofs` is the only mutable namespace object. A conditional replacement is
-the commit point. The other objects are immutable and content-addressed.
+the commit point. Checkpoints and change segments are immutable and
+content-addressed; operation receipts have immutable deterministic keys.
 
 ### HEAD
 
@@ -172,15 +176,17 @@ zstd frame                    variable
 SHA-256 of preceding bytes    32 bytes
 ```
 
-The decoded named-field CBOR record contains format major, volume identity,
-current cursor, checkpoint digest, checkpoint cursor, an ordered transaction
-tail, maintenance epoch, maintenance state, and an optional fixed maintenance
-cursor.
+The decoded strict CBOR record contains the volume identity, optional branch
+identity, sealed state, and optional namespace state. Namespace state contains
+the checkpoint digest and encoded length, checkpoint cursor, an ordered
+transaction tail, up to eight change-segment references, and the most recent
+committed operation result.
 
 Transactions in the tail contain the operation identity, parent and committed
 cursors, resulting root, generation preconditions, and ordered node,
 directory, directory-entry, and file-version effects. The chain MUST be
-consecutive from the checkpoint cursor to the current cursor.
+consecutive from the checkpoint cursor to the current cursor. The tail has at
+most 32 transactions and at most 128 KiB of encoded change bodies.
 
 ### Checkpoint
 
@@ -192,9 +198,10 @@ decoded CBOR length           u64
 zstd frame                    variable
 ```
 
-The decoded strict CBOR record contains one complete `NamespaceSnapshot` and
-the ordered committed-operation receipts required for publication recovery.
-The format does not add another node, directory, file-version, or extent model.
+The decoded strict CBOR record contains one complete filesystem
+`VolumeSnapshot`. Managed file-version data remains in each ordinary
+`FileVersion` descriptor; the format does not add another node, directory,
+precondition, or snapshot graph.
 SHA-256 of the complete envelope determines its object key. Mutable namespace
 state references that digest together with the encoded object length, allowing
 one exact bounded range GET without a preceding metadata request; both values
@@ -203,8 +210,38 @@ are verified before decoding.
 Encoded and decoded checkpoint sizes are each limited to 256 MiB. Recovery
 uses one bounded OpenDAL range read, verifies the complete content identity,
 requires the exact v1 magic and decoded length, rejects trailing or unknown
-CBOR fields, validates the volume and snapshot, and rejects duplicate receipts.
-A checkpoint never depends on another checkpoint.
+CBOR fields, and validates the volume and snapshot. A checkpoint never depends
+on another checkpoint.
+
+### Change segment
+
+A change segment uses the common Managed v1 envelope:
+
+```text
+"OFS1CHG1"                    8 bytes
+strict CBOR body              variable
+SHA-256 of magic and body     32 bytes
+```
+
+The body contains the volume identity, starting checkpoint reference,
+starting cursor, and at most 32 consecutive namespace changes. Its complete
+digest determines the object key. HEAD records the digest, encoded length,
+start cursor, and end cursor, so recovery uses one exact range GET and verifies
+the complete object before decoding. The encoded body is limited to 16 MiB.
+
+### Operation receipt
+
+An operation receipt uses magic `OFS1OPR1` with the same strict
+`magic || CBOR || SHA-256` envelope and a 4096-byte body limit. Its body stores
+authority scope, `OperationId`, committed cursor, and publication request
+digest. The deterministic key is scoped by `base` or the lowercase branch id.
+
+HEAD stores the most recent committed result and a fixed operation-prefix
+filter. Recent results remain reconstructable from the transaction tail and
+retained change segments. The writer persists the initial checkpoint result
+when it is first displaced and persists every result in a change segment
+before removing that segment from HEAD. A committed result is therefore in
+HEAD, retained history, or its deterministic receipt; it does not expire.
 
 ## Transactional Metadata layout
 
@@ -221,9 +258,10 @@ fields, an integer CAS `revision`, and the encoded bytes in lowercase
 `record_key` is exactly the logical key used by Object Metadata, including the
 superblock, base HEAD, and extension registry and heads. `VolumeId` is verified
 from the stored value instead of being duplicated in the table schema.
-Immutable checkpoints for both base and branch authorities remain in the
-configured OpenDAL storage. The filesystem and Data segment layouts are
-identical for Object and Transactional Metadata.
+Immutable checkpoints, change segments, and operation receipts for both base
+and branch authorities remain in the configured OpenDAL storage. The
+filesystem and Data segment layouts are identical for Object and Transactional
+Metadata.
 
 ## Publication and reachability
 
@@ -232,8 +270,9 @@ Publication is ordered as follows:
 1. Observe one Metadata snapshot and revision token.
 2. Write and verify immutable Data segments.
 3. Validate the target namespace and generation preconditions.
-4. Write any immutable checkpoint objects.
-5. Commit with one conditional HEAD replacement or one native transaction.
+4. Write any immutable checkpoint or change-segment objects.
+5. Persist any operation results that are about to leave retained metadata.
+6. Commit with one conditional HEAD replacement or one native transaction.
 
 Segments written before a failed Metadata commit are unreachable. Managed v1
 does not reclaim data segments or immutable metadata objects, so publication
@@ -249,7 +288,8 @@ A reader MUST reject:
 - unordered or duplicate records and invalid key ranges;
 - overflow, out-of-bounds extents, gaps, or overlaps;
 - an invalid cursor chain, generation transition, or filesystem invariant;
-- a missing referenced segment or checkpoint.
+- a missing referenced data segment, checkpoint, change segment, or operation
+  receipt required to resolve a committed operation.
 
 An immutable write may accept an existing object only after verifying that it
 has the expected identity and contents. Missing referenced objects are

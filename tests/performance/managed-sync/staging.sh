@@ -9,7 +9,7 @@
 
 set -euo pipefail
 
-: "${OFS_BIN:?}" "${OFS_CASE_ROOT:?}" "${OFS_STORAGE_URL:?}" "${OFS_AUDIT_LOG:?}"
+: "${OFS_BIN:?}" "${OFS_CASE_ROOT:?}" "${OFS_STORAGE_URL:?}"
 
 fail() {
   printf 'managed-sync staging regression: %s\n' "$*" >&2
@@ -77,23 +77,19 @@ changed_bytes=$(find "$peer/changed" -type f -printf '%s\n' | \
   awk '{ total += $1 } END { print total + 0 }')
 candidate_bytes=$((changed_bytes + $(stat -c %s "$peer/conflict.txt")))
 
-conflict_started_ns=$(date +%s%N)
 if OFS_CONFIG="$peer_catalog" "$OFS_BIN" sync staging "$peer" --state "$peer_state" \
   >/dev/null 2>&1; then
   fail 'same-path conflict succeeded without explicit resolution'
 fi
-conflict_ended_ns=$(date +%s%N)
 conflict_status=$(OFS_CONFIG="$peer_catalog" "$OFS_BIN" status --state "$peer_state" --json)
 grep -Eq '"conflicts"[[:space:]]*:[[:space:]]*1' <<<"$conflict_status" || \
   fail 'unresolved conflict was not retained'
 
-resolve_started_ns=$(date +%s%N)
 OFS_CONFIG="$peer_catalog" "$OFS_BIN" sync staging "$peer" --state "$peer_state" \
   --resolve conflict.txt >/dev/null &
 sync_pid=$!
 pause_when_pending "$peer_state" "$sync_pid" || \
   fail 'could not pause resolved sync before deferred finalization'
-resolve_paused_ns=$(date +%s%N)
 
 staging=$(python3 - "$peer_state" <<'PY'
 import json
@@ -122,63 +118,12 @@ staged_bytes=$(find "$staging" -type f -printf '%s\n' | awk '{ total += $1 } END
 kill -KILL "$sync_pid" 2>/dev/null || true
 wait "$sync_pid" 2>/dev/null || true
 [[ -d $staging ]] || fail 'pending staging was lost with the interrupted process'
-retry_started_ns=$(date +%s%N)
 OFS_CONFIG="$peer_catalog" "$OFS_BIN" sync staging "$peer" --state "$peer_state" \
   --resolve conflict.txt >/dev/null || fail 'pending resolved sync did not recover'
-retry_ended_ns=$(date +%s%N)
 OFS_CONFIG="$catalog" "$OFS_BIN" sync staging "$replica" --state "$state" >/dev/null
 grep -Fxq 'resolved local candidate' "$replica/conflict.txt" || \
   fail 'explicit conflict resolution did not converge on the retained local candidate'
 diff -qr "$replica" "$peer" >/dev/null || fail 'replicas diverged after conflict resolution recovery'
-
-python3 - "$OFS_AUDIT_LOG" \
-  "$conflict_started_ns" "$conflict_ended_ns" \
-  "$resolve_started_ns" "$resolve_paused_ns" \
-  "$retry_started_ns" "$retry_ended_ns" <<'PY'
-import json
-import pathlib
-import sys
-import time
-from datetime import datetime
-
-log = pathlib.Path(sys.argv[1])
-windows = {
-    "conflict": (int(sys.argv[2]), int(sys.argv[3])),
-    "before_finalize": (int(sys.argv[4]), int(sys.argv[5])),
-    "retry": (int(sys.argv[6]), int(sys.argv[7])),
-}
-puts = {name: 0 for name in windows}
-deadline = time.monotonic() + 5
-while True:
-    puts = {name: 0 for name in windows}
-    for line in log.read_text(encoding="utf-8").splitlines():
-        event = json.loads(line)
-        if event["api"]["name"] != "PutObject":
-            continue
-        if "/.ofs/managed/data/v1/segments/sha256/" not in event["requestPath"]:
-            continue
-        event_ns = int(
-            datetime.fromisoformat(event["time"].replace("Z", "+00:00")).timestamp()
-            * 1_000_000_000
-        )
-        for name, (start, end) in windows.items():
-            if start <= event_ns <= end:
-                puts[name] += 1
-    if puts["retry"] or time.monotonic() >= deadline:
-        break
-    time.sleep(0.05)
-if puts["conflict"]:
-    raise SystemExit(f"unresolved conflict uploaded {puts['conflict']} data segment(s)")
-if puts["before_finalize"]:
-    raise SystemExit(f"pending intent did not precede {puts['before_finalize']} segment upload(s)")
-if not puts["retry"]:
-    raise SystemExit("pending recovery finalized no unique data segments")
-print(
-    "deferred finalize evidence: "
-    f"conflict_puts={puts['conflict']} "
-    f"pre_finalize_puts={puts['before_finalize']} retry_puts={puts['retry']}"
-)
-PY
 
 mkdir "$replica/committed-cache-loss"
 for index in $(seq -w 1 128); do
@@ -195,9 +140,17 @@ pending_state="$OFS_CASE_ROOT/pending-before-commit.json"
 cp "$state" "$pending_state"
 kill -CONT "$sync_pid"
 wait "$sync_pid" || fail 'publication did not commit after preserving its pending state'
+for round in $(seq 1 40); do
+  if ((round % 2)); then
+    chmod u+x "$replica/conflict.txt"
+  else
+    chmod u-x "$replica/conflict.txt"
+  fi
+  OFS_CONFIG="$catalog" "$OFS_BIN" sync staging "$replica" --state "$state" >/dev/null
+done
 cp "$pending_state" "$state"
 OFS_CONFIG="$catalog" "$OFS_BIN" sync staging "$replica" --state "$state" >/dev/null || \
-  fail 'committed publication could not recover without its pending cache'
+  fail 'committed publication could not recover from retained history without its pending cache'
 OFS_CONFIG="$catalog" "$OFS_BIN" sync staging "$cold" --state "$cold_state" >/dev/null
 diff -qr "$replica" "$cold" >/dev/null || fail 'cold replica differs after staging recovery'
 

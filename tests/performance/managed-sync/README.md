@@ -26,8 +26,8 @@ of publish/restore generations.
 The binaries connect directly to MinIO. MinIO sends one native audit event per
 API operation to an out-of-band webhook; the harness removes authentication
 headers before retaining the JSON Lines evidence. The report records request
-counts, request and response bytes,
-metadata/data/total object counts and bytes, request distributions, lifecycle
+counts, request and response bytes, metadata/data/total object counts and
+bytes, request distributions, replica-state size, command peak RSS, lifecycle
 median, and publication, cold-restore, and incremental-catch-up p95. Audit rows
 distinguish full and range `GetObject` operations and classify authoritative
 segments, metadata, and control objects. Initialization is reported separately and is not included in
@@ -37,11 +37,12 @@ metrics through a User-Agent heuristic. Every run writes a content-hashed
 logical manifest. Different final trees fail the comparison. The other gates
 reject more than 10 percent lifecycle regression, more than 15 percent publication, cold-restore, or
 incremental-catch-up p95 regression, more than 10 percent growth in total
-requests, restore segment GETs, transferred bytes, or stored bytes, or any
-no-op data upload.
+requests, restore segment GETs, transferred bytes, or stored bytes; more than
+20 percent peak-RSS regression; more than 25 percent replica-state growth;
+metadata above 2 percent of logical data; or any no-op data upload.
 
 `results.json` is the canonical report. Raw recomputable evidence remains in
-`audit.jsonl`, `commands.tsv`, `samples.tsv`, `inputs.tsv`, and each run's
+`audit.jsonl`, `commands.tsv`, `samples.tsv`, `resources.tsv`, `inputs.tsv`, and each run's
 command output, logical manifest, and object inventory. Replica trees,
 catalogs, and states are removed. A final native S3 audit event acts as the
 drain barrier before analysis.

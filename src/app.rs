@@ -58,7 +58,7 @@ async fn branch_command(config: &Path, command: BranchCommand) -> Result<()> {
     let branches = metadata.branches(&format, data)?;
     match command {
         BranchCommand::List(args) => {
-            let listed = branches.list().await?;
+            let listed = branches.list(concurrency).await?;
             if args.json {
                 let default = listed
                     .iter()
@@ -372,6 +372,15 @@ fn status(config: &Path, args: StatusArgs) -> Result<()> {
         "branch_id": state.branch.as_ref().map(|branch| branch.id.to_string()),
         "volume_model": "managed",
         "access_model": "sync",
+        "capabilities": {
+            "portable_names": true,
+            "stable_rename_identity": cfg!(unix),
+            "executable": cfg!(unix),
+            "symbolic_links": false,
+            "hard_links": false,
+            "remote_durability": "explicit_sync",
+            "namespace_publication": "generation_cas",
+        },
         "common_sequence": state.common().sequence(),
         "common_operation": state.common().operation().map(|operation| hex_bytes(operation.as_bytes())),
         "pending": state.pending.is_some(),

@@ -18,22 +18,20 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::filesystem::{FileVersionId, Generation};
+use crate::filesystem::{FileVersion, FileVersionId, Generation, VolumeError};
+use crate::managed::error::{corrupt, invalid};
 use crate::managed::format::{ContentRef, ExtentMap};
-
-pub(crate) type NodeRecord = crate::filesystem::NodeRecord;
-pub(crate) type DirectoryRecord = crate::filesystem::DirectoryRecord;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct FileVersionRecord {
+pub(crate) struct DecodedFileVersion {
     pub(crate) id: FileVersionId,
     pub(crate) logical_size: u64,
     pub(crate) logical_digest: [u8; 32],
     pub(crate) extent_map: ExtentMap,
 }
 
-impl FileVersionRecord {
+impl DecodedFileVersion {
     pub(crate) fn from_extents(
         logical_size: u64,
         logical_digest: [u8; 32],
@@ -124,7 +122,34 @@ fn encode_content(encoded: &mut Vec<u8>, content: &ContentRef) {
     encoded.extend_from_slice(&content.length.to_be_bytes());
 }
 
-pub(crate) type NamespaceSnapshot = crate::filesystem::VolumeSnapshot<FileVersionRecord>;
+pub(crate) fn encode_file_version(
+    version: &DecodedFileVersion,
+) -> Result<FileVersion, VolumeError> {
+    let mut descriptor = Vec::new();
+    ciborium::into_writer(&version.extent_map, &mut descriptor)
+        .map_err(|error| invalid("encode Managed file version", error.to_string()))?;
+    Ok(FileVersion::from_parts(
+        version.id,
+        version.logical_size,
+        version.logical_digest,
+        descriptor,
+    ))
+}
+
+pub(crate) fn decode_file_version(
+    version: &FileVersion,
+) -> Result<DecodedFileVersion, VolumeError> {
+    let extent_map: ExtentMap = ciborium::from_reader(version.descriptor())
+        .map_err(|error| corrupt("decode Managed file version", error.to_string()))?;
+    DecodedFileVersion::from_extents(version.logical_size, version.logical_digest, extent_map)
+        .filter(|decoded| decoded.id == version.id)
+        .ok_or_else(|| {
+            corrupt(
+                "decode Managed file version",
+                "descriptor does not match its filesystem identity",
+            )
+        })
+}
 
 pub(crate) fn managed_generation(value: u64) -> Generation {
     Generation::from_bytes(value.to_be_bytes().to_vec())

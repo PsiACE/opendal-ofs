@@ -6,7 +6,7 @@
 // "License"); you may not use this file except in compliance
 // with the License.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -201,6 +201,7 @@ impl StagedTree {
         {
             bail!("volume did not prepare every changed file exactly once");
         }
+        let changed = changed.iter().map(String::as_str).collect::<BTreeSet<_>>();
 
         let mut entries = tree
             .entries()
@@ -255,7 +256,9 @@ impl StagedTree {
                 .file = Some(TargetFile::from(version));
         }
         for (path, entry) in tree.entries() {
-            require_same_identity(tree.root(), path, entry.kind, entry.native_identity)?;
+            if !changed.contains(path.as_str()) {
+                require_same_identity(tree.root(), path, entry.kind, entry.native_identity)?;
+            }
         }
         let source = TargetManifest { entries };
         let staged = Self {

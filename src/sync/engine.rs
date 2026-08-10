@@ -54,6 +54,7 @@ impl<V: Volume> SyncEngine<V> {
         state_path: impl AsRef<Path>,
         resolve_paths: &[String],
     ) -> Result<SyncResult> {
+        super::local::require_native_capabilities()?;
         let replica_path = replica_path.as_ref();
         let state_path = state_path.as_ref();
         let requested = resolve_paths.iter().cloned().collect::<BTreeSet<_>>();

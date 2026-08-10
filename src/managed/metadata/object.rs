@@ -17,7 +17,6 @@
 
 use futures::StreamExt;
 use opendal::{ErrorKind, Operator};
-use sha2::{Digest as _, Sha256};
 
 use crate::filesystem::{VolumeError, VolumeErrorKind};
 use crate::managed::error::{corrupt, error, unavailable};
@@ -84,24 +83,6 @@ async fn read_object(
         .and_then(|metadata| metadata.etag())
         .map(str::to_owned);
     Ok(Some((bytes, revision)))
-}
-
-pub(crate) async fn read_content_addressed(
-    operator: &Operator,
-    key: &str,
-    expected: &[u8; 32],
-    maximum_bytes: usize,
-    action: &'static str,
-    missing: &'static str,
-    invalid: &'static str,
-) -> Result<Vec<u8>, VolumeError> {
-    let bytes = read(operator, key, maximum_bytes, action)
-        .await?
-        .ok_or_else(|| corrupt(action, missing))?;
-    if Sha256::digest(&bytes).as_slice() != expected {
-        return Err(corrupt(action, invalid));
-    }
-    Ok(bytes)
 }
 
 pub(crate) async fn create(

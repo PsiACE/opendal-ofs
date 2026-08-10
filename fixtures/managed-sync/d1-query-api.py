@@ -13,6 +13,7 @@ import argparse
 import json
 import re
 import sqlite3
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -21,6 +22,18 @@ from urllib.parse import unquote, urlparse
 QUERY_PATH = re.compile(
     r"^(?:/client/v4)?/accounts/([^/]+)/d1/database/([^/]+)/query$"
 )
+
+
+class AuditLog:
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.Lock()
+
+    def append(self, event):
+        if self.path is None:
+            return
+        with self.lock, self.path.open("a", encoding="utf-8") as output:
+            output.write(json.dumps(event, separators=(",", ":"), sort_keys=True) + "\n")
 
 
 def json_value(value):
@@ -56,6 +69,7 @@ class D1Handler(BaseHTTPRequestHandler):
         if self.headers.get("Authorization") != f"Bearer {self.server.token}":
             self.reply(401, {"success": False, "errors": [{"message": "unauthorized"}]})
             return
+        length = 0
         try:
             length = int(self.headers.get("Content-Length", "0"))
             request = json.loads(self.rfile.read(length))
@@ -64,12 +78,14 @@ class D1Handler(BaseHTTPRequestHandler):
                 statements = [{"sql": request["sql"], "params": request.get("params", [])}]
             result = self.execute(unquote(match.group(2)), statements)
         except (ValueError, KeyError, json.JSONDecodeError, sqlite3.Error) as error:
-            self.reply(
+            response_bytes = self.reply(
                 200,
                 {"success": False, "result": [], "errors": [{"message": str(error)}]},
             )
+            self.audit(length, response_bytes, 200, 0)
             return
-        self.reply(200, {"success": True, "result": result, "errors": []})
+        response_bytes = self.reply(200, {"success": True, "result": result, "errors": []})
+        self.audit(length, response_bytes, 200, len(statements))
 
     def execute(self, database_id, statements):
         if not re.fullmatch(r"[A-Za-z0-9_-]+", database_id):
@@ -112,6 +128,19 @@ class D1Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
+        return len(payload)
+
+    def audit(self, request_bytes, response_bytes, status, statements):
+        self.server.audit.append(
+            {
+                "method": "POST",
+                "path": urlparse(self.path).path,
+                "request_bytes": request_bytes,
+                "response_bytes": response_bytes,
+                "statements": statements,
+                "status": status,
+            }
+        )
 
     def log_message(self, message, *arguments):
         print(f"{self.address_string()} - {message % arguments}", flush=True)
@@ -123,11 +152,15 @@ def main():
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--database-root", type=Path, required=True)
     parser.add_argument("--token", required=True)
+    parser.add_argument("--audit-log", type=Path)
     args = parser.parse_args()
     args.database_root.mkdir(parents=True, exist_ok=True)
     server = ThreadingHTTPServer((args.host, args.port), D1Handler)
     server.database_root = args.database_root
     server.token = args.token
+    server.audit = AuditLog(args.audit_log)
+    if args.audit_log is not None:
+        args.audit_log.touch()
     server.serve_forever()
 
 

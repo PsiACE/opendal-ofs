@@ -53,11 +53,7 @@ pub(crate) fn build_publication<V: Volume>(
         let kind = node_kind(entry.local.kind);
         let identity = old_paths
             .get(path)
-            .or_else(|| {
-                rename_sources
-                    .get(path)
-                    .and_then(|from| old_paths.get(from))
-            })
+            .or_else(|| rename_source(&rename_sources, path).and_then(|from| old_paths.get(&from)))
             .and_then(|id| old_nodes.and_then(|nodes| nodes.get(id)))
             .filter(|node| node.kind == kind)
             .map(|node| node.id)
@@ -161,6 +157,20 @@ pub(crate) fn build_publication<V: Volume>(
         file_versions,
     };
     VolumePublication::between(operation, authoritative_snapshot, target).map_err(Into::into)
+}
+
+fn rename_source(renames: &BTreeMap<String, String>, path: &str) -> Option<String> {
+    if let Some(source) = renames.get(path) {
+        return Some(source.clone());
+    }
+    let mut parent = path;
+    while let Some((next, _)) = parent.rsplit_once('/') {
+        parent = next;
+        if let Some(source) = renames.get(parent) {
+            return Some(format!("{source}{}", &path[parent.len()..]));
+        }
+    }
+    None
 }
 
 fn directory_entries(

@@ -62,6 +62,20 @@ def summarize(samples):
     }
 
 
+def load_resources(path: Path):
+    grouped = defaultdict(list)
+    for release, _run, metric, _sample, peak_rss_kib in read_tsv(path):
+        grouped[(release, metric)].append(int(peak_rss_kib))
+    return {
+        f"{release}.{metric}": {
+            "count": len(values),
+            "median_kib": statistics.median(values),
+            "p95_kib": percentile(values, 0.95),
+        }
+        for (release, metric), values in sorted(grouped.items())
+    }
+
+
 def request_phase(event_ns: int, intervals) -> str:
     for interval in intervals:
         if interval["start_ns"] <= event_ns <= interval["end_ns"]:
@@ -166,7 +180,7 @@ def logical_equality(directory: Path, inputs) -> tuple[bool, dict[str, str]]:
     return bool(values) and all(digest == values[0] for digest in values[1:]), digests
 
 
-def comparison_summary(statistics_by_metric, requests, object_totals, inputs, equal):
+def comparison_summary(statistics_by_metric, resources, requests, object_totals, inputs, equal):
     product_phases = {"cold_restore", "incremental_catchup", "publication", "noop"}
     request_totals = defaultdict(lambda: {"count": 0, "request_bytes": 0, "response_bytes": 0})
     request_operations = defaultdict(lambda: defaultdict(int))
@@ -226,6 +240,14 @@ def comparison_summary(statistics_by_metric, requests, object_totals, inputs, eq
                     "total_bytes",
                 )
             },
+            "local_state_bytes_median": statistics.median(
+                inputs[run]["replica_state_bytes"] for run in runs
+            ),
+            "peak_rss": {
+                key: value
+                for key, value in resources.items()
+                if key.startswith(f"{release}.")
+            },
             "latency": {
                 key: value
                 for key, value in statistics_by_metric.items()
@@ -255,6 +277,7 @@ def main() -> None:
     directory = arguments.directory
     samples, intervals = load_metrics(directory / "samples.tsv")
     statistics_by_metric = summarize(samples)
+    resources = load_resources(directory / "resources.tsv")
     requests, noop_data_puts = load_audit(
         directory / "audit.jsonl", intervals, arguments.access_key
     )
@@ -263,7 +286,7 @@ def main() -> None:
     equal, manifest_digests = logical_equality(directory, inputs)
     context = {key: value for key, value in read_tsv(directory / "context.tsv")}
     summary = comparison_summary(
-        statistics_by_metric, requests, object_totals, inputs, equal
+        statistics_by_metric, resources, requests, object_totals, inputs, equal
     )
     baseline_summary = summary["releases"]["baseline"]
     candidate_summary = summary["releases"]["candidate"]
@@ -297,6 +320,15 @@ def main() -> None:
         for name in request_specs
     )
     gates.extend(
+        relative_gate(
+            f"{metric}_peak_rss_p95",
+            resources[f"baseline.{metric}"]["p95_kib"],
+            resources[f"candidate.{metric}"]["p95_kib"],
+            0.20,
+        )
+        for metric in ("publication", "cold_restore", "incremental_catchup")
+    )
+    gates.extend(
         [
             relative_gate(
                 "transferred_bytes_median",
@@ -312,6 +344,29 @@ def main() -> None:
                 candidate_summary["remote_objects"]["total_bytes_median"],
                 0.10,
             ),
+            relative_gate(
+                "replica_state_bytes_median",
+                baseline_summary["local_state_bytes_median"],
+                candidate_summary["local_state_bytes_median"],
+                0.25,
+            ),
+            {
+                "name": "metadata_bytes_within_logical_budget",
+                "ratio": candidate_summary["remote_objects"]["metadata_bytes_median"]
+                / statistics.median(
+                    values["logical_bytes"]
+                    for values in inputs.values()
+                    if values["release"] == "candidate"
+                ),
+                "limit_ratio": 0.02,
+                "passed": candidate_summary["remote_objects"]["metadata_bytes_median"]
+                <= 0.02
+                * statistics.median(
+                    values["logical_bytes"]
+                    for values in inputs.values()
+                    if values["release"] == "candidate"
+                ),
+            },
             {
                 "name": "noop_phase_covered",
                 "passed": set(inputs)
@@ -347,6 +402,7 @@ def main() -> None:
             "inputs": "inputs.tsv",
             "runs": "runs/",
             "samples": "samples.tsv",
+            "resources": "resources.tsv",
         },
         "audit_distribution": requests,
         "logical_manifest_sha256": manifest_digests,

@@ -19,12 +19,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use super::decode_file_version;
 use super::validation::{
     match_preconditions, validate_directory_generation, validate_node_generation,
 };
-use super::{DirectoryRecord, FileVersionRecord, NamespaceSnapshot};
 use crate::filesystem::{
-    BranchId, ChangeCursor, OperationId, VolumeError, VolumeId, VolumeMutation,
+    BranchId, ChangeCursor, DirectoryRecord, FileVersion, OperationId, VolumeError, VolumeId,
+    VolumeMutation, VolumeSnapshot,
 };
 use crate::managed::error::corrupt;
 
@@ -32,7 +33,7 @@ use crate::managed::error::corrupt;
 #[serde(deny_unknown_fields)]
 pub(crate) struct NamespaceChange {
     pub(crate) origin_branch: Option<BranchId>,
-    pub(crate) mutation: VolumeMutation<FileVersionRecord>,
+    pub(crate) mutation: VolumeMutation,
 }
 
 pub(crate) struct ValidatedChange {
@@ -40,10 +41,7 @@ pub(crate) struct ValidatedChange {
 }
 
 impl NamespaceChange {
-    pub(crate) fn new(
-        mutation: VolumeMutation<FileVersionRecord>,
-        origin_branch: Option<BranchId>,
-    ) -> Self {
+    pub(crate) fn new(mutation: VolumeMutation, origin_branch: Option<BranchId>) -> Self {
         Self {
             origin_branch,
             mutation,
@@ -64,8 +62,8 @@ impl NamespaceChange {
 
     pub(crate) fn apply(
         &self,
-        base: Option<NamespaceSnapshot>,
-    ) -> Result<NamespaceSnapshot, VolumeError> {
+        base: Option<VolumeSnapshot>,
+    ) -> Result<VolumeSnapshot, VolumeError> {
         self.validate(self.mutation.volume_id)?;
         let Some(validated) = self.validate_against(base.as_ref()).map_err(|_| {
             corrupt(
@@ -84,10 +82,10 @@ impl NamespaceChange {
 
     pub(crate) fn apply_validated(
         &self,
-        base: Option<NamespaceSnapshot>,
+        base: Option<VolumeSnapshot>,
         validated: ValidatedChange,
-    ) -> NamespaceSnapshot {
-        let mut target = base.unwrap_or_else(|| NamespaceSnapshot {
+    ) -> VolumeSnapshot {
+        let mut target = base.unwrap_or_else(|| VolumeSnapshot {
             volume_id: self.mutation.volume_id,
             cursor: ChangeCursor::Genesis,
             root: self.mutation.root,
@@ -131,7 +129,7 @@ impl NamespaceChange {
 
     pub(crate) fn validate_against(
         &self,
-        base: Option<&NamespaceSnapshot>,
+        base: Option<&VolumeSnapshot>,
     ) -> Result<Option<ValidatedChange>, VolumeError> {
         if base.is_some_and(|base| {
             base.volume_id != self.mutation.volume_id || base.cursor != self.mutation.parent
@@ -203,7 +201,8 @@ impl NamespaceChange {
             |record| record.id,
             |_, current, next| {
                 if next.is_some_and(|next| {
-                    !next.is_valid() || current.is_some_and(|current| current != next)
+                    decode_file_version(next).is_err()
+                        || current.is_some_and(|current: &FileVersion| current != next)
                 }) {
                     Err(corrupt(
                         "read Managed transaction",

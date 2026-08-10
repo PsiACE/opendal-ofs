@@ -106,10 +106,10 @@ One invocation:
 
 1. Resolves an interrupted operation recorded in the state file.
 2. Observes a fixed remote snapshot.
-3. Freezes and scans the local tree.
+3. Scans the local tree and seals changed content into local staged segments.
 4. Reconciles the common base, local tree, and remote snapshot.
 5. Records a durable pending intent when local content must be published.
-6. Rebuilds, verifies, and uploads its immutable segments from frozen files.
+6. Verifies and uploads the sealed immutable segments.
 7. Publishes one generation-checked namespace change.
 8. Installs and verifies the merged tree.
 9. Advances the common base and exits.
@@ -139,6 +139,15 @@ The JSON object contains:
   "volume_id": "00112233445566778899aabbccddeeff",
   "volume_model": "managed",
   "access_model": "sync",
+  "capabilities": {
+    "portable_names": true,
+    "stable_rename_identity": true,
+    "executable": true,
+    "symbolic_links": false,
+    "hard_links": false,
+    "remote_durability": "explicit_sync",
+    "namespace_publication": "generation_cas"
+  },
   "common_sequence": 12,
   "pending": false,
   "conflicts": 0
@@ -203,9 +212,15 @@ that volume identity.
 ## Filesystem surface
 
 Managed Sync accepts regular files, directories, empty directories, portable
-UTF-8 names, and the Unix executable bit. It rejects symbolic links, hard
-links, unsupported file types, and ambiguous portable names before remote
-publication.
+UTF-8 names, and the Unix executable bit. Names must be NFC, at most 255 UTF-8
+bytes per component and 4096 bytes per relative path, valid as Windows desktop
+names, and unique after full Unicode case folding within a directory. Sync
+rejects symbolic links, hard links, unsupported file types, and ambiguous
+portable names before remote publication.
+
+The current Sync frontend requires Unix native file identity and executable
+attributes. It rejects another platform at admission instead of changing those
+semantics.
 
 The replica contains only user files. Catalog data, credentials, replica
 state, staging data, and conflict records stay outside the synchronized tree.

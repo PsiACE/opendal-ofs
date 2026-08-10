@@ -152,6 +152,30 @@ if ln "$replica_a/hard-link-source.txt" "$replica_a/hard-link-alias.txt" 2>/dev/
 fi
 rm "$replica_a/hard-link-source.txt"
 
+printf '%s\n' 'acceptance: reject ambiguous portable names before publication'
+portable_state=$(sha256sum "$state_a")
+mkdir "$replica_a/portable-names"
+: >"$replica_a/portable-names/CON"
+if portable_error=$(OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a" 2>&1); then
+  fail 'a platform-reserved name was published'
+fi
+grep -Fq 'non-portable path' <<<"$portable_error" || \
+  fail 'reserved-name rejection was not actionable'
+rm "$replica_a/portable-names/CON"
+: >"$replica_a/portable-names/"$'e\u0301'
+if OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a" >/dev/null 2>&1; then
+  fail 'a non-normalized name was published'
+fi
+rm "$replica_a/portable-names/"$'e\u0301'
+: >"$replica_a/portable-names/Foo"
+: >"$replica_a/portable-names/foo"
+if OFS_CONFIG="$config" "$OFS_BIN" sync workspace "$replica_a" --state "$state_a" >/dev/null 2>&1; then
+  fail 'a case-folding collision was published'
+fi
+rm -rf -- "$replica_a/portable-names"
+[[ "$(sha256sum "$state_a")" == "$portable_state" ]] || \
+  fail 'portable-name rejection changed replica state'
+
 printf '%s\n' 'acceptance: publish nested, empty, executable, and large files'
 mkdir -p "$replica_a/nested/level" "$replica_a/tools"
 printf '%s\n' 'created in a nested directory' >"$replica_a/nested/level/entry.txt"
@@ -359,6 +383,8 @@ grep -Eq '"volume_model"[[:space:]]*:[[:space:]]*"managed"' <<<"$status_json" ||
   fail 'status did not report volume_model=managed'
 grep -Eq '"access_model"[[:space:]]*:[[:space:]]*"sync"' <<<"$status_json" || \
   fail 'status did not report access_model=sync'
+grep -Eq '"stable_rename_identity"[[:space:]]*:[[:space:]]*true' <<<"$status_json" || \
+  fail 'status did not report the admitted native rename capability'
 grep -Eq '"volume_alias"[[:space:]]*:[[:space:]]*"recovered-workspace"' <<<"$status_json" || \
   fail 'status did not report the current client local alias'
 grep -Eq '"volume_id"[[:space:]]*:[[:space:]]*"[0-9a-f]{32}"' <<<"$status_json" || \

@@ -25,13 +25,12 @@ mod validation;
 
 pub(crate) use change::{NamespaceChange, ValidatedChange};
 pub(crate) use records::{
-    DirectoryRecord, FileVersionRecord, NamespaceSnapshot, managed_generation,
+    DecodedFileVersion, decode_file_version, encode_file_version, managed_generation,
     next_managed_generation,
 };
 pub(crate) use state::{
-    ChangeSegmentRef, CheckpointRef, StoredChange, StoredChangeSegment, StoredCheckpoint,
-    StoredCommittedResult, StoredNamespaceState, recover_namespace, replay_tail_from,
-    require_request_digest,
+    ChangeSegmentRef, CheckpointRef, StoredChangeSegment, StoredCheckpoint, StoredCommittedResult,
+    StoredNamespaceState, recover_namespace, replay_tail_from, require_request_digest,
 };
 pub(crate) use store::{MAX_HEAD_ENCODED_BYTES, StoredHead, decode_head, encode_head};
 pub(crate) use store::{NamespaceStore, NamespaceWitness};

@@ -24,6 +24,8 @@ use std::num::NonZeroUsize;
 
 use opendal::Operator;
 use serde::{Deserialize, Serialize};
+use unicode_casefold::UnicodeCaseFold as _;
+use unicode_normalization::UnicodeNormalization as _;
 
 use super::AuthorityIdentity;
 use super::{
@@ -88,16 +90,16 @@ pub struct DirectoryRecord {
 /// its decoded representation internally without copying the namespace model.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct VolumeSnapshot<F = FileVersion> {
+pub struct VolumeSnapshot {
     pub volume_id: VolumeId,
     pub cursor: ChangeCursor,
     pub root: NodeId,
     pub nodes: BTreeMap<NodeId, NodeRecord>,
     pub directories: BTreeMap<NodeId, DirectoryRecord>,
-    pub file_versions: BTreeMap<FileVersionId, F>,
+    pub file_versions: BTreeMap<FileVersionId, FileVersion>,
 }
 
-impl<F> VolumeSnapshot<F> {
+impl VolumeSnapshot {
     /// Return every non-root path in this namespace.
     ///
     /// Walking also proves that directories form a tree. Regular files may be
@@ -203,6 +205,7 @@ impl<F> VolumeSnapshot<F> {
         }
 
         let paths = self.paths()?;
+        validate_portable_paths(paths.keys().map(String::as_str))?;
         let reachable = paths
             .values()
             .copied()
@@ -213,6 +216,54 @@ impl<F> VolumeSnapshot<F> {
         }
         Ok(())
     }
+}
+
+const MAX_PORTABLE_COMPONENT_BYTES: usize = 255;
+const MAX_PORTABLE_PATH_BYTES: usize = 4096;
+
+pub(crate) fn validate_portable_paths<'a>(
+    paths: impl IntoIterator<Item = &'a str>,
+) -> Result<(), VolumeError> {
+    let mut folded = BTreeSet::new();
+    for path in paths {
+        if path.is_empty()
+            || path.len() > MAX_PORTABLE_PATH_BYTES
+            || path.starts_with('/')
+            || path.ends_with('/')
+            || path.contains("//")
+        {
+            return Err(invalid_snapshot("path is not portable"));
+        }
+        let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+        if name.len() > MAX_PORTABLE_COMPONENT_BYTES
+            || name == "."
+            || name == ".."
+            || name.ends_with([' ', '.'])
+            || name.chars().any(|character| {
+                character.is_control()
+                    || matches!(character, '<' | '>' | ':' | '"' | '\\' | '|' | '?' | '*')
+            })
+            || !name.nfc().eq(name.chars())
+        {
+            return Err(invalid_snapshot("path component is not portable"));
+        }
+        let folded_name = name.case_fold().nfc().collect::<String>();
+        let stem = folded_name.split('.').next().unwrap_or_default();
+        if matches!(stem, "con" | "prn" | "aux" | "nul")
+            || stem.len() == 4
+                && (stem.starts_with("com") || stem.starts_with("lpt"))
+                && matches!(stem.as_bytes()[3], b'1'..=b'9')
+            || matches!(stem, "com¹" | "com²" | "com³" | "lpt¹" | "lpt²" | "lpt³")
+        {
+            return Err(invalid_snapshot("path component is reserved"));
+        }
+        if !folded.insert((parent, folded_name)) {
+            return Err(invalid_snapshot(
+                "directory contains a case-folding collision",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn invalid_snapshot(message: &'static str) -> VolumeError {
@@ -299,7 +350,7 @@ impl DirectoryMutation {
 /// The changed records in one generation-checked publication.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct VolumeMutation<F = FileVersion> {
+pub(crate) struct VolumeMutation {
     pub(crate) volume_id: VolumeId,
     pub(crate) operation: OperationId,
     pub(crate) parent: ChangeCursor,
@@ -311,15 +362,15 @@ pub(crate) struct VolumeMutation<F = FileVersion> {
     pub(crate) remove_nodes: Vec<NodeId>,
     pub(crate) put_directories: Vec<DirectoryMutation>,
     pub(crate) remove_directories: Vec<NodeId>,
-    pub(crate) put_file_versions: Vec<F>,
+    pub(crate) put_file_versions: Vec<FileVersion>,
     pub(crate) remove_file_versions: Vec<FileVersionId>,
 }
 
-impl<F: Clone + Eq> VolumeMutation<F> {
+impl VolumeMutation {
     fn between(
         operation: OperationId,
-        base: Option<&VolumeSnapshot<F>>,
-        target: &VolumeSnapshot<F>,
+        base: Option<&VolumeSnapshot>,
+        target: &VolumeSnapshot,
     ) -> Self {
         let empty_nodes = BTreeMap::new();
         let empty_directories = BTreeMap::new();
@@ -416,16 +467,16 @@ fn invalid_mutation(message: &'static str) -> VolumeError {
 
 /// One generation-checked filesystem publication.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct VolumePublication<F = FileVersion> {
-    pub target: VolumeSnapshot<F>,
-    mutation: VolumeMutation<F>,
+pub struct VolumePublication {
+    pub target: VolumeSnapshot,
+    mutation: VolumeMutation,
 }
 
-impl<F: Clone + Eq> VolumePublication<F> {
+impl VolumePublication {
     pub(crate) fn between(
         operation: OperationId,
-        base: Option<&VolumeSnapshot<F>>,
-        target: VolumeSnapshot<F>,
+        base: Option<&VolumeSnapshot>,
+        target: VolumeSnapshot,
     ) -> Result<Self, VolumeError> {
         target.validate_structure()?;
         let parent = base.map_or(ChangeCursor::Genesis, |snapshot| snapshot.cursor);
@@ -439,7 +490,7 @@ impl<F: Clone + Eq> VolumePublication<F> {
         Ok(Self { target, mutation })
     }
 
-    pub(crate) fn mutation(&self) -> &VolumeMutation<F> {
+    pub(crate) fn mutation(&self) -> &VolumeMutation {
         &self.mutation
     }
 }

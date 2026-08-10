@@ -13,14 +13,16 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use super::{NamespaceChange, NamespaceSnapshot};
-use crate::filesystem::{BranchId, ChangeCursor, OperationId, VolumeError, VolumeId};
+use super::NamespaceChange;
+use crate::filesystem::{
+    BranchId, ChangeCursor, OperationId, VolumeError, VolumeId, VolumeSnapshot,
+};
 use crate::managed::error::{conflict, corrupt};
 
 pub(crate) const MAX_TAIL_TRANSACTIONS: usize = 32;
 pub(crate) const MAX_TAIL_BYTES: usize = 128 * 1024;
 pub(crate) const MAX_CHANGE_SEGMENTS: usize = 8;
-pub(crate) const MAX_COMMITTED_RESULTS: usize = 256;
+const OPERATION_PREFIX_WORDS: usize = 1024;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -33,11 +35,10 @@ pub(crate) struct CheckpointRef {
 #[serde(deny_unknown_fields)]
 pub(crate) struct ChangeSegmentRef {
     pub(crate) digest: [u8; 32],
+    pub(crate) length: u64,
     pub(crate) start: ChangeCursor,
     pub(crate) end: ChangeCursor,
 }
-
-pub(crate) type StoredChange = NamespaceChange;
 
 impl NamespaceChange {
     pub(crate) fn fingerprint(&self) -> Result<([u8; 32], usize), VolumeError> {
@@ -58,10 +59,10 @@ impl NamespaceChange {
 pub(crate) struct StoredNamespaceState {
     pub(crate) checkpoint: CheckpointRef,
     pub(crate) checkpoint_cursor: ChangeCursor,
-    pub(crate) tail: Vec<StoredChange>,
+    pub(crate) tail: Vec<NamespaceChange>,
     pub(crate) segments: Vec<ChangeSegmentRef>,
-    pub(crate) outcomes: Vec<StoredCommittedResult>,
-    pub(crate) outcomes_complete: bool,
+    pub(crate) operation_prefixes: Vec<u64>,
+    pub(crate) outcome: Option<StoredCommittedResult>,
 }
 
 impl StoredNamespaceState {
@@ -74,7 +75,7 @@ impl StoredNamespaceState {
     pub(crate) fn validate(&self, volume_id: VolumeId) -> Result<(), VolumeError> {
         if self.tail.len() > MAX_TAIL_TRANSACTIONS
             || self.segments.len() > MAX_CHANGE_SEGMENTS
-            || self.outcomes.len() > MAX_COMMITTED_RESULTS
+            || self.operation_prefixes.len() != OPERATION_PREFIX_WORDS
         {
             return Err(corrupt(
                 "read Managed namespace",
@@ -113,15 +114,12 @@ impl StoredNamespaceState {
             parent = change.cursor();
         }
         let cursor = self.cursor();
-        let mut outcome_keys = BTreeSet::new();
-        for result in &self.outcomes {
+        if let Some(result) = &self.outcome {
             result.validate()?;
-            if !outcome_keys.insert((result.origin_branch, result.operation))
-                || result.cursor.sequence() > cursor.sequence()
-            {
+            if result.cursor != cursor || !self.maybe_contains(result.operation) {
                 return Err(corrupt(
                     "read Managed namespace",
-                    "namespace outcome index is invalid",
+                    "namespace outcome does not describe HEAD",
                 ));
             }
         }
@@ -135,47 +133,79 @@ impl StoredNamespaceState {
         }
         let mut state = self.clone();
         state.tail.truncate((sequence - checkpoint) as usize);
-        state
-            .outcomes
-            .retain(|result| result.cursor.sequence() <= sequence);
+        if state
+            .outcome
+            .as_ref()
+            .is_some_and(|result| result.cursor.sequence() > sequence)
+        {
+            state.outcome = None;
+        }
         Some(state)
     }
 
     pub(crate) fn record_outcome(&mut self, result: StoredCommittedResult) {
-        self.outcomes.push(result);
-        let excess = self.outcomes.len().saturating_sub(MAX_COMMITTED_RESULTS);
-        if excess != 0 {
-            self.outcomes_complete = false;
-        }
-        self.outcomes.drain(..excess);
+        self.remember(result.operation);
+        self.outcome = Some(result);
     }
 
     pub(crate) fn reset_outcomes(&mut self) {
-        self.outcomes.clear();
-        self.outcomes_complete = true;
+        self.operation_prefixes.fill(0);
+        self.outcome = None;
+    }
+
+    pub(crate) fn empty_operation_index() -> Vec<u64> {
+        vec![0; OPERATION_PREFIX_WORDS]
+    }
+
+    pub(crate) fn maybe_contains(&self, operation: OperationId) -> bool {
+        let prefix = operation_prefix(operation);
+        self.operation_prefixes[prefix / 64] & (1 << (prefix % 64)) != 0
+    }
+
+    pub(crate) fn outcome_is_retained(&self) -> bool {
+        self.outcome.as_ref().is_none_or(|result| {
+            self.tail
+                .iter()
+                .any(|change| change.operation() == result.operation)
+                || self
+                    .segments
+                    .iter()
+                    .any(|segment| segment.end == result.cursor)
+        })
+    }
+
+    fn remember(&mut self, operation: OperationId) {
+        let prefix = operation_prefix(operation);
+        self.operation_prefixes[prefix / 64] |= 1 << (prefix % 64);
     }
 
     pub(crate) fn resolve(
         &self,
         origin: Option<BranchId>,
         operation: OperationId,
-    ) -> Result<Option<&StoredCommittedResult>, VolumeError> {
-        self.outcomes
-            .iter()
-            .find(|result| result.origin_branch == origin && result.operation == operation)
-            .map(|result| result.validate().map(|()| result))
-            .transpose()
+    ) -> Option<&StoredCommittedResult> {
+        self.outcome
+            .as_ref()
+            .filter(|result| result.origin_branch == origin && result.operation == operation)
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+fn operation_prefix(operation: OperationId) -> usize {
+    u16::from_be_bytes(
+        operation.as_bytes()[..2]
+            .try_into()
+            .expect("operation has 16 bytes"),
+    ) as usize
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct StoredCheckpoint {
-    pub(crate) snapshot: NamespaceSnapshot,
+    pub(crate) snapshot: VolumeSnapshot,
 }
 
 impl StoredCheckpoint {
-    pub(crate) fn recover(self, volume_id: VolumeId) -> Result<NamespaceSnapshot, VolumeError> {
+    pub(crate) fn recover(self, volume_id: VolumeId) -> Result<VolumeSnapshot, VolumeError> {
         if self.snapshot.volume_id != volume_id {
             return Err(corrupt(
                 "read Managed namespace",
@@ -198,7 +228,7 @@ pub(crate) struct StoredCommittedResult {
 
 impl StoredCommittedResult {
     pub(crate) fn from_change(
-        change: &StoredChange,
+        change: &NamespaceChange,
         request_sha256: [u8; 32],
     ) -> Result<Self, VolumeError> {
         let result = Self {
@@ -228,7 +258,7 @@ pub(crate) struct StoredChangeSegment {
     pub(crate) volume_id: VolumeId,
     pub(crate) checkpoint: CheckpointRef,
     pub(crate) checkpoint_cursor: ChangeCursor,
-    pub(crate) changes: Vec<StoredChange>,
+    pub(crate) changes: Vec<NamespaceChange>,
 }
 
 impl StoredChangeSegment {
@@ -281,7 +311,7 @@ pub(crate) fn recover_namespace(
     checkpoint: StoredCheckpoint,
     state: &StoredNamespaceState,
     volume_id: VolumeId,
-) -> Result<NamespaceSnapshot, VolumeError> {
+) -> Result<VolumeSnapshot, VolumeError> {
     let mut snapshot = checkpoint.recover(volume_id)?;
     if snapshot.cursor != state.checkpoint_cursor {
         return Err(corrupt(
@@ -306,9 +336,9 @@ pub(crate) fn recover_namespace(
 }
 
 pub(crate) fn replay_tail_from(
-    base: &NamespaceSnapshot,
+    base: &VolumeSnapshot,
     state: &StoredNamespaceState,
-) -> Result<Option<NamespaceSnapshot>, VolumeError> {
+) -> Result<Option<VolumeSnapshot>, VolumeError> {
     super::validate_snapshot(base)?;
     if base.cursor == state.cursor() {
         return Ok(Some(base.clone()));

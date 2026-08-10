@@ -30,12 +30,12 @@ use crate::managed::metadata::namespace::{
 use crate::managed::metadata::record::{RecordBackend, Revision};
 use futures::{StreamExt, TryStreamExt, stream};
 use opendal::Operator;
+use std::num::NonZeroUsize;
 
 const ROOT: &str = ".ofs/managed/metadata/v1/extensions/branch/v1";
 const REGISTRY_KEY: &str = ".ofs/managed/metadata/v1/extensions/branch/v1/registry.ofs";
 const MAX_REGISTRY_BODY_BYTES: usize = 4 * 1024 * 1024;
 const REGISTRY_RECORD: V1Record = V1Record::new(*b"OFS1BRG1", MAX_REGISTRY_BODY_BYTES);
-const BRANCH_LIST_CONCURRENCY: usize = 8;
 const BRANCH_CAS_ATTEMPTS: usize = 8;
 
 #[derive(Clone)]
@@ -119,7 +119,7 @@ impl BranchStore {
             .await
     }
 
-    pub async fn list(&self) -> Result<Vec<BranchInfo>, VolumeError> {
+    pub async fn list(&self, concurrency: NonZeroUsize) -> Result<Vec<BranchInfo>, VolumeError> {
         let (registry, _) = self.registry().await?;
         let default = registry.default_branch;
         let mut branches = stream::iter(registry.branches)
@@ -129,7 +129,7 @@ impl BranchStore {
                 })?;
                 Ok(info(name, id, &head, default))
             })
-            .buffer_unordered(BRANCH_LIST_CONCURRENCY)
+            .buffer_unordered(concurrency.get())
             .try_collect::<Vec<_>>()
             .await?;
         branches.sort_by(|left, right| left.binding.name.cmp(&right.binding.name));
