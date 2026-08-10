@@ -450,7 +450,7 @@ impl BranchStore {
             }
             sweeps.push((*id, sweep));
         }
-        let current = self.registry().await?.0;
+        let (mut current, revision) = self.registry().await?;
         if current.maintenance_owner != Some(owner)
             || current.maintenance_epoch != registry.maintenance_epoch
             || current.branches != registry.branches
@@ -466,15 +466,6 @@ impl BranchStore {
             .await?;
         for (id, sweep) in sweeps {
             self.unlock_head(id, sweep).await?;
-        }
-        let (mut current, revision) = self.registry().await?;
-        if current.maintenance_owner != Some(owner)
-            || current.maintenance_epoch != registry.maintenance_epoch
-        {
-            return Err(conflict(
-                "finish Managed data collection",
-                "branch registry collection fence changed",
-            ));
         }
         current.maintenance_owner = None;
         if !self
