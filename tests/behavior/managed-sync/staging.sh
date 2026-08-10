@@ -37,14 +37,9 @@ cold="$OFS_CASE_ROOT/cold"
 cold_state="$OFS_CASE_ROOT/state/cold.json"
 mkdir -p "$replica" "$peer" "$(dirname "$state")" "$cold"
 
-target_options=(--model managed --storage "$OFS_STORAGE_URL")
-if [[ -n ${OFS_METADATA_URL:-} ]]; then
-  target_options+=(--metadata "$OFS_METADATA_URL")
-fi
-unset OFS_STORAGE_URL OFS_METADATA_URL
 printf '%s\n' 'common conflict content' >"$replica/conflict.txt"
-"$OFS_BIN" sync "$replica" --state "$state" --init "${target_options[@]}" >/dev/null
-"$OFS_BIN" sync "$peer" --state "$peer_state" "${target_options[@]}" >/dev/null
+"$OFS_BIN" sync "$replica" --state "$state" --init --model managed >/dev/null
+"$OFS_BIN" sync "$peer" --state "$peer_state" >/dev/null
 
 printf '%s\n' 'remote conflict candidate' >"$replica/conflict.txt"
 "$OFS_BIN" sync "$replica" --state "$state" >/dev/null
@@ -109,7 +104,7 @@ done
 cp "$pending_state" "$state"
 "$OFS_BIN" sync "$replica" --state "$state" >/dev/null || \
   fail 'committed publication could not recover from retained history without its pending cache'
-"$OFS_BIN" sync "$cold" --state "$cold_state" "${target_options[@]}" >/dev/null
+"$OFS_BIN" sync "$cold" --state "$cold_state" >/dev/null
 diff -qr "$replica" "$cold" >/dev/null || fail 'cold replica differs after staging recovery'
 
 printf '%s\n' 'managed-sync staging recovery passed'

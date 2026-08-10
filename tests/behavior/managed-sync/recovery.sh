@@ -21,7 +21,7 @@ sync_b >/dev/null
 
 printf '%s\n' 'recovery: rebuild a cold client from the remote Managed format'
 cold_root_identity=$(ls -di -- "$cold_replica")
-attach_cold >/dev/null
+sync_cold >/dev/null
 diff -ru "$replica_a" "$cold_replica" || fail 'cold replica does not match the published tree'
 [[ "$(ls -di -- "$cold_replica")" == "$cold_root_identity" ]] || \
   fail 'cold rebuild replaced the replica root'

@@ -56,12 +56,6 @@ cold_replica="$OFS_CASE_ROOT/cold-replica"
 state_a="$OFS_CASE_ROOT/state/replica-a.json"
 state_b="$OFS_CASE_ROOT/state/replica-b.json"
 cold_state="$OFS_CASE_ROOT/state/cold-replica.json"
-target_options=(--model managed --storage "$OFS_STORAGE_URL")
-if [[ "$OFS_METADATA_MODE" == d1 ]]; then
-  target_options+=(--metadata "$OFS_METADATA_URL")
-fi
-unset OFS_STORAGE_URL OFS_METADATA_URL
-
 mkdir -p "$replica_a" "$replica_b" "$cold_replica" "$(dirname "$state_a")"
 
 sync_a() {
@@ -77,22 +71,14 @@ sync_cold() {
 }
 
 init_a() {
-  "$OFS_BIN" sync "$replica_a" --state "$state_a" --init "${target_options[@]}"
-}
-
-attach_b() {
-  "$OFS_BIN" sync "$replica_b" --state "$state_b" "${target_options[@]}"
-}
-
-attach_cold() {
-  "$OFS_BIN" sync "$cold_replica" --state "$cold_state" "${target_options[@]}"
+  "$OFS_BIN" sync "$replica_a" --state "$state_a" --init --model managed
 }
 
 establish_pair() {
   init_a >/dev/null
   printf '%s\n' 'private before sync' >"$replica_a/first.txt"
-  attach_b >/dev/null
-  [[ ! -e "$replica_b/first.txt" ]] || fail 'volume creation published a local file without sync'
+  sync_b >/dev/null
+  [[ ! -e "$replica_b/first.txt" ]] || fail 'initialization published a local file without sync'
   sync_a >/dev/null
   sync_b >/dev/null
   cmp "$replica_a/first.txt" "$replica_b/first.txt" || \

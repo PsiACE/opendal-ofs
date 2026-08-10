@@ -7,28 +7,34 @@
 // with the License.
 
 use anyhow::{Context, Result, bail};
-use ofs::sync::{ReplicaState, ReplicaTarget, SyncEngine, SyncVolume};
+use ofs::sync::{ReplicaState, SyncEngine, SyncVolume};
 
-use crate::cli::{StatusArgs, SyncArgs, TargetOptions};
+use crate::cli::{StatusArgs, SyncArgs};
 
 use super::providers::{initialize_managed_volume, open_managed_volume};
 
 pub(super) async fn sync_volume(args: SyncArgs) -> Result<()> {
     let transfer_concurrency = args.runtime.transfer_concurrency;
-    if args.enable.is_some() && !args.init {
-        bail!("--enable requires --init");
-    }
     let stored = ReplicaState::load(&args.state)?;
-    if stored.is_some() && args.init {
-        bail!("--init requires a new replica state");
+    if args.init {
+        if args.branch.is_some() || !args.resolve.is_empty() {
+            bail!("--branch and --resolve cannot be used with --init");
+        }
+        if stored.is_some() {
+            bail!("--init requires a new replica state");
+        }
+        if args.model.is_none() {
+            bail!("--init requires --model managed");
+        }
+    } else if args.model.is_some() || args.enable.is_some() {
+        bail!("--model and --enable require --init");
     }
-    let target = resolve_target(stored.as_ref(), args.target)?;
     let branch = resolve_branch(stored.as_ref(), args.branch.as_ref())?;
     let expected_volume = stored.as_ref().map(|state| state.volume);
     let volume = if args.init {
         initialize_managed_volume(
-            &target,
-            expected_volume,
+            &args.remote.storage,
+            args.remote.metadata.as_ref(),
             branch.as_ref(),
             args.enable.is_some(),
             transfer_concurrency,
@@ -36,7 +42,8 @@ pub(super) async fn sync_volume(args: SyncArgs) -> Result<()> {
         .await?
     } else {
         open_managed_volume(
-            &target,
+            &args.remote.storage,
+            args.remote.metadata.as_ref(),
             expected_volume,
             branch.as_ref(),
             transfer_concurrency,
@@ -52,7 +59,7 @@ pub(super) async fn sync_volume(args: SyncArgs) -> Result<()> {
         .unwrap_or_default();
     let engine = SyncEngine::new(volume, transfer_concurrency);
     let result = engine
-        .sync(&args.replica, &args.state, target, &args.resolve)
+        .sync(&args.replica, &args.state, &args.resolve)
         .await?;
     if !result.conflicts.is_empty() {
         bail!(
@@ -80,7 +87,7 @@ pub(super) fn status(args: StatusArgs) -> Result<()> {
         "volume_id": state.volume.to_string(),
         "branch_name": state.branch.as_ref().map(|branch| branch.name.as_str()),
         "branch_id": state.branch.as_ref().map(|branch| branch.id.to_string()),
-        "volume_model": state.target().model().as_str(),
+        "volume_model": "managed",
         "access_model": "sync",
         "capabilities": {
             "portable_names": true,
@@ -113,37 +120,6 @@ pub(super) fn status(args: StatusArgs) -> Result<()> {
         );
     }
     Ok(())
-}
-
-fn resolve_target(state: Option<&ReplicaState>, options: TargetOptions) -> Result<ReplicaTarget> {
-    let TargetOptions {
-        model,
-        storage,
-        metadata,
-    } = options;
-    match state {
-        Some(state) => {
-            let current = state.target();
-            let supplied = model.is_some() || storage.is_some() || metadata.is_some();
-            if !supplied {
-                return Ok(current.clone());
-            }
-            let requested = ReplicaTarget::new(
-                model.unwrap_or_else(|| current.model()),
-                storage.unwrap_or_else(|| current.storage().clone()),
-                metadata.or_else(|| current.metadata().cloned()),
-            )?;
-            if &requested != current {
-                bail!("target options disagree with the existing replica state");
-            }
-            Ok(requested)
-        }
-        None => ReplicaTarget::new(
-            model.context("--model managed is required for a new replica state")?,
-            storage.context("--storage is required for a new replica state")?,
-            metadata,
-        ),
-    }
 }
 
 fn resolve_branch(

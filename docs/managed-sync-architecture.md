@@ -6,9 +6,9 @@ its durable representation.
 
 ## Product boundary
 
-The current product surface is Managed Sync only. Initializing or attaching a
-replica requires the explicit RFC 016 model selection, but this build accepts
-only `--model managed`. Direct remains an RFC model rather than an implemented
+The current product surface is Managed Sync only. Initialization requires the
+explicit RFC 016 model selection, but this build accepts only
+`--model managed`. Direct remains an RFC model rather than an implemented
 storage path.
 
 ```text
@@ -22,9 +22,7 @@ publications, and errors. The Sync-owned `SyncVolume` port adds the staging,
 materialization, recovery, and transfer operations needed by the Sync access
 model; those operations remain owned by Sync rather than the filesystem model.
 
-Each replica state binds one remote `VolumeId` to credential-free storage and
-metadata locators. There is no client-wide volume registry. Provider
-credentials and replica paths remain local.
+Remote locators and provider credentials are invocation configuration.
 
 ## Ownership
 
@@ -170,10 +168,9 @@ overlapping subtree changes remain conflicts until explicitly resolved. The
 common base advances only after the merged tree is installed and verified.
 
 Replica state is local authority for recovery, not remote namespace state. It
-stores credential-free remote locators, volume and branch identities, the
-verified common snapshot, pending operation, staged descriptors, and conflicts.
-The saved operation is resolved before a missing or malformed staging cache is
-discarded and rebuilt.
+stores volume and branch identities, the verified common snapshot, pending
+operation, staged descriptors, and conflicts. The saved operation is resolved
+before a missing or malformed staging cache is discarded and rebuilt.
 
 ## Filesystem admission
 
@@ -190,6 +187,5 @@ non-overlapping root moves and expanded only at validation or publication.
 
 ## Related documents
 
-- [Managed Sync workflow](managed-sync-workflow.md)
 - [Managed storage format](managed-storage-format.md)
 - [RFC 016](../rfcs/0016_filesystem_architecture.md)

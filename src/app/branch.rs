@@ -8,7 +8,6 @@
 
 use anyhow::{Context, Result};
 use ofs::managed::extensions::branch::{BranchInfo, ForkPoint};
-use ofs::sync::ReplicaState;
 
 use crate::cli::{BranchArgs, BranchCommand};
 
@@ -16,13 +15,17 @@ use super::providers::{ManagedContext, open_managed_context};
 
 pub(super) async fn branch_command(args: BranchArgs) -> Result<()> {
     let concurrency = args.runtime.transfer_concurrency;
-    let state = ReplicaState::load(&args.state)?
-        .with_context(|| format!("replica state does not exist: {}", args.state.display()))?;
     let ManagedContext {
         format,
         data,
         metadata,
-    } = open_managed_context(state.target(), Some(state.volume), concurrency).await?;
+    } = open_managed_context(
+        &args.remote.storage,
+        args.remote.metadata.as_ref(),
+        None,
+        concurrency,
+    )
+    .await?;
     let branches = metadata.branches(&format, data)?;
     match args.command {
         BranchCommand::List { json } => {

@@ -70,29 +70,23 @@ mkdir -p "$main_replica" "$observed_replica" "$experiment_replica" \
   "$empty_replica" "$rewind_cold" "$large_replica" "$large_parent" \
   "$state_root"
 
-target_options=(--model managed --storage "$OFS_STORAGE_URL")
-if [[ "$OFS_METADATA_MODE" == d1 ]]; then
-  target_options+=(--metadata "$OFS_METADATA_URL")
-fi
-unset OFS_STORAGE_URL OFS_METADATA_URL
-
 attach() {
   local replica=$1 state=$2
   shift 2
-  "$OFS_BIN" sync "$replica" --state "$state" "${target_options[@]}" "$@"
+  "$OFS_BIN" sync "$replica" --state "$state" "$@"
 }
 
 branch_cmd() {
-  "$OFS_BIN" branch --state "$main_state" "$@"
+  "$OFS_BIN" branch "$@"
 }
 
 gc_cmd() {
-  "$OFS_BIN" volume gc --state "$main_state" "$@"
+  "$OFS_BIN" volume gc "$@"
 }
 
 printf '%s\n' 'acceptance: initialize a branching volume with the default main branch'
 "$OFS_BIN" sync "$main_replica" --state "$main_state" --init --enable branch \
-  "${target_options[@]}" >/dev/null
+  --model managed >/dev/null
 branches=$(branch_cmd list --json)
 python3 -c '
 import json, sys
@@ -103,7 +97,7 @@ assert [branch["name"] for branch in value["branches"]] == ["main"]
 
 if [[ "$OFS_METADATA_MODE" == object ]]; then
   attach "$observed_replica" "$observed_state" >/dev/null
-  observed_branches=$("$OFS_BIN" branch --state "$observed_state" list --json)
+  observed_branches=$("$OFS_BIN" branch list --json)
   python3 -c '
 import json, sys
 value = json.load(sys.stdin)

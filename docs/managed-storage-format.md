@@ -45,9 +45,8 @@ Readers MUST determine the remote identity from the superblock and MUST reject
 a replica state whose expected `VolumeId` does not match it.
 
 Storage and metadata locators select the physical stores; they are not volume
-identities and are not persisted in the remote format. A Sync replica MAY store
-credential-free locators in its local state. Moving a format-preserving copy to
-equivalent storage does not change its `VolumeId`.
+identities. Moving a format-preserving copy to equivalent storage does not
+change its `VolumeId`.
 
 ## Superblock
 
@@ -414,5 +413,4 @@ corruption, not an empty namespace or empty file.
 ## Related documents
 
 - [Managed Sync architecture](managed-sync-architecture.md)
-- [Managed Sync workflow](managed-sync-workflow.md)
 - [RFC 016](../rfcs/0016_filesystem_architecture.md)

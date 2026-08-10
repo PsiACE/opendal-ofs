@@ -34,15 +34,6 @@ cargo install ofs
 
 > `cargo` is the Rust package manager. Follow the Rust [installation guide](https://www.rust-lang.org/tools/install) to install it.
 
-### Initialize and synchronize a Managed volume
-
-Initializing a volume or attaching a new replica requires the explicit
-`--model managed` selection. Managed is the only model accepted by the current
-build. Later syncs recover the credential-free target from replica state.
-
-See the [Managed Sync workflow](docs/managed-sync-workflow.md) for Object and
-D1 setup, synchronization, branches, conflict handling, and recovery.
-
 ## Branding
 
 The first and most prominent mentions must use the full form: **Apache OpenDAL™** of the name for any individual usage (webpage, handout, slides, etc.) Depending on the context and writing style, you should use the full form of the name sufficiently often to ensure that readers clearly understand the association of both the OpenDAL project and the OpenDAL software product to the ASF as the parent organization.

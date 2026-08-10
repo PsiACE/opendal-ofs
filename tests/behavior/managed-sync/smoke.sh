@@ -13,8 +13,8 @@ source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 printf '%s\n' 'smoke: first publication and empty-replica materialization'
 init_a >/dev/null
-attach_b >/dev/null
-empty_collection=$("$OFS_BIN" volume gc --state "$state_a")
+sync_b >/dev/null
+empty_collection=$("$OFS_BIN" volume gc)
 grep -Fq 'scanned=0 deleted=0 bytes=0' <<<"$empty_collection" || \
   fail 'an unpublished volume was not an empty collection'
 printf '%s\n' 'private before sync' >"$replica_a/first.txt"

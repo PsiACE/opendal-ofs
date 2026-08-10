@@ -43,13 +43,12 @@ pub(crate) enum VolumeCommand {
 
 #[derive(Debug, Args)]
 pub(crate) struct VolumeGcArgs {
-    /// State of any replica attached to the Managed volume.
-    #[arg(long, value_name = "PATH")]
-    pub state: PathBuf,
-
     /// Resume an interrupted collection after its previous process stopped.
     #[arg(long)]
     pub resume: bool,
+
+    #[command(flatten)]
+    pub remote: RemoteOptions,
 
     #[command(flatten)]
     pub runtime: StorageOptions,
@@ -94,9 +93,8 @@ pub(crate) enum BranchCommand {
 
 #[derive(Debug, Args)]
 pub(crate) struct BranchArgs {
-    /// State of any replica attached to the Managed volume.
-    #[arg(long, value_name = "PATH")]
-    pub state: PathBuf,
+    #[command(flatten)]
+    pub remote: RemoteOptions,
 
     #[command(flatten)]
     pub runtime: StorageOptions,
@@ -128,12 +126,16 @@ pub(crate) struct SyncArgs {
     #[arg(long)]
     pub init: bool,
 
+    /// Namespace authority model. Required only with --init.
+    #[arg(long, value_parser = parse_volume_model, value_name = "MODEL")]
+    pub model: Option<VolumeModel>,
+
     /// Managed volume feature to require while initializing.
     #[arg(long, value_enum, value_name = "FEATURE")]
     pub enable: Option<EnableFeature>,
 
     #[command(flatten)]
-    pub target: TargetOptions,
+    pub remote: RemoteOptions,
 
     /// Resolve a retained conflict with the current local candidate. May be repeated.
     #[arg(long, value_name = "RELATIVE_PATH")]
@@ -144,16 +146,12 @@ pub(crate) struct SyncArgs {
 }
 
 #[derive(Debug, Args)]
-pub(crate) struct TargetOptions {
-    /// Namespace authority model. Required when attaching a new replica.
-    #[arg(long, value_parser = parse_volume_model, value_name = "MODEL")]
-    pub model: Option<VolumeModel>,
-
-    /// Credential-free OpenDAL data URL. Required when attaching a new replica.
+pub(crate) struct RemoteOptions {
+    /// OpenDAL data URL.
     #[arg(long, env = "OFS_STORAGE_URL", value_name = "URL")]
-    pub storage: Option<Url>,
+    pub storage: Url,
 
-    /// Credential-free D1 metadata URL. OFS_METADATA_URL provides the same setting.
+    /// D1 metadata URL. OFS_METADATA_URL provides the same setting.
     #[arg(long, env = "OFS_METADATA_URL", value_name = "URL")]
     pub metadata: Option<Url>,
 }

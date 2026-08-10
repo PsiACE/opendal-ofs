@@ -14,7 +14,6 @@ use std::num::NonZeroUsize;
 use anyhow::{Context, Result, anyhow, bail};
 use ofs::filesystem::{BranchName, VolumeId};
 use ofs::managed::{D1Config, ManagedExtension, ManagedFormat, ManagedMetadata, ManagedVolume};
-use ofs::sync::ReplicaTarget;
 use opendal::Operator;
 use opendal::layers::{ConcurrentLimitLayer, RetryLayer};
 use url::Url;
@@ -26,7 +25,8 @@ pub(super) struct ManagedContext {
 }
 
 pub(super) async fn open_managed_volume(
-    target: &ReplicaTarget,
+    storage: &Url,
+    metadata: Option<&Url>,
     expected_volume: Option<VolumeId>,
     branch: Option<&BranchName>,
     transfer_concurrency: NonZeroUsize,
@@ -35,28 +35,26 @@ pub(super) async fn open_managed_volume(
         format,
         data,
         metadata,
-    } = open_managed_context(target, expected_volume, transfer_concurrency).await?;
+    } = open_managed_context(storage, metadata, expected_volume, transfer_concurrency).await?;
     volume_from_context(format, data, metadata, branch).await
 }
 
 pub(super) async fn initialize_managed_volume(
-    target: &ReplicaTarget,
-    expected_volume: Option<VolumeId>,
+    storage: &Url,
+    metadata_url: Option<&Url>,
     branch: Option<&BranchName>,
     branch_enabled: bool,
     transfer_concurrency: NonZeroUsize,
 ) -> Result<ManagedVolume> {
-    let data = open_operator(target.storage(), transfer_concurrency)?;
-    let metadata = open_metadata(data.clone(), target.metadata())?;
-    let provisional_id = expected_volume.unwrap_or_else(VolumeId::generate);
-    let desired = ManagedFormat::v1(provisional_id);
+    let data = open_operator(storage, transfer_concurrency)?;
+    let metadata = open_metadata(data.clone(), metadata_url)?;
+    let desired = ManagedFormat::v1(VolumeId::generate());
     let desired = if branch_enabled {
         desired.with_extension(ManagedExtension::BranchV1)
     } else {
         desired
     };
     let format = metadata.create_format(&desired).await?;
-    validate_volume(expected_volume, &format)?;
     if branch_enabled && !format.requires_extension(ManagedExtension::BranchV1) {
         bail!("existing Managed volume does not enable requested extension branch/v1");
     }
@@ -90,12 +88,13 @@ async fn volume_from_context(
 }
 
 pub(super) async fn open_managed_context(
-    target: &ReplicaTarget,
+    storage: &Url,
+    metadata_url: Option<&Url>,
     expected_volume: Option<VolumeId>,
     transfer_concurrency: NonZeroUsize,
 ) -> Result<ManagedContext> {
-    let data = open_operator(target.storage(), transfer_concurrency)?;
-    let metadata = open_metadata(data.clone(), target.metadata())?;
+    let data = open_operator(storage, transfer_concurrency)?;
+    let metadata = open_metadata(data.clone(), metadata_url)?;
     let format = metadata.read_format().await?;
     validate_volume(expected_volume, &format)?;
     Ok(ManagedContext {
