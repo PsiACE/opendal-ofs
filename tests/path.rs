@@ -46,13 +46,18 @@ fn test_path(ctx: &mut OfsTestContext) {
     .map(|(x, y)| (x.to_string(), y))
     .collect::<Vec<_>>();
 
-    for (path, is_file) in actual_entries.iter() {
-        let path = ctx.mount_point.path().join(path);
-        match is_file {
-            true => fs::write(path, "hello").unwrap(),
-            false => fs::create_dir(path).unwrap(),
+    runtime().block_on(async {
+        for (path, is_file) in &actual_entries {
+            match is_file {
+                true => {
+                    ctx.backend.write(path, "hello").await.unwrap();
+                }
+                false => {
+                    ctx.backend.create_dir(&format!("{path}/")).await.unwrap();
+                }
+            }
         }
-    }
+    });
 
     assert_eq!(
         actual_entries,

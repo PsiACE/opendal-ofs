@@ -17,7 +17,6 @@
 
 use std::sync::OnceLock;
 
-use opendal::Capability;
 use opendal::Operator;
 use opendal::services;
 use opendal::tests;
@@ -36,9 +35,6 @@ pub(crate) struct OfsTestContext {
     pub backend: Operator,
     // Keep the temporary backend root alive when no test service is configured.
     _backend_root: Option<TempDir>,
-    // This is a false positive, the field is used in the test.
-    #[allow(dead_code)]
-    pub capability: Capability,
     mount_handle: fuse3::raw::MountHandle,
 }
 
@@ -58,8 +54,6 @@ impl TestContext for OfsTestContext {
                 backend_root = Some(tmp_root);
                 backend
             });
-        let capability = backend.info().full_capability();
-
         INIT_LOGGER.get_or_init(|| logforth::starter_log::stderr().apply());
 
         let mount_point = tempfile::tempdir().unwrap();
@@ -76,6 +70,7 @@ impl TestContext for OfsTestContext {
                 #[allow(clippy::async_yields_async)]
                 async move {
                     let mut mount_options = fuse3::MountOptions::default();
+                    mount_options.read_only(true);
                     let gid = nix::unistd::getgid().into();
                     mount_options.gid(gid);
                     let uid = nix::unistd::getuid().into();
@@ -93,7 +88,6 @@ impl TestContext for OfsTestContext {
             mount_point,
             backend,
             _backend_root: backend_root,
-            capability,
             mount_handle,
         }
     }
