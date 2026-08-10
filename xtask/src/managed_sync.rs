@@ -39,14 +39,16 @@ pub(crate) fn run_fixture(keep: bool, case: Option<&str>) {
     build_ofs();
     let fixture = Fixture::new(keep).start();
     fixture.create_bucket();
-    match case.unwrap_or("admission") {
-        "admission" => admission(&fixture),
-        name => panic!("unknown Managed Sync behavior case: {name}"),
+    match case {
+        Some("admission") => admission(&fixture),
+        Some("smoke") => smoke(&fixture),
+        Some(name) => panic!("unknown Managed Sync behavior case: {name}"),
+        None => {
+            admission(&fixture);
+            smoke(&fixture);
+        }
     }
-    println!(
-        "Managed Sync behavior passed: {}",
-        case.unwrap_or("admission")
-    );
+    println!("Managed Sync behavior passed: {}", case.unwrap_or("all"));
 }
 
 struct Fixture {
@@ -121,6 +123,128 @@ fn admission(fixture: &Fixture) {
             "storage configuration is not persisted in replica state"
         );
     }
+}
+
+fn smoke(fixture: &Fixture) {
+    let root = CaseRoot::new();
+    let replica_a = root.path.join("replica-a");
+    let replica_b = root.path.join("replica-b");
+    let state_a = root.path.join("state-a");
+    let state_b = root.path.join("state-b");
+    fs::create_dir_all(replica_a.join("nested")).expect("create replica A");
+    fs::create_dir_all(&replica_b).expect("create replica B");
+    let storage = fixture.storage_url("smoke");
+
+    run_ofs_success(
+        ofs_sync(&replica_a, &state_a, &storage, true),
+        "initialize smoke replica",
+    );
+    fs::write(replica_a.join("empty"), []).expect("write empty file");
+    fs::write(replica_a.join("nested/one"), b"shared content\n").expect("write nested file");
+    fs::write(replica_a.join("two"), b"shared content\n").expect("write repeated file");
+    fs::write(replica_a.join("tool"), b"#!/bin/sh\nexit 0\n").expect("write executable file");
+    make_executable(&replica_a.join("tool"));
+
+    let published = run_ofs_success(
+        ofs_sync(&replica_a, &state_a, &storage, false),
+        "publish smoke tree",
+    );
+    assert!(
+        output_text(&published.stdout).contains("(published)"),
+        "a changed tree reports remote publication"
+    );
+    run_ofs_success(
+        ofs_sync(&replica_b, &state_b, &storage, false),
+        "cold restore smoke tree",
+    );
+    assert_eq!(
+        tree_fingerprint(&replica_a),
+        tree_fingerprint(&replica_b),
+        "cold restore reproduces files, directories, content, and executable state"
+    );
+
+    let no_op = run_ofs_success(
+        ofs_sync(&replica_a, &state_a, &storage, false),
+        "repeat unchanged sync",
+    );
+    assert!(
+        !output_text(&no_op.stdout).contains("(published)"),
+        "an unchanged sync does not publish a namespace generation"
+    );
+
+    fs::write(replica_a.join("nested/one"), b"changed content\n").expect("change nested file");
+    run_ofs_success(
+        ofs_sync(&replica_a, &state_a, &storage, false),
+        "publish changed smoke tree",
+    );
+    run_ofs_success(
+        ofs_sync(&replica_b, &state_b, &storage, false),
+        "install changed smoke tree",
+    );
+    assert_eq!(
+        tree_fingerprint(&replica_a),
+        tree_fingerprint(&replica_b),
+        "a later remote generation converges into the peer replica"
+    );
+}
+
+fn tree_fingerprint(root: &Path) -> blake3::Hash {
+    let mut paths = Vec::new();
+    let mut pending = vec![root.to_owned()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory).expect("read behavior tree") {
+            let entry = entry.expect("read behavior entry");
+            if entry.file_type().expect("read behavior file type").is_dir() {
+                pending.push(entry.path());
+            }
+            paths.push(entry.path());
+        }
+    }
+    paths.sort();
+    let mut fingerprint = blake3::Hasher::new();
+    for path in paths {
+        let relative = path
+            .strip_prefix(root)
+            .expect("behavior path is below root");
+        let relative = relative.to_str().expect("behavior path is Unicode");
+        let metadata = fs::metadata(&path).expect("read behavior metadata");
+        fingerprint.update(&(relative.len() as u64).to_be_bytes());
+        fingerprint.update(relative.as_bytes());
+        if metadata.is_dir() {
+            fingerprint.update(b"d");
+        } else {
+            fingerprint.update(b"f");
+            fingerprint.update(&[u8::from(is_executable(&metadata))]);
+            fingerprint.update(&fs::read(path).expect("read behavior file"));
+        }
+    }
+    fingerprint.finalize()
+}
+
+#[cfg(unix)]
+fn make_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut permissions = fs::metadata(path)
+        .expect("read executable metadata")
+        .permissions();
+    permissions.set_mode(permissions.mode() | 0o111);
+    fs::set_permissions(path, permissions).expect("set executable mode");
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) {}
+
+#[cfg(unix)]
+fn is_executable(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable(_metadata: &fs::Metadata) -> bool {
+    false
 }
 
 fn build_ofs() {

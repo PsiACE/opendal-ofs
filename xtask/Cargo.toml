@@ -30,6 +30,7 @@ rust-version.workspace = true
 release = false
 
 [dependencies]
+blake3 = { workspace = true }
 clap = { workspace = true }
 which = { workspace = true }
 

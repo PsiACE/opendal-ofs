@@ -99,7 +99,7 @@ enum BehaviorTarget {
 #[derive(Parser)]
 #[clap(name = "managed-sync")]
 struct CommandManagedSyncBehavior {
-    #[arg(long, value_parser = ["admission"], value_name = "NAME")]
+    #[arg(long, value_parser = ["admission", "smoke"], value_name = "NAME")]
     case: Option<String>,
 
     #[arg(long, help = "Leave the fixture running after the command exits.")]
