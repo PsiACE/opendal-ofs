@@ -76,14 +76,11 @@ pub(crate) fn build_publication<V: Volume>(
             let file = target_manifest
                 .file(path)
                 .with_context(|| format!("target file {path:?} has no volume version"))?;
+            let size = target_manifest.entries[path].local.size;
             let version = staged
-                .resolve_version(file, authoritative_snapshot)
+                .resolve_version(file, size, authoritative_snapshot)
                 .with_context(|| format!("resolve target file version for {path:?}"))?
                 .clone();
-            let size = target_manifest.entries[path].local.size;
-            if version.logical_size != size {
-                bail!("target file version for {path:?} does not match the local file");
-            }
             match file_versions.insert(version.id, version.clone()) {
                 Some(existing) if existing != version => {
                     bail!("target file version identity is reused with different content")

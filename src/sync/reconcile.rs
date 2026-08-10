@@ -11,7 +11,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{Result, bail};
 
 use super::path::{SnapshotEntry, SnapshotTree, subtree};
-use super::staging::TargetFile;
 use super::{ConflictRecord, ReplicaState, StagedTree, TargetManifest};
 use crate::filesystem::NodeKind;
 
@@ -39,7 +38,7 @@ impl ReconcilePlan {
     fn select_file(&mut self, path: String, entry: SnapshotEntry<'_>, edit: TargetEdit) {
         self.target.select_file(
             path.clone(),
-            TargetFile::from(entry.file.expect("remote file has a version")),
+            entry.file.expect("remote file has a version"),
             entry.node.attributes.executable,
         );
         self.edits.insert(path, edit);
@@ -159,8 +158,7 @@ pub(crate) fn reconcile(
                 (Some(base), Some(local), Some(remote)) if local == base => {
                     let version = remote_entry
                         .and_then(|entry| entry.file)
-                        .expect("remote file has a version")
-                        .into();
+                        .expect("remote file has a version");
                     plan.target.select_attributes(&path, version, remote)?;
                 }
                 (Some(base), Some(_), Some(remote)) if remote == base => {

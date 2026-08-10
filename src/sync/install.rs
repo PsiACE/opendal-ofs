@@ -70,18 +70,24 @@ pub(super) async fn apply_target<V: Volume>(
         }
     }
 
-    let requests = materialize
-        .iter()
-        .map(|path| -> Result<_> {
-            let file = manifest
-                .file(path)
-                .with_context(|| format!("materialization path {path:?} is not a target file"))?;
-            Ok(MaterializeRequest {
-                path: path.clone(),
-                version: staged.resolve_version(file, authority)?.clone(),
+    let requests =
+        materialize
+            .iter()
+            .map(|path| -> Result<_> {
+                let entry = manifest.entries.get(path).with_context(|| {
+                    format!("materialization path {path:?} is not a target file")
+                })?;
+                let file = entry.file.as_ref().with_context(|| {
+                    format!("materialization path {path:?} is not a target file")
+                })?;
+                Ok(MaterializeRequest {
+                    path: path.clone(),
+                    version: staged
+                        .resolve_version(file, entry.local.size, authority)?
+                        .clone(),
+                })
             })
-        })
-        .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()?;
     let segment_staging = staged.segment_operator()?;
     volume
         .materialize(
@@ -115,13 +121,17 @@ async fn reuse_local_file(
     let Some(source_entry) = source.entries.get(source_path) else {
         return Ok(false);
     };
-    let (Some(source_file), Some(target_file)) =
-        (source.file(source_path), target.file(target_path))
-    else {
+    let Some(source_file) = source.file(source_path) else {
+        return Ok(false);
+    };
+    let Some(target_entry) = target.entries.get(target_path) else {
+        return Ok(false);
+    };
+    let Some(target_file) = &target_entry.file else {
         return Ok(false);
     };
     if source_file.logical_digest != target_file.logical_digest
-        || source_entry.local.size != target_file.logical_size
+        || source_entry.local.size != target_entry.local.size
     {
         return Ok(false);
     }
@@ -142,11 +152,11 @@ async fn reuse_local_file(
     let source_unchanged = entry_at(source_root, source_path)
         .await
         .is_ok_and(|observed| observed == source_entry.local);
-    if copied != target_file.logical_size || !source_unchanged {
+    if copied != target_entry.local.size || !source_unchanged {
         let _ = tokio::fs::remove_file(destination).await;
         return Ok(false);
     }
-    set_executable(&destination, target.entries[target_path].local.executable)?;
+    set_executable(&destination, target_entry.local.executable)?;
     Ok(true)
 }
 

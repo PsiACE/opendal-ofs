@@ -31,7 +31,6 @@ const SEGMENTS_DIR: &str = "segments";
 #[serde(deny_unknown_fields)]
 pub(crate) struct TargetFile {
     pub id: FileVersionId,
-    pub logical_size: u64,
     pub logical_digest: [u8; 32],
 }
 
@@ -39,7 +38,6 @@ impl From<&FileVersion> for TargetFile {
     fn from(version: &FileVersion) -> Self {
         Self {
             id: version.id,
-            logical_size: version.logical_size,
             logical_digest: version.logical_digest,
         }
     }
@@ -63,7 +61,7 @@ impl TargetManifest {
         self.entries.get(path)?.file.as_ref()
     }
 
-    pub(crate) fn select_file(&mut self, path: String, file: TargetFile, executable: bool) {
+    pub(crate) fn select_file(&mut self, path: String, file: &FileVersion, executable: bool) {
         self.remove(&path);
         self.entries.insert(
             path,
@@ -75,7 +73,7 @@ impl TargetManifest {
                     executable,
                     native_identity: None,
                 },
-                file: Some(file),
+                file: Some(TargetFile::from(file)),
             },
         );
     }
@@ -100,7 +98,7 @@ impl TargetManifest {
     pub(crate) fn select_attributes(
         &mut self,
         path: &str,
-        version: TargetFile,
+        version: &FileVersion,
         executable: bool,
     ) -> Result<()> {
         let entry = self
@@ -111,13 +109,12 @@ impl TargetManifest {
             .file
             .as_mut()
             .with_context(|| format!("remote attributes reference a directory {path:?}"))?;
-        if file.logical_size != version.logical_size
-            || file.logical_digest != version.logical_digest
+        if entry.local.size != version.logical_size || file.logical_digest != version.logical_digest
         {
             bail!("remote attributes disagree with staged file {path:?}");
         }
         entry.local.executable = executable;
-        *file = version;
+        *file = TargetFile::from(version);
         Ok(())
     }
 
@@ -328,6 +325,7 @@ impl StagedTree {
     pub(crate) fn resolve_version<'a>(
         &'a self,
         file: &TargetFile,
+        logical_size: u64,
         authority: Option<&'a VolumeSnapshot>,
     ) -> Result<&'a FileVersion> {
         let version = self
@@ -335,7 +333,7 @@ impl StagedTree {
             .get(&file.id)
             .or_else(|| authority.and_then(|snapshot| snapshot.file_versions.get(&file.id)))
             .with_context(|| format!("file version {:?} is unavailable", file.id.as_bytes()))?;
-        if TargetFile::from(version) != *file {
+        if version.logical_size != logical_size || TargetFile::from(version) != *file {
             bail!("file version identity disagrees with its logical metadata");
         }
         Ok(version)
@@ -360,12 +358,6 @@ fn validate_manifest(manifest: &TargetManifest) -> Result<()> {
     for (path, entry) in &manifest.entries {
         if (entry.local.kind == NodeKind::RegularFile) != entry.file.is_some() {
             bail!("staged path {path:?} has inconsistent kind and file state");
-        }
-        let Some(file) = &entry.file else {
-            continue;
-        };
-        if entry.local.size != file.logical_size {
-            bail!("staged file {path:?} disagrees with its volume version");
         }
     }
     Ok(())

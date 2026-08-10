@@ -15,7 +15,7 @@ use anyhow::{Context, Result, bail};
 use super::{ReconcilePlan, TargetEdit, digest, executable, remote_matches_base};
 use crate::filesystem::{NodeId, NodeKind};
 use crate::sync::path::{SnapshotEntry, SnapshotTree, subtree};
-use crate::sync::staging::{TargetEntry, TargetFile};
+use crate::sync::staging::TargetEntry;
 use crate::sync::{ConflictRecord, ReplicaState, StagedTree};
 
 pub(super) fn reconcile_remote_renames(
@@ -62,7 +62,7 @@ pub(super) fn reconcile_remote_renames(
             if new_local.is_some_and(|file| file.1 != renamed_executable) {
                 plan.target.select_attributes(
                     new_path,
-                    TargetFile::from(renamed.file.expect("remote rename is a file")),
+                    renamed.file.expect("remote rename is a file"),
                     renamed_executable,
                 )?;
             }
