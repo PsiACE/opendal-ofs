@@ -21,6 +21,7 @@ on:
   pull_request:
     branches:
       - main
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -122,6 +123,27 @@ jobs:
 
       - name: Run Managed Sync behavior
         run: cargo x behavior managed-sync
+
+  managed-bub-e2e:
+    name: Managed Bub E2E
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    environment: managed-sync-e2e
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      BUB_API_KEY: ${{ secrets.BUB_API_KEY }}
+      BUB_MODEL: ${{ vars.BUB_MODEL || 'deepseek:deepseek-chat' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Show fixture tools
+        run: |
+          rustc --version
+          cargo --version
+          docker compose version
+
+      - name: Synchronize Bub sessions and skills
+        run: cargo x e2e managed-sync-bub
 
   required:
     name: Required
