@@ -16,7 +16,7 @@
 // under the License.
 
 use futures::StreamExt;
-use opendal::{ErrorKind, Operator};
+use opendal::{Buffer, ErrorKind, Operator};
 
 use crate::filesystem::VolumeError;
 use crate::managed::error::{corrupt, unavailable};
@@ -126,11 +126,11 @@ pub(crate) async fn replace(
 pub(crate) async fn ensure_immutable(
     operator: &Operator,
     key: &str,
-    expected: &[u8],
+    expected: Buffer,
     action: &'static str,
 ) -> Result<(), VolumeError> {
     match operator
-        .write_with(key, expected.to_vec())
+        .write_with(key, expected.clone())
         .if_not_exists(true)
         .await
     {
@@ -145,7 +145,7 @@ pub(crate) async fn ensure_immutable(
     let observed = read(operator, key, expected.len(), action)
         .await?
         .ok_or_else(|| unavailable(action, "object metadata is unavailable"))?;
-    if observed == expected {
+    if observed.as_slice() == expected.to_bytes().as_ref() {
         Ok(())
     } else {
         Err(corrupt(action, "immutable object changed"))

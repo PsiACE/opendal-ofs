@@ -38,7 +38,6 @@ use crate::managed::metadata::object::ensure_immutable;
 const SEGMENT_ROOT: &str = ".ofs/managed/data/v1/segments/sha256";
 const STAGING_PLAN_KEY: &str = "plan.ofs";
 const STAGING_PLAN_RECORD: V1Record = V1Record::new(*b"OFS1DSP1", 64 * 1024 * 1024);
-const RANGE_FETCH_GAP: usize = 64 * 1024;
 // Placement policy. These values are not part of the durable format.
 const TARGET_SEGMENT_SIZE: u64 = 16 * 1024 * 1024;
 const MATERIALIZE_WINDOW_BYTES: u64 = TARGET_SEGMENT_SIZE;
@@ -310,13 +309,7 @@ impl ManagedData {
                     }
                 })?;
                 verify_complete_segment(reference, &segment)?;
-                ensure_immutable(
-                    &self.operator,
-                    &key,
-                    &segment.to_bytes(),
-                    "create data segment",
-                )
-                .await
+                ensure_immutable(&self.operator, &key, segment, "create data segment").await
             })
             .buffer_unordered(concurrency.get())
             .try_for_each(|()| async { Ok(()) })
@@ -541,7 +534,7 @@ impl ManagedData {
                 let reader = self
                     .operator
                     .reader_with(&segment_key(segment))
-                    .gap(RANGE_FETCH_GAP)
+                    .concurrent(concurrency.get())
                     .content_length_hint(segment.length)
                     .await
                     .map_err(|error| referenced_segment_error("read data segment", error))?;

@@ -415,7 +415,7 @@ impl NamespaceStore {
         ensure_immutable(
             &self.data,
             &self.operation_key(result.operation),
-            &bytes,
+            bytes.into(),
             "record Managed publication",
         )
         .await
@@ -502,7 +502,7 @@ impl NamespaceStore {
         ensure_immutable(
             &self.data,
             &checkpoint_key(reference.digest),
-            &bytes,
+            bytes.into(),
             "checkpoint Managed namespace",
         )
         .await?;
@@ -563,16 +563,17 @@ impl NamespaceStore {
             .encode(segment)
             .map_err(|error| invalid("write Managed change segment", error.message()))?;
         let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        let length = bytes.len() as u64;
         ensure_immutable(
             &self.data,
             &change_segment_key(digest),
-            &bytes,
+            bytes.into(),
             "archive Managed changes",
         )
         .await?;
         Ok(ChangeSegmentRef {
             digest,
-            length: bytes.len() as u64,
+            length,
             start: segment.start(),
             end: segment.cursor(),
         })
