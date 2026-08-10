@@ -646,25 +646,28 @@ async fn materialize_file(
     version: &DecodedFileVersion,
     fetched: &FetchedContent,
 ) -> Result<(), VolumeError> {
-    let mut writer = target
-        .writer(path)
-        .await
-        .map_err(|_| unavailable("write materialized file", "storage operation failed"))?;
     let mut logical = Sha256::new();
     let mut written = 0_u64;
-    if let Err(error) = write_extents(
-        &mut writer,
-        &version.extent_map.extents,
-        fetched,
-        &mut logical,
-        &mut written,
-    )
-    .await
-    {
-        let _ = writer.abort().await;
-        return Err(error);
+    let mut chunks = Vec::new();
+    for extent in &version.extent_map.extents {
+        let bytes = fetched
+            .get(&extent.content)
+            .cloned()
+            .ok_or_else(|| corrupt("materialize Managed files", "extent was not fetched"))?;
+        written = written
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| corrupt("materialize Managed files", "logical file length overflows"))?;
+        for chunk in bytes {
+            logical.update(&chunk);
+            chunks.push(chunk);
+        }
     }
-    finish_materialized_file(writer, version, logical, written).await
+    verify_materialized_file(version, logical, written)?;
+    target
+        .write(path, Buffer::from(chunks))
+        .await
+        .map(|_| ())
+        .map_err(|_| unavailable("write materialized file", "storage operation failed"))
 }
 
 async fn write_extents(
@@ -699,20 +702,31 @@ async fn finish_materialized_file(
     logical: Sha256,
     written: u64,
 ) -> Result<(), VolumeError> {
-    if written != version.logical_size
-        || <[u8; 32]>::from(logical.finalize()) != version.logical_digest
-    {
+    if let Err(error) = verify_materialized_file(version, logical, written) {
         let _ = writer.abort().await;
-        return Err(corrupt(
-            "materialize Managed files",
-            "logical digest does not match the file version",
-        ));
+        return Err(error);
     }
     writer
         .close()
         .await
         .map(|_| ())
         .map_err(|_| unavailable("write materialized file", "storage operation failed"))
+}
+
+fn verify_materialized_file(
+    version: &DecodedFileVersion,
+    logical: Sha256,
+    written: u64,
+) -> Result<(), VolumeError> {
+    if written != version.logical_size
+        || <[u8; 32]>::from(logical.finalize()) != version.logical_digest
+    {
+        return Err(corrupt(
+            "materialize Managed files",
+            "logical digest does not match the file version",
+        ));
+    }
+    Ok(())
 }
 
 fn extent_window_end(extents: &[Extent], start: usize) -> usize {
