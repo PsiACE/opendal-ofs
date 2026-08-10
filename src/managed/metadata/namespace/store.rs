@@ -8,9 +8,6 @@
 
 //! One namespace authority state machine over a bound revision-CAS HEAD.
 
-use futures::future::try_join_all;
-use opendal::Operator;
-use serde::{Deserialize, Serialize};
 use super::{
     NamespaceChange, StoredChangeSegment, StoredCommittedResult, StoredNamespaceState,
     recover_namespace, replay_tail_from, require_request_digest,
@@ -22,6 +19,9 @@ use crate::filesystem::{
 use crate::managed::error::{conflict, corrupt, invalid};
 use crate::managed::format::{CompressedRecord, V1Record};
 use crate::managed::metadata::record::{RecordBackend, Revision};
+use futures::future::try_join_all;
+use opendal::Operator;
+use serde::{Deserialize, Serialize};
 
 mod gc;
 mod history;
@@ -30,9 +30,9 @@ mod receipt;
 pub(crate) use gc::{NamespaceGcSweep, RetainedMetadataReads};
 
 #[cfg(test)]
-use history::{decode_checkpoint, encode_checkpoint};
-#[cfg(test)]
 use super::CheckpointRef;
+#[cfg(test)]
+use history::{decode_checkpoint, encode_checkpoint};
 
 const BASE_HEAD_KEY: &str = ".ofs/managed/metadata/v1/head.ofs";
 const CHECKPOINT_ROOT: &str = ".ofs/managed/metadata/v1/checkpoints/sha256";

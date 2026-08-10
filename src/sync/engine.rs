@@ -16,9 +16,7 @@ use super::install::{
     apply_target, fresh_sibling, install_staged_changes, install_staged_tree, remove_tree,
 };
 use super::path::SnapshotTree;
-use super::{
-    ConflictRecord, LocalTree, ReplicaState, StagedTree, build_publication, reconcile,
-};
+use super::{ConflictRecord, LocalTree, ReplicaState, StagedTree, build_publication, reconcile};
 use crate::filesystem::{
     ChangeCursor, CommitOutcome, FileVersionId, NodeKind, OperationId, Volume, VolumeObservation,
 };
