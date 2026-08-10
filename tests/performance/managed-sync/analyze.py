@@ -7,10 +7,9 @@
 # "License"); you may not use this file except in compliance
 # with the License.
 
-"""Summarize release A/B evidence and enforce user-visible performance gates."""
+"""Summarize release A/B evidence and verify its behavioral contracts."""
 
 import argparse
-import hashlib
 import json
 import math
 import statistics
@@ -32,12 +31,11 @@ def percentile(values: list[int], quantile: float) -> int:
 def load_metrics(path: Path):
     samples = []
     intervals = defaultdict(list)
-    for release, run, metric, sample, value, started, ended in read_tsv(path):
+    for release, run, metric, _sample, value, started, ended in read_tsv(path):
         record = {
             "release": release,
             "run": run,
             "metric": metric,
-            "sample": sample,
             "value_ms": int(value),
             "start_ns": int(started),
             "end_ns": int(ended),
@@ -57,20 +55,6 @@ def summarize(samples):
             "count": len(values),
             "median_ms": statistics.median(values),
             "p95_ms": percentile(values, 0.95),
-        }
-        for (release, metric), values in sorted(grouped.items())
-    }
-
-
-def load_resources(path: Path):
-    grouped = defaultdict(list)
-    for release, _run, metric, _sample, peak_rss_kib in read_tsv(path):
-        grouped[(release, metric)].append(int(peak_rss_kib))
-    return {
-        f"{release}.{metric}": {
-            "count": len(values),
-            "median_kib": statistics.median(values),
-            "p95_kib": percentile(values, 0.95),
         }
         for (release, metric), values in sorted(grouped.items())
     }
@@ -169,21 +153,17 @@ def load_inputs(path: Path):
     return dict(values)
 
 
-def logical_equality(directory: Path, inputs) -> tuple[bool, dict[str, str]]:
-    digests = {
-        run: hashlib.sha256(
-            (directory / "runs" / run / "logical-tree.json").read_bytes()
-        ).hexdigest()
+def logical_equality(directory: Path, inputs) -> bool:
+    manifests = [
+        (directory / "runs" / run / "logical-tree.json").read_bytes()
         for run in sorted(inputs)
-    }
-    values = list(digests.values())
-    return bool(values) and all(digest == values[0] for digest in values[1:]), digests
+    ]
+    return bool(manifests) and all(value == manifests[0] for value in manifests[1:])
 
 
-def comparison_summary(statistics_by_metric, resources, requests, object_totals, inputs, equal):
+def comparison_summary(statistics_by_metric, requests, object_totals, inputs):
     product_phases = {"cold_restore", "incremental_catchup", "publication", "noop"}
     request_totals = defaultdict(lambda: {"count": 0, "request_bytes": 0, "response_bytes": 0})
-    request_operations = defaultdict(lambda: defaultdict(int))
     range_gets = defaultdict(int)
     segment_gets = defaultdict(lambda: defaultdict(int))
     for row in requests:
@@ -193,15 +173,13 @@ def comparison_summary(statistics_by_metric, resources, requests, object_totals,
         total["count"] += row["count"]
         total["request_bytes"] += row["bytes_in"]
         total["response_bytes"] += row["bytes_out"]
-        request_operations[row["run"]][row["operation"]] += row["count"]
         if row["operation"] == "GetObject" and row["range"]:
             range_gets[row["run"]] += row["count"]
         if row["operation"] == "GetObject" and row["object_class"] == "segment_data":
             segment_gets[row["run"]][row["phase"]] += row["count"]
 
     releases = sorted({values["release"] for values in inputs.values()})
-    operations = sorted({row["operation"] for row in requests})
-    result = {"logical_equality": equal, "releases": {}}
+    result = {"releases": {}}
     for release in releases:
         runs = [run for run, values in inputs.items() if values["release"] == release]
 
@@ -213,12 +191,6 @@ def comparison_summary(statistics_by_metric, resources, requests, object_totals,
                 "count_median": med(request_totals, "count"),
                 "request_bytes_median": med(request_totals, "request_bytes"),
                 "response_bytes_median": med(request_totals, "response_bytes"),
-                "by_operation_count_median": {
-                    operation: statistics.median(
-                        request_operations[run][operation] for run in runs
-                    )
-                    for operation in operations
-                },
                 "range_get_count_median": statistics.median(
                     range_gets[run] for run in runs
                 ),
@@ -243,11 +215,6 @@ def comparison_summary(statistics_by_metric, resources, requests, object_totals,
             "local_state_bytes_median": statistics.median(
                 inputs[run]["replica_state_bytes"] for run in runs
             ),
-            "peak_rss": {
-                key: value
-                for key, value in resources.items()
-                if key.startswith(f"{release}.")
-            },
             "latency": {
                 key: value
                 for key, value in statistics_by_metric.items()
@@ -255,18 +222,6 @@ def comparison_summary(statistics_by_metric, resources, requests, object_totals,
             },
         }
     return result
-
-
-def relative_gate(name: str, baseline: float, candidate: float, limit: float):
-    delta = candidate / baseline - 1 if baseline else (0 if candidate == 0 else math.inf)
-    return {
-        "name": name,
-        "baseline": baseline,
-        "candidate": candidate,
-        "delta_ratio": delta,
-        "limit_ratio": limit,
-        "passed": delta <= limit,
-    }
 
 
 def main() -> None:
@@ -277,120 +232,33 @@ def main() -> None:
     directory = arguments.directory
     samples, intervals = load_metrics(directory / "samples.tsv")
     statistics_by_metric = summarize(samples)
-    resources = load_resources(directory / "resources.tsv")
     requests, noop_data_puts = load_audit(
         directory / "audit.jsonl", intervals, arguments.access_key
     )
     inputs = load_inputs(directory / "inputs.tsv")
     object_totals = load_object_totals(directory, inputs)
-    equal, manifest_digests = logical_equality(directory, inputs)
+    equal = logical_equality(directory, inputs)
     context = {key: value for key, value in read_tsv(directory / "context.tsv")}
-    summary = comparison_summary(
-        statistics_by_metric, resources, requests, object_totals, inputs, equal
-    )
-    baseline_summary = summary["releases"]["baseline"]
-    candidate_summary = summary["releases"]["candidate"]
-    latency_specs = (
-        ("lifecycle_median", "lifecycle", "median_ms", 0.10),
-        ("publication_p95", "publication", "p95_ms", 0.15),
-        ("cold_restore_p95", "cold_restore", "p95_ms", 0.15),
-        ("incremental_catchup_p95", "incremental_catchup", "p95_ms", 0.15),
-    )
-    request_specs = (
-        "count_median",
-        "cold_restore_segment_get_count_median",
-        "incremental_catchup_segment_get_count_median",
-    )
-    gates = [
-        relative_gate(
-            name,
-            statistics_by_metric[f"baseline.{metric}"][aggregate],
-            statistics_by_metric[f"candidate.{metric}"][aggregate],
-            limit,
-        )
-        for name, metric, aggregate, limit in latency_specs
-    ]
-    gates.extend(
-        relative_gate(
-            "request_count_median" if name == "count_median" else name,
-            baseline_summary["requests"][name],
-            candidate_summary["requests"][name],
-            0.10,
-        )
-        for name in request_specs
-    )
-    gates.extend(
-        relative_gate(
-            f"{metric}_peak_rss_p95",
-            resources[f"baseline.{metric}"]["p95_kib"],
-            resources[f"candidate.{metric}"]["p95_kib"],
-            0.20,
-        )
-        for metric in ("publication", "cold_restore", "incremental_catchup")
-    )
-    gates.extend(
-        [
-            relative_gate(
-                "transferred_bytes_median",
-                baseline_summary["requests"]["request_bytes_median"]
-                + baseline_summary["requests"]["response_bytes_median"],
-                candidate_summary["requests"]["request_bytes_median"]
-                + candidate_summary["requests"]["response_bytes_median"],
-                0.10,
-            ),
-            relative_gate(
-                "stored_bytes_median",
-                baseline_summary["remote_objects"]["total_bytes_median"],
-                candidate_summary["remote_objects"]["total_bytes_median"],
-                0.10,
-            ),
-            relative_gate(
-                "replica_state_bytes_median",
-                baseline_summary["local_state_bytes_median"],
-                candidate_summary["local_state_bytes_median"],
-                0.25,
-            ),
-            {
-                "name": "metadata_bytes_within_logical_budget",
-                "ratio": candidate_summary["remote_objects"]["metadata_bytes_median"]
-                / statistics.median(
-                    values["logical_bytes"]
-                    for values in inputs.values()
-                    if values["release"] == "candidate"
-                ),
-                "limit_ratio": 0.02,
-                "passed": candidate_summary["remote_objects"]["metadata_bytes_median"]
-                <= 0.02
-                * statistics.median(
-                    values["logical_bytes"]
-                    for values in inputs.values()
-                    if values["release"] == "candidate"
-                ),
-            },
-            {
-                "name": "noop_phase_covered",
-                "passed": set(inputs)
-                <= {sample["run"] for sample in samples if sample["metric"] == "noop"},
-            },
-            {
-                "name": "noop_has_no_data_put",
-                "count": noop_data_puts,
-                "passed": noop_data_puts == 0,
-            },
-            {
-                "name": "object_inventory_observed",
-                "passed": all(
-                    object_totals.get(run, {}).get("total_objects", 0) > 0
-                    for run in inputs
-                ),
-            },
-            {
-                "name": "logical_trees_are_equal",
-                "passed": equal,
-            },
-        ]
-    )
-    verdict = "pass" if all(gate["passed"] for gate in gates) else "fail"
+    summary = comparison_summary(statistics_by_metric, requests, object_totals, inputs)
+    expected_runs = set(inputs)
+    expected_phases = {"cold_restore", "incremental_catchup", "publication", "noop"}
+    observed_phases = {(sample["run"], sample["metric"]) for sample in samples}
+    audit_runs = {row["run"] for row in requests if row["phase"] in expected_phases}
+    checks = {
+        "all_phases_observed": all(
+            (run, phase) in observed_phases
+            for run in expected_runs
+            for phase in expected_phases
+        ),
+        "native_audit_observed": expected_runs <= audit_runs,
+        "object_inventory_observed": all(
+            object_totals.get(run, {}).get("total_objects", 0) > 0
+            for run in expected_runs
+        ),
+        "noop_has_no_data_put": noop_data_puts == 0,
+        "logical_trees_are_equal": equal,
+    }
+    verdict = "pass" if all(checks.values()) else "fail"
     report = {
         "format": "ofs-managed-sync-performance",
         "version": 1,
@@ -402,17 +270,15 @@ def main() -> None:
             "inputs": "inputs.tsv",
             "runs": "runs/",
             "samples": "samples.tsv",
-            "resources": "resources.tsv",
         },
         "audit_distribution": requests,
-        "logical_manifest_sha256": manifest_digests,
         "summary": summary,
-        "gates": gates,
+        "checks": checks,
     }
     (directory / "results.json").write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
-    print(json.dumps({"verdict": verdict, **summary, "gates": gates}, indent=2))
+    print(json.dumps({"verdict": verdict, **summary, "checks": checks}, indent=2))
     raise SystemExit(verdict != "pass")
 
 

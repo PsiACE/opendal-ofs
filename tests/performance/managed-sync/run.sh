@@ -207,7 +207,6 @@ mc_run admin user add performance "$access_key" "$secret_key" >/dev/null
 mc_run admin policy attach performance readwrite --user "$access_key" >/dev/null
 
 : >"$output/samples.tsv"
-: >"$output/resources.tsv"
 : >"$output/inputs.tsv"
 : >"$output/commands.tsv"
 {
@@ -231,7 +230,6 @@ for index in "${!schedule[@]}"; do
   AWS_ACCESS_KEY_ID="$access_key" AWS_SECRET_ACCESS_KEY="$secret_key" AWS_REGION=us-east-1 \
     OFS_BIN="$scratch/ofs-$release" OFS_RUN_ROOT="$run_root" OFS_STORAGE_URL="$storage_url" \
     OFS_METRICS="$output/samples.tsv" OFS_INPUTS="$output/inputs.tsv" \
-    OFS_RESOURCES="$output/resources.tsv" \
     OFS_COMMANDS="$output/commands.tsv" OFS_RELEASE="$release" OFS_RUN_ID="$run" \
     OFS_PERF_ROUNDS="$rounds" OFS_CONTAINER_RUNTIME="$runtime" "$workload"
 

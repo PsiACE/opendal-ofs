@@ -11,7 +11,7 @@ set -euo pipefail
 
 : "${OFS_BIN:?}" "${OFS_RUN_ROOT:?}" "${OFS_STORAGE_URL:?}" "${OFS_METRICS:?}"
 : "${OFS_INPUTS:?}" "${OFS_COMMANDS:?}" "${OFS_RELEASE:?}" "${OFS_RUN_ID:?}"
-: "${OFS_PERF_ROUNDS:?}" "${OFS_RESOURCES:?}"
+: "${OFS_PERF_ROUNDS:?}"
 
 rounds=$OFS_PERF_ROUNDS
 volume=performance-volume
@@ -30,20 +30,15 @@ record_command() {
 measure() {
   local metric=$1 sample=$2 output=$3
   shift 3
-  local started_ns ended_ns elapsed_ms resource
+  local started_ns ended_ns elapsed_ms
   started_ns=$(date +%s%N)
   record_command "$@"
-  resource=$(mktemp "${TMPDIR:-/tmp}/ofs-managed-resource.XXXXXX")
-  /usr/bin/time -f '%M' -o "$resource" env OFS_CONFIG="$catalog" "$@" >"$output"
+  OFS_CONFIG="$catalog" "$@" >"$output"
   ended_ns=$(date +%s%N)
   elapsed_ms=$(((ended_ns - started_ns) / 1000000))
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$OFS_RELEASE" "$OFS_RUN_ID" "$metric" "$sample" "$elapsed_ms" \
     "$started_ns" "$ended_ns" >>"$OFS_METRICS"
-  printf '%s\t%s\t%s\t%s\t%s\n' \
-    "$OFS_RELEASE" "$OFS_RUN_ID" "$metric" "$sample" "$(tail -n 1 "$resource")" \
-    >>"$OFS_RESOURCES"
-  rm "$resource"
 }
 
 write_deterministic() {

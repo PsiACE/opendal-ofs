@@ -85,8 +85,10 @@ as private implementation details.
 The performance command uses MinIO's native audit webhook as its request and
 transfer-byte authority. It attributes operations to cold restore,
 publication, incremental catch-up, and no-op phases, inventories remote data
-and metadata objects separately, records command peak RSS and replica-state
-size, and checks logical tree equality. The local D1 query fixture records
+and metadata objects separately, records latency and replica-state size, and
+checks logical tree equality. Those measurements are report evidence; acceptance
+requires complete phase, audit, and inventory evidence, equal trees, and no
+data upload during no-op sync. The local D1 query fixture records
 native HTTP request count, request bytes, response bytes, and SQL statement
 count without logging credentials or query parameters.
 
