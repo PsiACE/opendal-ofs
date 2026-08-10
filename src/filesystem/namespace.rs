@@ -15,8 +15,27 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Apache OpenDAL™ File System.
-//!
-//! Managed Sync follows the volume and access boundaries defined by RFC 016.
+use serde::{Deserialize, Serialize};
 
-pub mod filesystem;
+use super::NodeId;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeKind {
+    Directory,
+    RegularFile,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeAttributes {
+    pub executable: bool,
+}
+
+/// One named edge from a directory to a filesystem node.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirectoryEntry {
+    pub node: NodeId,
+    pub kind: NodeKind,
+}

@@ -30,6 +30,12 @@ publish = false
 repository.workspace = true
 rust-version.workspace = true
 
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+unicode-casefold = "0.2"
+unicode-normalization = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
 [workspace]
 members = [".", "xtask"]
 resolver = "3"

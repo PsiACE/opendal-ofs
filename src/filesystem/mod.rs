@@ -15,8 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Apache OpenDAL™ File System.
-//!
-//! Managed Sync follows the volume and access boundaries defined by RFC 016.
+//! Filesystem values shared by Managed volumes and Sync replicas.
 
-pub mod filesystem;
+mod error;
+mod identity;
+mod namespace;
+mod snapshot;
+
+pub use error::{VolumeError, VolumeErrorKind};
+pub use identity::{ChangeCursor, FileVersionId, Generation, NodeId, OperationId, VolumeId};
+pub use namespace::{DirectoryEntry, NodeAttributes, NodeKind};
+pub use snapshot::{DirectoryRecord, FileVersion, NodeRecord, VolumeSnapshot};
