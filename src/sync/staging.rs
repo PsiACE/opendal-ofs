@@ -287,7 +287,7 @@ impl StagedTree {
             manifest: None,
             prepared,
         };
-        staged.validate()?;
+        validate_manifest(&staged.source)?;
         Ok(staged)
     }
 
@@ -341,10 +341,8 @@ impl StagedTree {
         Ok(version)
     }
 
-    pub(crate) fn replace_manifest(&mut self, manifest: TargetManifest) -> Result<()> {
-        validate_manifest(&manifest)?;
+    pub(crate) fn replace_manifest(&mut self, manifest: TargetManifest) {
         self.manifest = (manifest != self.source).then_some(manifest);
-        Ok(())
     }
 
     pub(crate) fn matches_source_observation(&self, observed: &LocalTree) -> bool {
@@ -355,14 +353,6 @@ impl StagedTree {
                     .get(path)
                     .is_some_and(|observed| observed == &entry.local)
             })
-    }
-
-    fn validate(&self) -> Result<()> {
-        validate_manifest(&self.source)?;
-        if let Some(manifest) = &self.manifest {
-            validate_manifest(manifest)?;
-        }
-        Ok(())
     }
 }
 

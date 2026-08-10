@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{BufReader, ErrorKind};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -97,13 +97,13 @@ impl ReplicaState {
 
     pub fn load(path: impl AsRef<Path>) -> Result<Option<Self>> {
         let path = path.as_ref();
-        let bytes = match fs::read(path) {
-            Ok(bytes) => bytes,
+        let file = match fs::File::open(path) {
+            Ok(file) => file,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error).context("read replica state"),
         };
         let stored: StoredState =
-            serde_json::from_slice(&bytes).context("parse replica state JSON")?;
+            serde_json::from_reader(BufReader::new(file)).context("parse replica state JSON")?;
         let mut state: Self = stored.try_into()?;
         if let Some(intent) = &mut state.pending {
             let mut components = intent.staging.components();

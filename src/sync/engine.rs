@@ -381,7 +381,8 @@ async fn apply_target<V: Volume>(
             .executable;
         set_executable(&root.join(path), executable)?;
     }
-    staged.replace_manifest(manifest)
+    staged.replace_manifest(manifest);
+    Ok(())
 }
 
 async fn reuse_local_file(
