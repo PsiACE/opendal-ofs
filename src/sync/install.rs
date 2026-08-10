@@ -198,9 +198,15 @@ pub(super) fn install_staged_changes(
             fs::create_dir_all(parent)?;
             let temporary = parent.join(format!(".ofs-install-{}", uuid::Uuid::new_v4()));
             let result = (|| -> Result<()> {
-                let copied = fs::copy(&source, &temporary)?;
-                if copied != entry.local.size {
-                    bail!("staged path {path:?} returned a short copy")
+                let installed = match fs::rename(&source, &temporary) {
+                    Ok(()) => fs::metadata(&temporary)?.len(),
+                    Err(error) if error.kind() == std::io::ErrorKind::CrossesDevices => {
+                        fs::copy(&source, &temporary)?
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                if installed != entry.local.size {
+                    bail!("staged path {path:?} has an unexpected length")
                 }
                 set_executable(&temporary, entry.local.executable)?;
                 fs::File::open(&temporary)?.sync_all()?;
