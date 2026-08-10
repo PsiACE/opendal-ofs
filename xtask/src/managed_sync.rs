@@ -1528,7 +1528,11 @@ fn docker_compose() -> Command {
 }
 
 fn docker_command() -> Command {
-    Command::new(which::which("docker").unwrap_or_else(|error| panic!("docker not found: {error}")))
+    Command::new(
+        which::which("docker")
+            .or_else(|_| which::which("podman"))
+            .unwrap_or_else(|error| panic!("docker or podman not found: {error}")),
+    )
 }
 
 fn container_http_proxy() -> Option<String> {
