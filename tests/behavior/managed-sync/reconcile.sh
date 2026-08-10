@@ -81,7 +81,7 @@ printf '%s\n' 'changed locally' >"$replica_a/overlap/value.txt"
 rm -rf -- "$replica_b/overlap"
 sync_b >/dev/null
 overlap_tree=$(tree_digest "$replica_a")
-overlap_state=$(sha256sum "$state_a")
+overlap_state=$(b3sum "$state_a")
 if sync_a 2>"$OFS_CASE_ROOT/directory-overlap.err"; then
   fail 'overlapping remote directory deletion replaced a local subtree change'
 fi
@@ -89,7 +89,7 @@ grep -Fq 'directory deletion overlaps local changes' "$OFS_CASE_ROOT/directory-o
   fail 'directory overlap error was not actionable'
 [[ "$(tree_digest "$replica_a")" == "$overlap_tree" ]] || \
   fail 'directory overlap rejection changed user files'
-[[ "$(sha256sum "$state_a")" == "$overlap_state" ]] || \
+[[ "$(b3sum "$state_a")" == "$overlap_state" ]] || \
   fail 'directory overlap rejection changed replica state'
 rm -rf -- "$replica_a/overlap"
 sync_a >/dev/null

@@ -49,5 +49,7 @@ jobs:
 
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup
+      - name: Install b3sum
+        run: cargo install b3sum --locked --version 1.8.6
       - name: Managed acceptance
         run: tests/behavior/managed-sync/run.sh test all

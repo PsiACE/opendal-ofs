@@ -12,6 +12,7 @@ set -euo pipefail
 : "${OFS_BIN:?}" "${OFS_RUN_ROOT:?}" "${OFS_STORAGE_URL:?}" "${OFS_METRICS:?}"
 : "${OFS_INPUTS:?}" "${OFS_COMMANDS:?}" "${OFS_RELEASE:?}" "${OFS_RUN_ID:?}"
 : "${OFS_PERF_ROUNDS:?}"
+command -v b3sum >/dev/null || { printf '%s\n' 'b3sum is required' >&2; exit 2; }
 
 rounds=$OFS_PERF_ROUNDS
 volume=performance-volume
@@ -143,10 +144,10 @@ read -r logical_files logical_bytes < <(
     awk '{ bytes += $1; files += 1 } END { print files + 0, bytes + 0 }'
 )
 python3 - "$current_tree" "$OFS_RUN_ROOT/logical-tree.json" <<'PY'
-import hashlib
 import json
 import pathlib
 import stat
+import subprocess
 import sys
 
 root = pathlib.Path(sys.argv[1])
@@ -156,17 +157,19 @@ for path in sorted(root.rglob("*")):
     if path.is_dir():
         entries.append({"path": relative, "type": "directory"})
         continue
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for block in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(block)
+    digest = subprocess.run(
+        ["b3sum", str(path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.split()[0]
     entries.append(
         {
             "path": relative,
             "type": "file",
             "bytes": path.stat().st_size,
             "executable": bool(path.stat().st_mode & stat.S_IXUSR),
-            "sha256": digest.hexdigest(),
+            "blake3": digest,
         }
     )
 pathlib.Path(sys.argv[2]).write_text(

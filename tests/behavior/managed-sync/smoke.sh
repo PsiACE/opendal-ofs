@@ -38,7 +38,7 @@ fi
 rm "$replica_a/hard-link-source.txt"
 
 printf '%s\n' 'smoke: reject ambiguous portable names before publication'
-portable_state=$(sha256sum "$state_a")
+portable_state=$(b3sum "$state_a")
 mkdir "$replica_a/portable-names"
 : >"$replica_a/portable-names/CON"
 if sync_a >"$OFS_CASE_ROOT/portable-name.err" 2>&1; then
@@ -58,7 +58,7 @@ if sync_a >/dev/null 2>&1; then
   fail 'a case-folding collision was published'
 fi
 rm -rf -- "$replica_a/portable-names"
-[[ "$(sha256sum "$state_a")" == "$portable_state" ]] || \
+[[ "$(b3sum "$state_a")" == "$portable_state" ]] || \
   fail 'portable-name rejection changed replica state'
 
 printf '%s\n' 'smoke: publish nested, empty, executable, large, and reused content'

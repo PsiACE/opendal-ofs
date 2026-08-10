@@ -12,7 +12,7 @@ tests/performance/managed-sync/run.sh \
 A baseline is required through `--baseline`, `OFS_PERF_BASELINE`, or
 `OFS_PERF_BASELINE_BIN`. The candidate defaults to a fresh release build of the
 current `HEAD` commit. Pass `--candidate PATH_OR_REF` to compare two supplied
-binaries or refs.
+binaries or refs. The harness requires the standard BLAKE3 `b3sum` command.
 
 Both binaries use the same host, one long-running local MinIO, and separate
 object roots. Samples run in the fixed order baseline, candidate, candidate,

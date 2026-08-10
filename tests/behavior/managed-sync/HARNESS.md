@@ -26,8 +26,9 @@ scripts; the fixture changes only the environment. `common.sh` contains only
 their environment, fixture, and CLI-driving helpers.
 
 The harness must provide a fresh `OFS_CASE_ROOT`, a built `OFS_BIN`, and a
-credential-free `OFS_STORAGE_URL`. Credentials belong in provider environment
-variables. Select the metadata authority with:
+credential-free `OFS_STORAGE_URL`. It also requires the standard BLAKE3
+`b3sum` command for exact tree and state fingerprints. Credentials belong in
+provider environment variables. Select the metadata authority with:
 
 ```text
 OFS_METADATA_MODE=object

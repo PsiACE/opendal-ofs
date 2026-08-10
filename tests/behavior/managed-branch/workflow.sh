@@ -16,7 +16,7 @@ fail() {
 
 tree_digest() {
   local root=$1
-  (cd "$root" && find . -type f -exec sha256sum {} + | LC_ALL=C sort | sha256sum)
+  (cd "$root" && find . -type f -exec b3sum {} + | LC_ALL=C sort | b3sum)
 }
 
 json_field() {
@@ -31,6 +31,7 @@ OFS_STORAGE_URL=${OFS_STORAGE_URL:-}
 OFS_METADATA_MODE=${OFS_METADATA_MODE:-object}
 OFS_METADATA_URL=${OFS_METADATA_URL:-}
 
+command -v b3sum >/dev/null || fail 'b3sum is required'
 [[ -x "$OFS_BIN" ]] || fail 'OFS_BIN must name the built ofs executable'
 [[ -n "$OFS_CASE_ROOT" ]] || fail 'OFS_CASE_ROOT must name a fresh test directory'
 [[ ! -e "$OFS_CASE_ROOT" ]] || fail "OFS_CASE_ROOT already exists: $OFS_CASE_ROOT"

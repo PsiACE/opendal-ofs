@@ -198,6 +198,7 @@ run_tests() {
       fail 'expected test all, test admission|smoke|reconcile|recovery|scale|branch object|d1, or test staging'
       ;;
   esac
+  command -v b3sum >/dev/null || fail 'b3sum is required'
   cargo build --locked
   select_compose
   audit_root=$(mktemp -d "${TMPDIR:-/tmp}/ofs-managed-audit.XXXXXX")

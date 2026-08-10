@@ -23,7 +23,7 @@ fail() {
 
 tree_digest() {
   local root=$1
-  (cd "$root" && find . -type f -exec sha256sum {} + | LC_ALL=C sort | sha256sum)
+  (cd "$root" && find . -type f -exec b3sum {} + | LC_ALL=C sort | b3sum)
 }
 
 json_field() {
