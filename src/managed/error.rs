@@ -15,9 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Apache OpenDAL™ File System.
-//!
-//! Managed Sync follows the volume and access boundaries defined by RFC 016.
+use crate::filesystem::{VolumeError, VolumeErrorKind};
 
-pub mod filesystem;
-pub mod managed;
+pub(crate) fn invalid(action: &'static str, message: &'static str) -> VolumeError {
+    error(VolumeErrorKind::Invalid, action, message)
+}
+
+pub(crate) fn corrupt(action: &'static str, message: &'static str) -> VolumeError {
+    error(VolumeErrorKind::Corrupt, action, message)
+}
+
+pub(crate) fn unavailable(action: &'static str, message: &'static str) -> VolumeError {
+    error(VolumeErrorKind::Unavailable, action, message)
+}
+
+pub(crate) fn unsupported(action: &'static str, message: &'static str) -> VolumeError {
+    error(VolumeErrorKind::UnsupportedFormat, action, message)
+}
+
+fn error(kind: VolumeErrorKind, action: &'static str, message: &'static str) -> VolumeError {
+    VolumeError::new(kind, format!("{action}: {message}"))
+}
