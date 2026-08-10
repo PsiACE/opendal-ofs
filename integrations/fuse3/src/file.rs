@@ -16,53 +16,32 @@
 // under the License.
 
 use std::ffi::OsString;
-use std::sync::Arc;
 
 use fuse3::Errno;
-use opendal::Writer;
-use tokio::sync::Mutex;
 
-/// Opened file represents file that opened in memory.
-///
-/// # FIXME
-///
-/// We should remove the `pub` filed to avoid unexpected changes.
-pub struct OpenedFile {
-    pub path: OsString,
-    pub is_read: bool,
-    pub content_length: u64,
-    pub inner_writer: Option<Arc<Mutex<InnerWriter>>>,
+pub(crate) struct OpenedFile {
+    pub(crate) path: OsString,
+    pub(crate) content_length: u64,
+    pub(crate) version: Option<String>,
+    pub(crate) etag: Option<String>,
 }
 
-/// # FIXME
-///
-/// We need better naming and API for this struct.
-pub struct InnerWriter {
-    pub writer: Option<Writer>,
-    pub written: u64,
-}
-
-/// File key is the key of opened file.
-///
-/// # FIXME
-///
-/// We should remove the `pub` filed to avoid unexpected changes.
 #[derive(Debug, Clone, Copy)]
-pub struct FileKey(pub usize);
+pub(crate) struct FileKey(pub(crate) usize);
 
 impl TryFrom<u64> for FileKey {
     type Error = Errno;
 
     fn try_from(value: u64) -> std::result::Result<Self, Self::Error> {
-        match value {
-            0 => Err(Errno::from(libc::EBADF)),
-            _ => Ok(FileKey(value as usize - 1)),
-        }
+        let key = value.checked_sub(1).ok_or(Errno::from(libc::EBADF))?;
+        usize::try_from(key)
+            .map(FileKey)
+            .map_err(|_| Errno::from(libc::EOVERFLOW))
     }
 }
 
 impl FileKey {
-    pub fn to_fh(self) -> u64 {
-        self.0 as u64 + 1 // ensure fh is not 0
+    pub(crate) fn to_fh(self) -> u64 {
+        u64::try_from(self.0).expect("usize always fits in u64 on supported targets") + 1
     }
 }

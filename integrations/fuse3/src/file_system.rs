@@ -34,16 +34,14 @@ use opendal::ErrorKind;
 use opendal::Metadata;
 use opendal::Operator;
 use sharded_slab::Slab;
-use tokio::sync::Mutex;
 
 use super::directory::OpenedDirectory;
 use super::file::FileKey;
-use super::file::InnerWriter;
 use super::file::OpenedFile;
 
 const TTL: Duration = Duration::from_secs(1); // 1 second
 
-/// `Filesystem` represents the filesystem that implements [`PathFilesystem`] by opendal.
+/// Read-only [`PathFilesystem`] backed by an OpenDAL [`Operator`].
 ///
 /// `Filesystem` must be used along with `fuse3`'s `Session` like the following:
 ///
@@ -64,7 +62,8 @@ const TTL: Duration = Duration::from_secs(1); // 1 second
 ///     let fs = Filesystem::new(op, 1000, 1000);
 ///
 ///     // Configure mount options.
-///     let mount_options = MountOptions::default();
+///     let mut mount_options = MountOptions::default();
+///     mount_options.read_only(true);
 ///
 ///     // Start a fuse3 session and mount it.
 ///     let mut mount_handle = Session::new(mount_options)
@@ -103,37 +102,13 @@ impl Filesystem {
         }
     }
 
-    fn check_flags(&self, flags: u32) -> Result<(bool, bool, bool)> {
-        let is_trunc = flags & libc::O_TRUNC as u32 != 0 || flags & libc::O_CREAT as u32 != 0;
-        let is_append = flags & libc::O_APPEND as u32 != 0;
-
-        let mode = flags & libc::O_ACCMODE as u32;
-        let is_read = mode == libc::O_RDONLY as u32 || mode == libc::O_RDWR as u32;
-        let is_write = mode == libc::O_WRONLY as u32 || mode == libc::O_RDWR as u32 || is_append;
-        if !is_read && !is_write {
-            Err(Errno::from(libc::EINVAL))?;
+    fn check_open_flags(flags: u32) -> Result<()> {
+        let access_mode = flags & libc::O_ACCMODE as u32;
+        let mutating = flags & (libc::O_CREAT | libc::O_TRUNC | libc::O_APPEND) as u32 != 0;
+        if access_mode != libc::O_RDONLY as u32 || mutating {
+            return Err(Errno::from(libc::EROFS));
         }
-        // OpenDAL only supports truncate write and append write,
-        // so O_TRUNC or O_APPEND needs to be specified explicitly
-        if (is_write && !is_trunc && !is_append) || is_trunc && !is_write {
-            Err(Errno::from(libc::EINVAL))?;
-        }
-
-        let capability = self.op.info().full_capability();
-        if is_read && !capability.read {
-            Err(Errno::from(libc::EACCES))?;
-        }
-        if is_trunc && !capability.write {
-            Err(Errno::from(libc::EACCES))?;
-        }
-        if is_append && !capability.write_can_append {
-            Err(Errno::from(libc::EACCES))?;
-        }
-
-        log::trace!(
-            "check_flags: is_read={is_read}, is_write={is_write}, is_trunc={is_trunc}, is_append={is_append}"
-        );
-        Ok((is_read, is_trunc, is_append))
+        Ok(())
     }
 
     // Get opened file and check given path
@@ -145,7 +120,7 @@ impl Filesystem {
         let file = self
             .opened_files
             .get(key.0)
-            .ok_or(Errno::from(libc::ENOENT))?;
+            .ok_or(Errno::from(libc::EBADF))?;
 
         if matches!(path, Some(path) if path != file.path) {
             log::trace!(
@@ -163,23 +138,12 @@ impl Filesystem {
         let directory = self
             .opened_directories
             .get(key.0)
-            .ok_or(Errno::from(libc::ENOENT))?
+            .ok_or(Errno::from(libc::EBADF))?
             .clone();
         if !directory.matches(path) {
             Err(Errno::from(libc::EBADF))?;
         }
         Ok(directory)
-    }
-
-    async fn finish_writer(inner_writer: Option<Arc<Mutex<InnerWriter>>>) -> Result<()> {
-        if let Some(inner_writer) = inner_writer {
-            let mut inner = inner_writer.lock().await;
-            if let Some(mut writer) = inner.writer.take() {
-                writer.close().await.map_err(opendal_error2errno)?;
-            }
-        }
-
-        Ok(())
     }
 }
 
@@ -197,12 +161,8 @@ impl PathFilesystem for Filesystem {
     async fn lookup(&self, _req: Request, parent: &OsStr, name: &OsStr) -> Result<ReplyEntry> {
         log::debug!("lookup(parent={parent:?}, name={name:?})");
 
-        let path = PathBuf::from(parent).join(name);
-        let metadata = self
-            .op
-            .stat(&path.to_string_lossy())
-            .await
-            .map_err(opendal_error2errno)?;
+        let path = child_path(parent, name)?;
+        let metadata = self.op.stat(&path).await.map_err(opendal_error2errno)?;
 
         let now = SystemTime::now();
         let attr = metadata2file_attr(&metadata, now, self.uid, self.gid);
@@ -219,25 +179,24 @@ impl PathFilesystem for Filesystem {
     ) -> Result<ReplyAttr> {
         log::debug!("getattr(path={path:?}, fh={fh:?}, flags={flags:?})");
 
-        let fh_path = fh.and_then(|fh| {
-            self.opened_files
-                .get(FileKey::try_from(fh).ok()?.0)
-                .map(|f| f.path.clone())
-        });
+        let fh_path = match fh {
+            Some(fh) => Some(
+                self.get_opened_file(FileKey::try_from(fh)?, path)?
+                    .path
+                    .clone(),
+            ),
+            None => None,
+        };
 
         let file_path = match (path.map(Into::into), fh_path) {
-            (Some(a), Some(b)) => {
-                if a != b {
-                    Err(Errno::from(libc::EBADF))?;
-                }
-                Some(a)
-            }
+            (Some(a), Some(_)) => Some(a),
             (a, b) => a.or(b),
         };
 
+        let file_path = file_path.unwrap_or_default();
         let metadata = self
             .op
-            .stat(&file_path.unwrap_or_default().to_string_lossy())
+            .stat(opendal_path(&file_path)?)
             .await
             .map_err(opendal_error2errno)?;
 
@@ -247,131 +206,14 @@ impl PathFilesystem for Filesystem {
         Ok(ReplyAttr { ttl: TTL, attr })
     }
 
-    async fn setattr(
-        &self,
-        _req: Request,
-        path: Option<&OsStr>,
-        fh: Option<u64>,
-        set_attr: SetAttr,
-    ) -> Result<ReplyAttr> {
-        log::debug!("setattr(path={path:?}, fh={fh:?}, set_attr={set_attr:?})");
-
-        self.getattr(_req, path, fh, 0).await
-    }
-
-    async fn symlink(
-        &self,
-        _req: Request,
-        parent: &OsStr,
-        name: &OsStr,
-        link_path: &OsStr,
-    ) -> Result<ReplyEntry> {
-        log::debug!("symlink(parent={parent:?}, name={name:?}, link_path={link_path:?})");
-        Err(libc::EOPNOTSUPP.into())
-    }
-
-    async fn mknod(
-        &self,
-        _req: Request,
-        parent: &OsStr,
-        name: &OsStr,
-        mode: u32,
-        _rdev: u32,
-    ) -> Result<ReplyEntry> {
-        log::debug!("mknod(parent={parent:?}, name={name:?}, mode=0o{mode:o})");
-        Err(libc::EOPNOTSUPP.into())
-    }
-
-    async fn mkdir(
-        &self,
-        _req: Request,
-        parent: &OsStr,
-        name: &OsStr,
-        mode: u32,
-        _umask: u32,
-    ) -> Result<ReplyEntry> {
-        log::debug!("mkdir(parent={parent:?}, name={name:?}, mode=0o{mode:o})");
-
-        let mut path = PathBuf::from(parent).join(name);
-        path.push(""); // ref https://users.rust-lang.org/t/trailing-in-paths/43166
-        self.op
-            .create_dir(&path.to_string_lossy())
-            .await
-            .map_err(opendal_error2errno)?;
-
-        let now = SystemTime::now();
-        let attr = dummy_file_attr(FileType::Directory, now, self.uid, self.gid);
-
-        Ok(ReplyEntry { ttl: TTL, attr })
-    }
-
-    async fn unlink(&self, _req: Request, parent: &OsStr, name: &OsStr) -> Result<()> {
-        log::debug!("unlink(parent={parent:?}, name={name:?})");
-
-        let path = PathBuf::from(parent).join(name);
-        self.op
-            .delete(&path.to_string_lossy())
-            .await
-            .map_err(opendal_error2errno)?;
-
-        Ok(())
-    }
-
-    async fn rmdir(&self, _req: Request, parent: &OsStr, name: &OsStr) -> Result<()> {
-        log::debug!("rmdir(parent={parent:?}, name={name:?})");
-
-        let path = PathBuf::from(parent).join(name);
-        self.op
-            .delete(&path.to_string_lossy())
-            .await
-            .map_err(opendal_error2errno)?;
-
-        Ok(())
-    }
-
-    async fn rename(
-        &self,
-        _req: Request,
-        origin_parent: &OsStr,
-        origin_name: &OsStr,
-        parent: &OsStr,
-        name: &OsStr,
-    ) -> Result<()> {
-        log::debug!(
-            "rename(p={origin_parent:?}, name={origin_name:?}, newp={parent:?}, newname={name:?})"
-        );
-
-        if !self.op.info().full_capability().rename {
-            return Err(Errno::from(libc::ENOTSUP))?;
-        }
-
-        let origin_path = PathBuf::from(origin_parent).join(origin_name);
-        let path = PathBuf::from(parent).join(name);
-
-        self.op
-            .rename(&origin_path.to_string_lossy(), &path.to_string_lossy())
-            .await
-            .map_err(opendal_error2errno)?;
-
-        Ok(())
-    }
-
-    async fn link(
-        &self,
-        _req: Request,
-        path: &OsStr,
-        new_parent: &OsStr,
-        new_name: &OsStr,
-    ) -> Result<ReplyEntry> {
-        log::debug!("link(path={path:?}, new_parent={new_parent:?}, new_name={new_name:?})");
-        Err(libc::EOPNOTSUPP.into())
-    }
-
     async fn opendir(&self, _req: Request, path: &OsStr, flags: u32) -> Result<ReplyOpen> {
         log::debug!("opendir(path={path:?}, flags=0x{flags:x})");
+        Self::check_open_flags(flags)?;
         let key = self
             .opened_directories
-            .insert(Arc::new(OpenedDirectory::new(path)))
+            .insert(Arc::new(
+                OpenedDirectory::new(path).ok_or(Errno::from(libc::EILSEQ))?,
+            ))
             .ok_or(Errno::from(libc::EBUSY))?;
         Ok(ReplyOpen {
             fh: FileKey(key).to_fh(),
@@ -382,48 +224,28 @@ impl PathFilesystem for Filesystem {
     async fn open(&self, _req: Request, path: &OsStr, flags: u32) -> Result<ReplyOpen> {
         log::debug!("open(path={path:?}, flags=0x{flags:x})");
 
-        let (is_read, is_trunc, is_append) = self.check_flags(flags)?;
-        if flags & libc::O_CREAT as u32 != 0 {
-            self.op
-                .write(&path.to_string_lossy(), Bytes::new())
-                .await
-                .map_err(opendal_error2errno)?;
-        }
-
-        let content_length = if is_trunc {
-            0
-        } else if is_read || is_append {
-            self.op
-                .stat(&path.to_string_lossy())
-                .await
-                .map_err(opendal_error2errno)?
-                .content_length()
-        } else {
-            0
-        };
-
-        let inner_writer = if is_trunc || is_append {
-            let writer = self
-                .op
-                .writer_with(&path.to_string_lossy())
-                .append(is_append)
-                .await
-                .map_err(opendal_error2errno)?;
-            Some(Arc::new(Mutex::new(InnerWriter {
-                writer: Some(writer),
-                written: content_length,
-            })))
-        } else {
-            None
-        };
+        Self::check_open_flags(flags)?;
+        let metadata = self
+            .op
+            .stat(opendal_path(path)?)
+            .await
+            .map_err(opendal_error2errno)?;
+        let capability = self.op.info().full_capability();
+        let version = capability
+            .read_with_version
+            .then(|| metadata.version().map(str::to_owned))
+            .flatten();
+        let etag = (version.is_none() && capability.read_with_if_match)
+            .then(|| metadata.etag().map(str::to_owned))
+            .flatten();
 
         let key = self
             .opened_files
             .insert(OpenedFile {
                 path: path.into(),
-                is_read,
-                content_length,
-                inner_writer,
+                content_length: metadata.content_length(),
+                version,
+                etag,
             })
             .ok_or(Errno::from(libc::EBUSY))?;
 
@@ -443,82 +265,30 @@ impl PathFilesystem for Filesystem {
     ) -> Result<ReplyData> {
         log::debug!("read(path={path:?}, fh={fh}, offset={offset}, size={size})");
 
-        let (file_path, content_length, inner_writer) = {
+        let (file_path, content_length, version, etag) = {
             let file = self.get_opened_file(FileKey::try_from(fh)?, path)?;
-            if !file.is_read {
-                Err(Errno::from(libc::EACCES))?;
-            }
             (
-                file.path.to_string_lossy().to_string(),
+                opendal_path(&file.path)?.to_owned(),
                 file.content_length,
-                file.inner_writer.clone(),
+                file.version.clone(),
+                file.etag.clone(),
             )
-        };
-        let content_length = match inner_writer {
-            Some(inner_writer) => inner_writer.lock().await.written,
-            None => content_length,
         };
         if size == 0 || offset >= content_length {
             return Ok(ReplyData { data: Bytes::new() });
         }
         let end = offset.saturating_add(u64::from(size)).min(content_length);
 
-        let data = self
-            .op
-            .read_with(&file_path)
-            .range(offset..end)
-            .await
-            .map_err(opendal_error2errno)?;
+        let mut read = self.op.read_with(&file_path).range(offset..end);
+        if let Some(version) = &version {
+            read = read.version(version);
+        } else if let Some(etag) = &etag {
+            read = read.if_match(etag);
+        }
+        let data = read.await.map_err(opendal_error2errno)?;
 
         Ok(ReplyData {
             data: data.to_bytes(),
-        })
-    }
-
-    async fn write(
-        &self,
-        _req: Request,
-        path: Option<&OsStr>,
-        fh: u64,
-        offset: u64,
-        data: &[u8],
-        _write_flags: u32,
-        flags: u32,
-    ) -> Result<ReplyWrite> {
-        log::debug!(
-            "write(path={:?}, fh={}, offset={}, data_len={}, flags=0x{:x})",
-            path,
-            fh,
-            offset,
-            data.len(),
-            flags
-        );
-
-        let Some(inner_writer) = ({
-            self.get_opened_file(FileKey::try_from(fh)?, path)?
-                .inner_writer
-                .clone()
-        }) else {
-            Err(Errno::from(libc::EACCES))?
-        };
-
-        let mut inner = inner_writer.lock().await;
-        // OpenDAL doesn't support random write
-        if offset != inner.written {
-            Err(Errno::from(libc::EINVAL))?;
-        }
-
-        inner
-            .writer
-            .as_mut()
-            .ok_or(Errno::from(libc::EBADF))?
-            .write_from(data)
-            .await
-            .map_err(opendal_error2errno)?;
-        inner.written += data.len() as u64;
-
-        Ok(ReplyWrite {
-            written: data.len() as _,
         })
     }
 
@@ -535,15 +305,15 @@ impl PathFilesystem for Filesystem {
             "release(path={path:?}, fh={fh}, flags=0x{flags:x}, lock_owner={lock_owner}, flush={flush})"
         );
 
-        let Some(file) = self.opened_files.take(FileKey::try_from(fh)?.0) else {
-            return Ok(());
-        };
-
-        Self::finish_writer(file.inner_writer).await
+        let key = FileKey::try_from(fh)?;
+        {
+            self.get_opened_file(key, path)?;
+        }
+        self.opened_files.take(key.0);
+        Ok(())
     }
 
-    /// FUSE can call flush multiple times or omit it. The first flush finalizes the writer, while
-    /// release provides the fallback when flush is omitted.
+    /// Validate repeated close-time flushes without changing the read-only handle.
     async fn flush(
         &self,
         _req: Request,
@@ -553,12 +323,7 @@ impl PathFilesystem for Filesystem {
     ) -> Result<()> {
         log::debug!("flush(path={path:?}, fh={fh}, lock_owner={lock_owner})");
 
-        let inner_writer = {
-            let file = self.get_opened_file(FileKey::try_from(fh)?, path)?;
-            file.inner_writer.clone()
-        };
-
-        Self::finish_writer(inner_writer).await?;
+        self.get_opened_file(FileKey::try_from(fh)?, path)?;
         Ok(())
     }
 
@@ -618,64 +383,18 @@ impl PathFilesystem for Filesystem {
     async fn access(&self, _req: Request, path: &OsStr, mask: u32) -> Result<()> {
         log::debug!("access(path={path:?}, mask=0x{mask:x})");
 
-        self.op
-            .stat(&path.to_string_lossy())
+        if mask & libc::W_OK as u32 != 0 {
+            return Err(Errno::from(libc::EROFS));
+        }
+        let metadata = self
+            .op
+            .stat(opendal_path(path)?)
             .await
             .map_err(opendal_error2errno)?;
-
+        if mask & libc::X_OK as u32 != 0 && metadata.mode() != EntryMode::DIR {
+            return Err(Errno::from(libc::EACCES));
+        }
         Ok(())
-    }
-
-    async fn create(
-        &self,
-        _req: Request,
-        parent: &OsStr,
-        name: &OsStr,
-        mode: u32,
-        flags: u32,
-    ) -> Result<ReplyCreated> {
-        log::debug!("create(parent={parent:?}, name={name:?}, mode=0o{mode:o}, flags=0x{flags:x})");
-
-        let (is_read, is_trunc, is_append) = self.check_flags(flags | libc::O_CREAT as u32)?;
-
-        let path = PathBuf::from(parent).join(name);
-
-        let inner_writer = if is_trunc || is_append {
-            let writer = self
-                .op
-                .writer_with(&path.to_string_lossy())
-                .chunk(4 * 1024 * 1024)
-                .append(is_append)
-                .await
-                .map_err(opendal_error2errno)?;
-            Some(Arc::new(Mutex::new(InnerWriter {
-                writer: Some(writer),
-                written: 0,
-            })))
-        } else {
-            None
-        };
-
-        let now = SystemTime::now();
-        let attr = dummy_file_attr(FileType::RegularFile, now, self.uid, self.gid);
-
-        let key = self
-            .opened_files
-            .insert(OpenedFile {
-                path: path.into(),
-                is_read,
-                content_length: 0,
-                inner_writer,
-            })
-            .ok_or(Errno::from(libc::EBUSY))?;
-
-        Ok(ReplyCreated {
-            ttl: TTL,
-            attr,
-            generation: 0,
-            fh: FileKey(key).to_fh(),
-            flags,
-        })
     }
 
     type DirEntryPlusStream<'a> = BoxStream<'a, Result<DirectoryEntryPlus>>;
@@ -739,50 +458,6 @@ impl PathFilesystem for Filesystem {
         })
     }
 
-    async fn rename2(
-        &self,
-        req: Request,
-        origin_parent: &OsStr,
-        origin_name: &OsStr,
-        parent: &OsStr,
-        name: &OsStr,
-        _flags: u32,
-    ) -> Result<()> {
-        log::debug!(
-            "rename2(origin_parent={origin_parent:?}, origin_name={origin_name:?}, parent={parent:?}, name={name:?})"
-        );
-        self.rename(req, origin_parent, origin_name, parent, name)
-            .await
-    }
-
-    async fn copy_file_range(
-        &self,
-        req: Request,
-        from_path: Option<&OsStr>,
-        fh_in: u64,
-        offset_in: u64,
-        to_path: Option<&OsStr>,
-        fh_out: u64,
-        offset_out: u64,
-        length: u64,
-        flags: u64,
-    ) -> Result<ReplyCopyFileRange> {
-        log::debug!(
-            "copy_file_range(from_path={from_path:?}, fh_in={fh_in}, offset_in={offset_in}, to_path={to_path:?}, fh_out={fh_out}, offset_out={offset_out}, length={length}, flags={flags})"
-        );
-        let data = self
-            .read(req, from_path, fh_in, offset_in, length as _)
-            .await?;
-
-        let ReplyWrite { written } = self
-            .write(req, to_path, fh_out, offset_out, &data.data, 0, flags as _)
-            .await?;
-
-        Ok(ReplyCopyFileRange {
-            copied: u64::from(written),
-        })
-    }
-
     async fn statfs(&self, _req: Request, path: &OsStr) -> Result<ReplyStatFs> {
         log::debug!("statfs(path={path:?})");
         Ok(ReplyStatFs {
@@ -796,6 +471,18 @@ impl PathFilesystem for Filesystem {
             frsize: 0,
         })
     }
+}
+
+fn opendal_path(path: &OsStr) -> Result<&str> {
+    path.to_str().ok_or_else(|| Errno::from(libc::EILSEQ))
+}
+
+fn child_path(parent: &OsStr, name: &OsStr) -> Result<String> {
+    PathBuf::from(parent)
+        .join(name)
+        .into_os_string()
+        .into_string()
+        .map_err(|_| Errno::from(libc::EILSEQ))
 }
 
 fn directory_entry_offset(base: u64, index: usize) -> Result<i64> {
@@ -828,6 +515,10 @@ fn metadata2file_attr(metadata: &Metadata, atime: SystemTime, uid: u32, gid: u32
 }
 
 const fn dummy_file_attr(kind: FileType, now: SystemTime, uid: u32, gid: u32) -> FileAttr {
+    let (mode, nlink) = match kind {
+        FileType::Directory => (0o555, 2),
+        _ => (0o444, 1),
+    };
     FileAttr {
         size: 0,
         blocks: 0,
@@ -835,8 +526,8 @@ const fn dummy_file_attr(kind: FileType, now: SystemTime, uid: u32, gid: u32) ->
         mtime: now,
         ctime: now,
         kind,
-        perm: fuse3::perm_from_mode_and_kind(kind, 0o775),
-        nlink: 0,
+        perm: mode,
+        nlink,
         uid,
         gid,
         rdev: 0,
@@ -858,7 +549,10 @@ fn opendal_error2errno(err: opendal::Error) -> fuse3::Errno {
         ErrorKind::AlreadyExists => Errno::from(libc::EEXIST),
         ErrorKind::NotADirectory => Errno::from(libc::ENOTDIR),
         ErrorKind::RangeNotSatisfied => Errno::from(libc::EINVAL),
-        ErrorKind::RateLimited => Errno::from(libc::EBUSY),
-        _ => Errno::from(libc::ENOENT),
+        ErrorKind::RateLimited => Errno::from(libc::EAGAIN),
+        ErrorKind::IsSameFile => Errno::from(libc::EINVAL),
+        ErrorKind::ConditionNotMatch => Errno::from(libc::ESTALE),
+        ErrorKind::ConfigInvalid | ErrorKind::Unexpected => Errno::from(libc::EIO),
+        _ => Errno::from(libc::EIO),
     }
 }

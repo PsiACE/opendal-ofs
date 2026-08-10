@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! `fuse3_opendal` is an [`fuse3`](https://github.com/Sherlock-Holo/fuse3) implementation using opendal.
+//! `fuse3_opendal` is a read-only [`fuse3`](https://github.com/Sherlock-Holo/fuse3)
+//! filesystem backed by OpenDAL.
 //!
 //! This crate can help you to access ANY storage services by mounting locally by [`FUSE`](https://www.kernel.org/doc/html/next/filesystems/fuse.html).
 //!
@@ -36,7 +37,8 @@
 //!     let fs = Filesystem::new(op, 1000, 1000);
 //!
 //!     // Configure mount options.
-//!     let mount_options = MountOptions::default();
+//!     let mut mount_options = MountOptions::default();
+//!     mount_options.read_only(true);
 //!
 //!     // Start a fuse3 session and mount it.
 //!     let mut mount_handle = Session::new(mount_options)

@@ -34,11 +34,11 @@ pub(crate) struct OpenedDirectory {
 }
 
 impl OpenedDirectory {
-    pub(crate) fn new(path: &OsStr) -> Self {
-        Self {
+    pub(crate) fn new(path: &OsStr) -> Option<Self> {
+        Some(Self {
             path: path.into(),
-            cursor: Mutex::new(DirectoryCursor::new(path)),
-        }
+            cursor: Mutex::new(DirectoryCursor::new(path.to_str()?)),
+        })
     }
 
     pub(crate) fn matches(&self, path: &OsStr) -> bool {
@@ -63,8 +63,8 @@ struct DirectoryCursor {
 }
 
 impl DirectoryCursor {
-    fn new(path: &OsStr) -> Self {
-        let mut path = path.to_string_lossy().into_owned();
+    fn new(path: &str) -> Self {
+        let mut path = path.to_owned();
         if !path.ends_with('/') {
             path.push('/');
         }
