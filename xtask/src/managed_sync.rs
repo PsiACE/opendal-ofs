@@ -43,16 +43,95 @@ pub(crate) fn run_fixture(keep: bool, case: Option<&str>) {
         Some("admission") => admission(&fixture),
         Some("growing") => growing(&fixture),
         Some("reconcile") => reconcile(&fixture),
+        Some("rename") => rename(&fixture),
         Some("smoke") => smoke(&fixture),
         Some(name) => panic!("unknown Managed Sync behavior case: {name}"),
         None => {
             admission(&fixture);
             smoke(&fixture);
             reconcile(&fixture);
+            rename(&fixture);
             growing(&fixture);
         }
     }
     println!("Managed Sync behavior passed: {}", case.unwrap_or("all"));
+}
+
+fn rename(fixture: &Fixture) {
+    let root = CaseRoot::new();
+    let replica_a = root.path.join("replica-a");
+    let replica_b = root.path.join("replica-b");
+    let state_a = root.path.join("state-a");
+    let state_b = root.path.join("state-b");
+    fs::create_dir_all(replica_a.join("tree-before/branch/empty"))
+        .expect("create rename source tree");
+    fs::create_dir_all(&replica_b).expect("create rename replica B");
+    fs::write(replica_a.join("file-before"), b"stable file\n").expect("write rename file");
+    fs::write(
+        replica_a.join("tree-before/branch/leaf"),
+        b"stable directory tree\n",
+    )
+    .expect("write rename tree leaf");
+    let storage = fixture.storage_url("rename");
+
+    run_ofs_success(
+        ofs_sync(&replica_a, &state_a, &storage, true),
+        "initialize rename replica",
+    );
+    run_ofs_success(
+        ofs_sync(&replica_a, &state_a, &storage, false),
+        "publish rename base",
+    );
+    run_ofs_success(
+        ofs_sync(&replica_b, &state_b, &storage, false),
+        "attach rename replica B",
+    );
+
+    fs::rename(replica_a.join("file-before"), replica_a.join("file-after"))
+        .expect("rename file");
+    fs::rename(
+        replica_a.join("tree-before"),
+        replica_a.join("tree-after"),
+    )
+    .expect("move directory tree");
+    make_executable(&replica_a.join("file-after"));
+    run_ofs_success(
+        ofs_sync(&replica_a, &state_a, &storage, false),
+        "publish file and directory moves",
+    );
+
+    run_ofs_success(
+        ofs_sync(&replica_b, &state_b, &storage, false),
+        "install remote moves",
+    );
+    assert!(
+        !replica_b.join("file-before").exists() && !replica_b.join("tree-before").exists(),
+        "old paths disappear after remote moves"
+    );
+    assert!(
+        replica_b.join("tree-after/branch/empty").is_dir(),
+        "a moved empty directory is retained"
+    );
+    assert_eq!(
+        tree_fingerprint(&replica_a),
+        tree_fingerprint(&replica_b),
+        "file identity, directory contents, and attributes survive moves"
+    );
+
+    fs::write(replica_b.join("file-after"), b"edited after move\n")
+        .expect("edit moved file in peer");
+    run_ofs_success(
+        ofs_sync(&replica_b, &state_b, &storage, false),
+        "publish edit through moved identity",
+    );
+    run_ofs_success(
+        ofs_sync(&replica_a, &state_a, &storage, false),
+        "install post-move peer edit",
+    );
+    assert_eq!(
+        fs::read(replica_a.join("file-after")).expect("read post-move edit"),
+        b"edited after move\n"
+    );
 }
 
 fn reconcile(fixture: &Fixture) {
