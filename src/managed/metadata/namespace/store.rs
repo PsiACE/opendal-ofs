@@ -444,7 +444,12 @@ impl NamespaceStore {
         self.retain_checkpoint(state.checkpoint, roots, reads)
             .await?;
         for change in &state.tail {
-            for version in &change.mutation.put_file_versions {
+            for version in change
+                .mutation
+                .file_versions
+                .iter()
+                .filter_map(|change| change.target.as_ref())
+            {
                 roots.retain_file_version(version)?;
             }
         }
@@ -463,7 +468,12 @@ impl NamespaceStore {
             self.retain_checkpoint(segment.checkpoint, roots, reads)
                 .await?;
             for change in segment.changes {
-                for version in &change.mutation.put_file_versions {
+                for version in change
+                    .mutation
+                    .file_versions
+                    .iter()
+                    .filter_map(|change| change.target.as_ref())
+                {
                     roots.retain_file_version(version)?;
                 }
             }

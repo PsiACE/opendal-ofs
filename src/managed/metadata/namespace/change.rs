@@ -15,17 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::validation::{
-    match_preconditions, validate_directory_generation, validate_node_generation,
-};
+use super::validation::{validate_directory_generation, validate_node_generation};
 use super::{decode_file_version, file_versions_have_consistent_segments};
 use crate::filesystem::{
-    BranchId, ChangeCursor, DirectoryRecord, FileVersion, OperationId, VolumeError, VolumeId,
-    VolumeMutation, VolumeSnapshot,
+    BranchId, ChangeCursor, DirectoryRecord, OperationId, VolumeError, VolumeId, VolumeMutation,
+    VolumeSnapshot,
 };
 use crate::managed::error::corrupt;
 
@@ -37,7 +35,7 @@ pub(crate) struct NamespaceChange {
 }
 
 pub(super) struct ValidatedChange {
-    put_directories: Vec<DirectoryRecord>,
+    directories: Vec<Option<DirectoryRecord>>,
 }
 
 impl NamespaceChange {
@@ -92,35 +90,24 @@ impl NamespaceChange {
             directories: BTreeMap::new(),
             file_versions: BTreeMap::new(),
         });
-        for id in &self.mutation.remove_nodes {
-            target.nodes.remove(id);
+        for change in &self.mutation.nodes {
+            match &change.target {
+                Some(record) => target.nodes.insert(change.node, record.clone()),
+                None => target.nodes.remove(&change.node),
+            };
         }
-        target.nodes.extend(
-            self.mutation
-                .put_nodes
-                .iter()
-                .cloned()
-                .map(|record| (record.id, record)),
-        );
-        for id in &self.mutation.remove_directories {
-            target.directories.remove(id);
+        for (change, record) in self.mutation.directories.iter().zip(validated.directories) {
+            match record {
+                Some(record) => target.directories.insert(change.directory, record),
+                None => target.directories.remove(&change.directory),
+            };
         }
-        target.directories.extend(
-            validated
-                .put_directories
-                .into_iter()
-                .map(|record| (record.node, record)),
-        );
-        for id in &self.mutation.remove_file_versions {
-            target.file_versions.remove(id);
+        for change in &self.mutation.file_versions {
+            match &change.target {
+                Some(record) => target.file_versions.insert(change.version, record.clone()),
+                None => target.file_versions.remove(&change.version),
+            };
         }
-        target.file_versions.extend(
-            self.mutation
-                .put_file_versions
-                .iter()
-                .cloned()
-                .map(|record| (record.id, record)),
-        );
         target.root = self.mutation.root;
         target.cursor = self.mutation.cursor;
         target
@@ -145,88 +132,81 @@ impl NamespaceChange {
         let nodes = base.map_or(&empty_nodes, |snapshot| &snapshot.nodes);
         let directories = base.map_or(&empty_directories, |snapshot| &snapshot.directories);
         let versions = base.map_or(&empty_versions, |snapshot| &snapshot.file_versions);
-        let Some(expected_nodes) = match_preconditions(
-            nodes,
-            self.mutation
-                .expected_nodes
-                .iter()
-                .map(|condition| (condition.node, condition.expected_generation.as_ref())),
-            |record| &record.generation,
-            "duplicate node precondition",
-        )?
-        else {
-            return Ok(None);
-        };
-        validate_records(
-            nodes,
-            self.mutation.remove_nodes.iter().copied(),
-            self.mutation.put_nodes.iter(),
-            |record| record.id,
-            |id, current, next| {
-                validate_node_generation(current, next, expected_nodes.contains(&id))
-            },
-        )?;
-        let put_directories = self
-            .mutation
-            .put_directories
-            .iter()
-            .map(|delta| delta.apply(directories.get(&delta.node)))
-            .collect::<Result<Vec<_>, _>>()?;
-        let Some(expected_directories) = match_preconditions(
-            directories,
-            self.mutation
-                .expected_directories
-                .iter()
-                .map(|condition| (condition.directory, condition.expected_generation.as_ref())),
-            |record| &record.generation,
-            "duplicate directory precondition",
-        )?
-        else {
-            return Ok(None);
-        };
-        validate_records(
-            directories,
-            self.mutation.remove_directories.iter().copied(),
-            put_directories.iter(),
-            |record| record.node,
-            |id, current, next| {
-                validate_directory_generation(current, next, expected_directories.contains(&id))
-            },
-        )?;
-        validate_records(
-            versions,
-            self.mutation.remove_file_versions.iter().copied(),
-            self.mutation.put_file_versions.iter(),
-            |record| record.id,
-            |_, current, next| {
-                if next.is_some_and(|next| {
-                    current.is_some_and(|current: &FileVersion| current != next)
-                }) {
-                    Err(corrupt(
+        for change in &self.mutation.nodes {
+            let current = nodes.get(&change.node);
+            if current.map(|record| &record.generation) != change.expected_generation.as_ref() {
+                return Ok(None);
+            }
+            if current.is_none() && change.target.is_none() {
+                return Err(corrupt(
+                    "read Managed transaction",
+                    "node removal is invalid",
+                ));
+            }
+            validate_node_generation(current, change.target.as_ref())?;
+        }
+        let mut validated_directories = Vec::with_capacity(self.mutation.directories.len());
+        for change in &self.mutation.directories {
+            let current = directories.get(&change.directory);
+            if current.map(|record| &record.generation) != change.expected_generation.as_ref() {
+                return Ok(None);
+            }
+            let target = change
+                .target
+                .as_ref()
+                .map(|delta| delta.apply(change.directory, current))
+                .transpose()?;
+            if current.is_none() && target.is_none() {
+                return Err(corrupt(
+                    "read Managed transaction",
+                    "directory removal is invalid",
+                ));
+            }
+            validate_directory_generation(current, target.as_ref())?;
+            validated_directories.push(target);
+        }
+        for change in &self.mutation.file_versions {
+            match (&change.target, versions.get(&change.version)) {
+                (None, None) => {
+                    return Err(corrupt(
                         "read Managed transaction",
-                        "file version delta is invalid",
-                    ))
-                } else {
-                    Ok(())
+                        "file version removal is invalid",
+                    ));
                 }
-            },
-        )?;
-        if !self.mutation.put_file_versions.is_empty()
-            || !self.mutation.remove_file_versions.is_empty()
-        {
-            let target_versions = versions
+                (Some(target), Some(current)) if target != current => {
+                    return Err(corrupt(
+                        "read Managed transaction",
+                        "file version replacement is invalid",
+                    ));
+                }
+                (Some(_), _) | (None, Some(_)) => {}
+            }
+        }
+        if !self.mutation.file_versions.is_empty() {
+            let mut target_versions: BTreeMap<_, _> = versions
                 .iter()
-                .filter(|(id, _)| !self.mutation.remove_file_versions.contains(id))
-                .map(|(_, version)| version)
-                .chain(self.mutation.put_file_versions.iter());
-            if !file_versions_have_consistent_segments(target_versions) {
+                .map(|(id, version)| (*id, version))
+                .collect();
+            for change in &self.mutation.file_versions {
+                match &change.target {
+                    Some(target) => {
+                        target_versions.insert(change.version, target);
+                    }
+                    None => {
+                        target_versions.remove(&change.version);
+                    }
+                }
+            }
+            if !file_versions_have_consistent_segments(target_versions.into_values()) {
                 return Err(corrupt(
                     "read Managed transaction",
                     "file version delta is invalid",
                 ));
             }
         }
-        Ok(Some(ValidatedChange { put_directories }))
+        Ok(Some(ValidatedChange {
+            directories: validated_directories,
+        }))
     }
 
     pub(crate) fn validate(&self, volume_id: VolumeId) -> Result<(), VolumeError> {
@@ -237,23 +217,29 @@ impl NamespaceChange {
             )
         })?;
         let mutation = &self.mutation;
-        let ordered = strictly_ordered_by(&mutation.expected_nodes, |left, right| {
-            left.node < right.node
-        }) && strictly_ordered_by(&mutation.expected_directories, |left, right| {
-            left.directory < right.directory
-        }) && strictly_ordered_by(&mutation.put_nodes, |left, right| {
-            left.id < right.id
-        }) && strictly_ordered_by(&mutation.remove_nodes, |left, right| left < right)
-            && strictly_ordered_by(&mutation.put_directories, |left, right| {
-                left.node < right.node
+        let ordered = strictly_ordered_by(&mutation.nodes, |left, right| left.node < right.node)
+            && strictly_ordered_by(&mutation.directories, |left, right| {
+                left.directory < right.directory
             })
-            && strictly_ordered_by(&mutation.remove_directories, |left, right| left < right)
-            && strictly_ordered_by(&mutation.put_file_versions, |left, right| {
-                left.id < right.id
+            && strictly_ordered_by(&mutation.file_versions, |left, right| {
+                left.version < right.version
             })
-            && strictly_ordered_by(&mutation.remove_file_versions, |left, right| left < right)
-            && mutation.put_directories.iter().all(|directory| {
-                strictly_ordered_by(&directory.remove_entries, |left, right| left < right)
+            && mutation.directories.iter().all(|change| {
+                change.target.as_ref().is_none_or(|directory| {
+                    strictly_ordered_by(&directory.remove_entries, |left, right| left < right)
+                })
+            })
+            && mutation.nodes.iter().all(|change| {
+                change
+                    .target
+                    .as_ref()
+                    .is_none_or(|node| node.id == change.node)
+            })
+            && mutation.file_versions.iter().all(|change| {
+                change
+                    .target
+                    .as_ref()
+                    .is_none_or(|version| version.id == change.version)
             });
         if !ordered {
             return Err(corrupt(
@@ -262,8 +248,9 @@ impl NamespaceChange {
             ));
         }
         if mutation
-            .put_file_versions
+            .file_versions
             .iter()
+            .filter_map(|change| change.target.as_ref())
             .any(|version| decode_file_version(version).is_err())
         {
             return Err(corrupt(
@@ -277,37 +264,4 @@ impl NamespaceChange {
 
 fn strictly_ordered_by<T>(values: &[T], before: impl Fn(&T, &T) -> bool) -> bool {
     values.windows(2).all(|pair| before(&pair[0], &pair[1]))
-}
-
-fn validate_records<'a, K, V: 'a>(
-    current: &BTreeMap<K, V>,
-    removed: impl IntoIterator<Item = K>,
-    put: impl IntoIterator<Item = &'a V>,
-    key: impl Fn(&V) -> K,
-    validate: impl Fn(K, Option<&V>, Option<&V>) -> Result<(), VolumeError>,
-) -> Result<(), VolumeError>
-where
-    K: Copy + Ord,
-{
-    let mut changed = BTreeSet::new();
-    for id in removed {
-        if !changed.insert(id) || !current.contains_key(&id) {
-            return Err(corrupt(
-                "read Managed transaction",
-                "transaction delta is invalid",
-            ));
-        }
-        validate(id, current.get(&id), None)?;
-    }
-    for record in put {
-        let id = key(record);
-        if !changed.insert(id) {
-            return Err(corrupt(
-                "read Managed transaction",
-                "transaction delta is invalid",
-            ));
-        }
-        validate(id, current.get(&id), Some(record))?;
-    }
-    Ok(())
 }

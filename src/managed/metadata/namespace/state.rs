@@ -60,60 +60,53 @@ impl NamespaceChange {
         hash_cursor(&mut digest, mutation.cursor);
         digest.update(mutation.root.as_bytes());
 
-        hash_len(&mut digest, mutation.expected_nodes.len())?;
-        for condition in &mutation.expected_nodes {
-            digest.update(condition.node.as_bytes());
-            hash_optional_generation(&mut digest, condition.expected_generation.as_ref())?;
-        }
-        hash_len(&mut digest, mutation.expected_directories.len())?;
-        for condition in &mutation.expected_directories {
-            digest.update(condition.directory.as_bytes());
-            hash_optional_generation(&mut digest, condition.expected_generation.as_ref())?;
-        }
-        hash_len(&mut digest, mutation.put_nodes.len())?;
-        for node in &mutation.put_nodes {
-            digest.update(node.id.as_bytes());
-            hash_generation(&mut digest, &node.generation)?;
-            hash_kind(&mut digest, node.kind);
-            digest.update([u8::from(node.attributes.executable)]);
-            match node.file_version {
+        hash_len(&mut digest, mutation.nodes.len())?;
+        for change in &mutation.nodes {
+            digest.update(change.node.as_bytes());
+            hash_optional_generation(&mut digest, change.expected_generation.as_ref())?;
+            match &change.target {
                 None => digest.update([0]),
-                Some(version) => {
+                Some(node) => {
                     digest.update([1]);
-                    digest.update(version.as_bytes());
+                    hash_generation(&mut digest, &node.generation)?;
+                    hash_kind(&mut digest, node.kind);
+                    digest.update([u8::from(node.attributes.executable)]);
+                    match node.file_version {
+                        None => digest.update([0]),
+                        Some(version) => {
+                            digest.update([1]);
+                            digest.update(version.as_bytes());
+                        }
+                    }
                 }
             }
         }
-        hash_len(&mut digest, mutation.remove_nodes.len())?;
-        for node in &mutation.remove_nodes {
-            digest.update(node.as_bytes());
-        }
-        hash_len(&mut digest, mutation.put_directories.len())?;
-        for directory in &mutation.put_directories {
-            digest.update(directory.node.as_bytes());
-            hash_generation(&mut digest, &directory.generation)?;
-            hash_len(&mut digest, directory.remove_entries.len())?;
-            for name in &directory.remove_entries {
-                hash_name(&mut digest, name)?;
+        hash_len(&mut digest, mutation.directories.len())?;
+        for change in &mutation.directories {
+            digest.update(change.directory.as_bytes());
+            hash_optional_generation(&mut digest, change.expected_generation.as_ref())?;
+            match &change.target {
+                None => digest.update([0]),
+                Some(directory) => {
+                    digest.update([1]);
+                    hash_generation(&mut digest, &directory.generation)?;
+                    hash_len(&mut digest, directory.remove_entries.len())?;
+                    for name in &directory.remove_entries {
+                        hash_name(&mut digest, name)?;
+                    }
+                    hash_len(&mut digest, directory.put_entries.len())?;
+                    for (name, entry) in &directory.put_entries {
+                        hash_name(&mut digest, name)?;
+                        digest.update(entry.node.as_bytes());
+                        hash_kind(&mut digest, entry.kind);
+                    }
+                }
             }
-            hash_len(&mut digest, directory.put_entries.len())?;
-            for (name, entry) in &directory.put_entries {
-                hash_name(&mut digest, name)?;
-                digest.update(entry.node.as_bytes());
-                hash_kind(&mut digest, entry.kind);
-            }
         }
-        hash_len(&mut digest, mutation.remove_directories.len())?;
-        for directory in &mutation.remove_directories {
-            digest.update(directory.as_bytes());
-        }
-        hash_len(&mut digest, mutation.put_file_versions.len())?;
-        for version in &mutation.put_file_versions {
-            digest.update(version.id.as_bytes());
-        }
-        hash_len(&mut digest, mutation.remove_file_versions.len())?;
-        for version in &mutation.remove_file_versions {
-            digest.update(version.as_bytes());
+        hash_len(&mut digest, mutation.file_versions.len())?;
+        for change in &mutation.file_versions {
+            digest.update(change.version.as_bytes());
+            digest.update([u8::from(change.target.is_some())]);
         }
         Ok(digest.finalize().into())
     }
@@ -582,7 +575,7 @@ mod tests {
 
         assert_eq!(
             hex::encode(change.request_sha256().unwrap()),
-            "f32678a3ccf8d7a2244302f43513ed667f396005a0b38584b0a53f0aa77edca9"
+            "627df8be759f08e34a61ffd1af19f5aedb3f50044639621181fad5bebaca088c"
         );
     }
 }

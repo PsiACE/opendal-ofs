@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{BTreeMap, BTreeSet};
-
 use super::file_versions_have_consistent_segments;
 use super::records::{managed_generation, managed_generation_number, next_managed_generation};
 use crate::filesystem::{
@@ -57,50 +55,25 @@ pub(crate) fn validate_snapshot_structure(snapshot: &VolumeSnapshot) -> Result<(
         .map_err(|_| invalid("read Managed namespace", "namespace structure is invalid"))
 }
 
-pub(super) fn match_preconditions<'a, K, V>(
-    current: &BTreeMap<K, V>,
-    expected: impl IntoIterator<Item = (K, Option<&'a Generation>)>,
-    generation: impl Fn(&V) -> &Generation,
-    duplicate: &'static str,
-) -> Result<Option<BTreeSet<K>>, VolumeError>
-where
-    K: Copy + Ord,
-{
-    let mut unique = BTreeSet::new();
-    for (key, expected_generation) in expected {
-        if !unique.insert(key) {
-            return Err(invalid("publish Managed namespace", duplicate));
-        }
-        if current.get(&key).map(&generation) != expected_generation {
-            return Ok(None);
-        }
-    }
-    Ok(Some(unique))
-}
-
 pub(super) fn validate_node_generation(
     current: Option<&NodeRecord>,
     next: Option<&NodeRecord>,
-    has_precondition: bool,
 ) -> Result<(), VolumeError> {
     validate_generation(
         current.map(|record| &record.generation),
         next.map(|record| &record.generation),
         current.map(node_body) != next.map(node_body),
-        has_precondition,
     )
 }
 
 pub(super) fn validate_directory_generation(
     current: Option<&DirectoryRecord>,
     next: Option<&DirectoryRecord>,
-    has_precondition: bool,
 ) -> Result<(), VolumeError> {
     validate_generation(
         current.map(|record| &record.generation),
         next.map(|record| &record.generation),
         current.map(|record| &record.entries) != next.map(|record| &record.entries),
-        has_precondition,
     )
 }
 
@@ -108,23 +81,16 @@ fn validate_generation(
     current: Option<&Generation>,
     next: Option<&Generation>,
     changed: bool,
-    has_precondition: bool,
 ) -> Result<(), VolumeError> {
     let expected = match (current, next, changed) {
         (None, Some(_), _) => managed_generation(1),
         (Some(generation), Some(_), false) => generation.clone(),
         (Some(generation), Some(_), true) => next_managed_generation(generation)
             .ok_or_else(|| invalid("publish Managed namespace", "record generation overflow"))?,
-        (Some(_), None, _) if has_precondition => return Ok(()),
-        (Some(_), None, _) => {
-            return Err(invalid(
-                "publish Managed namespace",
-                "changed record lacks a precondition",
-            ));
-        }
+        (Some(_), None, _) => return Ok(()),
         (None, None, _) => return Ok(()),
     };
-    if next.is_some_and(|generation| *generation != expected) || changed && !has_precondition {
+    if next.is_some_and(|generation| *generation != expected) {
         return Err(invalid(
             "publish Managed namespace",
             "record generation transition is invalid",
@@ -139,6 +105,7 @@ fn node_body(node: &NodeRecord) -> (NodeId, NodeKind, NodeAttributes, Option<Fil
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::num::NonZeroU64;
 
     use super::*;
@@ -186,6 +153,9 @@ mod tests {
         let base = base_snapshot();
         let mut target = base.clone();
         target.cursor = cursor(2);
+        let root = target.nodes.get_mut(&ROOT).unwrap();
+        root.generation = managed_generation(2);
+        root.attributes.executable = true;
         let publication = crate::filesystem::VolumePublication::between(
             OperationId::from_bytes([2; 16]),
             Some(&base),
@@ -193,10 +163,7 @@ mod tests {
         )
         .unwrap();
         let mut change = NamespaceChange::new(publication.mutation().clone(), None);
-        change.mutation.expected_nodes = vec![crate::filesystem::NodePrecondition {
-            node: ROOT,
-            expected_generation: Some(managed_generation(2)),
-        }];
+        change.mutation.nodes[0].expected_generation = Some(managed_generation(2));
         assert!(change.validate_against(Some(&base)).unwrap().is_none());
     }
 }

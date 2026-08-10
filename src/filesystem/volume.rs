@@ -266,22 +266,30 @@ fn invalid_snapshot(message: &'static str) -> VolumeError {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct NodePrecondition {
+pub(crate) struct NodeChange {
     pub node: NodeId,
     pub expected_generation: Option<Generation>,
+    pub target: Option<NodeRecord>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct DirectoryPrecondition {
+pub(crate) struct DirectoryChange {
     pub directory: NodeId,
     pub expected_generation: Option<Generation>,
+    pub target: Option<DirectoryMutation>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FileVersionChange {
+    pub version: FileVersionId,
+    pub target: Option<FileVersion>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DirectoryMutation {
-    pub(crate) node: NodeId,
     pub(crate) generation: Generation,
     pub(crate) put_entries: BTreeMap<String, DirectoryEntry>,
     pub(crate) remove_entries: Vec<String>,
@@ -290,7 +298,6 @@ pub(crate) struct DirectoryMutation {
 impl DirectoryMutation {
     fn between(target: &DirectoryRecord, base: Option<&DirectoryRecord>) -> Self {
         Self {
-            node: target.node,
             generation: target.generation.clone(),
             put_entries: target
                 .entries
@@ -314,16 +321,14 @@ impl DirectoryMutation {
 
     pub(crate) fn apply(
         &self,
+        node: NodeId,
         base: Option<&DirectoryRecord>,
     ) -> Result<DirectoryRecord, VolumeError> {
         let mut directory = base.cloned().unwrap_or(DirectoryRecord {
-            node: self.node,
+            node,
             generation: self.generation.clone(),
             entries: BTreeMap::new(),
         });
-        if directory.node != self.node {
-            return Err(invalid_mutation("directory delta identity is invalid"));
-        }
         directory.generation = self.generation.clone();
         let mut changed = BTreeSet::new();
         for name in &self.remove_entries {
@@ -350,14 +355,9 @@ pub(crate) struct VolumeMutation {
     pub(crate) parent: ChangeCursor,
     pub(crate) cursor: ChangeCursor,
     pub(crate) root: NodeId,
-    pub(crate) expected_nodes: Vec<NodePrecondition>,
-    pub(crate) expected_directories: Vec<DirectoryPrecondition>,
-    pub(crate) put_nodes: Vec<NodeRecord>,
-    pub(crate) remove_nodes: Vec<NodeId>,
-    pub(crate) put_directories: Vec<DirectoryMutation>,
-    pub(crate) remove_directories: Vec<NodeId>,
-    pub(crate) put_file_versions: Vec<FileVersion>,
-    pub(crate) remove_file_versions: Vec<FileVersionId>,
+    pub(crate) nodes: Vec<NodeChange>,
+    pub(crate) directories: Vec<DirectoryChange>,
+    pub(crate) file_versions: Vec<FileVersionChange>,
 }
 
 impl VolumeMutation {
@@ -372,20 +372,30 @@ impl VolumeMutation {
         let base_nodes = base.map_or(&empty_nodes, |snapshot| &snapshot.nodes);
         let base_directories = base.map_or(&empty_directories, |snapshot| &snapshot.directories);
         let base_versions = base.map_or(&empty_versions, |snapshot| &snapshot.file_versions);
-        let expected_nodes = changed_keys(base_nodes, &target.nodes)
-            .map(|node| NodePrecondition {
+        let nodes = changed_keys(base_nodes, &target.nodes)
+            .map(|node| NodeChange {
                 node,
                 expected_generation: base_nodes
                     .get(&node)
                     .map(|record| record.generation.clone()),
+                target: target.nodes.get(&node).cloned(),
             })
             .collect();
-        let expected_directories = changed_keys(base_directories, &target.directories)
-            .map(|directory| DirectoryPrecondition {
+        let directories = changed_keys(base_directories, &target.directories)
+            .map(|directory| DirectoryChange {
                 directory,
                 expected_generation: base_directories
                     .get(&directory)
                     .map(|record| record.generation.clone()),
+                target: target.directories.get(&directory).map(|record| {
+                    DirectoryMutation::between(record, base_directories.get(&directory))
+                }),
+            })
+            .collect();
+        let file_versions = changed_keys(base_versions, &target.file_versions)
+            .map(|version| FileVersionChange {
+                version,
+                target: target.file_versions.get(&version).cloned(),
             })
             .collect();
         Self {
@@ -394,41 +404,9 @@ impl VolumeMutation {
             parent: base.map_or(ChangeCursor::Genesis, |snapshot| snapshot.cursor),
             cursor: target.cursor,
             root: target.root,
-            expected_nodes,
-            expected_directories,
-            put_nodes: target
-                .nodes
-                .iter()
-                .filter(|(id, record)| base_nodes.get(id) != Some(record))
-                .map(|(_, record)| record.clone())
-                .collect(),
-            remove_nodes: base_nodes
-                .keys()
-                .filter(|id| !target.nodes.contains_key(id))
-                .copied()
-                .collect(),
-            put_directories: target
-                .directories
-                .iter()
-                .filter(|(id, record)| base_directories.get(id) != Some(record))
-                .map(|(id, record)| DirectoryMutation::between(record, base_directories.get(id)))
-                .collect(),
-            remove_directories: base_directories
-                .keys()
-                .filter(|id| !target.directories.contains_key(id))
-                .copied()
-                .collect(),
-            put_file_versions: target
-                .file_versions
-                .iter()
-                .filter(|(id, record)| base_versions.get(id) != Some(record))
-                .map(|(_, record)| record.clone())
-                .collect(),
-            remove_file_versions: base_versions
-                .keys()
-                .filter(|id| !target.file_versions.contains_key(id))
-                .copied()
-                .collect(),
+            nodes,
+            directories,
+            file_versions,
         }
     }
 

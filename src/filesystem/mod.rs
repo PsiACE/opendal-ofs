@@ -31,8 +31,6 @@ pub use identity::BranchId;
 pub use identity::{ChangeCursor, FileVersionId, Generation, NodeId, OperationId, VolumeId};
 pub use model::VolumeModel;
 pub use namespace::{DirectoryEntry, NodeAttributes, NodeKind};
-#[cfg(test)]
-pub(crate) use volume::NodePrecondition;
 pub(crate) use volume::VolumeMutation;
 pub(crate) use volume::validate_portable_paths;
 pub use volume::{
