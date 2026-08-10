@@ -165,6 +165,31 @@ pub(super) fn install_staged_changes(
     staged: &StagedTree,
     before: &TargetManifest,
 ) -> Result<()> {
+    if before.entries.is_empty() {
+        let mut roots = staged
+            .manifest()
+            .entries
+            .keys()
+            .filter(|path| !path.contains('/'));
+        let Some(first) = roots.next() else {
+            return Ok(());
+        };
+        let source = staged.root.join(first);
+        let destination = replica.join(first);
+        match fs::rename(&source, &destination) {
+            Ok(()) => {
+                for root in roots {
+                    fs::rename(staged.root.join(root), replica.join(root))?;
+                }
+                #[cfg(unix)]
+                fs::File::open(replica)?.sync_all()?;
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::CrossesDevices => {}
+            Err(error) => return Err(error).context("install staged replica contents"),
+        }
+    }
+
     for (path, _) in removal_roots(before, staged.manifest()) {
         let target = replica.join(path);
         match fs::symlink_metadata(&target) {
