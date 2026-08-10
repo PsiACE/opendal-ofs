@@ -107,12 +107,29 @@ jobs:
       - name: Check licenses
         run: cargo x licenses
 
+  managed-behavior:
+    name: Managed behavior
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Show fixture tools
+        run: |
+          rustc --version
+          cargo --version
+          docker compose version
+
+      - name: Run Managed Sync behavior
+        run: cargo x behavior managed-sync
+
   required:
     name: Required
     runs-on: ubuntu-24.04
     if: ${{ always() }}
     needs:
       - check
+      - managed-behavior
       - msrv
       - test
       - compliance
@@ -121,6 +138,7 @@ jobs:
         run: |
           if [[ ! ( \
                  "${{ needs.check.result }}" == "success" \
+              && "${{ needs.managed-behavior.result }}" == "success" \
               && "${{ needs.msrv.result }}" == "success" \
               && "${{ needs.test.result }}" == "success" \
               && "${{ needs.compliance.result }}" == "success" \
