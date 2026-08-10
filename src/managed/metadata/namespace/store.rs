@@ -456,15 +456,12 @@ impl NamespaceStore {
         &self,
         reference: CheckpointRef,
     ) -> Result<VolumeSnapshot, VolumeError> {
-        let encoded_length = usize::try_from(reference.length)
-            .ok()
-            .filter(|length| *length <= MAX_CHECKPOINT_ENCODED_BYTES)
-            .ok_or_else(|| {
-                corrupt(
-                    "read Managed namespace",
-                    "checkpoint exceeds its encoded size limit",
-                )
-            })?;
+        if reference.length > MAX_CHECKPOINT_ENCODED_BYTES as u64 {
+            return Err(corrupt(
+                "read Managed namespace",
+                "checkpoint exceeds its encoded size limit",
+            ));
+        }
         let key = checkpoint_key(reference.digest);
         let bytes = match self
             .data
@@ -484,9 +481,7 @@ impl NamespaceStore {
                 ));
             }
         };
-        if bytes.len() != encoded_length
-            || <[u8; 32]>::from(Sha256::digest(&bytes)) != reference.digest
-        {
+        if <[u8; 32]>::from(Sha256::digest(&bytes)) != reference.digest {
             return Err(corrupt(
                 "read Managed namespace",
                 "checkpoint identity is invalid",
@@ -518,15 +513,12 @@ impl NamespaceStore {
         &self,
         reference: ChangeSegmentRef,
     ) -> Result<StoredChangeSegment, VolumeError> {
-        let encoded_length = usize::try_from(reference.length)
-            .ok()
-            .filter(|length| *length <= CHANGE_SEGMENT_RECORD.maximum_encoded_bytes())
-            .ok_or_else(|| {
-                corrupt(
-                    "read Managed change segment",
-                    "namespace change segment exceeds its size limit",
-                )
-            })?;
+        if reference.length > CHANGE_SEGMENT_RECORD.maximum_encoded_bytes() as u64 {
+            return Err(corrupt(
+                "read Managed change segment",
+                "namespace change segment exceeds its size limit",
+            ));
+        }
         let bytes = self
             .data
             .read_with(&change_segment_key(reference.digest))
@@ -544,7 +536,7 @@ impl NamespaceStore {
                 }
             })?
             .to_bytes();
-        if bytes.len() != encoded_length || Sha256::digest(&bytes).as_slice() != reference.digest {
+        if Sha256::digest(&bytes).as_slice() != reference.digest {
             return Err(corrupt(
                 "read Managed change segment",
                 "namespace change segment identity is invalid",

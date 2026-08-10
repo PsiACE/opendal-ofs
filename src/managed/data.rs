@@ -554,12 +554,6 @@ impl ManagedData {
                     )
                     .await
                     .map_err(|error| referenced_segment_error("read data segment", error))?;
-                if fetched.len() != demands.len() {
-                    return Err(corrupt(
-                        "read data segment",
-                        "range fetch returned an unexpected result count",
-                    ));
-                }
                 demands
                     .iter()
                     .copied()
@@ -751,13 +745,7 @@ fn complete_demand_contents(
 }
 
 fn verify_range_demand(bytes: &Buffer, demand: DemandKey) -> Result<(), VolumeError> {
-    let (_, length, content) = demand;
-    if bytes.len() as u64 != length {
-        return Err(corrupt(
-            "read data segment",
-            "segment range returned an unexpected length",
-        ));
-    }
+    let (_, _, content) = demand;
     if buffer_content_ref(bytes) != content {
         return Err(corrupt(
             "read data segment",
