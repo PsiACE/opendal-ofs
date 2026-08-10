@@ -12,7 +12,7 @@ use std::num::NonZeroU64;
 use anyhow::{Context, Result, bail};
 
 use super::path::SnapshotTree;
-use super::staging::{StagedTree, TargetManifest};
+use super::staging::StagedTree;
 use crate::filesystem::{
     ChangeCursor, DirectoryEntry, DirectoryRecord, NodeAttributes, NodeId, NodeKind, NodeRecord,
     OperationId, Volume, VolumePublication, VolumeSnapshot,
@@ -63,6 +63,8 @@ pub(crate) fn build_publication<V: Volume>(
 
     let mut nodes = BTreeMap::new();
     let mut file_versions = BTreeMap::new();
+    let mut directory_entries = BTreeMap::<String, BTreeMap<String, DirectoryEntry>>::new();
+    directory_entries.insert(String::new(), BTreeMap::new());
     for (path, kind) in std::iter::once(("", NodeKind::Directory)).chain(
         target_manifest
             .entries
@@ -111,21 +113,30 @@ pub(crate) fn build_publication<V: Volume>(
                 file_version,
             },
         );
-    }
-
-    let entries = directory_entries(target_manifest, &identities)?;
-    let mut directories = BTreeMap::new();
-    for (path, kind) in std::iter::once(("", NodeKind::Directory)).chain(
-        target_manifest
-            .entries
-            .iter()
-            .map(|(path, entry)| (path.as_str(), entry.local.kind)),
-    ) {
-        if kind != NodeKind::Directory {
+        if path.is_empty() {
             continue;
         }
-        let node = identities[path];
-        let current = entries.get(path).cloned().unwrap_or_default();
+        let (parent, name) = split_path(path)?;
+        if !parent.is_empty()
+            && !target_manifest
+                .entries
+                .get(parent)
+                .is_some_and(|entry| entry.local.kind == NodeKind::Directory)
+        {
+            bail!("local path {path:?} has no directory parent");
+        }
+        directory_entries
+            .entry(parent.to_owned())
+            .or_default()
+            .insert(name.to_owned(), DirectoryEntry { node: id, kind });
+        if kind == NodeKind::Directory {
+            directory_entries.entry(path.to_owned()).or_default();
+        }
+    }
+
+    let mut directories = BTreeMap::new();
+    for (path, current) in directory_entries {
+        let node = identities[&path];
         let generation = next_directory_generation(volume_api, node, &current, old_directories)?;
         directories.insert(
             node,
@@ -170,40 +181,6 @@ fn rename_source(renames: &BTreeMap<String, String>, path: &str) -> Option<Strin
         }
     }
     None
-}
-
-fn directory_entries(
-    target: &TargetManifest,
-    identities: &BTreeMap<String, NodeId>,
-) -> Result<BTreeMap<String, BTreeMap<String, DirectoryEntry>>> {
-    let mut directories = BTreeMap::<String, BTreeMap<String, DirectoryEntry>>::new();
-    directories.insert(String::new(), BTreeMap::new());
-    for (path, entry) in &target.entries {
-        let (parent, name) = split_path(path)?;
-        if name.is_empty() {
-            bail!("local path {path:?} is invalid");
-        }
-        if !parent.is_empty()
-            && !target
-                .entries
-                .get(parent)
-                .is_some_and(|entry| entry.local.kind == NodeKind::Directory)
-        {
-            bail!("local path {path:?} has no directory parent");
-        }
-        let kind = entry.local.kind;
-        directories.entry(parent.to_owned()).or_default().insert(
-            name.to_owned(),
-            DirectoryEntry {
-                node: identities[path],
-                kind,
-            },
-        );
-        if kind == NodeKind::Directory {
-            directories.entry(path.clone()).or_default();
-        }
-    }
-    Ok(directories)
 }
 
 fn split_path(path: &str) -> Result<(&str, &str)> {
