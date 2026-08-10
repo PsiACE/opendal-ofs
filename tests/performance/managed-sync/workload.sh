@@ -80,6 +80,7 @@ lagging_tree="$OFS_RUN_ROOT/replica-lagging"
 lagging_state="$OFS_RUN_ROOT/state-lagging.json"
 mkdir -p "$source_tree/memory" "$source_tree/skills" "$lagging_tree"
 write_deterministic "$source_tree/memory/seed.bin" $((16 * 1024 * 1024)) seed
+truncate -s $((80 * 1024 * 1024)) "$source_tree/memory/repeated.bin"
 for group in $(seq 0 7); do
   for item in $(seq 0 15); do
     write_deterministic \

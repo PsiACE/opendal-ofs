@@ -20,8 +20,9 @@ baseline, baseline, candidate. Run the command once with `--rounds 20` and
 again with `--rounds 50` when evaluating checkpoint behavior.
 
 The workload exercises publication, cold restore, incremental catch-up, and a
-no-op over deterministic large and small files. `--rounds` controls the number
-of publish/restore generations.
+no-op over deterministic small files, changed content, and a repeated file
+larger than the bounded materialization threshold. `--rounds` controls the
+number of publish/restore generations.
 
 The binaries connect directly to MinIO. MinIO sends one native audit event per
 API operation to an out-of-band webhook; the harness removes authentication

@@ -65,7 +65,7 @@ printf '%s\n' 'smoke: publish nested, empty, executable, large, and reused conte
 mkdir -p "$replica_a/nested/level" "$replica_a/tools"
 printf '%s\n' 'created in a nested directory' >"$replica_a/nested/level/entry.txt"
 : >"$replica_a/empty.bin"
-dd if=/dev/zero of="$replica_a/large.bin" bs=1048576 count=8 2>/dev/null
+dd if=/dev/zero of="$replica_a/large.bin" bs=1048576 count=80 2>/dev/null
 printf '%s\n' '#!/bin/sh' 'printf "managed sync executable\\n"' >"$replica_a/tools/run.sh"
 chmod u+x "$replica_a/tools/run.sh"
 cp "$replica_a/first.txt" "$replica_a/reused-content.txt"
