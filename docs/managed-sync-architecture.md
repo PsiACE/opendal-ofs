@@ -57,6 +57,23 @@ Managed domain behavior: they depend on volume history and are not transparent
 storage layers. Provider-native audit counters are the performance authority
 for request, transfer, and stored metadata costs.
 
+The integration shape follows the behavior it exposes:
+
+| Shape | Contract | OFS use |
+| --- | --- | --- |
+| OpenDAL Layer | The same storage operation with a transparent cross-cutting policy | Retry, concurrency limits, and complete immutable-segment Foyer caching |
+| OpenDAL Accessor or Service | A storage API backed by another data model | Direct storage today; a future Managed filesystem view for Mount or embedding |
+| Built-in Managed extension | New durable volume behavior, identities, or commands | `branch/v1` namespace authorities and their lifecycle |
+| Domain operation | A visible multi-step state transition | Sync, publication recovery, staging, verification, and reachability collection |
+
+Timeout and observability layers may be added at the same composition root when
+they become configured runtime policies. Immutable-index and route layers do
+not replace namespace metadata: its authority is mutable, D1 requires revision
+CAS, and maintenance is the only path that lists data. Branch is therefore an
+extension over the one namespace implementation, not a Layer that rewrites
+arbitrary storage calls. Managed Mount, if added, should expose an Accessor
+instead of hiding namespace transactions inside a Layer.
+
 ## Namespace and publication
 
 A snapshot contains stable node identities, node generations, directory
