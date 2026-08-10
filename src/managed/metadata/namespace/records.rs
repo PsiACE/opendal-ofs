@@ -23,7 +23,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::filesystem::{FileVersion, FileVersionId, Generation, VolumeError};
 use crate::managed::error::{corrupt, invalid};
-use crate::managed::format::{ContentRef, ExtentMap};
+use crate::managed::format::ExtentMap;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -90,23 +90,19 @@ fn canonical_file_version_id(
     digest: &[u8; 32],
     extent_map: &ExtentMap,
 ) -> Option<FileVersionId> {
-    let mut encoded = Vec::new();
-    encoded.extend_from_slice(b"OFS-FILE-V1\0");
-    encoded.extend_from_slice(&size.to_be_bytes());
-    encoded.extend_from_slice(digest);
-    encoded.extend_from_slice(&u64::try_from(extent_map.extents.len()).ok()?.to_be_bytes());
+    let mut identity = Sha256::new();
+    identity.update(b"OFS-FILE-V1\0");
+    identity.update(size.to_be_bytes());
+    identity.update(digest);
+    identity.update(u64::try_from(extent_map.extents.len()).ok()?.to_be_bytes());
     for extent in &extent_map.extents {
-        encode_content(&mut encoded, &extent.content);
-        encoded.extend_from_slice(&extent.segment.digest);
-        encoded.extend_from_slice(&extent.segment.length.to_be_bytes());
-        encoded.extend_from_slice(&extent.segment_offset.to_be_bytes());
+        identity.update(extent.content.digest);
+        identity.update(extent.content.length.to_be_bytes());
+        identity.update(extent.segment.digest);
+        identity.update(extent.segment.length.to_be_bytes());
+        identity.update(extent.segment_offset.to_be_bytes());
     }
-    Some(FileVersionId::from_bytes(Sha256::digest(encoded).into()))
-}
-
-fn encode_content(encoded: &mut Vec<u8>, content: &ContentRef) {
-    encoded.extend_from_slice(&content.digest);
-    encoded.extend_from_slice(&content.length.to_be_bytes());
+    Some(FileVersionId::from_bytes(identity.finalize().into()))
 }
 
 pub(crate) fn encode_file_version(
@@ -184,7 +180,7 @@ pub(crate) fn next_managed_generation(generation: &Generation) -> Option<Generat
 mod tests {
     use super::*;
     use crate::filesystem::VolumeErrorKind;
-    use crate::managed::format::{Extent, SegmentRef};
+    use crate::managed::format::{ContentRef, Extent, SegmentRef};
 
     #[test]
     fn file_version_descriptors_have_one_identity() {
