@@ -22,6 +22,8 @@ use std::process::Command as StdCommand;
 use clap::Parser;
 use clap::Subcommand;
 
+mod managed_sync;
+
 fn main() {
     let cmd = Command::parse();
     cmd.run();
@@ -37,6 +39,7 @@ struct Command {
 impl Command {
     fn run(self) {
         match self.sub {
+            SubCommand::Behavior(cmd) => cmd.run(),
             SubCommand::Check(cmd) => cmd.run(),
             SubCommand::Licenses(cmd) => cmd.run(),
             SubCommand::Lint(cmd) => cmd.run(),
@@ -47,6 +50,8 @@ impl Command {
 
 #[derive(Subcommand)]
 enum SubCommand {
+    #[clap(about = "Run user-visible behavior scenarios.")]
+    Behavior(CommandBehavior),
     #[clap(about = "Check all workspace targets.")]
     Check(CommandCheck),
     #[clap(about = "Check source headers and dependency licenses.")]
@@ -55,6 +60,40 @@ enum SubCommand {
     Lint(CommandLint),
     #[clap(about = "Run all workspace tests.")]
     Test(CommandTest),
+}
+
+#[derive(Parser)]
+#[clap(name = "behavior")]
+struct CommandBehavior {
+    #[command(subcommand)]
+    target: BehaviorTarget,
+}
+
+impl CommandBehavior {
+    fn run(self) {
+        match self.target {
+            BehaviorTarget::ManagedSync(cmd) => cmd.run(),
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum BehaviorTarget {
+    #[clap(about = "Run Managed Sync behavior scenarios.")]
+    ManagedSync(CommandManagedSyncBehavior),
+}
+
+#[derive(Parser)]
+#[clap(name = "managed-sync")]
+struct CommandManagedSyncBehavior {
+    #[arg(long, help = "Leave the fixture running after the command exits.")]
+    keep: bool,
+}
+
+impl CommandManagedSyncBehavior {
+    fn run(self) {
+        managed_sync::run_fixture(self.keep);
+    }
 }
 
 #[derive(Parser)]
