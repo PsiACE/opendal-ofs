@@ -61,6 +61,515 @@ pub(crate) fn run_fixture(keep: bool, case: Option<&str>) {
     println!("Managed Sync behavior passed: {}", case.unwrap_or("all"));
 }
 
+pub(crate) fn run_bub_e2e(keep: bool) {
+    let api_key = env::var("BUB_API_KEY")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .expect("BUB_API_KEY is required for the Bub end-to-end scenario");
+    let fixture = Fixture::new(keep).start_bub();
+    fixture.create_bucket();
+    let sessions = fixture.container_storage_url("bub/sessions");
+    let skills = fixture.container_storage_url("bub/skills");
+    let mut observed_output = Vec::new();
+
+    for service in ["bub-a", "bub-b"] {
+        container_success(
+            &fixture,
+            service,
+            &[
+                "mkdir",
+                "-p",
+                "/sync/sessions/tapes",
+                "/workspace/.agents/skills",
+                "/var/lib/ofs",
+                "/var/lib/bub/.bub",
+            ],
+            "prepare isolated Bub client",
+        );
+        container_success(
+            &fixture,
+            service,
+            &["ofs", "--version"],
+            "verify installed OFS",
+        );
+        container_success(
+            &fixture,
+            service,
+            &["bub", "--help"],
+            "verify installed Bub",
+        );
+    }
+    container_success(
+        &fixture,
+        "bub-a",
+        &["touch", "/var/lib/ofs/a-only"],
+        "create client A isolation marker",
+    );
+    container_success(
+        &fixture,
+        "bub-b",
+        &["test", "!", "-e", "/var/lib/ofs/a-only"],
+        "verify client filesystem isolation",
+    );
+    container_success(
+        &fixture,
+        "bub-b",
+        &["touch", "/var/lib/ofs/b-only"],
+        "create client B isolation marker",
+    );
+    container_success(
+        &fixture,
+        "bub-a",
+        &["test", "!", "-e", "/var/lib/ofs/b-only"],
+        "verify reverse client filesystem isolation",
+    );
+
+    for (replica, state, storage) in [
+        ("/sync/sessions/tapes", "/var/lib/ofs/sessions.state", &sessions),
+        (
+            "/workspace/.agents/skills",
+            "/var/lib/ofs/skills.state",
+            &skills,
+        ),
+    ] {
+        container_sync(
+            &fixture,
+            "bub-a",
+            replica,
+            state,
+            storage,
+            true,
+            &[],
+        );
+        container_sync(
+            &fixture,
+            "bub-b",
+            replica,
+            state,
+            storage,
+            false,
+            &[],
+        );
+    }
+
+    let fact_a = format!("HARBOR-A-{}", std::process::id());
+    observed_output.push(container_bub(
+        &fixture,
+        "bub-a",
+        "handoff-a",
+        &format!("Remember this exact handoff fact for later: {fact_a}. Reply with the fact."),
+    ));
+    let marker_a = format!("BUB-SKILL-A-{}", std::process::id());
+    observed_output.push(container_bub(
+        &fixture,
+        "bub-a",
+        "create-skill-a",
+        &skill_creation_prompt("sync-a", &marker_a),
+    ));
+    container_success(
+        &fixture,
+        "bub-a",
+        &["test", "-f", "/workspace/.agents/skills/sync-a/SKILL.md"],
+        "verify Bub created skill A",
+    );
+    container_success(
+        &fixture,
+        "bub-b",
+        &["test", "!", "-e", "/workspace/.agents/skills/sync-a"],
+        "verify skill A is isolated before synchronization",
+    );
+    converge(&fixture, "bub-a", "bub-b", &sessions, &skills);
+
+    let continued_a = container_bub(
+        &fixture,
+        "bub-b",
+        "handoff-a",
+        "Return the exact handoff fact that I previously asked you to remember.",
+    );
+    assert!(
+        continued_a.contains(&fact_a),
+        "Bub session created in A did not continue in B"
+    );
+    observed_output.push(continued_a);
+    let invoked_a = container_bub(
+        &fixture,
+        "bub-b",
+        "invoke-skill-a",
+        "$sync-a Follow this project skill now.",
+    );
+    assert!(
+        invoked_a.contains(&marker_a),
+        "Bub skill created in A was not discovered and invoked in B"
+    );
+    observed_output.push(invoked_a);
+
+    let fact_b = format!("HARBOR-B-{}", std::process::id());
+    observed_output.push(container_bub(
+        &fixture,
+        "bub-b",
+        "handoff-b",
+        &format!("Remember this exact handoff fact for later: {fact_b}. Reply with the fact."),
+    ));
+    let marker_b = format!("BUB-SKILL-B-{}", std::process::id());
+    observed_output.push(container_bub(
+        &fixture,
+        "bub-b",
+        "create-skill-b",
+        &skill_creation_prompt("sync-b", &marker_b),
+    ));
+    container_success(
+        &fixture,
+        "bub-b",
+        &["test", "-f", "/workspace/.agents/skills/sync-b/SKILL.md"],
+        "verify Bub created skill B",
+    );
+    container_success(
+        &fixture,
+        "bub-a",
+        &["test", "!", "-e", "/workspace/.agents/skills/sync-b"],
+        "verify skill B is isolated before synchronization",
+    );
+    converge(&fixture, "bub-b", "bub-a", &sessions, &skills);
+
+    let continued_b = container_bub(
+        &fixture,
+        "bub-a",
+        "handoff-b",
+        "Return the exact handoff fact that I previously asked you to remember.",
+    );
+    assert!(
+        continued_b.contains(&fact_b),
+        "Bub session created in B did not continue in A"
+    );
+    observed_output.push(continued_b);
+    let invoked_b = container_bub(
+        &fixture,
+        "bub-a",
+        "invoke-skill-b",
+        "$sync-b Follow this project skill now.",
+    );
+    assert!(
+        invoked_b.contains(&marker_b),
+        "Bub skill created in B was not discovered and invoked in A"
+    );
+    observed_output.push(invoked_b);
+
+    converge(&fixture, "bub-a", "bub-b", &sessions, &skills);
+    let before_noop = bub_statuses(&fixture);
+    for (replica, state, storage) in [
+        ("/sync/sessions/tapes", "/var/lib/ofs/sessions.state", &sessions),
+        (
+            "/workspace/.agents/skills",
+            "/var/lib/ofs/skills.state",
+            &skills,
+        ),
+    ] {
+        for service in ["bub-a", "bub-b"] {
+            let output = container_sync(
+                &fixture,
+                service,
+                replica,
+                state,
+                storage,
+                false,
+                &[],
+            );
+            assert!(
+                !output.contains("(published)"),
+                "final Bub convergence is not a no-op"
+            );
+            observed_output.push(output);
+        }
+    }
+
+    let statuses = bub_statuses(&fixture);
+    for (before, after) in before_noop.iter().zip(&statuses) {
+        assert_eq!(
+            json_u64(before, "common_sequence"),
+            json_u64(after, "common_sequence"),
+            "final no-op advanced a common cursor"
+        );
+        assert_eq!(
+            json_u64(before, "remote_sequence"),
+            json_u64(after, "remote_sequence"),
+            "final no-op advanced a remote cursor"
+        );
+    }
+    for status in &statuses {
+        assert!(
+            status.contains("\"pending\":false") && status.contains("\"conflicts\":0"),
+            "Bub convergence status contains pending work or conflicts"
+        );
+        assert_eq!(
+            json_u64(status, "common_sequence"),
+            json_u64(status, "remote_sequence"),
+            "Bub replica stopped behind the remote cursor"
+        );
+    }
+    assert_eq!(
+        json_u64(&statuses[0], "common_sequence"),
+        json_u64(&statuses[1], "common_sequence"),
+        "Bub session replicas ended at different cursors"
+    );
+    assert_eq!(
+        json_u64(&statuses[2], "common_sequence"),
+        json_u64(&statuses[3], "common_sequence"),
+        "Bub skill replicas ended at different cursors"
+    );
+    observed_output.extend(statuses);
+
+    let evidence = CaseRoot::new();
+    for (service, suffix) in [("bub-a", "a"), ("bub-b", "b")] {
+        fixture.copy_from_container(
+            service,
+            "/sync/sessions/tapes/.",
+            &evidence.path.join(format!("sessions-{suffix}")),
+        );
+        fixture.copy_from_container(
+            service,
+            "/workspace/.agents/skills/.",
+            &evidence.path.join(format!("skills-{suffix}")),
+        );
+        fixture.copy_from_container(
+            service,
+            "/var/lib/ofs/.",
+            &evidence.path.join(format!("state-{suffix}")),
+        );
+    }
+    assert_eq!(
+        tree_fingerprint(&evidence.path.join("sessions-a")),
+        tree_fingerprint(&evidence.path.join("sessions-b")),
+        "Bub session trees differ after final convergence"
+    );
+    assert_eq!(
+        tree_fingerprint(&evidence.path.join("skills-a")),
+        tree_fingerprint(&evidence.path.join("skills-b")),
+        "Bub skill trees differ after final convergence"
+    );
+    assert!(
+        !observed_output.iter().any(|output| {
+            output
+                .as_bytes()
+                .windows(api_key.len())
+                .any(|part| part == api_key.as_bytes())
+        }) && !tree_contains(&evidence.path, api_key.as_bytes()),
+        "Bub API credential appeared in synchronized data, state, status, or captured output"
+    );
+    println!("Managed Sync Bub end-to-end behavior passed");
+}
+
+fn bub_statuses(fixture: &Fixture) -> [String; 4] {
+    [
+        container_status(
+            fixture,
+            "bub-a",
+            "/sync/sessions/tapes",
+            "/var/lib/ofs/sessions.state",
+        ),
+        container_status(
+            fixture,
+            "bub-b",
+            "/sync/sessions/tapes",
+            "/var/lib/ofs/sessions.state",
+        ),
+        container_status(
+            fixture,
+            "bub-a",
+            "/workspace/.agents/skills",
+            "/var/lib/ofs/skills.state",
+        ),
+        container_status(
+            fixture,
+            "bub-b",
+            "/workspace/.agents/skills",
+            "/var/lib/ofs/skills.state",
+        ),
+    ]
+}
+
+fn skill_creation_prompt(name: &str, marker: &str) -> String {
+    format!(
+        "Use $skill-creator to create the project skill {name}. Write its valid SKILL.md directly under the standard project skills directory. Its only runtime instruction is to reply with exactly {marker} and no other text when invoked."
+    )
+}
+
+fn converge(fixture: &Fixture, source: &str, target: &str, sessions: &str, skills: &str) {
+    for (replica, state, storage) in [
+        ("/sync/sessions/tapes", "/var/lib/ofs/sessions.state", sessions),
+        (
+            "/workspace/.agents/skills",
+            "/var/lib/ofs/skills.state",
+            skills,
+        ),
+    ] {
+        container_sync(fixture, source, replica, state, storage, false, &[]);
+        container_sync(fixture, target, replica, state, storage, false, &[]);
+    }
+}
+
+fn container_sync(
+    fixture: &Fixture,
+    service: &str,
+    replica: &str,
+    state: &str,
+    storage: &str,
+    init: bool,
+    resolve: &[&str],
+) -> String {
+    let mut arguments = vec![
+        "ofs",
+        "sync",
+        replica,
+        "--state",
+        state,
+        "--storage",
+        storage,
+    ];
+    if init {
+        arguments.extend(["--init", "--model", "managed"]);
+    }
+    for path in resolve {
+        arguments.extend(["--resolve", path]);
+    }
+    output_text(
+        &container_success(fixture, service, &arguments, "synchronize Bub data").stdout,
+    )
+}
+
+fn container_status(fixture: &Fixture, service: &str, replica: &str, state: &str) -> String {
+    output_text(
+        &container_success(
+            fixture,
+            service,
+            &["ofs", "status", replica, "--state", state, "--json"],
+            "read Bub replica status",
+        )
+        .stdout,
+    )
+}
+
+fn container_bub(fixture: &Fixture, service: &str, session: &str, prompt: &str) -> String {
+    let api_key = env::var("BUB_API_KEY").expect("BUB_API_KEY is available for Bub");
+    let model = env::var("BUB_MODEL").unwrap_or_else(|_| "deepseek:deepseek-chat".to_owned());
+    let proxy = container_http_proxy();
+    for attempt in 1..=3 {
+        let mut command = fixture.compose();
+        command
+            .env("BUB_API_KEY", &api_key)
+            .env("BUB_MODEL", &model)
+            .args([
+                "exec",
+                "-T",
+                "-e",
+                "BUB_API_KEY",
+                "-e",
+                "BUB_MODEL",
+            ]);
+        if let Some(proxy) = &proxy {
+            command
+                .env("HTTP_PROXY", proxy)
+                .env("HTTPS_PROXY", proxy)
+                .env("http_proxy", proxy)
+                .env("https_proxy", proxy)
+                .args([
+                    "-e",
+                    "HTTP_PROXY",
+                    "-e",
+                    "HTTPS_PROXY",
+                    "-e",
+                    "http_proxy",
+                    "-e",
+                    "https_proxy",
+                ]);
+        }
+        let output = command
+            .arg(service)
+            .args([
+                "bub",
+                "--workspace",
+                "/workspace",
+                "run",
+                prompt,
+                "--session-id",
+                session,
+            ])
+            .output()
+            .expect("execute Bub turn");
+        let transcript = format!(
+            "{}\n{}",
+            output_text(&output.stdout),
+            output_text(&output.stderr)
+        );
+        assert!(
+            !transcript.contains(&api_key),
+            "Bub API credential appeared in captured turn output"
+        );
+        if output.status.success() {
+            return transcript;
+        }
+        if attempt == 3 {
+            panic!(
+                "run Bub turn failed after {attempt} attempts ({}); output withheld",
+                output.status
+            );
+        }
+    }
+    unreachable!()
+}
+
+fn container_success(
+    fixture: &Fixture,
+    service: &str,
+    arguments: &[&str],
+    action: &str,
+) -> Output {
+    let mut command = fixture.compose();
+    command.args(["exec", "-T", service]).args(arguments);
+    let output = command.output().expect("execute container command");
+    assert!(
+        output.status.success(),
+        "{action} failed: {}",
+        output_text(&output.stderr)
+    );
+    output
+}
+
+fn json_u64(document: &str, field: &str) -> u64 {
+    let marker = format!("\"{field}\":");
+    let value = document
+        .split_once(&marker)
+        .map(|(_, suffix)| suffix)
+        .expect("status contains expected numeric field")
+        .trim_start();
+    value
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .expect("status numeric field is an integer")
+}
+
+fn tree_contains(root: &Path, needle: &[u8]) -> bool {
+    let mut pending = vec![root.to_owned()];
+    while let Some(path) = pending.pop() {
+        let metadata = fs::metadata(&path).expect("read evidence metadata");
+        if metadata.is_dir() {
+            pending.extend(
+                fs::read_dir(path)
+                    .expect("read evidence directory")
+                    .map(|entry| entry.expect("read evidence entry").path()),
+            );
+        } else if fs::read(path)
+            .expect("read evidence file")
+            .windows(needle.len())
+            .any(|part| part == needle)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn gc(fixture: &Fixture) {
     let root = CaseRoot::new();
     let replica_a = root.path.join("replica-a");
@@ -778,6 +1287,21 @@ impl Fixture {
         self
     }
 
+    fn start_bub(mut self) -> Self {
+        let workspace = PathBuf::from(env!("CARGO_WORKSPACE_DIR"));
+        run(docker_command()
+            .args(["build", "--network", "host", "--tag", &self.bub_image()])
+            .args(["--file"])
+            .arg(workspace.join("fixtures/managed-sync/bub.Dockerfile"))
+            .arg(&workspace));
+        self.started = true;
+        run(self
+            .compose()
+            .args(["up", "--detach", "--no-build", "minio", "bub-a", "bub-b"]));
+        self.wait_until_ready();
+        self
+    }
+
     fn wait_until_ready(&self) {
         let deadline = Instant::now() + FIXTURE_READY_TIMEOUT;
         while Instant::now() < deadline {
@@ -820,13 +1344,54 @@ impl Fixture {
         )
     }
 
+    fn container_storage_url(&self, root: &str) -> String {
+        format!(
+            "s3://managed-sync/{root}?endpoint=http%3A%2F%2F127.0.0.1%3A{}&region=us-east-1",
+            self.minio_port
+        )
+    }
+
+    fn copy_from_container(&self, service: &str, source: &str, destination: &Path) {
+        fs::create_dir(destination).expect("create container evidence directory");
+        let project_label = format!("label=com.docker.compose.project={}", self.project);
+        let service_label = format!("label=com.docker.compose.service={service}");
+        let container = docker_command()
+            .args([
+                "ps",
+                "--filter",
+                &project_label,
+                "--filter",
+                &service_label,
+                "--quiet",
+            ])
+            .output()
+            .expect("resolve fixture container");
+        assert!(
+            container.status.success(),
+            "resolve fixture container failed: {}",
+            output_text(&container.stderr)
+        );
+        let container = output_text(&container.stdout);
+        assert!(
+            !container.is_empty() && !container.contains('\n'),
+            "fixture service did not resolve to exactly one running container"
+        );
+        let remote = format!("{container}:{source}");
+        run(docker_command().args(["cp", &remote]).arg(destination));
+    }
+
     fn compose(&self) -> Command {
         let mut command = docker_compose();
         command
+            .env("OFS_BUB_IMAGE", self.bub_image())
             .env("OFS_MANAGED_SYNC_MINIO_PORT", self.minio_port.to_string())
             .args(["--project-name", &self.project, "--file"])
             .arg(&self.compose_file);
         command
+    }
+
+    fn bub_image(&self) -> String {
+        format!("{}-bub:local", self.project)
     }
 
     fn stop(&self) -> bool {
@@ -854,10 +1419,19 @@ impl Drop for Fixture {
 }
 
 fn docker_compose() -> Command {
-    let docker = which::which("docker").unwrap_or_else(|error| panic!("docker not found: {error}"));
-    let mut command = Command::new(docker);
+    let mut command = docker_command();
     command.arg("compose");
     command
+}
+
+fn docker_command() -> Command {
+    Command::new(which::which("docker").unwrap_or_else(|error| panic!("docker not found: {error}")))
+}
+
+fn container_http_proxy() -> Option<String> {
+    ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"]
+        .into_iter()
+        .find_map(|name| env::var(name).ok().filter(|value| !value.is_empty()))
 }
 
 fn minio_is_ready(port: u16) -> bool {
@@ -884,7 +1458,15 @@ fn minio_is_ready(port: u16) -> bool {
 }
 
 fn run(command: &mut Command) {
-    println!("{command:?}");
+    println!(
+        "{} {}",
+        command.get_program().to_string_lossy(),
+        command
+            .get_args()
+            .map(|argument| argument.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
     let status = command.status().expect("failed to execute process");
     assert!(status.success(), "command failed: {status}");
 }

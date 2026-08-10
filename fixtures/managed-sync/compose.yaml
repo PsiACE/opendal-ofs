@@ -16,6 +16,28 @@
 # under the License.
 
 services:
+  bub-a: &bub-client
+    build:
+      context: ../..
+      dockerfile: fixtures/managed-sync/bub.Dockerfile
+    image: ${OFS_BUB_IMAGE:-opendal-ofs-managed-sync-bub:local}
+    depends_on:
+      - minio
+    network_mode: host
+    environment: &bub-environment
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_EC2_METADATA_DISABLED: "true"
+      AWS_REGION: us-east-1
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      HOME: /var/lib/bub
+      NO_PROXY: 127.0.0.1,localhost
+      no_proxy: 127.0.0.1,localhost
+
+  bub-b:
+    <<: *bub-client
+    environment:
+      <<: *bub-environment
+
   minio:
     image: quay.io/minio/minio:RELEASE.2024-09-22T00-33-43Z
     command: server /data

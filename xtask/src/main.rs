@@ -42,6 +42,7 @@ impl Command {
             SubCommand::Behavior(cmd) => cmd.run(),
             SubCommand::Build(cmd) => cmd.run(),
             SubCommand::Check(cmd) => cmd.run(),
+            SubCommand::E2e(cmd) => cmd.run(),
             SubCommand::Licenses(cmd) => cmd.run(),
             SubCommand::Lint(cmd) => cmd.run(),
             SubCommand::Test(cmd) => cmd.run(),
@@ -57,12 +58,48 @@ enum SubCommand {
     Build(CommandBuild),
     #[clap(about = "Check all workspace targets.")]
     Check(CommandCheck),
+    #[clap(about = "Run end-to-end scenarios that require external credentials.")]
+    E2e(CommandE2e),
     #[clap(about = "Check source headers and dependency licenses.")]
     Licenses(CommandLicenses),
     #[clap(about = "Run source and documentation linters.")]
     Lint(CommandLint),
     #[clap(about = "Run all workspace tests.")]
     Test(CommandTest),
+}
+
+#[derive(Parser)]
+#[clap(name = "e2e")]
+struct CommandE2e {
+    #[command(subcommand)]
+    target: E2eTarget,
+}
+
+impl CommandE2e {
+    fn run(self) {
+        match self.target {
+            E2eTarget::ManagedSyncBub(cmd) => cmd.run(),
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum E2eTarget {
+    #[clap(about = "Synchronize Bub sessions and skills across isolated containers.")]
+    ManagedSyncBub(CommandManagedSyncBub),
+}
+
+#[derive(Parser)]
+#[clap(name = "managed-sync-bub")]
+struct CommandManagedSyncBub {
+    #[arg(long, help = "Leave the fixture running after the command exits.")]
+    keep: bool,
+}
+
+impl CommandManagedSyncBub {
+    fn run(self) {
+        managed_sync::run_bub_e2e(self.keep);
+    }
 }
 
 #[derive(Parser)]
