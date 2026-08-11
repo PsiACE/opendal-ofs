@@ -22,7 +22,7 @@ mod error;
 mod format;
 mod gc;
 mod head;
-mod history;
+mod index;
 mod object;
 mod record;
 

@@ -25,7 +25,7 @@ use super::ManagedVolume;
 use super::data::{decode_descriptor, segment_key};
 use super::head::GcFence;
 
-const DATA_PREFIX: &str = ".ofs/managed/data/";
+const DATA_PREFIX: &str = "managed/1/objects/raw/";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct GcOutcome {
@@ -44,7 +44,7 @@ impl ManagedVolume {
             ));
         }
         let (fence, snapshot) = self.begin_gc(resume).await?;
-        let live = live_segments(&snapshot)?;
+        let live = live_objects(&snapshot)?;
         let outcome = self.sweep(&live).await?;
         self.finish_gc(fence).await?;
         Ok(outcome)
@@ -56,16 +56,16 @@ impl ManagedVolume {
         let fence = match (resume, head.maintenance) {
             (false, None) => GcFence {
                 owner,
-                cursor: head.snapshot.cursor,
+                namespace_commit: head.namespace_commit,
             },
             (false, Some(_)) => {
                 return Err(conflict(
                     "begin Managed data collection: another collection is active",
                 ));
             }
-            (true, Some(active)) if active.cursor == head.snapshot.cursor => GcFence {
+            (true, Some(active)) if active.namespace_commit == head.namespace_commit => GcFence {
                 owner,
-                cursor: active.cursor,
+                namespace_commit: active.namespace_commit,
             },
             (true, Some(_)) => {
                 return Err(corrupt(
@@ -84,7 +84,8 @@ impl ManagedVolume {
                 "begin Managed data collection: namespace authority changed",
             ));
         }
-        Ok((fence, head.snapshot))
+        let snapshot = self.snapshot_at(head.namespace_commit).await?;
+        Ok((fence, snapshot))
     }
 
     async fn sweep(&self, live: &BTreeMap<String, u64>) -> Result<GcOutcome, VolumeError> {
@@ -94,7 +95,7 @@ impl ManagedVolume {
             .lister_with(DATA_PREFIX)
             .recursive(true)
             .await
-            .map_err(|_| unavailable("list Managed data segments"))?;
+            .map_err(|_| unavailable("list Managed data objects"))?;
         let mut deleter = self
             .operator()
             .deleter()
@@ -103,23 +104,23 @@ impl ManagedVolume {
         while let Some(entry) = lister
             .try_next()
             .await
-            .map_err(|_| unavailable("list Managed data segments"))?
+            .map_err(|_| unavailable("list Managed data objects"))?
         {
-            if !entry.metadata().is_file() || !valid_segment_key(entry.path()) {
+            if !entry.metadata().is_file() || !valid_object_key(entry.path()) {
                 continue;
             }
             outcome.scanned += 1;
             let length = entry.metadata().content_length();
             if let Some(expected) = live.get(entry.path()) {
                 if *expected != length {
-                    return Err(corrupt("live Managed segment length is invalid"));
+                    return Err(corrupt("live Managed object length is invalid"));
                 }
                 continue;
             }
             deleter
                 .delete(entry.path())
                 .await
-                .map_err(|_| unavailable("delete Managed data segment"))?;
+                .map_err(|_| unavailable("delete Managed data object"))?;
             outcome.deleted += 1;
             outcome.deleted_bytes = outcome
                 .deleted_bytes
@@ -135,7 +136,7 @@ impl ManagedVolume {
 
     async fn finish_gc(&self, fence: GcFence) -> Result<(), VolumeError> {
         let (mut head, revision) = self.read_head().await?;
-        if head.maintenance != Some(fence) || head.snapshot.cursor != fence.cursor {
+        if head.maintenance != Some(fence) || head.namespace_commit != fence.namespace_commit {
             return Err(conflict(
                 "finish Managed data collection: collection fence changed",
             ));
@@ -151,7 +152,7 @@ impl ManagedVolume {
     }
 }
 
-fn live_segments(snapshot: &VolumeSnapshot) -> Result<BTreeMap<String, u64>, VolumeError> {
+fn live_objects(snapshot: &VolumeSnapshot) -> Result<BTreeMap<String, u64>, VolumeError> {
     let mut live = BTreeMap::new();
     for version in snapshot.file_versions.values() {
         for segment in decode_descriptor(version)?.segments {
@@ -160,16 +161,21 @@ fn live_segments(snapshot: &VolumeSnapshot) -> Result<BTreeMap<String, u64>, Vol
                 .insert(key, segment.length)
                 .is_some_and(|length| length != segment.length)
             {
-                return Err(corrupt("one Managed segment has conflicting lengths"));
+                return Err(corrupt("one Managed object has conflicting lengths"));
             }
         }
     }
     Ok(live)
 }
 
-fn valid_segment_key(path: &str) -> bool {
-    path.strip_prefix(DATA_PREFIX).is_some_and(|digest| {
-        digest.len() == 64
+fn valid_object_key(path: &str) -> bool {
+    path.strip_prefix(DATA_PREFIX).is_some_and(|suffix| {
+        let Some((prefix, digest)) = suffix.split_once('/') else {
+            return false;
+        };
+        prefix.len() == 2
+            && digest.len() == 64
+            && prefix == &digest[..2]
             && digest
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
