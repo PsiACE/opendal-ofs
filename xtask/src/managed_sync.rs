@@ -958,12 +958,12 @@ fn rename(fixture: &Fixture) {
     let replica_b = root.path.join("replica-b");
     let state_a = root.path.join("state-a");
     let state_b = root.path.join("state-b");
-    fs::create_dir_all(replica_a.join("tree-before/branch/empty"))
+    fs::create_dir_all(replica_a.join("tree-before/subtree/empty"))
         .expect("create rename source tree");
     fs::create_dir_all(&replica_b).expect("create rename replica B");
     fs::write(replica_a.join("file-before"), b"stable file\n").expect("write rename file");
     fs::write(
-        replica_a.join("tree-before/branch/leaf"),
+        replica_a.join("tree-before/subtree/leaf"),
         b"stable directory tree\n",
     )
     .expect("write rename tree leaf");
@@ -997,7 +997,7 @@ fn rename(fixture: &Fixture) {
         "old paths disappear after remote moves"
     );
     assert!(
-        replica_b.join("tree-after/branch/empty").is_dir(),
+        replica_b.join("tree-after/subtree/empty").is_dir(),
         "a moved empty directory is retained"
     );
     assert_eq!(
