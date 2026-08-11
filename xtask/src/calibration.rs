@@ -68,8 +68,9 @@ pub(crate) fn run(reference: &str, samples: usize, output: Option<&Path>, keep: 
     let mut build = Build::new(&workspace, &output, &reference_revision, keep);
     build.compile();
 
-    let audit_log = output.join(".audit.jsonl");
-    let fixture = Fixture::new(keep).start_audited(audit_log.clone());
+    let audit_directory = output.join(".audit");
+    let audit_state = audit_directory.join("audit.json");
+    let fixture = Fixture::new(keep).start_audited(audit_state.clone());
     fixture.create_bucket();
     fixture.create_evaluation_user();
 
@@ -104,10 +105,10 @@ pub(crate) fn run(reference: &str, samples: usize, output: Option<&Path>, keep: 
         CliDialect::ManagedSyncV1.create(build.binary(Role::Candidate), &barrier_storage),
     );
     for run in &mut runs {
-        run.audit = audit_summary(&audit_log, &run.volume_root);
+        run.audit = audit_summary(&audit_state, &run.volume_root);
     }
     if !keep {
-        fs::remove_file(&audit_log).expect("remove aggregated MinIO audit log");
+        fs::remove_dir_all(&audit_directory).expect("remove MinIO audit state");
     }
 
     write_json_atomic(
@@ -117,7 +118,7 @@ pub(crate) fn run(reference: &str, samples: usize, output: Option<&Path>, keep: 
             &reference_revision,
             &candidate_revision,
             samples,
-            keep.then(|| audit_log.to_string_lossy().into_owned()),
+            keep.then(|| audit_state.to_string_lossy().into_owned()),
             &runs,
         ),
     );
@@ -586,7 +587,7 @@ fn report(
     reference_revision: &str,
     candidate_revision: &str,
     samples: usize,
-    audit_log: Option<String>,
+    audit_state: Option<String>,
     runs: &[Sample],
 ) -> Value {
     json!({
@@ -609,7 +610,7 @@ fn report(
             "candidate": aggregate(runs, Role::Candidate),
         },
         "runs": runs.iter().map(sample_document).collect::<Vec<_>>(),
-        "audit_log_retained": audit_log,
+        "audit_state_retained": audit_state,
         "checks": {
             "fixed_workload": true,
             "settled_status_at_acceptance_boundaries": true,

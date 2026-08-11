@@ -23,8 +23,6 @@ use std::fs;
 use std::io::BufRead;
 use std::io::BufReader;
 use std::io::Read;
-use std::io::Seek;
-use std::io::SeekFrom;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
@@ -220,42 +218,31 @@ pub(crate) fn log_contains(path: &Path, needle: &[u8]) -> bool {
     }
 }
 
-pub(crate) fn wait_for_log_marker(path: &Path, marker: &[u8], start: u64, timeout: Duration) {
-    assert!(!marker.is_empty(), "evaluation log marker is empty");
+pub(crate) fn wait_for_audit_marker(path: &Path, marker: &str, timeout: Duration) {
+    assert!(!marker.is_empty(), "evaluation audit marker is empty");
     let deadline = Instant::now() + timeout;
-    let mut position = start;
-    let mut overlap = Vec::new();
-    let mut found = false;
+    let mut previous = Vec::new();
     let mut stable_observations = 0;
 
     while Instant::now() < deadline {
-        let mut file = fs::File::open(path).expect("open evaluation log");
-        file.seek(SeekFrom::Start(position))
-            .expect("seek evaluation log");
-        let mut appended = Vec::new();
-        file.read_to_end(&mut appended)
-            .expect("read appended evaluation log");
-
-        if appended.is_empty() {
-            if found {
-                stable_observations += 1;
-                if stable_observations == 3 {
-                    return;
-                }
+        let current = fs::read(path).expect("read evaluation audit state");
+        let document: Value = serde_json::from_slice(&current).expect("audit state is JSON");
+        let found = document
+            .get("markers")
+            .and_then(Value::as_array)
+            .is_some_and(|markers| markers.iter().any(|value| value.as_str() == Some(marker)));
+        if found && current == previous {
+            stable_observations += 1;
+            if stable_observations == 25 {
+                return;
             }
         } else {
-            position = position
-                .checked_add(appended.len() as u64)
-                .expect("evaluation log position fits in u64");
-            overlap.extend_from_slice(&appended);
-            found |= overlap.windows(marker.len()).any(|window| window == marker);
-            let retained = marker.len().saturating_sub(1).min(overlap.len());
-            overlap.drain(..overlap.len() - retained);
             stable_observations = 0;
         }
+        previous = current;
         thread::sleep(Duration::from_millis(200));
     }
-    panic!("evaluation log did not reach its marker");
+    panic!("evaluation audit state did not reach its marker");
 }
 
 pub(crate) fn short_log_excerpt(path: &Path) -> String {
@@ -345,62 +332,20 @@ pub(crate) fn inventory(mut command: Command) -> Value {
 }
 
 pub(crate) fn audit_summary(path: &Path, volume_root: &str) -> Value {
-    let file = fs::File::open(path).expect("open MinIO audit log");
-    let volume_path = format!("/managed-sync/{volume_root}");
-    let mut requests = 0_u64;
-    let mut request_bytes = 0_u64;
-    let mut response_bytes = 0_u64;
-    let mut groups = BTreeMap::<String, RequestTotal>::new();
-    for line in BufReader::new(file).lines() {
-        let line = line.expect("read MinIO audit event");
-        if line.trim().is_empty() {
-            continue;
-        }
-        let event: Value = serde_json::from_str(&line).expect("MinIO audit event is JSON");
-        if event.get("accessKey").and_then(Value::as_str) != Some(PRODUCT_ACCESS_KEY) {
-            continue;
-        }
-        let request_path = event
-            .get("requestPath")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if !request_path.starts_with(&volume_path) {
-            continue;
-        }
-        let api = event.get("api").expect("MinIO audit event has API details");
-        let operation = api.get("name").and_then(Value::as_str).unwrap_or("unknown");
-        let status = api
-            .get("statusCode")
+    let document: Value = serde_json::from_slice(&fs::read(path).expect("read MinIO audit state"))
+        .expect("MinIO audit state is JSON");
+    let summary = document
+        .get("volumes")
+        .and_then(|volumes| volumes.get(volume_root))
+        .unwrap_or_else(|| panic!("MinIO audit state has no volume {volume_root}"));
+    assert!(
+        summary
+            .get("requests")
             .and_then(Value::as_u64)
-            .unwrap_or_default();
-        let received = api.get("rx").and_then(Value::as_u64).unwrap_or_default();
-        let sent = api.get("tx").and_then(Value::as_u64).unwrap_or_default();
-        let range = event
-            .get("requestHeader")
-            .and_then(Value::as_object)
-            .is_some_and(|headers| headers.contains_key("Range"));
-        requests += 1;
-        request_bytes = request_bytes.saturating_add(received);
-        response_bytes = response_bytes.saturating_add(sent);
-        let key = format!(
-            "{operation}|{status}|{}|{}",
-            object_class(request_path),
-            if range { "range" } else { "complete" }
-        );
-        groups.entry(key).or_default().add(received, sent);
-    }
-    json!({
-        "requests": requests,
-        "request_bytes": request_bytes,
-        "response_bytes": response_bytes,
-        "groups": groups.into_iter().map(|(key, total)| {
-            (key, json!({
-                "requests": total.requests,
-                "request_bytes": total.received,
-                "response_bytes": total.sent,
-            }))
-        }).collect::<serde_json::Map<_, _>>(),
-    })
+            .is_some_and(|requests| requests > 0),
+        "MinIO audit summary is empty"
+    );
+    summary.clone()
 }
 
 #[derive(Default)]
@@ -413,21 +358,6 @@ impl ObjectTotal {
     fn add(&mut self, bytes: u64) {
         self.objects += 1;
         self.bytes = self.bytes.saturating_add(bytes);
-    }
-}
-
-#[derive(Default)]
-struct RequestTotal {
-    requests: u64,
-    received: u64,
-    sent: u64,
-}
-
-impl RequestTotal {
-    fn add(&mut self, received: u64, sent: u64) {
-        self.requests += 1;
-        self.received = self.received.saturating_add(received);
-        self.sent = self.sent.saturating_add(sent);
     }
 }
 

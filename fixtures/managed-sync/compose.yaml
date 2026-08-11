@@ -22,13 +22,13 @@ services:
     command:
       - python
       - /fixture/audit.py
-      - --log
-      - /evidence/audit.jsonl
+      - --state
+      - /evidence/audit.json
       - --ready
       - /tmp/audit.ready
     volumes:
       - ./audit.py:/fixture/audit.py:ro,Z
-      - ${OFS_MANAGED_SYNC_AUDIT_LOG:-/tmp/ofs-managed-sync-audit.jsonl}:/evidence/audit.jsonl:Z
+      - ${OFS_MANAGED_SYNC_AUDIT_DIR:-/tmp/ofs-managed-sync-audit}:/evidence:Z
 
   bub-a: &bub-client
     build:
@@ -56,7 +56,7 @@ services:
     image: quay.io/minio/minio:RELEASE.2024-09-22T00-33-43Z
     command: server /data
     environment:
-      MINIO_AUDIT_WEBHOOK_BATCH_SIZE_HARNESS: "1"
+      MINIO_AUDIT_WEBHOOK_BATCH_SIZE_HARNESS: "1000"
       MINIO_AUDIT_WEBHOOK_ENABLE_HARNESS: ${OFS_MANAGED_SYNC_AUDIT_ENABLE:-off}
       MINIO_AUDIT_WEBHOOK_ENDPOINT_HARNESS: http://audit:8080
       MINIO_ROOT_PASSWORD: minioadmin

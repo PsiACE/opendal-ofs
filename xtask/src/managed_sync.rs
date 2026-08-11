@@ -1171,7 +1171,7 @@ fn deterministic_bytes(length: usize, seed: u8) -> Vec<u8> {
 }
 
 pub(crate) struct Fixture {
-    audit_log: Option<PathBuf>,
+    audit_state: Option<PathBuf>,
     compose_file: PathBuf,
     keep: bool,
     minio_port: u16,
@@ -1567,7 +1567,7 @@ impl Fixture {
             .unwrap_or(DEFAULT_MINIO_PORT);
         let workspace = PathBuf::from(env!("CARGO_WORKSPACE_DIR"));
         Self {
-            audit_log: None,
+            audit_state: None,
             compose_file: workspace.join("fixtures/managed-sync/compose.yaml"),
             keep,
             minio_port,
@@ -1583,9 +1583,21 @@ impl Fixture {
         self
     }
 
-    pub(crate) fn start_audited(mut self, audit_log: PathBuf) -> Self {
-        fs::File::create(&audit_log).expect("create Managed Sync audit log");
-        self.audit_log = Some(audit_log);
+    pub(crate) fn start_audited(mut self, audit_state: PathBuf) -> Self {
+        assert_eq!(
+            audit_state.file_name().and_then(|name| name.to_str()),
+            Some("audit.json"),
+            "Managed Sync audit state must be named audit.json"
+        );
+        let audit_directory = audit_state
+            .parent()
+            .expect("Managed Sync audit state has a parent");
+        fs::create_dir_all(audit_directory).expect("create Managed Sync audit directory");
+        assert!(
+            !audit_state.exists(),
+            "Managed Sync audit state already exists"
+        );
+        self.audit_state = Some(audit_state);
         self.started = true;
         run(self.compose().args(["up", "--detach", "audit"]));
         let deadline = Instant::now() + FIXTURE_READY_TIMEOUT;
@@ -1700,21 +1712,13 @@ impl Fixture {
     }
 
     pub(crate) fn finish_audit_with(&self, marker: &str, mut command: Command) {
-        let audit_log = self
-            .audit_log
+        let audit_state = self
+            .audit_state
             .as_ref()
-            .expect("audited fixture has an audit log");
-        let audit_start = fs::metadata(audit_log)
-            .expect("inspect Managed Sync audit log")
-            .len();
+            .expect("audited fixture has audit state");
         evaluation::use_product_credentials(&mut command);
         run_ofs_success(command, "publish MinIO audit barrier");
-        evaluation::wait_for_log_marker(
-            audit_log,
-            marker.as_bytes(),
-            audit_start,
-            FIXTURE_READY_TIMEOUT,
-        );
+        evaluation::wait_for_audit_marker(audit_state, marker, FIXTURE_READY_TIMEOUT);
     }
 
     pub(crate) fn storage_url(&self, root: &str) -> String {
@@ -1767,10 +1771,13 @@ impl Fixture {
             .env("OFS_MANAGED_SYNC_MINIO_PORT", self.minio_port.to_string())
             .args(["--project-name", &self.project, "--file"])
             .arg(&self.compose_file);
-        if let Some(audit_log) = &self.audit_log {
-            command
-                .env("OFS_MANAGED_SYNC_AUDIT_ENABLE", "on")
-                .env("OFS_MANAGED_SYNC_AUDIT_LOG", audit_log);
+        if let Some(audit_state) = &self.audit_state {
+            command.env("OFS_MANAGED_SYNC_AUDIT_ENABLE", "on").env(
+                "OFS_MANAGED_SYNC_AUDIT_DIR",
+                audit_state
+                    .parent()
+                    .expect("Managed Sync audit state has a parent"),
+            );
         }
         command
     }

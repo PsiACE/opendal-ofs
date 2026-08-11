@@ -62,9 +62,10 @@ pub(crate) fn run(profile: &str, output: &Path, keep: bool) {
         .as_secs();
     let run_name = format!("{}-{nonce}-{}", profile.name(), std::process::id());
     let report_path = output.join(format!("{run_name}.json"));
-    let audit_log = output.join(format!(".{run_name}.audit.jsonl"));
+    let audit_directory = output.join(format!(".{run_name}.audit"));
+    let audit_state = audit_directory.join("audit.json");
     let work = WorkRoot::new(output.join(format!(".{run_name}.work")), keep);
-    let fixture = Fixture::new(keep).start_audited(audit_log.clone());
+    let fixture = Fixture::new(keep).start_audited(audit_state.clone());
     fixture.create_bucket();
     fixture.create_evaluation_user();
 
@@ -181,11 +182,11 @@ pub(crate) fn run(profile: &str, output: &Path, keep: bool) {
     );
     runner.record_backend(
         fixture.inventory(&volume_root),
-        audit_summary(&audit_log, &volume_root),
-        keep.then(|| audit_log.to_string_lossy().into_owned()),
+        audit_summary(&audit_state, &volume_root),
+        keep.then(|| audit_state.to_string_lossy().into_owned()),
     );
     if !keep {
-        fs::remove_file(&audit_log).expect("remove aggregated MinIO audit log");
+        fs::remove_dir_all(&audit_directory).expect("remove MinIO audit state");
     }
     runner.complete();
 
@@ -559,10 +560,10 @@ impl Runner {
         self.write_report();
     }
 
-    fn record_backend(&mut self, inventory: Value, audit: Value, audit_log: Option<String>) {
+    fn record_backend(&mut self, inventory: Value, audit: Value, audit_state: Option<String>) {
         self.report["object_inventory"] = inventory;
         self.report["backend_requests"] = audit;
-        self.report["audit_log_retained"] = audit_log.map_or(Value::Null, Value::String);
+        self.report["audit_state_retained"] = audit_state.map_or(Value::Null, Value::String);
         self.write_report();
     }
 
