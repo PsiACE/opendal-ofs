@@ -171,13 +171,3 @@ pub(crate) async fn create_immutable(
         )),
     }
 }
-
-pub(crate) async fn read_data(operator: &Operator, key: &str) -> Result<Buffer, VolumeError> {
-    operator.read(key).await.map_err(|error| {
-        if error.kind() == ErrorKind::NotFound {
-            corrupt("read Managed data", "referenced segment is missing")
-        } else {
-            unavailable("read Managed data", "object storage is unavailable")
-        }
-    })
-}

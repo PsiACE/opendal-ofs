@@ -22,7 +22,7 @@ use futures::TryStreamExt as _;
 use crate::filesystem::{OperationId, VolumeError, VolumeErrorKind, VolumeSnapshot};
 
 use super::ManagedVolume;
-use super::data::{decode_descriptor, segment_key};
+use super::data::{whole_object, whole_object_key};
 use super::head::GcFence;
 
 const DATA_PREFIX: &str = "managed/1/objects/raw/";
@@ -155,11 +155,11 @@ impl ManagedVolume {
 fn live_objects(snapshot: &VolumeSnapshot) -> Result<BTreeMap<String, u64>, VolumeError> {
     let mut live = BTreeMap::new();
     for version in snapshot.file_versions.values() {
-        for segment in decode_descriptor(version)?.segments {
-            let key = segment_key(segment.digest);
+        if let Some(object) = whole_object(version)? {
+            let key = whole_object_key(object.digest);
             if live
-                .insert(key, segment.length)
-                .is_some_and(|length| length != segment.length)
+                .insert(key, object.length)
+                .is_some_and(|length| length != object.length)
             {
                 return Err(corrupt("one Managed object has conflicting lengths"));
             }

@@ -332,12 +332,6 @@ impl SyncEngine {
             if common.file_versions.get(&version.id) == Some(version) {
                 continue;
             }
-            let observed = self.volume.inspect_file(&root.join(&path)).await?;
-            if observed != *version {
-                return Err(SyncError::new(
-                    "local file changed after its publication was prepared",
-                ));
-            }
             self.volume.publish_file(&root.join(path), version).await?;
         }
         Ok(())

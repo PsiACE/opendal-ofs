@@ -30,15 +30,11 @@ use super::{
 #[serde(deny_unknown_fields)]
 pub struct FileVersion {
     pub id: FileVersionId,
-    descriptor: Box<[u8]>,
 }
 
 impl FileVersion {
-    pub fn new(id: FileVersionId, descriptor: impl Into<Box<[u8]>>) -> Self {
-        Self {
-            id,
-            descriptor: descriptor.into(),
-        }
+    pub const fn new(id: FileVersionId) -> Self {
+        Self { id }
     }
 
     pub const fn logical_length(&self) -> u64 {
@@ -47,10 +43,6 @@ impl FileVersion {
 
     pub const fn digest(&self) -> super::Digest {
         self.id.digest()
-    }
-
-    pub fn descriptor(&self) -> &[u8] {
-        &self.descriptor
     }
 }
 

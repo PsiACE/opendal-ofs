@@ -20,7 +20,6 @@ use std::path::Path;
 use blake3::Hasher;
 use futures::StreamExt as _;
 use opendal::{Buffer, ErrorKind, Operator};
-use serde::{Deserialize, Serialize};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -34,39 +33,10 @@ const IO_BUFFER_BYTES: usize = 256 * 1024;
 const UPLOAD_PART_BYTES: usize = 16 * 1024 * 1024;
 const UPLOAD_CONCURRENCY: usize = 4;
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum FileLayout {
-    Empty,
-    Whole,
-}
-
 #[derive(Clone, Copy, Debug)]
 pub(super) struct WholeObject {
     pub(super) digest: [u8; 32],
     pub(super) length: u64,
-}
-
-pub(super) struct WholeObjects(Option<WholeObject>);
-
-impl WholeObjects {
-    fn into_option(self) -> Option<WholeObject> {
-        self.0
-    }
-}
-
-impl IntoIterator for WholeObjects {
-    type Item = WholeObject;
-    type IntoIter = std::option::IntoIter<WholeObject>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.into_iter()
-    }
-}
-
-/// A zero-or-one iterable object set for collector traversal.
-pub(super) struct Descriptor {
-    pub(super) segments: WholeObjects,
 }
 
 impl ManagedVolume {
@@ -77,17 +47,10 @@ impl ManagedVolume {
             .map_err(|_| unavailable("inspect local file"))?;
         let (logical_size, logical_digest) =
             inspect_reader(&mut file, "inspect local file").await?;
-        let layout = if logical_size == 0 {
-            FileLayout::Empty
-        } else {
-            FileLayout::Whole
-        };
-        let descriptor = serde_json::to_vec(&layout)
-            .map_err(|_| invalid("inspect local file", "descriptor cannot be encoded"))?;
-        Ok(FileVersion::new(
-            FileVersionId::new(Digest::from_bytes(logical_digest), logical_size),
-            descriptor,
-        ))
+        Ok(FileVersion::new(FileVersionId::new(
+            Digest::from_bytes(logical_digest),
+            logical_size,
+        )))
     }
 
     /// Publish one immutable whole-file object before its version is committed.
@@ -96,11 +59,10 @@ impl ManagedVolume {
         path: &Path,
         version: &FileVersion,
     ) -> Result<(), VolumeError> {
-        let descriptor = decode_descriptor(version)?;
         let mut file = File::open(path)
             .await
             .map_err(|_| unavailable("publish local file"))?;
-        let Some(object) = descriptor.segments.into_option() else {
+        let Some(object) = whole_object(version)? else {
             let (length, digest) = inspect_reader(&mut file, "publish local file").await?;
             return verify_local_identity(length, digest, version);
         };
@@ -159,7 +121,6 @@ impl ManagedVolume {
         version: &FileVersion,
         destination: &Path,
     ) -> Result<(), VolumeError> {
-        let descriptor = decode_descriptor(version)?;
         let parent = destination.parent().unwrap_or_else(|| Path::new("."));
         tokio::fs::create_dir_all(parent)
             .await
@@ -174,7 +135,7 @@ impl ManagedVolume {
             let mut file = File::create(&temporary)
                 .await
                 .map_err(|_| unavailable("materialize Managed file"))?;
-            if let Some(object) = descriptor.segments.into_option() {
+            if let Some(object) = whole_object(version)? {
                 stream_object(self.operator(), object, Some(&mut file)).await?;
             }
             file.sync_all()
@@ -286,23 +247,16 @@ fn verify_local_identity(
     Ok(())
 }
 
-pub(super) fn decode_descriptor(version: &FileVersion) -> Result<Descriptor, VolumeError> {
-    let layout: FileLayout = serde_json::from_slice(version.descriptor())
-        .map_err(|_| corrupt("read Managed file", "file descriptor is invalid"))?;
+pub(super) fn whole_object(version: &FileVersion) -> Result<Option<WholeObject>, VolumeError> {
     let digest = *version.digest().as_bytes();
-    let segments = match (layout, version.logical_length()) {
-        (FileLayout::Empty, 0) if digest == *blake3::hash(&[]).as_bytes() => None,
-        (FileLayout::Whole, length) if length > 0 => Some(WholeObject { digest, length }),
-        _ => {
-            return Err(corrupt(
-                "read Managed file",
-                "file descriptor is inconsistent",
-            ));
-        }
-    };
-    Ok(Descriptor {
-        segments: WholeObjects(segments),
-    })
+    match version.logical_length() {
+        0 if digest == *blake3::hash(&[]).as_bytes() => Ok(None),
+        0 => Err(corrupt(
+            "read Managed file",
+            "empty file content identity is invalid",
+        )),
+        length => Ok(Some(WholeObject { digest, length })),
+    }
 }
 
 fn object_key(digest: [u8; 32]) -> String {
@@ -310,14 +264,9 @@ fn object_key(digest: [u8; 32]) -> String {
     format!("managed/1/objects/raw/{}/{}", &digest.as_str()[..2], digest)
 }
 
-pub(super) fn segment_key(digest: [u8; 32]) -> String {
+pub(super) fn whole_object_key(digest: [u8; 32]) -> String {
     object_key(digest)
 }
-
-// Keep the metadata helper linked while data reads use bounded streams.
-const _: () = {
-    let _ = super::object::read_data;
-};
 
 fn invalid(action: &'static str, message: &'static str) -> VolumeError {
     VolumeError::new(VolumeErrorKind::Invalid, format!("{action}: {message}"))
