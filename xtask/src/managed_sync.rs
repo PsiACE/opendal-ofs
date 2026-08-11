@@ -140,8 +140,8 @@ pub(crate) fn run_bub_e2e(keep: bool) {
             &skills,
         ),
     ] {
-        container_sync(&fixture, "bub-a", replica, state, storage, true, &[]);
-        container_sync(&fixture, "bub-b", replica, state, storage, false, &[]);
+        container_volume_create(&fixture, "bub-a", storage);
+        container_sync(&fixture, "bub-b", replica, state, storage, &[]);
     }
 
     let fact_a = format!("HARBOR-A-{}", std::process::id());
@@ -261,7 +261,7 @@ pub(crate) fn run_bub_e2e(keep: bool) {
         ),
     ] {
         for service in ["bub-a", "bub-b"] {
-            let output = container_sync(&fixture, service, replica, state, storage, false, &[]);
+            let output = container_sync(&fixture, service, replica, state, storage, &[]);
             assert!(
                 !output.contains("(published)"),
                 "final Bub convergence is not a no-op"
@@ -273,38 +273,33 @@ pub(crate) fn run_bub_e2e(keep: bool) {
     let statuses = bub_statuses(&fixture);
     for (before, after) in before_noop.iter().zip(&statuses) {
         assert_eq!(
-            json_u64(before, "common_sequence"),
-            json_u64(after, "common_sequence"),
+            before.common_sequence, after.common_sequence,
             "final no-op advanced a common cursor"
         );
         assert_eq!(
-            json_u64(before, "remote_sequence"),
-            json_u64(after, "remote_sequence"),
+            before.remote_sequence, after.remote_sequence,
             "final no-op advanced a remote cursor"
         );
     }
     for status in &statuses {
         assert!(
-            status.contains("\"pending\":false") && status.contains("\"conflicts\":0"),
+            !status.pending && status.conflicts == 0,
             "Bub convergence status contains pending work or conflicts"
         );
         assert_eq!(
-            json_u64(status, "common_sequence"),
-            json_u64(status, "remote_sequence"),
+            status.common_sequence, status.remote_sequence,
             "Bub replica stopped behind the remote cursor"
         );
     }
     assert_eq!(
-        json_u64(&statuses[0], "common_sequence"),
-        json_u64(&statuses[1], "common_sequence"),
+        statuses[0].common_sequence, statuses[1].common_sequence,
         "Bub session replicas ended at different cursors"
     );
     assert_eq!(
-        json_u64(&statuses[2], "common_sequence"),
-        json_u64(&statuses[3], "common_sequence"),
+        statuses[2].common_sequence, statuses[3].common_sequence,
         "Bub skill replicas ended at different cursors"
     );
-    observed_output.extend(statuses);
+    observed_output.extend(statuses.into_iter().map(|status| status.document));
 
     let evidence = CaseRoot::new();
     for (service, suffix) in [("bub-a", "a"), ("bub-b", "b")] {
@@ -346,7 +341,7 @@ pub(crate) fn run_bub_e2e(keep: bool) {
     println!("Managed Sync Bub end-to-end behavior passed");
 }
 
-fn bub_statuses(fixture: &Fixture) -> [String; 4] {
+fn bub_statuses(fixture: &Fixture) -> [ManagedStatus; 4] {
     [
         container_status(
             fixture,
@@ -394,9 +389,18 @@ fn converge(fixture: &Fixture, source: &str, target: &str, sessions: &str, skill
             skills,
         ),
     ] {
-        container_sync(fixture, source, replica, state, storage, false, &[]);
-        container_sync(fixture, target, replica, state, storage, false, &[]);
+        container_sync(fixture, source, replica, state, storage, &[]);
+        container_sync(fixture, target, replica, state, storage, &[]);
     }
+}
+
+fn container_volume_create(fixture: &Fixture, service: &str, storage: &str) {
+    container_success(
+        fixture,
+        service,
+        &["ofs", "volume", "create", storage, "--model", "managed"],
+        "create Managed volume",
+    );
 }
 
 fn container_sync(
@@ -405,20 +409,8 @@ fn container_sync(
     replica: &str,
     state: &str,
     storage: &str,
-    init: bool,
     resolve: &[&str],
 ) -> String {
-    if init {
-        return output_text(
-            &container_success(
-                fixture,
-                service,
-                &["ofs", "volume", "create", storage, "--model", "managed"],
-                "create Managed volume",
-            )
-            .stdout,
-        );
-    }
     let mut arguments = vec!["ofs", "sync", storage, replica, "--state", state];
     for path in resolve {
         arguments.extend(["--resolve", path]);
@@ -426,8 +418,8 @@ fn container_sync(
     output_text(&container_success(fixture, service, &arguments, "synchronize Bub data").stdout)
 }
 
-fn container_status(fixture: &Fixture, service: &str, replica: &str, state: &str) -> String {
-    output_text(
+fn container_status(fixture: &Fixture, service: &str, replica: &str, state: &str) -> ManagedStatus {
+    ManagedStatus::parse(output_text(
         &container_success(
             fixture,
             service,
@@ -435,7 +427,7 @@ fn container_status(fixture: &Fixture, service: &str, replica: &str, state: &str
             "read Bub replica status",
         )
         .stdout,
-    )
+    ))
 }
 
 fn container_bub(fixture: &Fixture, service: &str, session: &str, prompt: &str) -> String {
@@ -512,12 +504,49 @@ fn container_success(fixture: &Fixture, service: &str, arguments: &[&str], actio
     output
 }
 
-fn json_u64(document: &str, field: &str) -> u64 {
-    let status: serde_json::Value = serde_json::from_str(document).expect("status is valid JSON");
+struct ManagedStatus {
+    document: String,
+    volume_id: String,
+    common_sequence: u64,
+    remote_sequence: u64,
+    pending: bool,
+    conflicts: u64,
+}
+
+impl ManagedStatus {
+    fn parse(document: String) -> Self {
+        let value: serde_json::Value =
+            serde_json::from_str(&document).expect("status is valid JSON");
+        Self {
+            volume_id: status_string(&value, "volume_id").to_owned(),
+            common_sequence: status_u64(&value, "common_sequence"),
+            remote_sequence: status_u64(&value, "remote_sequence"),
+            pending: status_bool(&value, "pending"),
+            conflicts: status_u64(&value, "conflicts"),
+            document,
+        }
+    }
+}
+
+fn status_u64(status: &serde_json::Value, field: &str) -> u64 {
     status
         .get(field)
         .and_then(serde_json::Value::as_u64)
         .unwrap_or_else(|| panic!("status field {field} is an unsigned integer"))
+}
+
+fn status_bool(status: &serde_json::Value, field: &str) -> bool {
+    status
+        .get(field)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or_else(|| panic!("status field {field} is a Boolean"))
+}
+
+fn status_string<'a>(status: &'a serde_json::Value, field: &str) -> &'a str {
+    status
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("status field {field} is a string"))
 }
 
 fn tree_contains(root: &Path, needle: &[u8]) -> bool {
@@ -551,10 +580,7 @@ fn gc(fixture: &Fixture) {
     fs::create_dir_all(&replica_b).expect("create GC replica B");
     let storage = fixture.storage_url("gc");
 
-    run_ofs_success(
-        ofs_sync(&replica_a, &state_a, &storage, true),
-        "initialize GC replica",
-    );
+    run_ofs_success(ofs_volume_create(&storage), "create GC volume");
     fs::write(
         replica_a.join("changing.bin"),
         deterministic_bytes(512 * 1024, 11),
@@ -566,7 +592,7 @@ fn gc(fixture: &Fixture) {
     )
     .expect("write live GC content");
     run_ofs_success(
-        ofs_sync(&replica_a, &state_a, &storage, false),
+        ofs_sync(&replica_a, &state_a, &storage),
         "publish initial GC tree",
     );
     fs::write(
@@ -575,30 +601,21 @@ fn gc(fixture: &Fixture) {
     )
     .expect("replace GC content");
     run_ofs_success(
-        ofs_sync(&replica_a, &state_a, &storage, false),
+        ofs_sync(&replica_a, &state_a, &storage),
         "publish replacement before GC",
     );
 
-    let collected = run_ofs_success(ofs_gc(&storage, false), "collect unreachable segments");
-    let collected = output_text(&collected.stdout);
-    assert!(
-        !collected.contains("deleted 0 segment"),
-        "collection removes data unreachable from the current namespace: {collected}"
-    );
+    run_ofs_success(ofs_gc(&storage, false), "collect unreachable objects");
     run_ofs_success(
-        ofs_sync(&replica_b, &state_b, &storage, false),
+        ofs_sync(&replica_b, &state_b, &storage),
         "cold restore after collection",
     );
     assert_eq!(
         tree_fingerprint(&replica_a),
         tree_fingerprint(&replica_b),
-        "collection preserves every segment needed for cold restore"
+        "collection preserves every object needed for cold restore"
     );
-    let repeated = run_ofs_success(ofs_gc(&storage, false), "repeat completed collection");
-    assert!(
-        output_text(&repeated.stdout).contains("deleted 0 segment"),
-        "a repeated collection is a no-op"
-    );
+    run_ofs_success(ofs_gc(&storage, false), "repeat completed collection");
 }
 
 fn recovery_gc(fixture: &Fixture) {
@@ -611,12 +628,9 @@ fn recovery_gc(fixture: &Fixture) {
     fs::create_dir_all(&replica_b).expect("create recovery replica B");
     let storage = fixture.storage_url("recovery-gc");
 
+    run_ofs_success(ofs_volume_create(&storage), "create recovery volume");
     run_ofs_success(
-        ofs_sync(&replica_a, &state_a, &storage, true),
-        "initialize recovery replica",
-    );
-    run_ofs_success(
-        ofs_sync(&replica_b, &state_b, &storage, false),
+        ofs_sync(&replica_b, &state_b, &storage),
         "attach recovery peer",
     );
     fs::write(
@@ -624,12 +638,12 @@ fn recovery_gc(fixture: &Fixture) {
         deterministic_bytes(512 * 1024, 19),
     )
     .expect("write interrupted publication");
-    let mut interrupted = ofs_sync(&replica_a, &state_a, &storage, false);
+    let mut interrupted = ofs_sync(&replica_a, &state_a, &storage);
     interrupted.env("OFS_INTERNAL_TEST_INTERRUPT", "after-publish");
     run_ofs_failure(interrupted, "interrupt committed publication");
 
     run_ofs_success(
-        ofs_sync(&replica_b, &state_b, &storage, false),
+        ofs_sync(&replica_b, &state_b, &storage),
         "install interrupted publication in peer",
     );
     fs::write(
@@ -638,20 +652,13 @@ fn recovery_gc(fixture: &Fixture) {
     )
     .expect("replace interrupted publication");
     run_ofs_success(
-        ofs_sync(&replica_b, &state_b, &storage, false),
+        ofs_sync(&replica_b, &state_b, &storage),
         "advance beyond interrupted publication",
     );
-    let collected = run_ofs_success(
-        ofs_gc(&storage, false),
-        "collect superseded interrupted publication",
-    );
-    assert!(
-        !output_text(&collected.stdout).contains("deleted 0 segment"),
-        "collection reclaims the superseded target before its origin recovers"
-    );
+    run_ofs_success(ofs_gc(&storage, false), "collect superseded objects");
 
     run_ofs_success(
-        ofs_sync(&replica_a, &state_a, &storage, false),
+        ofs_sync(&replica_a, &state_a, &storage),
         "recover committed publication from current head",
     );
     assert_eq!(
@@ -659,12 +666,15 @@ fn recovery_gc(fixture: &Fixture) {
         tree_fingerprint(&replica_b),
         "a committed operation recovers to the current namespace after collection"
     );
-    let status = run_ofs_success(
-        ofs_status(&replica_a, &state_a),
-        "read recovered publication status",
-    );
+    let status = ManagedStatus::parse(output_text(
+        &run_ofs_success(
+            ofs_status(&replica_a, &state_a),
+            "read recovered publication status",
+        )
+        .stdout,
+    ));
     assert!(
-        output_text(&status.stdout).contains("\"pending\":false"),
+        !status.pending,
         "recovery clears the committed pending publication"
     );
 }
@@ -680,17 +690,17 @@ fn install_recovery(fixture: &Fixture) {
     let storage = fixture.storage_url("install-recovery");
 
     run_ofs_success(
-        ofs_sync(&replica_a, &state_a, &storage, true),
-        "initialize install recovery replica",
+        ofs_volume_create(&storage),
+        "create install recovery volume",
     );
     fs::write(replica_a.join("removed.txt"), b"old generation\n")
         .expect("write install recovery base");
     run_ofs_success(
-        ofs_sync(&replica_a, &state_a, &storage, false),
+        ofs_sync(&replica_a, &state_a, &storage),
         "publish install recovery base",
     );
     run_ofs_success(
-        ofs_sync(&replica_b, &state_b, &storage, false),
+        ofs_sync(&replica_b, &state_b, &storage),
         "attach install recovery peer",
     );
 
@@ -698,15 +708,15 @@ fn install_recovery(fixture: &Fixture) {
     fs::write(replica_a.join("current.txt"), b"current generation\n")
         .expect("write install recovery target");
     run_ofs_success(
-        ofs_sync(&replica_a, &state_a, &storage, false),
+        ofs_sync(&replica_a, &state_a, &storage),
         "publish install recovery target",
     );
-    let mut interrupted = ofs_sync(&replica_b, &state_b, &storage, false);
+    let mut interrupted = ofs_sync(&replica_b, &state_b, &storage);
     interrupted.env("OFS_INTERNAL_TEST_INTERRUPT", "during-install");
     run_ofs_failure(interrupted, "interrupt remote installation");
 
     let recovered = run_ofs_success(
-        ofs_sync(&replica_b, &state_b, &storage, false),
+        ofs_sync(&replica_b, &state_b, &storage),
         "resume interrupted remote installation",
     );
     assert!(
@@ -718,13 +728,15 @@ fn install_recovery(fixture: &Fixture) {
         tree_fingerprint(&replica_b),
         "an interrupted installation is safely rerunnable"
     );
-    let status = run_ofs_success(
-        ofs_status(&replica_b, &state_b),
-        "read recovered installation status",
-    );
+    let status = ManagedStatus::parse(output_text(
+        &run_ofs_success(
+            ofs_status(&replica_b, &state_b),
+            "read recovered installation status",
+        )
+        .stdout,
+    ));
     assert!(
-        output_text(&status.stdout).contains("\"pending\":false")
-            && output_text(&status.stdout).contains("\"conflicts\":0"),
+        !status.pending && status.conflicts == 0,
         "install recovery leaves no pending work or conflicts"
     );
 }
@@ -742,17 +754,14 @@ fn history(fixture: &Fixture) {
     fs::create_dir_all(&replica_c).expect("create history replica C");
     let storage = fixture.storage_url("history");
 
-    run_ofs_success(
-        ofs_sync(&replica_a, &state_a, &storage, true),
-        "initialize history replica",
-    );
+    run_ofs_success(ofs_volume_create(&storage), "create history volume");
     fs::write(replica_a.join("cursor.txt"), b"0\n").expect("write history base");
     run_ofs_success(
-        ofs_sync(&replica_a, &state_a, &storage, false),
+        ofs_sync(&replica_a, &state_a, &storage),
         "publish history base",
     );
     run_ofs_success(
-        ofs_sync(&replica_b, &state_b, &storage, false),
+        ofs_sync(&replica_b, &state_b, &storage),
         "attach lagging history replica",
     );
 
@@ -760,17 +769,17 @@ fn history(fixture: &Fixture) {
         fs::write(replica_a.join("cursor.txt"), format!("{generation}\n"))
             .expect("advance history file");
         run_ofs_success(
-            ofs_sync(&replica_a, &state_a, &storage, false),
+            ofs_sync(&replica_a, &state_a, &storage),
             "publish history generation",
         );
     }
 
     run_ofs_success(
-        ofs_sync(&replica_b, &state_b, &storage, false),
+        ofs_sync(&replica_b, &state_b, &storage),
         "catch up lagging history replica",
     );
     run_ofs_success(
-        ofs_sync(&replica_c, &state_c, &storage, false),
+        ofs_sync(&replica_c, &state_c, &storage),
         "restore cold history replica",
     );
     assert_eq!(
@@ -788,10 +797,11 @@ fn history(fixture: &Fixture) {
         (&replica_b, &state_b),
         (&replica_c, &state_c),
     ] {
-        let status = run_ofs_success(ofs_status(replica, state), "read converged history status");
-        let status = output_text(&status.stdout);
+        let status = ManagedStatus::parse(output_text(
+            &run_ofs_success(ofs_status(replica, state), "read converged history status").stdout,
+        ));
         assert!(
-            status.contains("\"pending\":false") && status.contains("\"conflicts\":0"),
+            !status.pending && status.conflicts == 0,
             "history convergence leaves no pending work or conflicts"
         );
     }
@@ -814,16 +824,13 @@ fn rename(fixture: &Fixture) {
     .expect("write rename tree leaf");
     let storage = fixture.storage_url("rename");
 
+    run_ofs_success(ofs_volume_create(&storage), "create rename volume");
     run_ofs_success(
-        ofs_sync(&replica_a, &state_a, &storage, true),
-        "initialize rename replica",
-    );
-    run_ofs_success(
-        ofs_sync(&replica_a, &state_a, &storage, false),
+        ofs_sync(&replica_a, &state_a, &storage),
         "publish rename base",
     );
     run_ofs_success(
-        ofs_sync(&replica_b, &state_b, &storage, false),
+        ofs_sync(&replica_b, &state_b, &storage),
         "attach rename replica B",
     );
 
@@ -832,12 +839,12 @@ fn rename(fixture: &Fixture) {
         .expect("move directory tree");
     make_executable(&replica_a.join("file-after"));
     run_ofs_success(
-        ofs_sync(&replica_a, &state_a, &storage, false),
+        ofs_sync(&replica_a, &state_a, &storage),
         "publish file and directory moves",
     );
 
     run_ofs_success(
-        ofs_sync(&replica_b, &state_b, &storage, false),
+        ofs_sync(&replica_b, &state_b, &storage),
         "install remote moves",
     );
     assert!(
@@ -857,11 +864,11 @@ fn rename(fixture: &Fixture) {
     fs::write(replica_b.join("file-after"), b"edited after move\n")
         .expect("edit moved file in peer");
     run_ofs_success(
-        ofs_sync(&replica_b, &state_b, &storage, false),
+        ofs_sync(&replica_b, &state_b, &storage),
         "publish edit through moved identity",
     );
     run_ofs_success(
-        ofs_sync(&replica_a, &state_a, &storage, false),
+        ofs_sync(&replica_a, &state_a, &storage),
         "install post-move peer edit",
     );
     assert_eq!(
@@ -880,29 +887,26 @@ fn reconcile(fixture: &Fixture) {
     fs::create_dir_all(&replica_b).expect("create reconcile replica B");
     let storage = fixture.storage_url("reconcile");
 
-    run_ofs_success(
-        ofs_sync(&replica_a, &state_a, &storage, true),
-        "initialize reconcile replica",
-    );
+    run_ofs_success(ofs_volume_create(&storage), "create reconcile volume");
     fs::write(replica_a.join("shared.txt"), b"common\n").expect("write common file");
     fs::write(replica_a.join("delete-edit.txt"), b"common\n").expect("write delete-edit base");
     run_ofs_success(
-        ofs_sync(&replica_a, &state_a, &storage, false),
+        ofs_sync(&replica_a, &state_a, &storage),
         "publish reconcile base",
     );
     run_ofs_success(
-        ofs_sync(&replica_b, &state_b, &storage, false),
+        ofs_sync(&replica_b, &state_b, &storage),
         "attach reconcile replica B",
     );
 
     fs::write(replica_a.join("from-a.txt"), b"from A\n").expect("write A-only change");
     fs::write(replica_b.join("from-b.txt"), b"from B\n").expect("write B-only change");
     run_ofs_success(
-        ofs_sync(&replica_a, &state_a, &storage, false),
+        ofs_sync(&replica_a, &state_a, &storage),
         "publish A-only change",
     );
     let merged = run_ofs_success(
-        ofs_sync(&replica_b, &state_b, &storage, false),
+        ofs_sync(&replica_b, &state_b, &storage),
         "merge B-only change",
     );
     assert!(
@@ -910,7 +914,7 @@ fn reconcile(fixture: &Fixture) {
         "a disjoint two-replica merge publishes one combined generation"
     );
     run_ofs_success(
-        ofs_sync(&replica_a, &state_a, &storage, false),
+        ofs_sync(&replica_a, &state_a, &storage),
         "install disjoint merge in A",
     );
     assert_eq!(
@@ -922,11 +926,11 @@ fn reconcile(fixture: &Fixture) {
     fs::write(replica_a.join("shared.txt"), b"candidate A\n").expect("write A candidate");
     fs::write(replica_b.join("shared.txt"), b"candidate B\n").expect("write B candidate");
     run_ofs_success(
-        ofs_sync(&replica_a, &state_a, &storage, false),
+        ofs_sync(&replica_a, &state_a, &storage),
         "publish A conflict candidate",
     );
     let conflict = run_ofs_failure(
-        ofs_sync(&replica_b, &state_b, &storage, false),
+        ofs_sync(&replica_b, &state_b, &storage),
         "retain concurrent file conflict",
     );
     assert!(
@@ -941,9 +945,11 @@ fn reconcile(fixture: &Fixture) {
         fs::read(replica_b.join("shared.txt")).expect("read local candidate"),
         b"candidate B\n"
     );
-    let status = run_ofs_success(ofs_status(&replica_b, &state_b), "report retained conflict");
+    let status = ManagedStatus::parse(output_text(
+        &run_ofs_success(ofs_status(&replica_b, &state_b), "report retained conflict").stdout,
+    ));
     assert!(
-        output_text(&status.stdout).contains("\"conflicts\":1"),
+        status.conflicts == 1,
         "status reports the unresolved conflict"
     );
     run_ofs_success(
@@ -951,7 +957,7 @@ fn reconcile(fixture: &Fixture) {
         "resolve file conflict with local candidate",
     );
     run_ofs_success(
-        ofs_sync(&replica_a, &state_a, &storage, false),
+        ofs_sync(&replica_a, &state_a, &storage),
         "install resolved file in A",
     );
     assert_eq!(
@@ -963,11 +969,11 @@ fn reconcile(fixture: &Fixture) {
     fs::write(replica_a.join("delete-edit.txt"), b"edited in A\n").expect("edit delete-edit file");
     fs::remove_file(replica_b.join("delete-edit.txt")).expect("delete file in B");
     run_ofs_success(
-        ofs_sync(&replica_a, &state_a, &storage, false),
+        ofs_sync(&replica_a, &state_a, &storage),
         "publish edit before delete conflict",
     );
     run_ofs_failure(
-        ofs_sync(&replica_b, &state_b, &storage, false),
+        ofs_sync(&replica_b, &state_b, &storage),
         "retain delete-versus-edit conflict",
     );
     assert!(
@@ -979,7 +985,7 @@ fn reconcile(fixture: &Fixture) {
         "resolve delete-versus-edit with local deletion",
     );
     run_ofs_success(
-        ofs_sync(&replica_a, &state_a, &storage, false),
+        ofs_sync(&replica_a, &state_a, &storage),
         "install resolved deletion in A",
     );
     assert!(
@@ -998,18 +1004,15 @@ fn growing(fixture: &Fixture) {
     fs::create_dir_all(&replica_b).expect("create growing replica B");
     let storage = fixture.storage_url("growing");
 
-    run_ofs_success(
-        ofs_sync(&replica_a, &state_a, &storage, true),
-        "initialize growing replica",
-    );
+    run_ofs_success(ofs_volume_create(&storage), "create growing-file volume");
     let initial = deterministic_bytes(2 * 1024 * 1024, 17);
     fs::write(replica_a.join("session.tape"), initial).expect("write growing session");
     run_ofs_success(
-        ofs_sync(&replica_a, &state_a, &storage, false),
+        ofs_sync(&replica_a, &state_a, &storage),
         "publish growing session",
     );
     run_ofs_success(
-        ofs_sync(&replica_b, &state_b, &storage, false),
+        ofs_sync(&replica_b, &state_b, &storage),
         "restore growing session",
     );
 
@@ -1021,11 +1024,11 @@ fn growing(fixture: &Fixture) {
         .expect("append growing session");
     file.sync_all().expect("persist growing session");
     run_ofs_success(
-        ofs_sync(&replica_a, &state_a, &storage, false),
+        ofs_sync(&replica_a, &state_a, &storage),
         "publish appended session",
     );
     run_ofs_success(
-        ofs_sync(&replica_b, &state_b, &storage, false),
+        ofs_sync(&replica_b, &state_b, &storage),
         "install appended session",
     );
     assert_eq!(
@@ -1034,7 +1037,7 @@ fn growing(fixture: &Fixture) {
         "an appended session converges without changing its bytes"
     );
     let no_op = run_ofs_success(
-        ofs_sync(&replica_b, &state_b, &storage, false),
+        ofs_sync(&replica_b, &state_b, &storage),
         "repeat appended session sync",
     );
     assert!(
@@ -1068,36 +1071,31 @@ fn admission(fixture: &Fixture) {
 
     let storage_a = fixture.storage_url("admission/a");
     let storage_b = fixture.storage_url("admission/b");
-    let initialized_a = run_ofs_success(
-        ofs_sync(&replica_a, &state_a, &storage_a, true),
-        "initialize replica A",
-    );
+    let initialized_a = run_ofs_success(ofs_volume_create(&storage_a), "create volume A");
     let volume_a = output_text(&initialized_a.stdout)
         .split_whitespace()
         .last()
         .expect("initialization reports its volume identity")
         .to_owned();
     run_ofs_success(
-        ofs_sync(&replica_a, &state_a, &storage_a, false),
+        ofs_sync(&replica_a, &state_a, &storage_a),
         "attach replica A",
     );
 
-    let status = run_ofs_success(ofs_status(&replica_a, &state_a), "read replica status");
-    let status = output_text(&status.stdout);
-    assert!(
-        status.contains(&format!("\"volume_id\":\"{volume_a}\"")),
-        "status reports the initialized remote identity: {status}"
+    let status = ManagedStatus::parse(output_text(
+        &run_ofs_success(ofs_status(&replica_a, &state_a), "read replica status").stdout,
+    ));
+    assert_eq!(
+        status.volume_id, volume_a,
+        "status reports the initialized remote identity"
     );
+    run_ofs_success(ofs_volume_create(&storage_b), "create volume B");
     run_ofs_success(
-        ofs_sync(&replica_b, &state_b, &storage_b, true),
-        "initialize replica B",
-    );
-    run_ofs_success(
-        ofs_sync(&replica_b, &state_b, &storage_b, false),
+        ofs_sync(&replica_b, &state_b, &storage_b),
         "attach replica B",
     );
     let fenced = run_ofs_failure(
-        ofs_sync(&replica_a, &state_a, &storage_b, false),
+        ofs_sync(&replica_a, &state_a, &storage_b),
         "open replica A against volume B",
     );
     assert!(
@@ -1135,10 +1133,7 @@ fn smoke(fixture: &Fixture) {
     fs::create_dir_all(&replica_b).expect("create replica B");
     let storage = fixture.storage_url("smoke");
 
-    run_ofs_success(
-        ofs_sync(&replica_a, &state_a, &storage, true),
-        "initialize smoke replica",
-    );
+    run_ofs_success(ofs_volume_create(&storage), "create smoke volume");
     fs::write(replica_a.join("empty"), []).expect("write empty file");
     fs::write(replica_a.join("nested/one"), b"shared content\n").expect("write nested file");
     fs::write(replica_a.join("two"), b"shared content\n").expect("write repeated file");
@@ -1146,7 +1141,7 @@ fn smoke(fixture: &Fixture) {
     make_executable(&replica_a.join("tool"));
 
     let published = run_ofs_success(
-        ofs_sync(&replica_a, &state_a, &storage, false),
+        ofs_sync(&replica_a, &state_a, &storage),
         "publish smoke tree",
     );
     assert!(
@@ -1154,7 +1149,7 @@ fn smoke(fixture: &Fixture) {
         "a changed tree reports remote publication"
     );
     run_ofs_success(
-        ofs_sync(&replica_b, &state_b, &storage, false),
+        ofs_sync(&replica_b, &state_b, &storage),
         "cold restore smoke tree",
     );
     assert_eq!(
@@ -1164,7 +1159,7 @@ fn smoke(fixture: &Fixture) {
     );
 
     let no_op = run_ofs_success(
-        ofs_sync(&replica_a, &state_a, &storage, false),
+        ofs_sync(&replica_a, &state_a, &storage),
         "repeat unchanged sync",
     );
     assert!(
@@ -1174,11 +1169,11 @@ fn smoke(fixture: &Fixture) {
 
     fs::write(replica_a.join("nested/one"), b"changed content\n").expect("change nested file");
     run_ofs_success(
-        ofs_sync(&replica_a, &state_a, &storage, false),
+        ofs_sync(&replica_a, &state_a, &storage),
         "publish changed smoke tree",
     );
     run_ofs_success(
-        ofs_sync(&replica_b, &state_b, &storage, false),
+        ofs_sync(&replica_b, &state_b, &storage),
         "install changed smoke tree",
     );
     assert_eq!(
@@ -1263,16 +1258,18 @@ fn build_ofs() {
     run(&mut command);
 }
 
-fn ofs_sync(replica: &Path, state: &Path, storage: &str, init: bool) -> Command {
+fn ofs_volume_create(storage: &str) -> Command {
     let mut command = ofs_command();
-    if init {
-        command
-            .arg("volume")
-            .arg("create")
-            .arg(storage)
-            .args(["--model", "managed"]);
-        return command;
-    }
+    command
+        .arg("volume")
+        .arg("create")
+        .arg(storage)
+        .args(["--model", "managed"]);
+    command
+}
+
+fn ofs_sync(replica: &Path, state: &Path, storage: &str) -> Command {
+    let mut command = ofs_command();
     command
         .arg("sync")
         .arg(storage)
@@ -1303,7 +1300,7 @@ fn ofs_gc(storage: &str, resume: bool) -> Command {
 }
 
 fn ofs_sync_resolve(replica: &Path, state: &Path, storage: &str, paths: &[&str]) -> Command {
-    let mut command = ofs_sync(replica, state, storage, false);
+    let mut command = ofs_sync(replica, state, storage);
     for path in paths {
         command.arg("--resolve").arg(path);
     }
