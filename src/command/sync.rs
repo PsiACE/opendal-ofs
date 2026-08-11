@@ -52,10 +52,17 @@ pub(super) async fn run(args: SyncArgs) -> Result<()> {
     let result = SyncEngine::new(volume.clone(), args.transfer_concurrency)
         .sync(&root, &args.state, &args.resolve)
         .await?;
-    if result.conflicts != 0 {
+    if !result.conflict_paths.is_empty() {
+        let paths = result
+            .conflict_paths
+            .iter()
+            .map(|path| format!("  {path}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         bail!(
-            "sync retained {} conflict(s); inspect `ofs status` and resolve explicitly",
-            result.conflicts
+            "sync retained {} conflict(s); rerun with `--resolve <relative-path>` for each normalized relative path:\n{}",
+            result.conflict_paths.len(),
+            paths
         );
     }
     println!(

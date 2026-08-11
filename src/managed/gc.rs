@@ -176,7 +176,7 @@ impl ManagedVolume {
                 "finish Managed data collection: collection ownership changed",
             ));
         }
-        head.reclamation_watermark = fence.namespace_commit;
+        head.reclamation_watermark = fence.namespace_commit.cursor();
         head.maintenance = None;
         if self.replace_head(&revision, &head).await? {
             Ok(())

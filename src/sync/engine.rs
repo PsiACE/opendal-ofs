@@ -29,9 +29,9 @@ use super::reconcile::{changed_paths, reconcile};
 use super::scan::{ScannedTree, scan};
 use super::{ReplicaState, SyncError};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SyncOutcome {
-    pub conflicts: usize,
+    pub conflict_paths: Vec<String>,
     pub published: bool,
     pub sequence: u64,
 }
@@ -132,7 +132,7 @@ impl SyncEngine {
                 state.advance(observed.revision());
                 state.save(state_path)?;
                 return Ok(SyncOutcome {
-                    conflicts: 0,
+                    conflict_paths: Vec::new(),
                     published: false,
                     sequence: observed.snapshot.cursor.sequence(),
                 });
@@ -160,7 +160,7 @@ impl SyncEngine {
         let remote_changed = observed.revision() != common_revision;
         match (local, remote_changed) {
             (ScannedTree::Unchanged, false) => Ok(SyncOutcome {
-                conflicts: 0,
+                conflict_paths: Vec::new(),
                 published: false,
                 sequence: base.cursor.sequence(),
             }),
@@ -173,7 +173,11 @@ impl SyncEngine {
                 self.publish_target_files(&root, &observed.snapshot, &local)
                     .await?;
                 let target = self.volume.prepare_publication(&observed, local).await?;
-                state.begin_publication(observed.revision(), target)?;
+                state.begin_publication(
+                    observed.revision(),
+                    target,
+                    observed.maintenance_generation(),
+                )?;
                 state.save(state_path)?;
                 test_interrupt("before-publish")?;
                 self.volume.commit_publication(&observed, target).await?;
@@ -181,7 +185,7 @@ impl SyncEngine {
                 state.advance(target);
                 state.save(state_path)?;
                 Ok(SyncOutcome {
-                    conflicts: 0,
+                    conflict_paths: Vec::new(),
                     published: true,
                     sequence: target.cursor().sequence(),
                 })
@@ -206,11 +210,15 @@ impl SyncEngine {
             (ScannedTree::Changed(local), true) => {
                 let plan = reconcile(base, &local, &observed.snapshot, &resolved)?;
                 if !plan.conflicts.is_empty() {
-                    let conflicts = plan.conflicts.len();
-                    state.retain_conflicts(conflicts, observed.revision(), false);
+                    let conflict_paths = plan
+                        .conflicts
+                        .into_iter()
+                        .map(|conflict| conflict.path)
+                        .collect::<Vec<_>>();
+                    state.retain_conflicts(conflict_paths.len(), observed.revision(), false);
                     state.save(state_path)?;
                     return Ok(SyncOutcome {
-                        conflicts,
+                        conflict_paths,
                         published: false,
                         sequence: base.cursor.sequence(),
                     });
@@ -222,7 +230,11 @@ impl SyncEngine {
                         .volume
                         .prepare_publication(&observed, plan.target.clone())
                         .await?;
-                    state.begin_publication(observed.revision(), target)?;
+                    state.begin_publication(
+                        observed.revision(),
+                        target,
+                        observed.maintenance_generation(),
+                    )?;
                     state.save(state_path)?;
                     test_interrupt("before-publish")?;
                     self.volume.commit_publication(&observed, target).await?;
@@ -267,7 +279,7 @@ impl SyncEngine {
             state.advance(observed.revision());
             state.save(state_path)?;
             return Ok(SyncOutcome {
-                conflicts: 0,
+                conflict_paths: Vec::new(),
                 published: false,
                 sequence: observed.snapshot.cursor.sequence(),
             });
@@ -292,7 +304,7 @@ impl SyncEngine {
                 .await;
         }
         Ok(SyncOutcome {
-            conflicts: 0,
+            conflict_paths: Vec::new(),
             published,
             sequence: target.cursor().sequence(),
         })
@@ -311,7 +323,7 @@ impl SyncEngine {
                 state.advance(observed.revision());
                 state.save(state_path)?;
                 return Ok(SyncOutcome {
-                    conflicts: 0,
+                    conflict_paths: Vec::new(),
                     published: false,
                     sequence: observed.snapshot.cursor.sequence(),
                 });
@@ -323,17 +335,17 @@ impl SyncEngine {
             state.advance(observed.revision());
             state.save(state_path)?;
             return Ok(SyncOutcome {
-                conflicts: 0,
+                conflict_paths: Vec::new(),
                 published: false,
                 sequence: observed.snapshot.cursor.sequence(),
             });
         }
         if resolved != &ambiguous {
-            let conflicts = ambiguous.len();
-            state.retain_conflicts(conflicts, observed.revision(), true);
+            let conflict_paths = ambiguous.into_iter().collect::<Vec<_>>();
+            state.retain_conflicts(conflict_paths.len(), observed.revision(), true);
             state.save(state_path)?;
             return Ok(SyncOutcome {
-                conflicts,
+                conflict_paths,
                 published: false,
                 sequence: state.common_revision().cursor().sequence(),
             });
@@ -342,7 +354,11 @@ impl SyncEngine {
         self.publish_target_files(root, &observed.snapshot, &local)
             .await?;
         let target = self.volume.prepare_publication(&observed, local).await?;
-        state.begin_publication(observed.revision(), target)?;
+        state.begin_publication(
+            observed.revision(),
+            target,
+            observed.maintenance_generation(),
+        )?;
         state.save(state_path)?;
         test_interrupt("before-publish")?;
         self.volume.commit_publication(&observed, target).await?;
@@ -350,7 +366,7 @@ impl SyncEngine {
         state.advance(target);
         state.save(state_path)?;
         Ok(SyncOutcome {
-            conflicts: 0,
+            conflict_paths: Vec::new(),
             published: true,
             sequence: target.cursor().sequence(),
         })
@@ -379,7 +395,7 @@ impl SyncEngine {
         state.advance(target_revision);
         state.save(state_path)?;
         Ok(SyncOutcome {
-            conflicts: 0,
+            conflict_paths: Vec::new(),
             published,
             sequence: target_revision.cursor().sequence(),
         })
@@ -392,7 +408,7 @@ impl SyncEngine {
         mut state: ReplicaState,
         observed: ManagedObservation,
     ) -> Result<SyncOutcome, SyncError> {
-        let (expected, target) = state
+        let (expected, target, maintenance_generation) = state
             .pending_publication()
             .expect("pending state has publication references");
         if observed.revision() == target {
@@ -413,7 +429,7 @@ impl SyncEngine {
                 .recover_install(root, state_path, state, observed, target, true)
                 .await;
         }
-        if !observed.accepts_prepared(target) {
+        if !observed.accepts_prepared(maintenance_generation) {
             state.cancel_pending(observed.revision());
             state.save(state_path)?;
             return Err(SyncError::new(

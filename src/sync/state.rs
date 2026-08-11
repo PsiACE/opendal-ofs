@@ -51,6 +51,7 @@ enum SyncPhase {
     Publishing {
         expected: NamespaceRevision,
         target: NamespaceRevision,
+        maintenance_generation: u64,
     },
     Installing {
         target: NamespaceRevision,
@@ -146,10 +147,11 @@ impl ReplicaState {
         }
         match self.phase {
             SyncPhase::Clean => Ok(()),
-            SyncPhase::Publishing { expected, target }
-                if expected.cursor().sequence() >= self.common.cursor().sequence()
-                    && target.cursor().sequence() == expected.cursor().sequence() + 1
-                    && target.cursor().operation().is_some() =>
+            SyncPhase::Publishing {
+                expected, target, ..
+            } if expected.cursor().sequence() >= self.common.cursor().sequence()
+                && target.cursor().sequence() == expected.cursor().sequence() + 1
+                && target.cursor().operation().is_some() =>
             {
                 Ok(())
             }
@@ -192,9 +194,13 @@ impl ReplicaState {
 
     pub(crate) const fn pending_publication(
         &self,
-    ) -> Option<(NamespaceRevision, NamespaceRevision)> {
+    ) -> Option<(NamespaceRevision, NamespaceRevision, u64)> {
         match self.phase {
-            SyncPhase::Publishing { expected, target } => Some((expected, target)),
+            SyncPhase::Publishing {
+                expected,
+                target,
+                maintenance_generation,
+            } => Some((expected, target, maintenance_generation)),
             _ => None,
         }
     }
@@ -218,8 +224,13 @@ impl ReplicaState {
         &mut self,
         expected: NamespaceRevision,
         target: NamespaceRevision,
+        maintenance_generation: u64,
     ) -> Result<(), SyncError> {
-        self.phase = SyncPhase::Publishing { expected, target };
+        self.phase = SyncPhase::Publishing {
+            expected,
+            target,
+            maintenance_generation,
+        };
         self.observed = expected;
         self.conflicts = 0;
         self.base_expired = false;

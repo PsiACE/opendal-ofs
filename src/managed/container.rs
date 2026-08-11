@@ -27,8 +27,6 @@ use crate::filesystem::{Checksum, Digest, VolumeError};
 use super::error::{corrupt, invalid, unavailable};
 use super::object;
 
-const FOOTER_MAGIC: [u8; 8] = *b"OFSMETA1";
-const FOOTER_BYTES: usize = 56;
 const TARGET_BYTES: usize = 16 * 1024 * 1024;
 const MAXIMUM_BYTES: usize = 32 * 1024 * 1024;
 
@@ -43,19 +41,13 @@ pub(crate) struct SectionRef {
     pub(crate) section_type: u8,
 }
 
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct SectionRecord {
+struct Pending<T> {
+    bytes: Vec<u8>,
+    value: T,
     offset: u64,
     length: u64,
     checksum: Checksum,
     section_type: u8,
-}
-
-struct Pending<T> {
-    bytes: Vec<u8>,
-    value: T,
-    record: SectionRecord,
 }
 
 pub(crate) struct ContainerWriter<'a, T> {
@@ -105,12 +97,10 @@ impl<'a, T> ContainerWriter<'a, T> {
             )
         })?;
         self.pending.push(Pending {
-            record: SectionRecord {
-                offset,
-                length,
-                checksum: Checksum::from_bytes(blake3::hash(&bytes).into()),
-                section_type,
-            },
+            offset,
+            length,
+            checksum: Checksum::from_bytes(blake3::hash(&bytes).into()),
+            section_type,
             bytes,
             value,
         });
@@ -125,25 +115,10 @@ impl<'a, T> ContainerWriter<'a, T> {
         if self.pending.is_empty() {
             return Ok(Vec::new());
         }
-        let mut bytes = Vec::with_capacity(self.bytes.saturating_add(FOOTER_BYTES + 4096));
-        let mut records = Vec::with_capacity(self.pending.len());
+        let mut bytes = Vec::with_capacity(self.bytes);
         for pending in &self.pending {
             bytes.extend_from_slice(&pending.bytes);
-            records.push(&pending.record);
         }
-        let directory_offset = bytes.len();
-        ciborium::into_writer(&records, &mut bytes).map_err(|_| {
-            invalid(
-                "write Managed metadata",
-                "container directory cannot be encoded",
-            )
-        })?;
-        let directory_length = bytes.len() - directory_offset;
-        let directory_checksum = blake3::hash(&bytes[directory_offset..]);
-        bytes.extend_from_slice(&FOOTER_MAGIC);
-        bytes.extend_from_slice(&(directory_offset as u64).to_be_bytes());
-        bytes.extend_from_slice(&(directory_length as u64).to_be_bytes());
-        bytes.extend_from_slice(directory_checksum.as_bytes());
         if bytes.len() > MAXIMUM_BYTES {
             return Err(invalid(
                 "write Managed metadata",
@@ -173,10 +148,10 @@ impl<'a, T> ContainerWriter<'a, T> {
                 let reference = SectionRef {
                     object,
                     object_length,
-                    offset: pending.record.offset,
-                    length: pending.record.length,
-                    checksum: pending.record.checksum,
-                    section_type: pending.record.section_type,
+                    offset: pending.offset,
+                    length: pending.length,
+                    checksum: pending.checksum,
+                    section_type: pending.section_type,
                 };
                 (pending.value, reference)
             })
@@ -191,7 +166,7 @@ pub(crate) async fn read_section(
     let end = reference
         .offset
         .checked_add(reference.length)
-        .filter(|end| *end <= reference.object_length.saturating_sub(FOOTER_BYTES as u64))
+        .filter(|end| *end <= reference.object_length)
         .ok_or_else(|| corrupt("read Managed metadata", "section range is invalid"))?;
     let reader = match operator.reader(&object_key(reference.object)).await {
         Ok(reader) => reader,

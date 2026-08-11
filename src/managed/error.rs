@@ -29,10 +29,6 @@ pub(crate) fn unavailable(action: &'static str, message: &'static str) -> Volume
     error(VolumeErrorKind::Unavailable, action, message)
 }
 
-pub(crate) fn unsupported(action: &'static str, message: &'static str) -> VolumeError {
-    error(VolumeErrorKind::UnsupportedFormat, action, message)
-}
-
 fn error(kind: VolumeErrorKind, action: &'static str, message: &'static str) -> VolumeError {
     VolumeError::new(kind, format!("{action}: {message}"))
 }

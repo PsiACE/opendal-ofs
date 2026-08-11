@@ -46,6 +46,7 @@ pub(super) fn run(args: StatusArgs) -> Result<()> {
                 "volume_model": "managed",
                 "capabilities": {
                     "executable": cfg!(unix),
+                    "extended_attributes": false,
                     "hard_links": false,
                     "namespace_publication": "generation_cas",
                     "portable_names": true,

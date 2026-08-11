@@ -48,9 +48,9 @@ pub struct ManagedVolume {
 pub struct ManagedObservation {
     pub snapshot: VolumeSnapshot,
     namespace_revision: NamespaceRevision,
-    reclamation_watermark: NamespaceRevision,
+    reclamation_watermark: ChangeCursor,
     maintenance_generation: u64,
-    changes: BTreeMap<ChangeCursor, ChangeRecord>,
+    changes: BTreeMap<ChangeCursor, ()>,
     operations: BTreeMap<OperationId, OperationRecord>,
     commit: NamespaceCommit,
     directory_entries: BTreeMap<DirectoryKey, DirectoryEntry>,
@@ -62,12 +62,16 @@ impl ManagedObservation {
         self.namespace_revision
     }
 
-    pub(crate) const fn accepts_prepared(&self, revision: NamespaceRevision) -> bool {
-        revision.prepared_during(self.maintenance_generation)
+    pub(crate) const fn maintenance_generation(&self) -> u64 {
+        self.maintenance_generation
+    }
+
+    pub(crate) const fn accepts_prepared(&self, maintenance_generation: u64) -> bool {
+        maintenance_generation == self.maintenance_generation
     }
 
     pub(crate) const fn can_read_revision(&self, revision: NamespaceRevision) -> bool {
-        revision.cursor.sequence() >= self.reclamation_watermark.cursor.sequence()
+        revision.cursor.sequence() >= self.reclamation_watermark.sequence()
             && revision.cursor.sequence() <= self.namespace_revision.cursor.sequence()
     }
 }
@@ -76,8 +80,8 @@ impl ManagedObservation {
 #[serde(deny_unknown_fields)]
 pub(super) struct Head {
     pub(super) namespace_commit: NamespaceRevision,
-    /// Oldest namespace revision whose graph remains guaranteed after collection.
-    pub(super) reclamation_watermark: NamespaceRevision,
+    /// Oldest namespace cursor whose graph remains guaranteed after collection.
+    pub(super) reclamation_watermark: ChangeCursor,
     pub(super) maintenance_generation: u64,
     pub(super) maintenance: Option<GcFence>,
 }
@@ -88,16 +92,11 @@ pub struct NamespaceRevision {
     commit: Digest,
     pub(super) encoded_length: u64,
     cursor: ChangeCursor,
-    maintenance_generation: u64,
 }
 
 impl NamespaceRevision {
     pub const fn cursor(self) -> ChangeCursor {
         self.cursor
-    }
-
-    pub(super) const fn prepared_during(self, maintenance_generation: u64) -> bool {
-        self.maintenance_generation == maintenance_generation
     }
 }
 
@@ -115,8 +114,6 @@ struct NamespaceCommit {
     volume_id: VolumeId,
     change_cursor: ChangeCursor,
     change_log_floor: ChangeCursor,
-    /// Reconciliation history is weak before the Head reclamation watermark.
-    previous: Option<NamespaceRevision>,
     node_index_root: PageRef,
     directory_entry_index_root: PageRef,
     change_log_root: PageRef,
@@ -132,19 +129,13 @@ struct DirectoryKey {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct ChangeRecord {
-    previous: ChangeCursor,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 struct OperationRecord {
     cursor: ChangeCursor,
 }
 
 struct StoredNamespace {
     snapshot: VolumeSnapshot,
-    changes: BTreeMap<ChangeCursor, ChangeRecord>,
+    changes: BTreeMap<ChangeCursor, ()>,
     operations: BTreeMap<OperationId, OperationRecord>,
     commit: NamespaceCommit,
     directory_entries: BTreeMap<DirectoryKey, DirectoryEntry>,
@@ -206,13 +197,12 @@ impl ManagedVolume {
                 &BTreeMap::new(),
                 &BTreeMap::new(),
                 ChangeCursor::Genesis,
-                0,
                 None,
             )
             .await?;
         let bytes = HEAD_RECORD.encode(&Head {
             namespace_commit,
-            reclamation_watermark: namespace_commit,
+            reclamation_watermark: ChangeCursor::Genesis,
             maintenance_generation: 0,
             maintenance: None,
         })?;
@@ -258,9 +248,7 @@ impl ManagedVolume {
             )
         })?;
         let head: Head = HEAD_RECORD.decode(&bytes)?;
-        if head.reclamation_watermark.cursor.sequence() > head.namespace_commit.cursor.sequence()
-            || head.namespace_commit.maintenance_generation > head.maintenance_generation
-            || head.reclamation_watermark.maintenance_generation > head.maintenance_generation
+        if head.reclamation_watermark.sequence() > head.namespace_commit.cursor.sequence()
             || head.maintenance.is_some_and(|fence| {
                 fence.namespace_commit != head.namespace_commit
                     || fence.maintenance_generation != head.maintenance_generation
@@ -292,12 +280,7 @@ impl ManagedVolume {
             .operation()
             .expect("validated publication has an operation identity");
         let mut changes = observed.changes.clone();
-        changes.insert(
-            target.cursor,
-            ChangeRecord {
-                previous: observed.snapshot.cursor,
-            },
-        );
+        changes.insert(target.cursor, ());
         let mut operations = observed.operations.clone();
         operations.insert(
             operation,
@@ -305,14 +288,13 @@ impl ManagedVolume {
                 cursor: target.cursor,
             },
         );
-        let change_log_floor = observed.reclamation_watermark.cursor;
+        let change_log_floor = observed.reclamation_watermark;
         changes.retain(|cursor, _| *cursor >= change_log_floor);
         self.write_namespace(
             &target,
             &changes,
             &operations,
             change_log_floor,
-            observed.maintenance_generation,
             Some(observed),
         )
         .await
@@ -325,7 +307,6 @@ impl ManagedVolume {
     ) -> Result<(), VolumeError> {
         if target.cursor.sequence() != observed.snapshot.cursor.sequence() + 1
             || target.cursor.operation().is_none()
-            || !target.prepared_during(observed.maintenance_generation)
         {
             return Err(VolumeError::new(
                 VolumeErrorKind::Invalid,
@@ -450,7 +431,7 @@ impl ManagedVolume {
             objects: &mut visit,
             records: |_: &mut dyn FnMut(String, u64) -> Result<(), VolumeError>,
                       _: ChangeCursor,
-                      _: ChangeRecord| Ok(()),
+                      _: ()| Ok(()),
         };
         visit_index_streaming(&self.operator, &commit.change_log_root, &mut index_visitor).await?;
 
@@ -471,10 +452,9 @@ impl ManagedVolume {
     async fn write_namespace(
         &self,
         snapshot: &VolumeSnapshot,
-        changes: &BTreeMap<ChangeCursor, ChangeRecord>,
+        changes: &BTreeMap<ChangeCursor, ()>,
         operations: &BTreeMap<OperationId, OperationRecord>,
         change_log_floor: ChangeCursor,
-        maintenance_generation: u64,
         previous: Option<&ManagedObservation>,
     ) -> Result<NamespaceRevision, VolumeError> {
         snapshot.validate()?;
@@ -539,7 +519,6 @@ impl ManagedVolume {
             volume_id: snapshot.volume_id,
             change_cursor: snapshot.cursor,
             change_log_floor,
-            previous: previous.map(|observation| observation.namespace_revision),
             node_index_root,
             directory_entry_index_root,
             change_log_root,
@@ -554,7 +533,6 @@ impl ManagedVolume {
                 .try_into()
                 .map_err(|_| invalid("namespace commit length overflows"))?,
             cursor: snapshot.cursor,
-            maintenance_generation,
         };
         object::create_immutable(&self.operator, &commit_key(digest), Buffer::from(bytes)).await?;
         Ok(reference)
@@ -578,16 +556,11 @@ impl ManagedVolume {
             BTreeMap<DirectoryKey, DirectoryEntry>,
             _,
         ) = read_index(&self.operator, &commit.directory_entry_index_root).await?;
-        let (changes, change_objects): (BTreeMap<ChangeCursor, ChangeRecord>, _) =
+        let (changes, change_objects): (BTreeMap<ChangeCursor, ()>, _) =
             read_index(&self.operator, &commit.change_log_root).await?;
         let (operations, operation_objects): (BTreeMap<OperationId, OperationRecord>, _) =
             read_index(&self.operator, &commit.operation_result_index_root).await?;
-        if changes
-            .keys()
-            .any(|cursor| *cursor < commit.change_log_floor)
-        {
-            return Err(corrupt("namespace history precedes its change-log floor"));
-        }
+        validate_change_log(commit.change_log_floor, commit.change_cursor, &changes)?;
 
         let mut directories = nodes
             .iter()
@@ -711,6 +684,41 @@ fn empty_snapshot(format: ManagedFormat) -> VolumeSnapshot {
 fn commit_key(digest: Digest) -> String {
     let digest = blake3::Hash::from_bytes(*digest.as_bytes()).to_hex();
     format!("managed/1/objects/commit/{}/{digest}", &digest[..2])
+}
+
+fn validate_change_log(
+    floor: ChangeCursor,
+    current: ChangeCursor,
+    changes: &BTreeMap<ChangeCursor, ()>,
+) -> Result<(), VolumeError> {
+    if current == ChangeCursor::Genesis {
+        if floor != ChangeCursor::Genesis || !changes.is_empty() {
+            return Err(corrupt("genesis namespace has an invalid change log"));
+        }
+        return Ok(());
+    }
+    if floor.sequence() > current.sequence() {
+        return Err(corrupt("change-log floor is ahead of the namespace"));
+    }
+
+    let first_sequence = floor.sequence().max(1);
+    let expected_records = current.sequence() - first_sequence + 1;
+    if u64::try_from(changes.len()).ok() != Some(expected_records)
+        || floor != ChangeCursor::Genesis && changes.keys().next().copied() != Some(floor)
+        || changes.keys().next_back().copied() != Some(current)
+    {
+        return Err(corrupt(
+            "change log does not cover its declared cursor range",
+        ));
+    }
+    for (offset, cursor) in changes.keys().enumerate() {
+        let offset =
+            u64::try_from(offset).map_err(|_| corrupt("change-log record count overflows"))?;
+        if cursor.sequence() != first_sequence + offset || *cursor == ChangeCursor::Genesis {
+            return Err(corrupt("change log is not a continuous cursor sequence"));
+        }
+    }
+    Ok(())
 }
 
 fn invalid(message: &'static str) -> VolumeError {

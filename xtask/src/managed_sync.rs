@@ -515,6 +515,8 @@ struct ManagedStatus {
     pending: bool,
     conflicts: u64,
     base_expired: bool,
+    extended_attributes: bool,
+    portable_names: bool,
 }
 
 impl ManagedStatus {
@@ -528,6 +530,16 @@ impl ManagedStatus {
             pending: status_bool(&value, "pending"),
             conflicts: status_u64(&value, "conflicts"),
             base_expired: status_bool(&value, "base_expired"),
+            extended_attributes: value
+                .get("capabilities")
+                .and_then(|capabilities| capabilities.get("extended_attributes"))
+                .and_then(serde_json::Value::as_bool)
+                .expect("extended_attributes capability is a Boolean"),
+            portable_names: value
+                .get("capabilities")
+                .and_then(|capabilities| capabilities.get("portable_names"))
+                .and_then(serde_json::Value::as_bool)
+                .expect("portable_names capability is a Boolean"),
             document,
         }
     }
@@ -1066,9 +1078,19 @@ fn reconcile(fixture: &Fixture) {
         ofs_sync(&replica_b, &state_b, &storage),
         "retain concurrent file conflict",
     );
+    let conflict_message = output_text(&conflict.stderr);
     assert!(
-        output_text(&conflict.stderr).contains("retained 1 conflict"),
-        "a concurrent file update reports one retained conflict"
+        conflict_message.contains("retained 1 conflict")
+            && conflict_message.contains("--resolve <relative-path>"),
+        "a concurrent file update explains explicit resolution"
+    );
+    let conflict_path = conflict_message
+        .lines()
+        .find_map(|line| line.strip_prefix("  "))
+        .expect("a concurrent file update reports its normalized relative path");
+    assert_eq!(
+        conflict_path, "shared.txt",
+        "the reported conflict identifies the user-visible path"
     );
     assert_eq!(
         fs::read(replica_a.join("shared.txt")).expect("read remote candidate"),
@@ -1081,12 +1103,12 @@ fn reconcile(fixture: &Fixture) {
     let status = ManagedStatus::parse(output_text(
         &run_ofs_success(ofs_status(&replica_b, &state_b), "report retained conflict").stdout,
     ));
-    assert!(
-        status.conflicts == 1,
-        "status reports the unresolved conflict"
+    assert_eq!(
+        status.conflicts, 1,
+        "status reports the unresolved conflict count"
     );
     run_ofs_success(
-        ofs_sync_resolve(&replica_b, &state_b, &storage, &["shared.txt"]),
+        ofs_sync_resolve(&replica_b, &state_b, &storage, &[conflict_path]),
         "resolve file conflict with local candidate",
     );
     run_ofs_success(
@@ -1198,8 +1220,8 @@ fn admission(fixture: &Fixture) {
     let root = CaseRoot::new();
     let replica_a = root.path.join("replica-a");
     let replica_b = root.path.join("replica-b");
-    let state_a = root.path.join("state-a.db");
-    let state_b = root.path.join("state-b.db");
+    let state_a = root.path.join("state-a");
+    let state_b = root.path.join("state-b");
     fs::create_dir_all(&replica_a).expect("create replica A");
     fs::create_dir_all(&replica_b).expect("create replica B");
 
@@ -1230,11 +1252,92 @@ fn admission(fixture: &Fixture) {
         status.volume_id, volume_a,
         "status reports the initialized remote identity"
     );
-    run_ofs_success(ofs_volume_create(&storage_b), "create volume B");
-    run_ofs_success(
-        ofs_sync(&replica_b, &state_b, &storage_b),
-        "attach replica B",
+    assert!(
+        !status.extended_attributes,
+        "status reports that extended attributes are unavailable"
     );
+    assert!(
+        status.portable_names,
+        "status advertises the portable-name contract"
+    );
+
+    let portable_path = "资料/café.txt";
+    fs::create_dir_all(replica_a.join("资料")).expect("create portable Unicode directory");
+    fs::write(replica_a.join(portable_path), b"portable name\n")
+        .expect("write portable Unicode file");
+    run_ofs_success(
+        ofs_sync(&replica_a, &state_a, &storage_a),
+        "publish portable Unicode name",
+    );
+    run_ofs_success(
+        ofs_sync(&replica_b, &state_b, &storage_a),
+        "install portable Unicode name in replica B",
+    );
+    assert_eq!(
+        tree_fingerprint(&replica_a),
+        tree_fingerprint(&replica_b),
+        "a valid NFC name converges across replicas"
+    );
+    let portable_sequence = ManagedStatus::parse(output_text(
+        &run_ofs_success(
+            ofs_status(&replica_b, &state_b),
+            "read portable-name sequence",
+        )
+        .stdout,
+    ))
+    .remote_sequence;
+
+    for (names, expected_error, action) in [
+        (
+            &["Case.txt", "case.txt"][..],
+            "case-folding collision",
+            "reject a case-folding collision",
+        ),
+        (
+            &["cafe\u{301}.txt"][..],
+            "path component is not portable",
+            "reject a non-NFC component",
+        ),
+        (
+            &["CON.txt"][..],
+            "path component is reserved",
+            "reject a platform-reserved name",
+        ),
+    ] {
+        for name in names {
+            fs::write(replica_a.join(name), b"invalid portable name\n")
+                .expect("write rejected portable name");
+        }
+        let rejected = run_ofs_failure(ofs_sync(&replica_a, &state_a, &storage_a), action);
+        assert!(
+            output_text(&rejected.stderr).contains(expected_error),
+            "the rejected name reports the violated portable-name contract"
+        );
+        for name in names {
+            fs::remove_file(replica_a.join(name)).expect("remove rejected portable name");
+        }
+        let unchanged = run_ofs_success(
+            ofs_sync(&replica_b, &state_b, &storage_a),
+            "observe remote after rejected portable name",
+        );
+        assert!(
+            !output_text(&unchanged.stdout).contains("(published)"),
+            "a rejected portable name does not publish remote changes"
+        );
+        let remote = ManagedStatus::parse(output_text(
+            &run_ofs_success(
+                ofs_status(&replica_b, &state_b),
+                "read sequence after rejected portable name",
+            )
+            .stdout,
+        ));
+        assert_eq!(
+            remote.remote_sequence, portable_sequence,
+            "a rejected portable name does not advance the remote sequence"
+        );
+    }
+
+    run_ofs_success(ofs_volume_create(&storage_b), "create volume B");
     let fenced = run_ofs_failure(
         ofs_sync(&replica_a, &state_a, &storage_b),
         "open replica A against volume B",

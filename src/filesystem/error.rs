@@ -20,7 +20,6 @@ use std::fmt;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VolumeErrorKind {
-    UnsupportedFormat,
     Invalid,
     Conflict,
     Corrupt,

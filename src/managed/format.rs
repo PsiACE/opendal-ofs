@@ -19,13 +19,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::filesystem::{NodeId, VolumeError, VolumeId};
 
-use super::error::unsupported;
 use super::record::Record;
 
 pub(crate) const FORMAT_KEY: &str = "managed/1/format";
 const MAX_FORMAT_BODY_BYTES: usize = 64 * 1024;
 
-const FORMAT: &str = "managed/1";
 const FORMAT_RECORD: Record = Record::new(*b"OFSFMT01", MAX_FORMAT_BODY_BYTES);
 pub(crate) const MAX_FORMAT_BYTES: usize = FORMAT_RECORD.maximum_encoded_bytes();
 
@@ -54,7 +52,6 @@ impl ManagedFormat {
 
     pub(crate) fn encode(self) -> Result<Vec<u8>, VolumeError> {
         FORMAT_RECORD.encode(&VolumeFormat {
-            format: FORMAT.to_owned(),
             volume_id: self.volume_id,
             root_node_id: self.root_node_id,
         })
@@ -62,12 +59,6 @@ impl ManagedFormat {
 
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, VolumeError> {
         let format: VolumeFormat = FORMAT_RECORD.decode(bytes)?;
-        if format.format != FORMAT {
-            return Err(unsupported(
-                "open Managed volume",
-                "Managed format is unsupported",
-            ));
-        }
         Ok(Self {
             volume_id: format.volume_id,
             root_node_id: format.root_node_id,
@@ -78,7 +69,6 @@ impl ManagedFormat {
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct VolumeFormat {
-    format: String,
     volume_id: VolumeId,
     root_node_id: NodeId,
 }
