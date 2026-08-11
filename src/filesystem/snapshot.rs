@@ -170,10 +170,16 @@ impl VolumeSnapshot {
         if reachable.len() != self.nodes.len() {
             return Err(invalid("namespace contains unreachable nodes"));
         }
-        if self
-            .file_versions
-            .iter()
-            .any(|(id, version)| *id != version.id)
+        let referenced_versions = self
+            .nodes
+            .values()
+            .filter_map(|node| node.file_version)
+            .collect::<BTreeSet<_>>();
+        if referenced_versions.len() != self.file_versions.len()
+            || self
+                .file_versions
+                .iter()
+                .any(|(id, version)| *id != version.id)
         {
             return Err(invalid("file-version key does not match its identity"));
         }

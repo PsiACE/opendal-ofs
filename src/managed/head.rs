@@ -21,9 +21,8 @@ use opendal::{Buffer, Operator};
 use serde::{Deserialize, Serialize};
 
 use crate::filesystem::{
-    ChangeCursor, DirectoryEntry, DirectoryRecord, FileVersion, FileVersionId, Generation,
-    NodeAttributes, NodeId, NodeKind, NodeRecord, OperationId, VolumeError, VolumeErrorKind,
-    VolumeId, VolumeSnapshot,
+    ChangeCursor, DirectoryEntry, DirectoryRecord, FileVersion, Generation, NodeAttributes, NodeId,
+    NodeKind, NodeRecord, OperationId, VolumeError, VolumeErrorKind, VolumeId, VolumeSnapshot,
 };
 
 use super::format::ManagedFormat;
@@ -77,7 +76,6 @@ struct NamespaceCommit {
     retained_change_floor: ChangeCursor,
     node_index_root: PageRef,
     directory_entry_index_root: PageRef,
-    file_version_index_root: PageRef,
     change_log_root: PageRef,
     operation_result_index_root: PageRef,
 }
@@ -290,7 +288,6 @@ impl ManagedVolume {
             retained_change_floor: ChangeCursor::Genesis,
             node_index_root: write_index(&self.operator, &snapshot.nodes).await?,
             directory_entry_index_root: write_index(&self.operator, &directory_entries).await?,
-            file_version_index_root: write_index(&self.operator, &snapshot.file_versions).await?,
             change_log_root: write_index(&self.operator, changes).await?,
             operation_result_index_root: write_index(&self.operator, operations).await?,
         };
@@ -329,8 +326,6 @@ impl ManagedVolume {
             read_index(&self.operator, &commit.node_index_root).await?;
         let directory_entries: BTreeMap<DirectoryKey, DirectoryEntry> =
             read_index(&self.operator, &commit.directory_entry_index_root).await?;
-        let file_versions: BTreeMap<FileVersionId, FileVersion> =
-            read_index(&self.operator, &commit.file_version_index_root).await?;
         let changes = read_index(&self.operator, &commit.change_log_root).await?;
         let operations = read_index(&self.operator, &commit.operation_result_index_root).await?;
 
@@ -355,6 +350,11 @@ impl ManagedVolume {
                 .entries
                 .insert(key.name, entry);
         }
+        let file_versions = nodes
+            .values()
+            .filter_map(|node| node.file_version)
+            .map(|id| (id, FileVersion::new(id)))
+            .collect();
         let snapshot = VolumeSnapshot {
             volume_id: commit.volume_id,
             cursor: commit.change_cursor,
