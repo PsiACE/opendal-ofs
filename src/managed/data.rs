@@ -18,7 +18,8 @@
 use std::path::Path;
 
 use blake3::Hasher;
-use opendal::Buffer;
+use futures::StreamExt as _;
+use opendal::{Buffer, ErrorKind, Operator};
 use serde::{Deserialize, Serialize};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -26,21 +27,44 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use crate::filesystem::{FileVersion, FileVersionId, OperationId, VolumeError, VolumeErrorKind};
 
 use super::ManagedVolume;
-use super::object;
 
-const SEGMENT_BYTES: usize = 1024 * 1024;
+const IO_BUFFER_BYTES: usize = 256 * 1024;
+const UPLOAD_PART_BYTES: usize = 16 * 1024 * 1024;
+const UPLOAD_CONCURRENCY: usize = 4;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct Segment {
+#[serde(rename_all = "snake_case")]
+enum FileLayout {
+    Empty,
+    Whole,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct WholeObject {
     pub(super) digest: [u8; 32],
     pub(super) length: u64,
 }
 
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+pub(super) struct WholeObjects(Option<WholeObject>);
+
+impl WholeObjects {
+    fn into_option(self) -> Option<WholeObject> {
+        self.0
+    }
+}
+
+impl IntoIterator for WholeObjects {
+    type Item = WholeObject;
+    type IntoIter = std::option::IntoIter<WholeObject>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+/// A zero-or-one iterable object set for collector traversal.
 pub(super) struct Descriptor {
-    pub(super) segments: Vec<Segment>,
+    pub(super) segments: WholeObjects,
 }
 
 impl ManagedVolume {
@@ -49,30 +73,14 @@ impl ManagedVolume {
         let mut file = File::open(path)
             .await
             .map_err(|_| unavailable("inspect local file"))?;
-        let mut logical = Hasher::new();
-        let mut logical_size = 0_u64;
-        let mut segments = Vec::new();
-        let mut buffer = vec![0; SEGMENT_BYTES];
-        loop {
-            let read = file
-                .read(&mut buffer)
-                .await
-                .map_err(|_| unavailable("inspect local file"))?;
-            if read == 0 {
-                break;
-            }
-            let bytes = &buffer[..read];
-            logical.update(bytes);
-            logical_size = logical_size
-                .checked_add(read as u64)
-                .ok_or_else(|| invalid("inspect local file", "file length overflows"))?;
-            segments.push(Segment {
-                digest: blake3::hash(bytes).into(),
-                length: read as u64,
-            });
-        }
-        let logical_digest: [u8; 32] = logical.finalize().into();
-        let descriptor = serde_json::to_vec(&Descriptor { segments })
+        let (logical_size, logical_digest) =
+            inspect_reader(&mut file, "inspect local file").await?;
+        let layout = if logical_size == 0 {
+            FileLayout::Empty
+        } else {
+            FileLayout::Whole
+        };
+        let descriptor = serde_json::to_vec(&layout)
             .map_err(|_| invalid("inspect local file", "descriptor cannot be encoded"))?;
         Ok(FileVersion::from_parts(
             FileVersionId::from_bytes(logical_digest),
@@ -82,7 +90,7 @@ impl ManagedVolume {
         ))
     }
 
-    /// Publish every immutable segment before its file version can be committed.
+    /// Publish one immutable whole-file object before its version is committed.
     pub async fn publish_file(
         &self,
         path: &Path,
@@ -92,44 +100,57 @@ impl ManagedVolume {
         let mut file = File::open(path)
             .await
             .map_err(|_| unavailable("publish local file"))?;
-        let mut logical = Hasher::new();
-        let mut buffer = vec![0; SEGMENT_BYTES];
-        for expected in descriptor.segments {
-            let length = usize::try_from(expected.length)
-                .ok()
-                .filter(|length| *length <= SEGMENT_BYTES && *length > 0)
-                .ok_or_else(|| corrupt("publish local file", "segment length is invalid"))?;
-            file.read_exact(&mut buffer[..length])
-                .await
-                .map_err(|_| invalid("publish local file", "file changed while being published"))?;
-            let bytes = &buffer[..length];
-            if blake3::hash(bytes).as_bytes() != &expected.digest {
-                return Err(invalid(
-                    "publish local file",
-                    "file changed while being published",
-                ));
-            }
-            logical.update(bytes);
-            object::create_immutable(
-                self.operator(),
-                &segment_key(expected.digest),
-                Buffer::from(bytes.to_vec()),
-            )
-            .await?;
-        }
-        if file
-            .read(&mut buffer[..1])
+        let Some(object) = descriptor.segments.into_option() else {
+            let (length, digest) = inspect_reader(&mut file, "publish local file").await?;
+            return verify_local_identity(length, digest, version);
+        };
+
+        let key = object_key(object.digest);
+        let mut writer = self
+            .operator()
+            .writer_with(&key)
+            .chunk(UPLOAD_PART_BYTES)
+            .concurrent(UPLOAD_CONCURRENCY)
             .await
-            .map_err(|_| unavailable("publish local file"))?
-            != 0
-            || logical.finalize().as_bytes() != &version.logical_digest
-        {
-            return Err(invalid(
-                "publish local file",
-                "file changed while being published",
-            ));
+            .map_err(|_| unavailable("publish local file"))?;
+        let mut hasher = Hasher::new();
+        let mut length = 0_u64;
+        let mut buffer = vec![0; IO_BUFFER_BYTES];
+        let transfer = async {
+            loop {
+                let read = file
+                    .read(&mut buffer)
+                    .await
+                    .map_err(|_| unavailable("publish local file"))?;
+                if read == 0 {
+                    break;
+                }
+                let bytes = &buffer[..read];
+                hasher.update(bytes);
+                length = length
+                    .checked_add(read as u64)
+                    .ok_or_else(|| invalid("publish local file", "file length overflows"))?;
+                writer
+                    .write(Buffer::from(bytes.to_vec()))
+                    .await
+                    .map_err(|_| unavailable("publish local file"))?;
+            }
+            verify_local_identity(length, hasher.finalize().into(), version)
         }
-        Ok(())
+        .await;
+        if let Err(error) = transfer {
+            let _ = writer.abort().await;
+            return Err(error);
+        }
+
+        if writer.close().await.is_ok() {
+            return Ok(());
+        }
+        if stream_object(self.operator(), object, None).await.is_ok() {
+            Ok(())
+        } else {
+            Err(unavailable("publish local file"))
+        }
     }
 
     /// Materialize and verify a complete file beside its final destination.
@@ -153,45 +174,8 @@ impl ManagedVolume {
             let mut file = File::create(&temporary)
                 .await
                 .map_err(|_| unavailable("materialize Managed file"))?;
-            let mut logical = Hasher::new();
-            let mut logical_size = 0_u64;
-            for segment in descriptor.segments {
-                let bytes =
-                    object::read_data(self.operator(), &segment_key(segment.digest)).await?;
-                if bytes.len() as u64 != segment.length {
-                    return Err(corrupt(
-                        "materialize Managed file",
-                        "segment length is invalid",
-                    ));
-                }
-                let mut segment_hash = Hasher::new();
-                for chunk in bytes {
-                    segment_hash.update(&chunk);
-                    logical.update(&chunk);
-                    file.write_all(&chunk)
-                        .await
-                        .map_err(|_| unavailable("materialize Managed file"))?;
-                    logical_size =
-                        logical_size
-                            .checked_add(chunk.len() as u64)
-                            .ok_or_else(|| {
-                                corrupt("materialize Managed file", "file length overflows")
-                            })?;
-                }
-                if segment_hash.finalize().as_bytes() != &segment.digest {
-                    return Err(corrupt(
-                        "materialize Managed file",
-                        "segment checksum is invalid",
-                    ));
-                }
-            }
-            if logical_size != version.logical_size
-                || logical.finalize().as_bytes() != &version.logical_digest
-            {
-                return Err(corrupt(
-                    "materialize Managed file",
-                    "file checksum is invalid",
-                ));
+            if let Some(object) = descriptor.segments.into_option() {
+                stream_object(self.operator(), object, Some(&mut file)).await?;
             }
             file.sync_all()
                 .await
@@ -217,34 +201,131 @@ impl ManagedVolume {
     }
 }
 
-pub(super) fn decode_descriptor(version: &FileVersion) -> Result<Descriptor, VolumeError> {
-    let descriptor: Descriptor = serde_json::from_slice(version.descriptor())
-        .map_err(|_| corrupt("read Managed file", "file descriptor is invalid"))?;
-    let expected_size = descriptor
-        .segments
-        .iter()
-        .try_fold(0_u64, |size, segment| size.checked_add(segment.length))
-        .ok_or_else(|| corrupt("read Managed file", "file length overflows"))?;
-    if expected_size != version.logical_size
-        || descriptor
-            .segments
-            .iter()
-            .any(|segment| segment.length == 0 || segment.length > SEGMENT_BYTES as u64)
-    {
+async fn inspect_reader(
+    file: &mut File,
+    action: &'static str,
+) -> Result<(u64, [u8; 32]), VolumeError> {
+    let mut hasher = Hasher::new();
+    let mut length = 0_u64;
+    let mut buffer = vec![0; IO_BUFFER_BYTES];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .await
+            .map_err(|_| unavailable(action))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        length = length
+            .checked_add(read as u64)
+            .ok_or_else(|| invalid(action, "file length overflows"))?;
+    }
+    Ok((length, hasher.finalize().into()))
+}
+
+async fn stream_object(
+    operator: &Operator,
+    object: WholeObject,
+    mut destination: Option<&mut File>,
+) -> Result<(), VolumeError> {
+    let key = object_key(object.digest);
+    let reader = match operator.reader(&key).await {
+        Ok(reader) => reader,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return Err(corrupt("read Managed data", "referenced object is missing"));
+        }
+        Err(_) => return Err(unavailable("read Managed data")),
+    };
+    let mut stream = reader
+        .into_stream(..)
+        .await
+        .map_err(|_| unavailable("read Managed data"))?;
+    let mut hasher = Hasher::new();
+    let mut length = 0_u64;
+    while let Some(buffer) = stream.next().await {
+        let buffer = match buffer {
+            Ok(buffer) => buffer,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return Err(corrupt("read Managed data", "referenced object is missing"));
+            }
+            Err(_) => return Err(unavailable("read Managed data")),
+        };
+        for chunk in buffer {
+            hasher.update(&chunk);
+            length = length
+                .checked_add(chunk.len() as u64)
+                .ok_or_else(|| corrupt("read Managed data", "object length overflows"))?;
+            if let Some(file) = destination.as_mut() {
+                file.write_all(&chunk)
+                    .await
+                    .map_err(|_| unavailable("materialize Managed file"))?;
+            }
+        }
+    }
+    if length != object.length || hasher.finalize().as_bytes() != &object.digest {
         return Err(corrupt(
-            "read Managed file",
-            "file descriptor is inconsistent",
+            "read Managed data",
+            "object content does not match its identity",
         ));
     }
-    Ok(descriptor)
+    Ok(())
+}
+
+fn verify_local_identity(
+    length: u64,
+    digest: [u8; 32],
+    version: &FileVersion,
+) -> Result<(), VolumeError> {
+    if length != version.logical_size || digest != version.logical_digest {
+        return Err(invalid(
+            "publish local file",
+            "file changed while being published",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn decode_descriptor(version: &FileVersion) -> Result<Descriptor, VolumeError> {
+    let layout: FileLayout = serde_json::from_slice(version.descriptor())
+        .map_err(|_| corrupt("read Managed file", "file descriptor is invalid"))?;
+    if version.id.as_bytes() != &version.logical_digest {
+        return Err(corrupt(
+            "read Managed file",
+            "file identity does not match its digest",
+        ));
+    }
+    let segments = match (layout, version.logical_size) {
+        (FileLayout::Empty, 0) if version.logical_digest == *blake3::hash(&[]).as_bytes() => None,
+        (FileLayout::Whole, length) if length > 0 => Some(WholeObject {
+            digest: version.logical_digest,
+            length,
+        }),
+        _ => {
+            return Err(corrupt(
+                "read Managed file",
+                "file descriptor is inconsistent",
+            ));
+        }
+    };
+    Ok(Descriptor {
+        segments: WholeObjects(segments),
+    })
+}
+
+fn object_key(digest: [u8; 32]) -> String {
+    let digest = blake3::Hash::from_bytes(digest).to_hex();
+    format!("managed/1/objects/raw/{}/{}", &digest.as_str()[..2], digest)
 }
 
 pub(super) fn segment_key(digest: [u8; 32]) -> String {
-    format!(
-        ".ofs/managed/data/{}",
-        blake3::Hash::from_bytes(digest).to_hex()
-    )
+    object_key(digest)
 }
+
+// Keep the metadata helper linked while data reads use bounded streams.
+const _: () = {
+    let _ = super::object::read_data;
+};
 
 fn invalid(action: &'static str, message: &'static str) -> VolumeError {
     VolumeError::new(VolumeErrorKind::Invalid, format!("{action}: {message}"))

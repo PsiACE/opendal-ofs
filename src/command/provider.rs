@@ -19,7 +19,7 @@ use std::num::NonZeroUsize;
 
 use anyhow::{Result, anyhow};
 use opendal::Operator;
-use opendal::layers::{ConcurrentLimitLayer, RetryLayer};
+use opendal::layers::{ConcurrentLimitLayer, RetryLayer, TimeoutLayer};
 
 pub(super) fn open_operator(storage: &str, concurrency: NonZeroUsize) -> Result<Operator> {
     let concurrency = concurrency.get();
@@ -29,6 +29,7 @@ pub(super) fn open_operator(storage: &str, concurrency: NonZeroUsize) -> Result<
                 .layer(
                     ConcurrentLimitLayer::new(concurrency).with_http_concurrent_limit(concurrency),
                 )
+                .layer(TimeoutLayer::new())
                 .layer(RetryLayer::new().with_jitter())
         })
         .map_err(|_| {
