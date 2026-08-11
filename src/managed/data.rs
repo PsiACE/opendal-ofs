@@ -71,6 +71,7 @@ impl ManagedVolume {
         let mut writer = self
             .operator()
             .writer_with(&key)
+            .if_not_exists(true)
             .chunk(UPLOAD_PART_BYTES)
             .concurrent(UPLOAD_CONCURRENCY)
             .await
@@ -105,8 +106,28 @@ impl ManagedVolume {
             return Err(error);
         }
 
-        if writer.close().await.is_ok() {
-            return Ok(());
+        match writer.close().await {
+            Ok(_) => return Ok(()),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    opendal::ErrorKind::AlreadyExists | opendal::ErrorKind::ConditionNotMatch
+                ) =>
+            {
+                let metadata = self
+                    .operator()
+                    .stat(&key)
+                    .await
+                    .map_err(|_| unavailable("publish local file"))?;
+                if metadata.content_length() == object.length {
+                    return Ok(());
+                }
+                return Err(VolumeError::new(
+                    crate::filesystem::VolumeErrorKind::Corrupt,
+                    "publish local file: immutable object has an invalid length",
+                ));
+            }
+            Err(_) => {}
         }
         if stream_object(self.operator(), object, None).await.is_ok() {
             Ok(())

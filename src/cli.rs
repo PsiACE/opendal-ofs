@@ -49,6 +49,14 @@ pub(crate) struct GcArgs {
     #[arg(long)]
     pub(crate) resume: bool,
 
+    /// Advance the retained history horizon to this change sequence.
+    #[arg(long, conflicts_with = "resume", value_name = "SEQUENCE")]
+    pub(crate) retain_from: Option<u64>,
+
+    /// Keep recently created unreachable objects for at least this long.
+    #[arg(long, default_value = "1h", value_name = "DURATION")]
+    pub(crate) orphan_grace: humantime::Duration,
+
     /// Maximum concurrency for storage operations.
     #[arg(
         long,

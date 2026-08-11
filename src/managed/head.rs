@@ -34,7 +34,6 @@ use super::record::Record;
 const HEAD_KEY: &str = "managed/1/head";
 const HEAD_RECORD: Record = Record::new(*b"OFSHEAD1", 64 * 1024);
 const COMMIT_RECORD: Record = Record::new(*b"OFSCMIT1", 1024 * 1024);
-const RETAINED_NAMESPACE_COMMITS: usize = 33;
 
 #[derive(Clone)]
 pub struct ManagedVolume {
@@ -45,7 +44,8 @@ pub struct ManagedVolume {
 pub struct ManagedObservation {
     pub snapshot: VolumeSnapshot,
     namespace_revision: NamespaceRevision,
-    revision: String,
+    retention_horizon: NamespaceRevision,
+    maintenance_generation: u64,
     changes: BTreeMap<ChangeCursor, ChangeRecord>,
     operations: BTreeMap<OperationId, OperationRecord>,
     commit: NamespaceCommit,
@@ -57,12 +57,23 @@ impl ManagedObservation {
     pub const fn revision(&self) -> NamespaceRevision {
         self.namespace_revision
     }
+
+    pub(crate) const fn accepts_prepared(&self, revision: NamespaceRevision) -> bool {
+        revision.prepared_during(self.maintenance_generation)
+    }
+
+    pub(crate) const fn retains(&self, revision: NamespaceRevision) -> bool {
+        revision.cursor.sequence() >= self.retention_horizon.cursor.sequence()
+            && revision.cursor.sequence() <= self.namespace_revision.cursor.sequence()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Head {
     pub(super) namespace_commit: NamespaceRevision,
+    pub(super) retention_horizon: NamespaceRevision,
+    pub(super) maintenance_generation: u64,
     pub(super) maintenance: Option<GcFence>,
 }
 
@@ -72,11 +83,16 @@ pub struct NamespaceRevision {
     commit: Digest,
     pub(super) encoded_length: u64,
     cursor: ChangeCursor,
+    maintenance_generation: u64,
 }
 
 impl NamespaceRevision {
     pub const fn cursor(self) -> ChangeCursor {
         self.cursor
+    }
+
+    pub(super) const fn prepared_during(self, maintenance_generation: u64) -> bool {
+        self.maintenance_generation == maintenance_generation
     }
 }
 
@@ -85,6 +101,8 @@ impl NamespaceRevision {
 pub(super) struct GcFence {
     pub(super) owner: OperationId,
     pub(super) namespace_commit: NamespaceRevision,
+    pub(super) retention_horizon: NamespaceRevision,
+    pub(super) maintenance_generation: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -92,7 +110,7 @@ pub(super) struct GcFence {
 struct NamespaceCommit {
     volume_id: VolumeId,
     change_cursor: ChangeCursor,
-    retained_change_floor: ChangeCursor,
+    change_log_floor: ChangeCursor,
     previous: Option<NamespaceRevision>,
     node_index_root: PageRef,
     directory_entry_index_root: PageRef,
@@ -161,11 +179,14 @@ impl ManagedVolume {
                 &BTreeMap::new(),
                 &BTreeMap::new(),
                 ChangeCursor::Genesis,
+                0,
                 None,
             )
             .await?;
         let bytes = HEAD_RECORD.encode(&Head {
             namespace_commit,
+            retention_horizon: namespace_commit,
+            maintenance_generation: 0,
             maintenance: None,
         })?;
         if object::create(&self.operator, HEAD_KEY, bytes).await? {
@@ -175,7 +196,7 @@ impl ManagedVolume {
     }
 
     pub async fn observe(&self) -> Result<ManagedObservation, VolumeError> {
-        let (head, revision) = self.read_head().await?;
+        let (head, _) = self.read_head().await?;
         if head.maintenance.is_some() {
             return Err(VolumeError::new(
                 VolumeErrorKind::Conflict,
@@ -186,7 +207,8 @@ impl ManagedVolume {
         Ok(ManagedObservation {
             snapshot: stored.snapshot,
             namespace_revision: head.namespace_commit,
-            revision,
+            retention_horizon: head.retention_horizon,
+            maintenance_generation: head.maintenance_generation,
             changes: stored.changes,
             operations: stored.operations,
             commit: stored.commit,
@@ -209,6 +231,20 @@ impl ManagedVolume {
             )
         })?;
         let head: Head = HEAD_RECORD.decode(&bytes)?;
+        if head.retention_horizon.cursor.sequence() > head.namespace_commit.cursor.sequence()
+            || head.namespace_commit.maintenance_generation > head.maintenance_generation
+            || head.retention_horizon.maintenance_generation > head.maintenance_generation
+            || head.maintenance.is_some_and(|fence| {
+                fence.namespace_commit != head.namespace_commit
+                    || fence.maintenance_generation != head.maintenance_generation
+                    || fence.retention_horizon.cursor.sequence()
+                        < head.retention_horizon.cursor.sequence()
+                    || fence.retention_horizon.cursor.sequence()
+                        > fence.namespace_commit.cursor.sequence()
+            })
+        {
+            return Err(corrupt("namespace head references are invalid"));
+        }
         Ok((head, revision))
     }
 
@@ -246,19 +282,14 @@ impl ManagedVolume {
                 cursor: target.cursor,
             },
         );
-        let retained_change_floor = changes
-            .keys()
-            .rev()
-            .nth(RETAINED_NAMESPACE_COMMITS - 1)
-            .copied()
-            .unwrap_or(ChangeCursor::Genesis);
-        changes.retain(|cursor, _| *cursor >= retained_change_floor);
-        operations.retain(|_, result| result.cursor >= retained_change_floor);
+        let change_log_floor = observed.retention_horizon.cursor;
+        changes.retain(|cursor, _| *cursor >= change_log_floor);
         self.write_namespace(
             &target,
             &changes,
             &operations,
-            retained_change_floor,
+            change_log_floor,
+            observed.maintenance_generation,
             Some(observed),
         )
         .await
@@ -271,20 +302,40 @@ impl ManagedVolume {
     ) -> Result<(), VolumeError> {
         if target.cursor.sequence() != observed.snapshot.cursor.sequence() + 1
             || target.cursor.operation().is_none()
+            || !target.prepared_during(observed.maintenance_generation)
         {
             return Err(VolumeError::new(
                 VolumeErrorKind::Invalid,
                 "publish Managed namespace: prepared publication ancestry is invalid",
             ));
         }
+        let (current_head, current_revision) = self.read_head().await?;
+        if current_head.maintenance.is_some()
+            || current_head.namespace_commit != observed.namespace_revision
+            || current_head.maintenance_generation != observed.maintenance_generation
+        {
+            return Err(VolumeError::new(
+                VolumeErrorKind::Conflict,
+                "publish Managed namespace: observed generation changed",
+            ));
+        }
         let bytes = HEAD_RECORD.encode(&Head {
             namespace_commit: target,
+            retention_horizon: current_head.retention_horizon,
+            maintenance_generation: current_head.maintenance_generation,
             maintenance: None,
         })?;
-        if object::replace(&self.operator, HEAD_KEY, &observed.revision, bytes).await? {
+        if object::replace(&self.operator, HEAD_KEY, &current_revision, bytes).await? {
             return Ok(());
         }
-        let current = self.observe().await?;
+        let (current_head, _) = self.read_head().await?;
+        if current_head.maintenance.is_some() {
+            return Err(VolumeError::new(
+                VolumeErrorKind::Conflict,
+                "publish Managed namespace: data collection started",
+            ));
+        }
+        let current = self.read_namespace(current_head.namespace_commit).await?;
         let operation = target
             .cursor
             .operation()
@@ -308,15 +359,6 @@ impl ManagedVolume {
         self.read_namespace(revision)
             .await
             .map(|stored| stored.snapshot)
-    }
-
-    pub async fn snapshot_if_present(
-        &self,
-        revision: NamespaceRevision,
-    ) -> Result<Option<VolumeSnapshot>, VolumeError> {
-        self.read_namespace_if_present(revision)
-            .await
-            .map(|stored| stored.map(|stored| stored.snapshot))
     }
 
     pub async fn operation_committed(
@@ -348,12 +390,13 @@ impl ManagedVolume {
     pub(super) async fn visit_reachable_objects(
         &self,
         reference: NamespaceRevision,
+        retention_horizon: NamespaceRevision,
         mut visit: impl FnMut(String, u64) -> Result<(), VolumeError>,
     ) -> Result<(), VolumeError> {
         let mut current = Some(reference);
-        for _ in 0..RETAINED_NAMESPACE_COMMITS {
+        loop {
             let Some(reference) = current else {
-                break;
+                return Err(corrupt("retention horizon is not in the commit history"));
             };
             let commit = self.read_commit(reference).await?;
             visit(commit_key(reference.commit), reference.encoded_length)?;
@@ -396,9 +439,47 @@ impl ManagedVolume {
             )
             .await?;
             visit_containers(containers, &mut visit)?;
+            if reference == retention_horizon {
+                break;
+            }
+            if commit
+                .previous
+                .is_some_and(|previous| previous.cursor.sequence() >= reference.cursor.sequence())
+            {
+                return Err(corrupt("namespace commit ancestry is not ordered"));
+            }
             current = commit.previous;
         }
         Ok(())
+    }
+
+    pub(super) async fn retention_horizon_at(
+        &self,
+        head: &Head,
+        sequence: u64,
+    ) -> Result<NamespaceRevision, VolumeError> {
+        let current_sequence = head.namespace_commit.cursor.sequence();
+        let retained_sequence = head.retention_horizon.cursor.sequence();
+        if sequence < retained_sequence || sequence > current_sequence {
+            return Err(VolumeError::new(
+                VolumeErrorKind::Invalid,
+                "collect Managed data: retained change is outside the available history",
+            ));
+        }
+        let mut reference = head.namespace_commit;
+        loop {
+            if reference.cursor.sequence() == sequence {
+                return Ok(reference);
+            }
+            let commit = self.read_commit(reference).await?;
+            let previous = commit
+                .previous
+                .ok_or_else(|| corrupt("retained change is not in the namespace commit history"))?;
+            if previous.cursor.sequence() >= reference.cursor.sequence() {
+                return Err(corrupt("namespace commit ancestry is not ordered"));
+            }
+            reference = previous;
+        }
     }
 
     async fn write_namespace(
@@ -406,7 +487,8 @@ impl ManagedVolume {
         snapshot: &VolumeSnapshot,
         changes: &BTreeMap<ChangeCursor, ChangeRecord>,
         operations: &BTreeMap<OperationId, OperationRecord>,
-        retained_change_floor: ChangeCursor,
+        change_log_floor: ChangeCursor,
+        maintenance_generation: u64,
         previous: Option<&ManagedObservation>,
     ) -> Result<NamespaceRevision, VolumeError> {
         snapshot.validate()?;
@@ -470,7 +552,7 @@ impl ManagedVolume {
         let commit = NamespaceCommit {
             volume_id: snapshot.volume_id,
             change_cursor: snapshot.cursor,
-            retained_change_floor,
+            change_log_floor,
             previous: previous.map(|observation| observation.namespace_revision),
             node_index_root,
             directory_entry_index_root,
@@ -486,6 +568,7 @@ impl ManagedVolume {
                 .try_into()
                 .map_err(|_| invalid("namespace commit length overflows"))?,
             cursor: snapshot.cursor,
+            maintenance_generation,
         };
         object::create_immutable(&self.operator, &commit_key(digest), Buffer::from(bytes)).await?;
         Ok(reference)
@@ -499,16 +582,6 @@ impl ManagedVolume {
         self.read_namespace_indexes(commit).await
     }
 
-    async fn read_namespace_if_present(
-        &self,
-        reference: NamespaceRevision,
-    ) -> Result<Option<StoredNamespace>, VolumeError> {
-        let Some(commit) = self.read_commit_if_present(reference).await? else {
-            return Ok(None);
-        };
-        self.read_namespace_indexes(commit).await.map(Some)
-    }
-
     async fn read_namespace_indexes(
         &self,
         commit: NamespaceCommit,
@@ -519,9 +592,16 @@ impl ManagedVolume {
             BTreeMap<DirectoryKey, DirectoryEntry>,
             _,
         ) = read_index(&self.operator, &commit.directory_entry_index_root).await?;
-        let (changes, change_objects) = read_index(&self.operator, &commit.change_log_root).await?;
-        let (operations, operation_objects) =
+        let (changes, change_objects): (BTreeMap<ChangeCursor, ChangeRecord>, _) =
+            read_index(&self.operator, &commit.change_log_root).await?;
+        let (operations, operation_objects): (BTreeMap<OperationId, OperationRecord>, _) =
             read_index(&self.operator, &commit.operation_result_index_root).await?;
+        if changes
+            .keys()
+            .any(|cursor| *cursor < commit.change_log_floor)
+        {
+            return Err(corrupt("namespace history precedes its change-log floor"));
+        }
 
         let mut directories = nodes
             .iter()

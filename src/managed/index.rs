@@ -17,7 +17,7 @@
 
 //! Persistent ordered indexes stored as immutable Managed metadata pages.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Cursor;
 
@@ -245,7 +245,6 @@ where
     K: Clone + DeserializeOwned + Ord + Serialize,
     V: DeserializeOwned,
 {
-    let mut visited = BTreeSet::new();
     let mut objects = BTreeMap::new();
     let mut pending = vec![(root.clone(), 0_usize, true)];
     let mut previous = None::<K>;
@@ -255,16 +254,6 @@ where
     while let Some((reference, depth, is_root)) = pending.pop() {
         if depth > MAX_TREE_DEPTH {
             return Err(corrupt("read Managed index", "index tree is too deep"));
-        }
-        if !visited.insert((
-            reference.section.object,
-            reference.section.offset,
-            reference.section.length,
-        )) {
-            return Err(corrupt(
-                "read Managed index",
-                "index page is referenced more than once",
-            ));
         }
         if objects
             .insert(reference.section.object, reference.section.object_length)

@@ -41,6 +41,7 @@ pub struct ReplicaState {
     observed: NamespaceRevision,
     phase: SyncPhase,
     conflicts: u64,
+    base_expired: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -74,6 +75,7 @@ impl ReplicaState {
             observed: common,
             phase: SyncPhase::Clean,
             conflicts: 0,
+            base_expired: false,
         }
     }
 
@@ -184,6 +186,10 @@ impl ReplicaState {
         !matches!(self.phase, SyncPhase::Clean)
     }
 
+    pub const fn base_expired(&self) -> bool {
+        self.base_expired
+    }
+
     pub(crate) const fn pending_publication(
         &self,
     ) -> Option<(NamespaceRevision, NamespaceRevision)> {
@@ -205,6 +211,7 @@ impl ReplicaState {
         self.observed = common;
         self.phase = SyncPhase::Clean;
         self.conflicts = 0;
+        self.base_expired = false;
     }
 
     pub(crate) fn begin_publication(
@@ -215,6 +222,7 @@ impl ReplicaState {
         self.phase = SyncPhase::Publishing { expected, target };
         self.observed = expected;
         self.conflicts = 0;
+        self.base_expired = false;
         self.validate()
     }
 
@@ -222,17 +230,25 @@ impl ReplicaState {
         self.phase = SyncPhase::Installing { target, published };
         self.observed = target;
         self.conflicts = 0;
+        self.base_expired = false;
     }
 
-    pub(crate) fn retain_conflicts(&mut self, conflicts: usize, remote: NamespaceRevision) {
+    pub(crate) fn retain_conflicts(
+        &mut self,
+        conflicts: usize,
+        remote: NamespaceRevision,
+        base_expired: bool,
+    ) {
         self.phase = SyncPhase::Clean;
         self.conflicts = conflicts.try_into().unwrap_or(u64::MAX);
         self.observed = remote;
+        self.base_expired = base_expired;
     }
 
     pub(crate) fn cancel_pending(&mut self, remote: NamespaceRevision) {
         self.phase = SyncPhase::Clean;
         self.observed = remote;
+        self.base_expired = false;
     }
 
     pub(crate) fn for_cold_install(

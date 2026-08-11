@@ -132,15 +132,12 @@ impl SyncEngine {
                 .await;
         }
 
-        let Some(base) = self
-            .volume
-            .snapshot_if_present(state.common_revision())
-            .await?
-        else {
+        if !observed.retains(state.common_revision()) {
             return self
                 .conservative_rebase(&root, state_path, state, observed, &resolved)
                 .await;
-        };
+        }
+        let base = self.volume.snapshot(state.common_revision()).await?;
         let local = scan(&root, &base, &self.volume).await?;
         let local_changed = local.snapshot.cursor != base.cursor;
         let remote_changed = observed.revision() != state.common_revision();
@@ -164,6 +161,7 @@ impl SyncEngine {
                     .await?;
                 state.begin_publication(observed.revision(), target)?;
                 state.save(state_path)?;
+                test_interrupt("before-publish")?;
                 self.volume.commit_publication(&observed, target).await?;
                 test_interrupt("after-publish")?;
                 state.advance(target);
@@ -195,7 +193,7 @@ impl SyncEngine {
                 let plan = reconcile(&base, &local.snapshot, &observed.snapshot, &resolved)?;
                 if !plan.conflicts.is_empty() {
                     let conflicts = plan.conflicts.len();
-                    state.retain_conflicts(conflicts, observed.revision());
+                    state.retain_conflicts(conflicts, observed.revision(), false);
                     state.save(state_path)?;
                     return Ok(SyncOutcome {
                         conflicts,
@@ -212,6 +210,7 @@ impl SyncEngine {
                         .await?;
                     state.begin_publication(observed.revision(), target)?;
                     state.save(state_path)?;
+                    test_interrupt("before-publish")?;
                     self.volume.commit_publication(&observed, target).await?;
                     test_interrupt("after-publish")?;
                     target
@@ -241,6 +240,18 @@ impl SyncEngine {
         target: NamespaceRevision,
         published: bool,
     ) -> Result<SyncOutcome, SyncError> {
+        if !observed.retains(target) {
+            state.begin_install(observed.revision(), false);
+            state.save(state_path)?;
+            repair(root, &observed.snapshot, &self.volume).await?;
+            state.advance(observed.revision());
+            state.save(state_path)?;
+            return Ok(SyncOutcome {
+                conflicts: 0,
+                published: false,
+                sequence: observed.snapshot.cursor.sequence(),
+            });
+        }
         let snapshot = self.volume.snapshot(target).await?;
         state.begin_install(target, published);
         state.save(state_path)?;
@@ -288,7 +299,7 @@ impl SyncEngine {
         }
         if resolved != &ambiguous {
             let conflicts = ambiguous.len();
-            state.retain_conflicts(conflicts, observed.revision());
+            state.retain_conflicts(conflicts, observed.revision(), true);
             state.save(state_path)?;
             return Ok(SyncOutcome {
                 conflicts,
@@ -305,6 +316,7 @@ impl SyncEngine {
             .await?;
         state.begin_publication(observed.revision(), target)?;
         state.save(state_path)?;
+        test_interrupt("before-publish")?;
         self.volume.commit_publication(&observed, target).await?;
         test_interrupt("after-publish")?;
         state.advance(target);
@@ -366,6 +378,13 @@ impl SyncEngine {
                 .recover_install(root, state_path, state, observed, target, true)
                 .await;
         }
+        if !observed.accepts_prepared(target) {
+            state.cancel_pending(observed.revision());
+            state.save(state_path)?;
+            return Err(SyncError::new(
+                "pending publication was invalidated by data collection; repeat sync to prepare it again",
+            ));
+        }
         if observed.revision() != expected {
             state.cancel_pending(observed.revision());
             state.save(state_path)?;
@@ -373,6 +392,7 @@ impl SyncEngine {
                 "pending publication conflicted with a newer remote change; repeat sync to reconcile",
             ));
         }
+        test_interrupt("before-publish")?;
         self.volume.commit_publication(&observed, target).await?;
         test_interrupt("after-publish")?;
         let committed = self.volume.observe().await?;

@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read as _, Write as _};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use futures::TryStreamExt as _;
 
@@ -26,6 +27,7 @@ use crate::filesystem::{OperationId, VolumeError, VolumeErrorKind};
 
 use super::ManagedVolume;
 use super::head::GcFence;
+use super::object;
 
 const OBJECT_PREFIX: &str = "managed/1/objects/";
 const INITIAL_PARTITIONS: usize = 256;
@@ -37,46 +39,107 @@ pub struct GcOutcome {
     pub scanned: usize,
     pub deleted: usize,
     pub deleted_bytes: u64,
+    pub retained_from: u64,
 }
 
 impl ManagedVolume {
-    pub async fn collect_unreachable(&self, resume: bool) -> Result<GcOutcome, VolumeError> {
-        let capability = self.operator().info().full_capability();
-        if !capability.list || !capability.delete {
+    pub async fn collect_unreachable(
+        &self,
+        resume: bool,
+        retain_from: Option<u64>,
+        orphan_grace: Duration,
+    ) -> Result<GcOutcome, VolumeError> {
+        if resume && retain_from.is_some() {
             return Err(VolumeError::new(
                 VolumeErrorKind::Invalid,
-                "collect Managed data: storage lacks list or delete",
+                "resume Managed data collection: retained change cannot be replaced",
             ));
         }
-        let fence = self.begin_gc(resume).await?;
+        let capability = self.operator().info().full_capability();
+        if !capability.list || !capability.delete || (!orphan_grace.is_zero() && !capability.stat) {
+            return Err(VolumeError::new(
+                VolumeErrorKind::Invalid,
+                "collect Managed data: storage lacks a required list, stat, or delete capability",
+            ));
+        }
+        if !orphan_grace.is_zero()
+            && object::last_modified(self.operator(), "managed/1/head")
+                .await?
+                .is_none()
+        {
+            return Err(VolumeError::new(
+                VolumeErrorKind::Invalid,
+                "collect Managed data: storage does not expose object modification time",
+            ));
+        }
+        let fence = self.begin_gc(resume, retain_from).await?;
+        let delete_before = if orphan_grace.is_zero() {
+            None
+        } else {
+            let Some(started_at) = object::last_modified(self.operator(), "managed/1/head").await?
+            else {
+                self.cancel_gc(fence).await?;
+                return Err(VolumeError::new(
+                    VolumeErrorKind::Invalid,
+                    "collect Managed data: collection fence has no storage modification time",
+                ));
+            };
+            Some(
+                started_at
+                    .checked_sub(orphan_grace)
+                    .unwrap_or(SystemTime::UNIX_EPOCH),
+            )
+        };
         let mut live = LiveObjects::create(fence.owner)?;
-        self.visit_reachable_objects(fence.namespace_commit, |key, length| {
-            live.insert(&key, length)
-        })
+        self.visit_reachable_objects(
+            fence.namespace_commit,
+            fence.retention_horizon,
+            |key, length| live.insert(&key, length),
+        )
         .await?;
         live.seal()?;
-        let outcome = self.sweep(&mut live).await?;
+        let mut outcome = self.sweep(&mut live, delete_before).await?;
         self.finish_gc(fence).await?;
+        outcome.retained_from = fence.retention_horizon.cursor().sequence();
         Ok(outcome)
     }
 
-    async fn begin_gc(&self, resume: bool) -> Result<GcFence, VolumeError> {
+    async fn begin_gc(
+        &self,
+        resume: bool,
+        retain_from: Option<u64>,
+    ) -> Result<GcFence, VolumeError> {
         let (mut head, revision) = self.read_head().await?;
         let owner = OperationId::generate();
         let fence = match (resume, head.maintenance) {
-            (false, None) => GcFence {
-                owner,
-                namespace_commit: head.namespace_commit,
-            },
+            (false, None) => {
+                let retention_horizon = match retain_from {
+                    Some(sequence) => self.retention_horizon_at(&head, sequence).await?,
+                    None => head.retention_horizon,
+                };
+                let maintenance_generation = head
+                    .maintenance_generation
+                    .checked_add(1)
+                    .ok_or_else(|| corrupt("maintenance generation overflows"))?;
+                head.maintenance_generation = maintenance_generation;
+                GcFence {
+                    owner,
+                    namespace_commit: head.namespace_commit,
+                    retention_horizon,
+                    maintenance_generation,
+                }
+            }
             (false, Some(_)) => {
                 return Err(conflict(
                     "begin Managed data collection: another collection is active",
                 ));
             }
-            (true, Some(active)) if active.namespace_commit == head.namespace_commit => GcFence {
-                owner,
-                namespace_commit: active.namespace_commit,
-            },
+            (true, Some(active))
+                if active.namespace_commit == head.namespace_commit
+                    && active.maintenance_generation == head.maintenance_generation =>
+            {
+                GcFence { owner, ..active }
+            }
             (true, Some(_)) => {
                 return Err(corrupt(
                     "resume Managed data collection: fence cursor is invalid",
@@ -97,7 +160,11 @@ impl ManagedVolume {
         Ok(fence)
     }
 
-    async fn sweep(&self, live: &mut LiveObjects) -> Result<GcOutcome, VolumeError> {
+    async fn sweep(
+        &self,
+        live: &mut LiveObjects,
+        delete_before: Option<SystemTime>,
+    ) -> Result<GcOutcome, VolumeError> {
         let mut outcome = GcOutcome::default();
         let mut deleter = self
             .operator()
@@ -139,6 +206,23 @@ impl ManagedVolume {
                         }
                         None => {}
                     }
+                    if let Some(delete_before) = delete_before {
+                        let mut metadata = entry.metadata().clone();
+                        if metadata.last_modified().is_none() {
+                            metadata = self
+                                .operator()
+                                .stat(entry.path())
+                                .await
+                                .map_err(|_| unavailable("inspect Managed data object"))?;
+                        }
+                        let Some(last_modified) = metadata.last_modified().map(SystemTime::from)
+                        else {
+                            continue;
+                        };
+                        if last_modified > delete_before {
+                            continue;
+                        }
+                    }
                     deleter
                         .delete(entry.path())
                         .await
@@ -165,12 +249,30 @@ impl ManagedVolume {
                 "finish Managed data collection: collection fence changed",
             ));
         }
+        head.retention_horizon = fence.retention_horizon;
         head.maintenance = None;
         if self.replace_head(&revision, &head).await? {
             Ok(())
         } else {
             Err(conflict(
                 "finish Managed data collection: namespace authority changed",
+            ))
+        }
+    }
+
+    async fn cancel_gc(&self, fence: GcFence) -> Result<(), VolumeError> {
+        let (mut head, revision) = self.read_head().await?;
+        if head.maintenance != Some(fence) {
+            return Err(conflict(
+                "cancel Managed data collection: collection fence changed",
+            ));
+        }
+        head.maintenance = None;
+        if self.replace_head(&revision, &head).await? {
+            Ok(())
+        } else {
+            Err(conflict(
+                "cancel Managed data collection: namespace authority changed",
             ))
         }
     }

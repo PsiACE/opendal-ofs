@@ -17,6 +17,7 @@
 
 use futures::StreamExt as _;
 use opendal::{Buffer, ErrorKind, Operator};
+use std::time::SystemTime;
 
 use crate::filesystem::VolumeError;
 
@@ -167,6 +168,20 @@ pub(crate) async fn create_immutable(
         }
         Err(_) => Err(unavailable(
             "publish Managed data",
+            "object storage is unavailable",
+        )),
+    }
+}
+
+pub(crate) async fn last_modified(
+    operator: &Operator,
+    key: &str,
+) -> Result<Option<SystemTime>, VolumeError> {
+    match operator.stat(key).await {
+        Ok(metadata) => Ok(metadata.last_modified().map(Into::into)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(unavailable(
+            "inspect Managed data",
             "object storage is unavailable",
         )),
     }

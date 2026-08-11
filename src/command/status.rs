@@ -35,6 +35,7 @@ pub(super) fn run(args: StatusArgs) -> Result<()> {
             "{}",
             serde_json::json!({
                 "access_model": "sync",
+                "base_expired": state.base_expired(),
                 "conflicts": state.conflict_count(),
                 "common_sequence": state.common_revision().cursor().sequence(),
                 "common_operation": state.common_revision().cursor().operation().map(|operation| operation.to_string()),
@@ -55,13 +56,17 @@ pub(super) fn run(args: StatusArgs) -> Result<()> {
             })
         );
     } else {
-        println!(
+        print!(
             "managed sync volume {} at change {}, {} pending, {} conflict(s)",
             state.volume_id(),
             state.common_revision().cursor().sequence(),
             usize::from(state.has_pending()),
             state.conflict_count()
         );
+        if state.base_expired() {
+            print!(", base expiration detected");
+        }
+        println!();
     }
     Ok(())
 }
