@@ -31,7 +31,6 @@ use super::ManagedVolume;
 
 const IO_BUFFER_BYTES: usize = 256 * 1024;
 const UPLOAD_PART_BYTES: usize = 16 * 1024 * 1024;
-const UPLOAD_CONCURRENCY: usize = 4;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct WholeObject {
@@ -73,7 +72,6 @@ impl ManagedVolume {
             .writer_with(&key)
             .if_not_exists(true)
             .chunk(UPLOAD_PART_BYTES)
-            .concurrent(UPLOAD_CONCURRENCY)
             .await
             .map_err(|_| unavailable("publish local file"))?;
         let mut hasher = Hasher::new();
