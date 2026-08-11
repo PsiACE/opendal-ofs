@@ -195,12 +195,34 @@ pub(crate) async fn read_index<K, V>(
     root: &PageRef,
 ) -> Result<BTreeMap<K, V>, VolumeError>
 where
-    K: DeserializeOwned + Ord + Serialize,
+    K: Clone + DeserializeOwned + Ord + Serialize,
     V: DeserializeOwned,
 {
     let mut entries = BTreeMap::new();
+    visit_index(operator, root, |key, value| {
+        entries.insert(key, value);
+        Ok(())
+    })
+    .await?;
+    Ok(entries)
+}
+
+/// Visit an index in key order without materializing its records.
+pub(crate) async fn visit_index<K, V>(
+    operator: &Operator,
+    root: &PageRef,
+    mut visitor: impl FnMut(K, V) -> Result<(), VolumeError>,
+) -> Result<BTreeMap<crate::filesystem::Digest, u64>, VolumeError>
+where
+    K: Clone + DeserializeOwned + Ord + Serialize,
+    V: DeserializeOwned,
+{
     let mut visited = BTreeSet::new();
+    let mut objects = BTreeMap::new();
     let mut pending = vec![(root.clone(), 0_usize, true)];
+    let mut previous = None::<K>;
+    let mut first_key = None;
+    let mut last_key = None;
 
     while let Some((reference, depth, is_root)) = pending.pop() {
         if depth > MAX_TREE_DEPTH {
@@ -214,6 +236,15 @@ where
             return Err(corrupt(
                 "read Managed index",
                 "index page is referenced more than once",
+            ));
+        }
+        if objects
+            .insert(reference.section.object, reference.section.object_length)
+            .is_some_and(|length| length != reference.section.object_length)
+        {
+            return Err(corrupt(
+                "read Managed index",
+                "metadata container has conflicting lengths",
             ));
         }
 
@@ -243,18 +274,18 @@ where
                             "index key is not canonically encoded",
                         ));
                     }
-                    if entries
-                        .last_key_value()
-                        .is_some_and(|(previous, _)| previous >= &key)
-                    {
+                    if previous.as_ref().is_some_and(|previous| previous >= &key) {
                         return Err(corrupt(
                             "read Managed index",
                             "index leaf records are not strictly ordered",
                         ));
                     }
                     page_first.get_or_insert_with(|| key_bytes.clone());
-                    page_last = Some(key_bytes);
-                    entries.insert(key, value);
+                    first_key.get_or_insert_with(|| key_bytes.clone());
+                    page_last = Some(key_bytes.clone());
+                    last_key = Some(key_bytes);
+                    visitor(key.clone(), value)?;
+                    previous = Some(key);
                 }
                 if page_first.as_deref() != Some(reference.first_key.as_ref())
                     || page_last.as_deref() != Some(reference.last_key.as_ref())
@@ -287,7 +318,7 @@ where
         }
     }
 
-    if entries.is_empty() {
+    if previous.is_none() {
         if !root.first_key.is_empty() || !root.last_key.is_empty() {
             return Err(corrupt(
                 "read Managed index",
@@ -295,9 +326,8 @@ where
             ));
         }
     } else {
-        let first = encode_cbor(entries.first_key_value().expect("not empty").0)?;
-        let last = encode_cbor(entries.last_key_value().expect("not empty").0)?;
-        if first.as_slice() != root.first_key.as_ref() || last.as_slice() != root.last_key.as_ref()
+        if first_key.as_deref() != Some(root.first_key.as_ref())
+            || last_key.as_deref() != Some(root.last_key.as_ref())
         {
             return Err(corrupt(
                 "read Managed index",
@@ -305,7 +335,7 @@ where
             ));
         }
     }
-    Ok(entries)
+    Ok(objects)
 }
 
 fn group_items(items: Vec<PageItem>, minimum_items: usize) -> Vec<Vec<PageItem>> {

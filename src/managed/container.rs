@@ -139,8 +139,7 @@ impl<'a, T> ContainerWriter<'a, T> {
         }
         let object = Digest::from_bytes(blake3::hash(&bytes).into());
         let object_length = bytes.len() as u64;
-        object::create_immutable(self.operator, &container_key(object), Buffer::from(bytes))
-            .await?;
+        object::create_immutable(self.operator, &object_key(object), Buffer::from(bytes)).await?;
         self.bytes = 0;
         Ok(self
             .pending
@@ -169,7 +168,7 @@ pub(crate) async fn read_section(
         .checked_add(reference.length)
         .filter(|end| *end <= reference.object_length.saturating_sub(FOOTER_BYTES as u64))
         .ok_or_else(|| corrupt("read Managed metadata", "section range is invalid"))?;
-    let reader = match operator.reader(&container_key(reference.object)).await {
+    let reader = match operator.reader(&object_key(reference.object)).await {
         Ok(reader) => reader,
         Err(error) if error.kind() == ErrorKind::NotFound => {
             return Err(corrupt(
@@ -200,7 +199,7 @@ pub(crate) async fn read_section(
     Ok(bytes)
 }
 
-fn container_key(digest: Digest) -> String {
+pub(super) fn object_key(digest: Digest) -> String {
     let digest = blake3::Hash::from_bytes(*digest.as_bytes()).to_hex();
     format!(
         "managed/1/objects/meta/{}/{}",

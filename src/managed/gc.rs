@@ -15,17 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::BTreeMap;
+use std::fs::OpenOptions;
+use std::path::PathBuf;
 
 use futures::TryStreamExt as _;
+use rusqlite::{Connection, OptionalExtension as _, params};
 
-use crate::filesystem::{OperationId, VolumeError, VolumeErrorKind, VolumeSnapshot};
+use crate::filesystem::{OperationId, VolumeError, VolumeErrorKind};
 
 use super::ManagedVolume;
-use super::data::{whole_object, whole_object_key};
 use super::head::GcFence;
 
-const DATA_PREFIX: &str = "managed/1/objects/raw/";
+const OBJECT_PREFIX: &str = "managed/1/objects/";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct GcOutcome {
@@ -43,14 +44,18 @@ impl ManagedVolume {
                 "collect Managed data: storage lacks list or delete",
             ));
         }
-        let (fence, snapshot) = self.begin_gc(resume).await?;
-        let live = live_objects(&snapshot)?;
+        let fence = self.begin_gc(resume).await?;
+        let live = LiveObjects::create(fence.owner)?;
+        self.visit_reachable_objects(fence.namespace_commit, |key, length| {
+            live.insert(&key, length)
+        })
+        .await?;
         let outcome = self.sweep(&live).await?;
         self.finish_gc(fence).await?;
         Ok(outcome)
     }
 
-    async fn begin_gc(&self, resume: bool) -> Result<(GcFence, VolumeSnapshot), VolumeError> {
+    async fn begin_gc(&self, resume: bool) -> Result<GcFence, VolumeError> {
         let (mut head, revision) = self.read_head().await?;
         let owner = OperationId::generate();
         let fence = match (resume, head.maintenance) {
@@ -84,15 +89,14 @@ impl ManagedVolume {
                 "begin Managed data collection: namespace authority changed",
             ));
         }
-        let snapshot = self.snapshot_at(head.namespace_commit).await?;
-        Ok((fence, snapshot))
+        Ok(fence)
     }
 
-    async fn sweep(&self, live: &BTreeMap<String, u64>) -> Result<GcOutcome, VolumeError> {
+    async fn sweep(&self, live: &LiveObjects) -> Result<GcOutcome, VolumeError> {
         let mut outcome = GcOutcome::default();
         let mut lister = self
             .operator()
-            .lister_with(DATA_PREFIX)
+            .lister_with(OBJECT_PREFIX)
             .recursive(true)
             .await
             .map_err(|_| unavailable("list Managed data objects"))?;
@@ -111,10 +115,7 @@ impl ManagedVolume {
             }
             outcome.scanned += 1;
             let length = entry.metadata().content_length();
-            if let Some(expected) = live.get(entry.path()) {
-                if *expected != length {
-                    return Err(corrupt("live Managed object length is invalid"));
-                }
+            if live.contains(entry.path(), length)? {
                 continue;
             }
             deleter
@@ -152,34 +153,105 @@ impl ManagedVolume {
     }
 }
 
-fn live_objects(snapshot: &VolumeSnapshot) -> Result<BTreeMap<String, u64>, VolumeError> {
-    let mut live = BTreeMap::new();
-    for version in snapshot.file_versions.values() {
-        if let Some(object) = whole_object(version)? {
-            let key = whole_object_key(object.digest);
-            if live
-                .insert(key, object.length)
-                .is_some_and(|length| length != object.length)
-            {
-                return Err(corrupt("one Managed object has conflicting lengths"));
-            }
+struct LiveObjects {
+    connection: Option<Connection>,
+    path: PathBuf,
+}
+
+impl LiveObjects {
+    fn create(operation: OperationId) -> Result<Self, VolumeError> {
+        let path = std::env::temp_dir().join(format!("ofs-managed-gc-{operation}.sqlite"));
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|_| unavailable("create Managed collection mark store"))?;
+        let connection = Connection::open(&path)
+            .map_err(|_| unavailable("open Managed collection mark store"))?;
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; \
+                 CREATE TABLE live (key TEXT PRIMARY KEY, length BLOB NOT NULL) \
+                 STRICT, WITHOUT ROWID;",
+            )
+            .map_err(|_| unavailable("initialize Managed collection mark store"))?;
+        Ok(Self {
+            connection: Some(connection),
+            path,
+        })
+    }
+
+    fn insert(&self, key: &str, length: u64) -> Result<(), VolumeError> {
+        let encoded_length = length.to_be_bytes();
+        self.connection()
+            .execute(
+                "INSERT INTO live (key, length) VALUES (?1, ?2) ON CONFLICT(key) DO NOTHING",
+                params![key, encoded_length.as_slice()],
+            )
+            .map_err(|_| unavailable("write Managed collection mark"))?;
+        if self.length(key)? != Some(length) {
+            return Err(corrupt("one Managed object has conflicting lengths"));
+        }
+        Ok(())
+    }
+
+    fn contains(&self, key: &str, length: u64) -> Result<bool, VolumeError> {
+        match self.length(key)? {
+            Some(expected) if expected == length => Ok(true),
+            Some(_) => Err(corrupt("live Managed object length is invalid")),
+            None => Ok(false),
         }
     }
-    Ok(live)
+
+    fn length(&self, key: &str) -> Result<Option<u64>, VolumeError> {
+        let bytes = self
+            .connection()
+            .query_row("SELECT length FROM live WHERE key=?1", [key], |row| {
+                row.get::<_, Vec<u8>>(0)
+            })
+            .optional()
+            .map_err(|_| unavailable("read Managed collection mark"))?;
+        bytes
+            .map(|bytes| {
+                bytes
+                    .try_into()
+                    .map(u64::from_be_bytes)
+                    .map_err(|_| corrupt("Managed collection mark length is invalid"))
+            })
+            .transpose()
+    }
+
+    fn connection(&self) -> &Connection {
+        self.connection
+            .as_ref()
+            .expect("the mark store connection is open")
+    }
+}
+
+impl Drop for LiveObjects {
+    fn drop(&mut self) {
+        drop(self.connection.take());
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 fn valid_object_key(path: &str) -> bool {
-    path.strip_prefix(DATA_PREFIX).is_some_and(|suffix| {
-        let Some((prefix, digest)) = suffix.split_once('/') else {
-            return false;
-        };
-        prefix.len() == 2
-            && digest.len() == 64
-            && prefix == &digest[..2]
-            && digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-    })
+    let Some(suffix) = path.strip_prefix(OBJECT_PREFIX) else {
+        return false;
+    };
+    let Some((kind, suffix)) = suffix.split_once('/') else {
+        return false;
+    };
+    let Some((prefix, digest)) = suffix.split_once('/') else {
+        return false;
+    };
+    matches!(kind, "commit" | "meta" | "raw")
+        && prefix.len() == 2
+        && digest.len() == 64
+        && prefix == &digest[..2]
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 fn conflict(message: &'static str) -> VolumeError {

@@ -28,7 +28,7 @@ pub(super) async fn run(args: GcArgs) -> Result<()> {
     let volume = metadata.open_for_gc().await?;
     let outcome = volume.collect_unreachable(args.resume).await?;
     println!(
-        "collected managed volume {}: scanned {}, deleted {} segment(s), {} byte(s)",
+        "collected managed volume {}: scanned {}, deleted {} object(s), {} byte(s)",
         volume.id(),
         outcome.scanned,
         outcome.deleted,

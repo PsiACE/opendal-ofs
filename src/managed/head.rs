@@ -26,7 +26,7 @@ use crate::filesystem::{
 };
 
 use super::format::ManagedFormat;
-use super::index::{PageRef, read_index, write_index};
+use super::index::{PageRef, read_index, visit_index, write_index};
 use super::object;
 use super::record::Record;
 
@@ -253,13 +253,52 @@ impl ManagedVolume {
         .await
     }
 
-    pub(super) async fn snapshot_at(
+    pub(super) async fn visit_reachable_objects(
         &self,
         reference: NamespaceCommitRef,
-    ) -> Result<VolumeSnapshot, VolumeError> {
-        self.read_namespace(reference)
-            .await
-            .map(|stored| stored.snapshot)
+        mut visit: impl FnMut(String, u64) -> Result<(), VolumeError>,
+    ) -> Result<(), VolumeError> {
+        let commit = self.read_commit(reference).await?;
+        visit(commit_key(reference.digest), reference.encoded_length)?;
+
+        let containers = visit_index::<NodeId, NodeRecord>(
+            &self.operator,
+            &commit.node_index_root,
+            |_, node| {
+                if let Some(version) = node.file_version {
+                    if let Some(object) = super::data::whole_object(&FileVersion::new(version))? {
+                        visit(super::data::whole_object_key(object.digest), object.length)?;
+                    }
+                }
+                Ok(())
+            },
+        )
+        .await?;
+        visit_containers(containers, &mut visit)?;
+
+        let containers = visit_index::<DirectoryKey, DirectoryEntry>(
+            &self.operator,
+            &commit.directory_entry_index_root,
+            |_, _| Ok(()),
+        )
+        .await?;
+        visit_containers(containers, &mut visit)?;
+
+        let containers = visit_index::<ChangeCursor, ChangeRecord>(
+            &self.operator,
+            &commit.change_log_root,
+            |_, _| Ok(()),
+        )
+        .await?;
+        visit_containers(containers, &mut visit)?;
+
+        let containers = visit_index::<OperationId, OperationRecord>(
+            &self.operator,
+            &commit.operation_result_index_root,
+            |_, _| Ok(()),
+        )
+        .await?;
+        visit_containers(containers, &mut visit)
     }
 
     async fn write_namespace(
@@ -308,20 +347,7 @@ impl ManagedVolume {
         &self,
         reference: NamespaceCommitRef,
     ) -> Result<StoredNamespace, VolumeError> {
-        let length = usize::try_from(reference.encoded_length)
-            .ok()
-            .filter(|length| *length <= COMMIT_RECORD.maximum_encoded_bytes())
-            .ok_or_else(|| corrupt("namespace commit length is invalid"))?;
-        let bytes = object::read(&self.operator, &commit_key(reference.digest), length)
-            .await?
-            .ok_or_else(|| corrupt("namespace commit is missing"))?;
-        if bytes.len() != length || blake3::hash(&bytes).as_bytes() != &reference.digest {
-            return Err(corrupt("namespace commit does not match its reference"));
-        }
-        let commit: NamespaceCommit = COMMIT_RECORD.decode(&bytes)?;
-        if commit.volume_id != self.id() {
-            return Err(corrupt("namespace commit belongs to another volume"));
-        }
+        let commit = self.read_commit(reference).await?;
         let nodes: BTreeMap<NodeId, NodeRecord> =
             read_index(&self.operator, &commit.node_index_root).await?;
         let directory_entries: BTreeMap<DirectoryKey, DirectoryEntry> =
@@ -370,6 +396,37 @@ impl ManagedVolume {
             operations,
         })
     }
+
+    async fn read_commit(
+        &self,
+        reference: NamespaceCommitRef,
+    ) -> Result<NamespaceCommit, VolumeError> {
+        let length = usize::try_from(reference.encoded_length)
+            .ok()
+            .filter(|length| *length <= COMMIT_RECORD.maximum_encoded_bytes())
+            .ok_or_else(|| corrupt("namespace commit length is invalid"))?;
+        let bytes = object::read(&self.operator, &commit_key(reference.digest), length)
+            .await?
+            .ok_or_else(|| corrupt("namespace commit is missing"))?;
+        if bytes.len() != length || blake3::hash(&bytes).as_bytes() != &reference.digest {
+            return Err(corrupt("namespace commit does not match its reference"));
+        }
+        let commit: NamespaceCommit = COMMIT_RECORD.decode(&bytes)?;
+        if commit.volume_id != self.id() {
+            return Err(corrupt("namespace commit belongs to another volume"));
+        }
+        Ok(commit)
+    }
+}
+
+fn visit_containers(
+    containers: BTreeMap<crate::filesystem::Digest, u64>,
+    visit: &mut impl FnMut(String, u64) -> Result<(), VolumeError>,
+) -> Result<(), VolumeError> {
+    for (digest, length) in containers {
+        visit(super::container::object_key(digest), length)?;
+    }
+    Ok(())
 }
 
 fn empty_snapshot(format: ManagedFormat) -> VolumeSnapshot {
