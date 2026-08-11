@@ -19,6 +19,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;
 use std::path::Path;
 
+use futures::StreamExt as _;
+
 use crate::filesystem::{
     ChangeCursor, DirectoryEntry, DirectoryRecord, FileVersionId, Generation, NodeAttributes,
     NodeId, NodeKind, NodeRecord, OperationId, VolumeSnapshot,
@@ -72,17 +74,42 @@ pub(crate) async fn scan(
         ids.insert(path.clone(), node);
     }
 
+    let mut inspected = futures::stream::iter(
+        local
+            .iter()
+            .filter(|(_, entry)| entry.kind == NodeKind::RegularFile),
+    )
+    .map(|(path, _)| async move {
+        Ok::<_, SyncError>((path, volume.inspect_file(&root.join(path)).await?))
+    })
+    .buffer_unordered(32);
     let mut file_versions = BTreeMap::new();
     let mut file_by_path = BTreeMap::<String, FileVersionId>::new();
-    for (path, entry) in &local {
-        if entry.kind != NodeKind::RegularFile {
-            continue;
-        }
-        let version = volume.inspect_file(&root.join(path)).await?;
+    while let Some(result) = inspected.next().await {
+        let (path, version) = result?;
         file_by_path.insert(path.clone(), version.id);
         file_versions
             .entry(version.id)
             .or_insert_with(|| version.clone());
+    }
+
+    let mut entries_by_directory = ids
+        .iter()
+        .filter(|(path, _)| path.is_empty() || local[*path].kind == NodeKind::Directory)
+        .map(|(_, node)| (*node, BTreeMap::new()))
+        .collect::<BTreeMap<_, _>>();
+    for (child_path, child) in &local {
+        let (parent, name) = child_path.rsplit_once('/').unwrap_or(("", child_path));
+        entries_by_directory
+            .get_mut(&ids[parent])
+            .expect("a local entry's parent is a directory")
+            .insert(
+                name.to_owned(),
+                DirectoryEntry {
+                    node: ids[child_path],
+                    kind: child.kind,
+                },
+            );
     }
 
     let mut directories = BTreeMap::new();
@@ -95,19 +122,9 @@ pub(crate) async fn scan(
         if kind != NodeKind::Directory {
             continue;
         }
-        let mut entries = BTreeMap::new();
-        for (child_path, child) in &local {
-            let (parent, name) = child_path.rsplit_once('/').unwrap_or(("", child_path));
-            if parent == path {
-                entries.insert(
-                    name.to_owned(),
-                    DirectoryEntry {
-                        node: ids[child_path],
-                        kind: child.kind,
-                    },
-                );
-            }
-        }
+        let entries = entries_by_directory
+            .remove(node)
+            .expect("every local directory has an entry set");
         let generation = base
             .directories
             .get(node)

@@ -18,6 +18,8 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
+use futures::{StreamExt as _, TryStreamExt as _};
+
 use crate::filesystem::{NodeKind, VolumeSnapshot};
 use crate::managed::ManagedVolume;
 
@@ -320,21 +322,24 @@ impl SyncEngine {
         common: &VolumeSnapshot,
         target: &VolumeSnapshot,
     ) -> Result<(), SyncError> {
-        for (path, node_id) in target.paths()? {
-            let node = &target.nodes[&node_id];
-            if node.kind != NodeKind::RegularFile {
-                continue;
-            }
-            let version = node
-                .file_version
-                .and_then(|id| target.file_versions.get(&id))
-                .ok_or_else(|| SyncError::new("pending file has no file version"))?;
-            if common.file_versions.get(&version.id) == Some(version) {
-                continue;
-            }
-            self.volume.publish_file(&root.join(path), version).await?;
-        }
-        Ok(())
+        futures::stream::iter(target.paths()?)
+            .map(Ok::<_, SyncError>)
+            .try_for_each_concurrent(16, |(path, node_id)| async move {
+                let node = &target.nodes[&node_id];
+                if node.kind != NodeKind::RegularFile {
+                    return Ok(());
+                }
+                let version = node
+                    .file_version
+                    .and_then(|id| target.file_versions.get(&id))
+                    .ok_or_else(|| SyncError::new("pending file has no file version"))?;
+                if common.file_versions.get(&version.id) == Some(version) {
+                    return Ok(());
+                }
+                self.volume.publish_file(&root.join(path), version).await?;
+                Ok(())
+            })
+            .await
     }
 }
 
