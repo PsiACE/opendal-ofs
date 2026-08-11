@@ -131,7 +131,6 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
-      BUB_API_KEY: ${{ secrets.BUB_API_KEY }}
       BUB_MODEL: ${{ vars.BUB_MODEL || 'deepseek:deepseek-chat' }}
     steps:
       - uses: actions/checkout@v7
@@ -143,6 +142,8 @@ jobs:
           docker compose version
 
       - name: Synchronize Bub sessions and skills
+        env:
+          BUB_API_KEY: ${{ secrets.BUB_API_KEY }}
         run: cargo x e2e managed-sync-bub
 
   required:
