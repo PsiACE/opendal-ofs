@@ -15,21 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod gc;
-mod provider;
-mod status;
-mod sync;
-mod volume;
-
 use anyhow::Result;
+use ofs::managed::ManagedMetadata;
 
-use crate::cli::{Cli, Command};
+use crate::cli::{VolumeArgs, VolumeCommand, VolumeCreateArgs};
 
-pub(crate) async fn run(cli: Cli) -> Result<()> {
-    match cli.command {
-        Command::Gc(args) => gc::run(args).await,
-        Command::Sync(args) => sync::run(args).await,
-        Command::Status(args) => status::run(args),
-        Command::Volume(args) => volume::run(args).await,
+use super::provider::open_operator;
+
+pub(super) async fn run(args: VolumeArgs) -> Result<()> {
+    match args.command {
+        VolumeCommand::Create(args) => create(args).await,
     }
+}
+
+async fn create(args: VolumeCreateArgs) -> Result<()> {
+    debug_assert_eq!(args.model, "managed");
+    let metadata =
+        ManagedMetadata::object(open_operator(&args.storage, args.transfer_concurrency)?)?;
+    let volume = metadata.initialize().await?;
+    println!("created managed volume {}", volume.id());
+    Ok(())
 }

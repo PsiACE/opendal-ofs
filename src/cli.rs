@@ -35,12 +35,14 @@ pub(crate) enum Command {
     Sync(SyncArgs),
     /// Report the durable state of a local Managed Sync replica.
     Status(StatusArgs),
+    /// Create and inspect filesystem volumes.
+    Volume(VolumeArgs),
 }
 
 #[derive(Debug, Args)]
 pub(crate) struct GcArgs {
     /// OpenDAL storage URL. Provider credentials come from the environment.
-    #[arg(long, env = "OFS_STORAGE_URL", value_name = "URL")]
+    #[arg(env = "OFS_STORAGE_URL", value_name = "VOLUME")]
     pub(crate) storage: String,
 
     /// Resume an interrupted collection fence.
@@ -59,24 +61,16 @@ pub(crate) struct GcArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct SyncArgs {
+    /// OpenDAL storage URL of an existing Managed volume.
+    #[arg(env = "OFS_STORAGE_URL", value_name = "VOLUME")]
+    pub(crate) storage: String,
+
     /// Local directory used as the Sync replica.
     pub(crate) replica: PathBuf,
 
     /// Durable replica state stored outside the replica directory.
     #[arg(long, value_name = "PATH")]
     pub(crate) state: PathBuf,
-
-    /// OpenDAL storage URL. Provider credentials come from the environment.
-    #[arg(long, env = "OFS_STORAGE_URL", value_name = "URL")]
-    pub(crate) storage: String,
-
-    /// Create the Managed format if it does not exist.
-    #[arg(long)]
-    pub(crate) init: bool,
-
-    /// Namespace authority model. Required only with --init.
-    #[arg(long, value_parser = ["managed"], value_name = "MODEL")]
-    pub(crate) model: Option<String>,
 
     /// Resolve an existing conflict by publishing the current local path.
     #[arg(long, value_name = "RELATIVE-PATH")]
@@ -104,4 +98,36 @@ pub(crate) struct StatusArgs {
     /// Emit machine-readable status.
     #[arg(long)]
     pub(crate) json: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct VolumeArgs {
+    #[command(subcommand)]
+    pub(crate) command: VolumeCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum VolumeCommand {
+    /// Create a new volume in empty storage.
+    Create(VolumeCreateArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct VolumeCreateArgs {
+    /// OpenDAL storage URL. Provider credentials come from the environment.
+    #[arg(env = "OFS_STORAGE_URL", value_name = "VOLUME")]
+    pub(crate) storage: String,
+
+    /// Namespace authority model.
+    #[arg(long, value_parser = ["managed"], value_name = "MODEL")]
+    pub(crate) model: String,
+
+    /// Maximum concurrency for storage operations.
+    #[arg(
+        long,
+        env = "OFS_TRANSFER_CONCURRENCY",
+        default_value = "4",
+        value_name = "N"
+    )]
+    pub(crate) transfer_concurrency: NonZeroUsize,
 }

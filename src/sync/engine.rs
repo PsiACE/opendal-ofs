@@ -83,24 +83,39 @@ impl SyncEngine {
                 )
                 .await;
         }
-        let Some(mut state) = stored else {
-            if !resolved.is_empty() {
-                return Err(SyncError::new(
-                    "--resolve requires an unresolved conflict in replica state",
-                ));
+        let mut state = match stored {
+            Some(state) => state,
+            None if observed.snapshot.cursor == crate::filesystem::ChangeCursor::Genesis
+                && !directory_is_empty(&root)? =>
+            {
+                if !resolved.is_empty() {
+                    return Err(SyncError::new(
+                        "--resolve requires an unresolved conflict in replica state",
+                    ));
+                }
+                let state = ReplicaState::new(root.clone(), observed.snapshot.clone())?;
+                state.save_new(state_path)?;
+                state
             }
-            require_empty(&root)?;
-            let mut state =
-                ReplicaState::for_cold_install(root.clone(), observed.snapshot.clone())?;
-            state.save_new(state_path)?;
-            install(&root, None, &observed.snapshot, &self.volume).await?;
-            state.advance(observed.snapshot.clone(), scan_native(&root)?)?;
-            state.save(state_path)?;
-            return Ok(SyncOutcome {
-                conflicts: 0,
-                published: false,
-                sequence: observed.snapshot.cursor.sequence(),
-            });
+            None => {
+                if !resolved.is_empty() {
+                    return Err(SyncError::new(
+                        "--resolve requires an unresolved conflict in replica state",
+                    ));
+                }
+                require_empty(&root)?;
+                let mut state =
+                    ReplicaState::for_cold_install(root.clone(), observed.snapshot.clone())?;
+                state.save_new(state_path)?;
+                install(&root, None, &observed.snapshot, &self.volume).await?;
+                state.advance(observed.snapshot.clone(), scan_native(&root)?)?;
+                state.save(state_path)?;
+                return Ok(SyncOutcome {
+                    conflicts: 0,
+                    published: false,
+                    sequence: observed.snapshot.cursor.sequence(),
+                });
+            }
         };
         if state.has_pending_publication() {
             return self
@@ -345,12 +360,16 @@ const fn test_interrupt(_point: &str) -> Result<(), SyncError> {
 }
 
 fn require_empty(root: &Path) -> Result<(), SyncError> {
-    let mut entries = std::fs::read_dir(root)
-        .map_err(|error| SyncError::io("read cold replica directory", error))?;
-    if entries.next().is_some() {
+    if !directory_is_empty(root)? {
         return Err(SyncError::new(
             "a replica without state must use an empty local directory",
         ));
     }
     Ok(())
+}
+
+fn directory_is_empty(root: &Path) -> Result<bool, SyncError> {
+    let mut entries =
+        std::fs::read_dir(root).map_err(|error| SyncError::io("read replica directory", error))?;
+    Ok(entries.next().is_none())
 }

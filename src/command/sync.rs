@@ -26,7 +26,6 @@ use crate::cli::SyncArgs;
 use super::provider::open_operator;
 
 pub(super) async fn run(args: SyncArgs) -> Result<()> {
-    validate_options(&args)?;
     let root = fs::canonicalize(&args.replica)
         .with_context(|| format!("cannot open replica directory: {}", args.replica.display()))?;
     if !root.is_dir() {
@@ -35,14 +34,6 @@ pub(super) async fn run(args: SyncArgs) -> Result<()> {
 
     let metadata =
         ManagedMetadata::object(open_operator(&args.storage, args.transfer_concurrency)?)?;
-    if args.init {
-        let volume = metadata.initialize().await?;
-        let observed = volume.observe().await?;
-        ReplicaState::new(root, observed.snapshot)?.save_new(&args.state)?;
-        println!("initialized managed sync volume {}", volume.id());
-        return Ok(());
-    }
-
     let stored = ReplicaState::load(&args.state)?;
     let volume = match &stored {
         Some(state) => metadata.open(state.volume_id()).await?,
@@ -64,14 +55,4 @@ pub(super) async fn run(args: SyncArgs) -> Result<()> {
         if result.published { " (published)" } else { "" }
     );
     Ok(())
-}
-
-fn validate_options(args: &SyncArgs) -> Result<()> {
-    match (args.init, args.model.as_deref()) {
-        (true, Some("managed")) if args.resolve.is_empty() => Ok(()),
-        (false, None) => Ok(()),
-        (true, Some("managed")) => bail!("--resolve cannot be used with --init"),
-        (true, _) => bail!("--init requires --model managed"),
-        (false, Some(_)) => bail!("--model requires --init"),
-    }
 }

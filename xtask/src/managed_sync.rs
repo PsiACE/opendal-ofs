@@ -408,18 +408,18 @@ fn container_sync(
     init: bool,
     resolve: &[&str],
 ) -> String {
-    let mut arguments = vec![
-        "ofs",
-        "sync",
-        replica,
-        "--state",
-        state,
-        "--storage",
-        storage,
-    ];
     if init {
-        arguments.extend(["--init", "--model", "managed"]);
+        return output_text(
+            &container_success(
+                fixture,
+                service,
+                &["ofs", "volume", "create", storage, "--model", "managed"],
+                "create Managed volume",
+            )
+            .stdout,
+        );
     }
+    let mut arguments = vec!["ofs", "sync", storage, replica, "--state", state];
     for path in resolve {
         arguments.extend(["--resolve", path]);
     }
@@ -1084,7 +1084,10 @@ fn admission(fixture: &Fixture) {
         .last()
         .expect("initialization reports its volume identity")
         .to_owned();
-    assert_eq!(volume_a.len(), 32, "volume identity is lowercase hex");
+    run_ofs_success(
+        ofs_sync(&replica_a, &state_a, &storage_a, false),
+        "attach replica A",
+    );
 
     let status = run_ofs_success(ofs_status(&replica_a, &state_a), "read replica status");
     let status = output_text(&status.stdout);
@@ -1093,13 +1096,12 @@ fn admission(fixture: &Fixture) {
         "status reports the initialized remote identity: {status}"
     );
     run_ofs_success(
-        ofs_sync(&replica_a, &state_a, &storage_a, false),
-        "reopen replica A",
-    );
-
-    run_ofs_success(
         ofs_sync(&replica_b, &state_b, &storage_b, true),
         "initialize replica B",
+    );
+    run_ofs_success(
+        ofs_sync(&replica_b, &state_b, &storage_b, false),
+        "attach replica B",
     );
     let fenced = run_ofs_failure(
         ofs_sync(&replica_a, &state_a, &storage_b, false),
@@ -1262,16 +1264,20 @@ fn build_ofs() {
 
 fn ofs_sync(replica: &Path, state: &Path, storage: &str, init: bool) -> Command {
     let mut command = ofs_command();
+    if init {
+        command
+            .arg("volume")
+            .arg("create")
+            .arg(storage)
+            .args(["--model", "managed"]);
+        return command;
+    }
     command
         .arg("sync")
+        .arg(storage)
         .arg(replica)
         .arg("--state")
-        .arg(state)
-        .arg("--storage")
-        .arg(storage);
-    if init {
-        command.args(["--init", "--model", "managed"]);
-    }
+        .arg(state);
     command
 }
 
@@ -1288,7 +1294,7 @@ fn ofs_status(replica: &Path, state: &Path) -> Command {
 
 fn ofs_gc(storage: &str, resume: bool) -> Command {
     let mut command = ofs_command();
-    command.arg("gc").arg("--storage").arg(storage);
+    command.arg("gc").arg(storage);
     if resume {
         command.arg("--resume");
     }

@@ -116,7 +116,7 @@ impl ReplicaState {
     pub fn save_new(&self, path: &Path) -> Result<(), SyncError> {
         if path.exists() {
             return Err(SyncError::new(format!(
-                "--init requires a new replica state: {}",
+                "cannot attach with an existing replica state: {}",
                 path.display()
             )));
         }
