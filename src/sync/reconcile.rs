@@ -31,6 +31,27 @@ pub(crate) struct ReconcilePlan {
     pub(crate) publish: bool,
 }
 
+pub(crate) fn changed_paths(
+    base: &VolumeSnapshot,
+    side: &VolumeSnapshot,
+) -> Result<BTreeSet<String>, SyncError> {
+    let base_paths = base.paths()?;
+    let side_paths = side.paths()?;
+    Ok(base_paths
+        .keys()
+        .chain(side_paths.keys())
+        .filter(|path| {
+            !same_entry(
+                base,
+                base_paths.get(*path).copied(),
+                side,
+                side_paths.get(*path).copied(),
+            )
+        })
+        .cloned()
+        .collect())
+}
+
 #[derive(Clone, Copy)]
 enum Source {
     Local,

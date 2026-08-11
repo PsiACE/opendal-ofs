@@ -24,7 +24,7 @@ use crate::filesystem::{ChangeCursor, NodeKind, VolumeSnapshot};
 use crate::managed::{ManagedObservation, ManagedVolume, NamespaceRevision};
 
 use super::install::{install, repair};
-use super::reconcile::reconcile;
+use super::reconcile::{changed_paths, reconcile};
 use super::scan::scan;
 use super::{ReplicaState, SyncError};
 
@@ -132,7 +132,15 @@ impl SyncEngine {
                 .await;
         }
 
-        let base = self.volume.snapshot(state.common_revision()).await?;
+        let Some(base) = self
+            .volume
+            .snapshot_if_present(state.common_revision())
+            .await?
+        else {
+            return self
+                .conservative_rebase(&root, state_path, state, observed, &resolved)
+                .await;
+        };
         let local = scan(&root, &base, &self.volume).await?;
         let local_changed = local.snapshot.cursor != base.cursor;
         let remote_changed = observed.revision() != state.common_revision();
@@ -255,6 +263,55 @@ impl SyncEngine {
         Ok(SyncOutcome {
             conflicts: 0,
             published,
+            sequence: target.cursor().sequence(),
+        })
+    }
+
+    async fn conservative_rebase(
+        &self,
+        root: &Path,
+        state_path: &Path,
+        mut state: ReplicaState,
+        observed: ManagedObservation,
+        resolved: &BTreeSet<String>,
+    ) -> Result<SyncOutcome, SyncError> {
+        let local = scan(root, &observed.snapshot, &self.volume).await?;
+        let ambiguous = changed_paths(&observed.snapshot, &local.snapshot)?;
+        if ambiguous.is_empty() {
+            state.advance(observed.revision());
+            state.save(state_path)?;
+            return Ok(SyncOutcome {
+                conflicts: 0,
+                published: false,
+                sequence: observed.snapshot.cursor.sequence(),
+            });
+        }
+        if resolved != &ambiguous {
+            let conflicts = ambiguous.len();
+            state.retain_conflicts(conflicts, observed.revision());
+            state.save(state_path)?;
+            return Ok(SyncOutcome {
+                conflicts,
+                published: false,
+                sequence: state.common_revision().cursor().sequence(),
+            });
+        }
+
+        self.publish_target_files(root, &observed.snapshot, &local.snapshot)
+            .await?;
+        let target = self
+            .volume
+            .prepare_publication(&observed, local.snapshot)
+            .await?;
+        state.begin_publication(observed.revision(), target)?;
+        state.save(state_path)?;
+        self.volume.commit_publication(&observed, target).await?;
+        test_interrupt("after-publish")?;
+        state.advance(target);
+        state.save(state_path)?;
+        Ok(SyncOutcome {
+            conflicts: 0,
+            published: true,
             sequence: target.cursor().sequence(),
         })
     }

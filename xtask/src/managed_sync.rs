@@ -746,12 +746,15 @@ fn history(fixture: &Fixture) {
     let replica_a = root.path.join("replica-a");
     let replica_b = root.path.join("replica-b");
     let replica_c = root.path.join("replica-c");
+    let replica_expired = root.path.join("replica-expired");
     let state_a = root.path.join("state-a");
     let state_b = root.path.join("state-b");
     let state_c = root.path.join("state-c");
+    let state_expired = root.path.join("state-expired");
     fs::create_dir_all(&replica_a).expect("create history replica A");
     fs::create_dir_all(&replica_b).expect("create history replica B");
     fs::create_dir_all(&replica_c).expect("create history replica C");
+    fs::create_dir_all(&replica_expired).expect("create expired history replica");
     let storage = fixture.storage_url("history");
 
     run_ofs_success(ofs_volume_create(&storage), "create history volume");
@@ -764,6 +767,10 @@ fn history(fixture: &Fixture) {
         ofs_sync(&replica_b, &state_b, &storage),
         "attach lagging history replica",
     );
+    run_ofs_success(
+        ofs_sync(&replica_expired, &state_expired, &storage),
+        "attach history replica that will pass the retention floor",
+    );
 
     for generation in 1..=32 {
         fs::write(replica_a.join("cursor.txt"), format!("{generation}\n"))
@@ -773,10 +780,49 @@ fn history(fixture: &Fixture) {
             "publish history generation",
         );
     }
+    run_ofs_success(
+        ofs_gc(&storage, false),
+        "collect at history retention boundary",
+    );
 
     run_ofs_success(
         ofs_sync(&replica_b, &state_b, &storage),
         "catch up lagging history replica",
+    );
+    fs::write(replica_a.join("cursor.txt"), b"33\n").expect("advance beyond history retention");
+    run_ofs_success(
+        ofs_sync(&replica_a, &state_a, &storage),
+        "publish beyond history retention",
+    );
+    run_ofs_success(ofs_gc(&storage, false), "collect expired history base");
+    fs::write(replica_expired.join("cursor.txt"), b"expired-local\n")
+        .expect("write change on expired history base");
+    run_ofs_failure(
+        ofs_sync(&replica_expired, &state_expired, &storage),
+        "report conservative conflict after history expiry",
+    );
+    let expired_status = ManagedStatus::parse(output_text(
+        &run_ofs_success(
+            ofs_status(&replica_expired, &state_expired),
+            "read expired history status",
+        )
+        .stdout,
+    ));
+    assert!(
+        expired_status.conflicts != 0,
+        "a replica beyond the retained floor reports an ambiguous local difference"
+    );
+    run_ofs_success(
+        ofs_sync_resolve(&replica_expired, &state_expired, &storage, &["cursor.txt"]),
+        "resolve conservative history conflict",
+    );
+    run_ofs_success(
+        ofs_sync(&replica_a, &state_a, &storage),
+        "install resolved expired history change",
+    );
+    run_ofs_success(
+        ofs_sync(&replica_b, &state_b, &storage),
+        "install post-boundary history changes",
     );
     run_ofs_success(
         ofs_sync(&replica_c, &state_c, &storage),
@@ -785,7 +831,7 @@ fn history(fixture: &Fixture) {
     assert_eq!(
         tree_fingerprint(&replica_a),
         tree_fingerprint(&replica_b),
-        "a lagging replica catches up across retained publication history"
+        "a replica at the retention boundary catches up and later converges"
     );
     assert_eq!(
         tree_fingerprint(&replica_a),
@@ -796,6 +842,7 @@ fn history(fixture: &Fixture) {
         (&replica_a, &state_a),
         (&replica_b, &state_b),
         (&replica_c, &state_c),
+        (&replica_expired, &state_expired),
     ] {
         let status = ManagedStatus::parse(output_text(
             &run_ofs_success(ofs_status(replica, state), "read converged history status").stdout,

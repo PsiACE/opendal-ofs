@@ -310,6 +310,15 @@ impl ManagedVolume {
             .map(|stored| stored.snapshot)
     }
 
+    pub async fn snapshot_if_present(
+        &self,
+        revision: NamespaceRevision,
+    ) -> Result<Option<VolumeSnapshot>, VolumeError> {
+        self.read_namespace_if_present(revision)
+            .await
+            .map(|stored| stored.map(|stored| stored.snapshot))
+    }
+
     pub async fn operation_committed(
         &self,
         operation: OperationId,
@@ -487,6 +496,23 @@ impl ManagedVolume {
         reference: NamespaceRevision,
     ) -> Result<StoredNamespace, VolumeError> {
         let commit = self.read_commit(reference).await?;
+        self.read_namespace_indexes(commit).await
+    }
+
+    async fn read_namespace_if_present(
+        &self,
+        reference: NamespaceRevision,
+    ) -> Result<Option<StoredNamespace>, VolumeError> {
+        let Some(commit) = self.read_commit_if_present(reference).await? else {
+            return Ok(None);
+        };
+        self.read_namespace_indexes(commit).await.map(Some)
+    }
+
+    async fn read_namespace_indexes(
+        &self,
+        commit: NamespaceCommit,
+    ) -> Result<StoredNamespace, VolumeError> {
         let (nodes, node_objects): (BTreeMap<NodeId, NodeRecord>, _) =
             read_index(&self.operator, &commit.node_index_root).await?;
         let (directory_entries, directory_entry_objects): (
@@ -551,13 +577,25 @@ impl ManagedVolume {
         &self,
         reference: NamespaceRevision,
     ) -> Result<NamespaceCommit, VolumeError> {
+        self.read_commit_if_present(reference)
+            .await?
+            .ok_or_else(|| corrupt("namespace commit is missing"))
+    }
+
+    async fn read_commit_if_present(
+        &self,
+        reference: NamespaceRevision,
+    ) -> Result<Option<NamespaceCommit>, VolumeError> {
         let length = usize::try_from(reference.encoded_length)
             .ok()
             .filter(|length| *length <= COMMIT_RECORD.maximum_encoded_bytes())
             .ok_or_else(|| corrupt("namespace commit length is invalid"))?;
         let bytes = object::read(&self.operator, &commit_key(reference.commit), length)
             .await?
-            .ok_or_else(|| corrupt("namespace commit is missing"))?;
+            .map_or_else(|| Ok(None), |bytes| Ok(Some(bytes)))?;
+        let Some(bytes) = bytes else {
+            return Ok(None);
+        };
         if bytes.len() != length || blake3::hash(&bytes).as_bytes() != reference.commit.as_bytes() {
             return Err(corrupt("namespace commit does not match its reference"));
         }
@@ -570,7 +608,7 @@ impl ManagedVolume {
                 "namespace commit cursor does not match its reference",
             ));
         }
-        Ok(commit)
+        Ok(Some(commit))
     }
 }
 
