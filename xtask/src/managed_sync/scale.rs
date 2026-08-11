@@ -297,6 +297,12 @@ impl Side {
 }
 
 fn generate_initial(profile: Profile, root: &Path) {
+    if matches!(profile, Profile::TinyFiles) {
+        for directory in ["created/a", "created/b", "renamed/a", "renamed/b"] {
+            fs::create_dir_all(root.join(directory))
+                .expect("create shared scale mutation directory");
+        }
+    }
     let mut buffer = vec![0; STREAM_BUFFER_SIZE];
     let mut previous_parent = PathBuf::new();
     for index in 0..profile.file_count() {
