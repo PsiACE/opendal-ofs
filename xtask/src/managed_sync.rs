@@ -513,18 +513,11 @@ fn container_success(fixture: &Fixture, service: &str, arguments: &[&str], actio
 }
 
 fn json_u64(document: &str, field: &str) -> u64 {
-    let marker = format!("\"{field}\":");
-    let value = document
-        .split_once(&marker)
-        .map(|(_, suffix)| suffix)
-        .expect("status contains expected numeric field")
-        .trim_start();
-    value
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect::<String>()
-        .parse()
-        .expect("status numeric field is an integer")
+    let status: serde_json::Value = serde_json::from_str(document).expect("status is valid JSON");
+    status
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_else(|| panic!("status field {field} is an unsigned integer"))
 }
 
 fn tree_contains(root: &Path, needle: &[u8]) -> bool {
@@ -1222,7 +1215,15 @@ fn tree_fingerprint(root: &Path) -> blake3::Hash {
         } else {
             fingerprint.update(b"f");
             fingerprint.update(&[u8::from(is_executable(&metadata))]);
-            fingerprint.update(&fs::read(path).expect("read behavior file"));
+            let mut file = fs::File::open(path).expect("open behavior file");
+            let mut buffer = [0; 1024 * 1024];
+            loop {
+                let read = file.read(&mut buffer).expect("read behavior file");
+                if read == 0 {
+                    break;
+                }
+                fingerprint.update(&buffer[..read]);
+            }
         }
     }
     fingerprint.finalize()
