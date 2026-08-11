@@ -375,7 +375,7 @@ fn bub_statuses(fixture: &Fixture) -> [ManagedStatus; 4] {
 
 fn skill_creation_prompt(name: &str, marker: &str) -> String {
     format!(
-        "Use $skill-creator to create the project skill {name}. Write its valid SKILL.md directly under the standard project skills directory. Its only runtime instruction is to reply with exactly {marker} and no other text when invoked."
+        "Use $skill-creator to create the project skill {name}. Create exactly /workspace/.agents/skills/{name}/SKILL.md; do not use the legacy .agent/skills path. Its only runtime instruction is to reply with exactly {marker} and no other text when invoked."
     )
 }
 

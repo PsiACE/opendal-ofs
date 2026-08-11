@@ -26,7 +26,8 @@ RUN cargo install --locked --path . --root /opt/ofs
 
 FROM python:3.13-slim-bookworm
 ARG BUB_VERSION=0.4.0
-RUN python -m pip install --no-cache-dir "bub==${BUB_VERSION}"
+ARG UV_VERSION=0.6.14
+RUN python -m pip install --no-cache-dir "bub==${BUB_VERSION}" "uv==${UV_VERSION}"
 COPY --from=ofs-builder /opt/ofs/bin/ofs /usr/local/bin/ofs
 
 ENV BUB_HOME=/sync/sessions \
