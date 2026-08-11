@@ -49,7 +49,7 @@ pub(super) async fn run(args: SyncArgs) -> Result<()> {
         Some(state) => metadata.open(state.volume_id()).await?,
         None => metadata.open_unbound().await?,
     };
-    let result = SyncEngine::new(volume.clone())
+    let result = SyncEngine::new(volume.clone(), args.transfer_concurrency)
         .sync(&root, &args.state, &args.resolve)
         .await?;
     if result.conflicts != 0 {

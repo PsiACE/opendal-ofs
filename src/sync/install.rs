@@ -19,6 +19,8 @@ use std::collections::BTreeSet;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
+use futures::{StreamExt as _, TryStreamExt as _};
+
 use crate::filesystem::{NodeKind, VolumeSnapshot};
 use crate::managed::ManagedVolume;
 
@@ -29,8 +31,9 @@ pub(crate) async fn install(
     current: Option<&VolumeSnapshot>,
     target: &VolumeSnapshot,
     volume: &ManagedVolume,
+    transfer_concurrency: usize,
 ) -> Result<(), SyncError> {
-    apply(root, current, target, volume, false).await
+    apply(root, current, target, volume, transfer_concurrency, false).await
 }
 
 /// Repair an interrupted installation from the current authoritative snapshot.
@@ -38,8 +41,9 @@ pub(crate) async fn repair(
     root: &Path,
     target: &VolumeSnapshot,
     volume: &ManagedVolume,
+    transfer_concurrency: usize,
 ) -> Result<(), SyncError> {
-    apply(root, None, target, volume, true).await
+    apply(root, None, target, volume, transfer_concurrency, true).await
 }
 
 async fn apply(
@@ -47,6 +51,7 @@ async fn apply(
     current: Option<&VolumeSnapshot>,
     target: &VolumeSnapshot,
     volume: &ManagedVolume,
+    transfer_concurrency: usize,
     authoritative: bool,
 ) -> Result<(), SyncError> {
     let target_paths = target.paths()?;
@@ -100,6 +105,7 @@ async fn apply(
         }
     }
 
+    let mut files = Vec::new();
     for (path, node_id) in &target_paths {
         let node = &target.nodes[node_id];
         if node.kind != NodeKind::RegularFile {
@@ -132,12 +138,21 @@ async fn apply(
             durability.changed_parent(&destination);
             test_interrupt()?;
         }
-        volume.materialize_file(version, &destination).await?;
-        set_executable(&destination, node.attributes.executable)?;
-        sync_file(&destination)?;
-        durability.changed_parent(&destination);
-        test_interrupt()?;
+        files.push((destination, version.clone(), node.attributes.executable));
     }
+    futures::stream::iter(files)
+        .map(Ok::<_, SyncError>)
+        .try_for_each_concurrent(
+            transfer_concurrency,
+            |(destination, version, executable)| async move {
+                volume.materialize_file(&version, &destination).await?;
+                set_executable(&destination, executable)?;
+                sync_file(&destination)?;
+                test_interrupt()?;
+                Ok(())
+            },
+        )
+        .await?;
     durability.sync()?;
     Ok(())
 }

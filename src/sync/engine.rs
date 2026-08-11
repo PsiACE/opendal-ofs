@@ -16,6 +16,7 @@
 // under the License.
 
 use std::collections::BTreeSet;
+use std::num::NonZeroUsize;
 use std::path::Path;
 
 use futures::{StreamExt as _, TryStreamExt as _};
@@ -36,12 +37,16 @@ pub struct SyncOutcome {
 }
 
 pub struct SyncEngine {
+    transfer_concurrency: usize,
     volume: ManagedVolume,
 }
 
 impl SyncEngine {
-    pub const fn new(volume: ManagedVolume) -> Self {
-        Self { volume }
+    pub const fn new(volume: ManagedVolume, transfer_concurrency: NonZeroUsize) -> Self {
+        Self {
+            transfer_concurrency: transfer_concurrency.get(),
+            volume,
+        }
     }
 
     pub async fn sync(
@@ -116,7 +121,14 @@ impl SyncEngine {
                     observed.revision(),
                 );
                 state.save_new(state_path)?;
-                install(&root, None, &observed.snapshot, &self.volume).await?;
+                install(
+                    &root,
+                    None,
+                    &observed.snapshot,
+                    &self.volume,
+                    self.transfer_concurrency,
+                )
+                .await?;
                 state.advance(observed.revision());
                 state.save(state_path)?;
                 return Ok(SyncOutcome {
@@ -243,7 +255,13 @@ impl SyncEngine {
         if !observed.retains(target) {
             state.begin_install(observed.revision(), false);
             state.save(state_path)?;
-            repair(root, &observed.snapshot, &self.volume).await?;
+            repair(
+                root,
+                &observed.snapshot,
+                &self.volume,
+                self.transfer_concurrency,
+            )
+            .await?;
             state.advance(observed.revision());
             state.save(state_path)?;
             return Ok(SyncOutcome {
@@ -255,7 +273,7 @@ impl SyncEngine {
         let snapshot = self.volume.snapshot(target).await?;
         state.begin_install(target, published);
         state.save(state_path)?;
-        repair(root, &snapshot, &self.volume).await?;
+        repair(root, &snapshot, &self.volume, self.transfer_concurrency).await?;
         state.advance(target);
         state.save(state_path)?;
         if observed.revision() != target {
@@ -340,7 +358,14 @@ impl SyncEngine {
     ) -> Result<SyncOutcome, SyncError> {
         state.begin_install(target_revision, published);
         state.save(state_path)?;
-        install(root, current, target, &self.volume).await?;
+        install(
+            root,
+            current,
+            target,
+            &self.volume,
+            self.transfer_concurrency,
+        )
+        .await?;
         state.advance(target_revision);
         state.save(state_path)?;
         Ok(SyncOutcome {
@@ -408,7 +433,7 @@ impl SyncEngine {
     ) -> Result<(), SyncError> {
         futures::stream::iter(target.paths()?)
             .map(Ok::<_, SyncError>)
-            .try_for_each_concurrent(16, |(path, node_id)| async move {
+            .try_for_each_concurrent(self.transfer_concurrency, |(path, node_id)| async move {
                 let node = &target.nodes[&node_id];
                 if node.kind != NodeKind::RegularFile {
                     return Ok(());
