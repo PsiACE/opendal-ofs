@@ -26,8 +26,11 @@ use crate::filesystem::{
     VolumeSnapshot,
 };
 
+use super::container::{self, SectionRef};
 use super::format::ManagedFormat;
-use super::index::{PageRef, read_index, visit_index, write_index, write_index_reusing};
+use super::index::{
+    IndexVisitor, PageRef, read_index, visit_index_once, write_index, write_index_reusing,
+};
 use super::object;
 use super::record::Record;
 
@@ -151,6 +154,44 @@ struct IndexObjects {
     directory_entries: BTreeMap<crate::filesystem::Digest, u64>,
     changes: BTreeMap<crate::filesystem::Digest, u64>,
     operations: BTreeMap<crate::filesystem::Digest, u64>,
+}
+
+#[derive(Clone, Copy)]
+#[repr(u8)]
+pub(super) enum IndexKind {
+    Nodes,
+    DirectoryEntries,
+    ChangeLog,
+    OperationResults,
+}
+
+struct ReachableIndexVisitor<'a, S, R> {
+    kind: IndexKind,
+    sections: &'a mut S,
+    objects: &'a mut dyn FnMut(String, u64) -> Result<(), VolumeError>,
+    records: R,
+}
+
+impl<K, V, S, R> IndexVisitor<K, V> for ReachableIndexVisitor<'_, S, R>
+where
+    S: FnMut(IndexKind, SectionRef) -> Result<bool, VolumeError>,
+    R: FnMut(
+        &mut dyn FnMut(String, u64) -> Result<(), VolumeError>,
+        K,
+        V,
+    ) -> Result<(), VolumeError>,
+{
+    fn visit_section(&mut self, section: SectionRef) -> Result<bool, VolumeError> {
+        let first_visit = (self.sections)(self.kind, section)?;
+        if first_visit {
+            (self.objects)(container::object_key(section.object), section.object_length)?;
+        }
+        Ok(first_visit)
+    }
+
+    fn visit_record(&mut self, key: K, value: V) -> Result<(), VolumeError> {
+        (self.records)(self.objects, key, value)
+    }
 }
 
 impl ManagedVolume {
@@ -392,6 +433,7 @@ impl ManagedVolume {
         reference: NamespaceRevision,
         retention_horizon: NamespaceRevision,
         mut visit: impl FnMut(String, u64) -> Result<(), VolumeError>,
+        mut visit_section: impl FnMut(IndexKind, SectionRef) -> Result<bool, VolumeError>,
     ) -> Result<(), VolumeError> {
         let mut current = Some(reference);
         loop {
@@ -401,10 +443,13 @@ impl ManagedVolume {
             let commit = self.read_commit(reference).await?;
             visit(commit_key(reference.commit), reference.encoded_length)?;
 
-            let containers = visit_index::<NodeId, NodeRecord>(
-                &self.operator,
-                &commit.node_index_root,
-                |_, node| {
+            let mut index_visitor = ReachableIndexVisitor {
+                kind: IndexKind::Nodes,
+                sections: &mut visit_section,
+                objects: &mut visit,
+                records: |visit: &mut dyn FnMut(String, u64) -> Result<(), VolumeError>,
+                          _: NodeId,
+                          node: NodeRecord| {
                     if let Some(version) = node.file_version
                         && let Some(object) = super::data::whole_object(&FileVersion::new(version))?
                     {
@@ -412,33 +457,48 @@ impl ManagedVolume {
                     }
                     Ok(())
                 },
-            )
-            .await?;
-            visit_containers(containers, &mut visit)?;
+            };
+            visit_index_once(&self.operator, &commit.node_index_root, &mut index_visitor).await?;
 
-            let containers = visit_index::<DirectoryKey, DirectoryEntry>(
+            let mut index_visitor = ReachableIndexVisitor {
+                kind: IndexKind::DirectoryEntries,
+                sections: &mut visit_section,
+                objects: &mut visit,
+                records: |_: &mut dyn FnMut(String, u64) -> Result<(), VolumeError>,
+                          _: DirectoryKey,
+                          _: DirectoryEntry| Ok(()),
+            };
+            visit_index_once(
                 &self.operator,
                 &commit.directory_entry_index_root,
-                |_, _| Ok(()),
+                &mut index_visitor,
             )
             .await?;
-            visit_containers(containers, &mut visit)?;
 
-            let containers = visit_index::<ChangeCursor, ChangeRecord>(
-                &self.operator,
-                &commit.change_log_root,
-                |_, _| Ok(()),
-            )
-            .await?;
-            visit_containers(containers, &mut visit)?;
+            let mut index_visitor = ReachableIndexVisitor {
+                kind: IndexKind::ChangeLog,
+                sections: &mut visit_section,
+                objects: &mut visit,
+                records: |_: &mut dyn FnMut(String, u64) -> Result<(), VolumeError>,
+                          _: ChangeCursor,
+                          _: ChangeRecord| Ok(()),
+            };
+            visit_index_once(&self.operator, &commit.change_log_root, &mut index_visitor).await?;
 
-            let containers = visit_index::<OperationId, OperationRecord>(
+            let mut index_visitor = ReachableIndexVisitor {
+                kind: IndexKind::OperationResults,
+                sections: &mut visit_section,
+                objects: &mut visit,
+                records: |_: &mut dyn FnMut(String, u64) -> Result<(), VolumeError>,
+                          _: OperationId,
+                          _: OperationRecord| Ok(()),
+            };
+            visit_index_once(
                 &self.operator,
                 &commit.operation_result_index_root,
-                |_, _| Ok(()),
+                &mut index_visitor,
             )
             .await?;
-            visit_containers(containers, &mut visit)?;
             if reference == retention_horizon {
                 break;
             }
@@ -690,16 +750,6 @@ impl ManagedVolume {
         }
         Ok(Some(commit))
     }
-}
-
-fn visit_containers(
-    containers: BTreeMap<crate::filesystem::Digest, u64>,
-    visit: &mut impl FnMut(String, u64) -> Result<(), VolumeError>,
-) -> Result<(), VolumeError> {
-    for (digest, length) in containers {
-        visit(super::container::object_key(digest), length)?;
-    }
-    Ok(())
 }
 
 fn empty_snapshot(format: ManagedFormat) -> VolumeSnapshot {

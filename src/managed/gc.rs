@@ -17,7 +17,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read as _, Write as _};
+use std::io::{BufReader, BufWriter, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -26,13 +26,17 @@ use futures::TryStreamExt as _;
 use crate::filesystem::{OperationId, VolumeError, VolumeErrorKind};
 
 use super::ManagedVolume;
-use super::head::GcFence;
+use super::container::SectionRef;
+use super::head::{GcFence, IndexKind};
 use super::object;
 
 const OBJECT_PREFIX: &str = "managed/1/objects/";
 const INITIAL_PARTITIONS: usize = 256;
 const MAX_UNIQUE_MARKS_PER_PARTITION: usize = 64 * 1024;
 const MARK_RECORD_BYTES: usize = 1 + 32 + 8;
+const SECTION_RECORD_BYTES: usize = 1 + 32 + 8 + 8 + 8 + 32 + 1;
+const SECTION_SLOT_BYTES: usize = 1 + SECTION_RECORD_BYTES;
+const INITIAL_SECTION_CAPACITY: u64 = 4 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct GcOutcome {
@@ -91,10 +95,12 @@ impl ManagedVolume {
             )
         };
         let mut live = LiveObjects::create(fence.owner)?;
+        let mut sections = ExactSections::create(&live.directory)?;
         self.visit_reachable_objects(
             fence.namespace_commit,
             fence.retention_horizon,
             |key, length| live.insert(&key, length),
+            |kind, section| sections.insert(kind, section),
         )
         .await?;
         live.seal()?;
@@ -275,6 +281,161 @@ impl ManagedVolume {
                 "cancel Managed data collection: namespace authority changed",
             ))
         }
+    }
+}
+
+struct ExactSections {
+    path: PathBuf,
+    file: File,
+    capacity: u64,
+    entries: u64,
+    generation: u64,
+}
+
+impl ExactSections {
+    fn create(directory: &Path) -> Result<Self, VolumeError> {
+        let path = directory.join("sections-0000000000000000");
+        let file = Self::create_table(&path, INITIAL_SECTION_CAPACITY)?;
+        Ok(Self {
+            path,
+            file,
+            capacity: INITIAL_SECTION_CAPACITY,
+            entries: 0,
+            generation: 0,
+        })
+    }
+
+    fn insert(&mut self, kind: IndexKind, section: SectionRef) -> Result<bool, VolumeError> {
+        let identity = SectionIdentity::new(kind, section);
+        if !Self::insert_into(&mut self.file, self.capacity, identity)? {
+            return Ok(false);
+        }
+        self.entries = self
+            .entries
+            .checked_add(1)
+            .ok_or_else(|| corrupt("Managed collection section count overflows"))?;
+        if self.entries.saturating_mul(10) >= self.capacity.saturating_mul(7) {
+            self.grow()?;
+        }
+        Ok(true)
+    }
+
+    fn create_table(path: &Path, capacity: u64) -> Result<File, VolumeError> {
+        if !capacity.is_power_of_two() {
+            return Err(corrupt("Managed collection section capacity is invalid"));
+        }
+        let length = capacity
+            .checked_mul(SECTION_SLOT_BYTES as u64)
+            .ok_or_else(|| corrupt("Managed collection section table length overflows"))?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|_| unavailable("create Managed collection section table"))?;
+        file.set_len(length)
+            .map_err(|_| unavailable("size Managed collection section table"))?;
+        Ok(file)
+    }
+
+    fn insert_into(
+        file: &mut File,
+        capacity: u64,
+        identity: SectionIdentity,
+    ) -> Result<bool, VolumeError> {
+        let mut slot = identity.hash() & (capacity - 1);
+        let mut bytes = [0; SECTION_SLOT_BYTES];
+        for _ in 0..capacity {
+            let offset = slot
+                .checked_mul(SECTION_SLOT_BYTES as u64)
+                .ok_or_else(|| corrupt("Managed collection section table offset overflows"))?;
+            file.seek(SeekFrom::Start(offset))
+                .map_err(|_| unavailable("seek Managed collection section table"))?;
+            file.read_exact(&mut bytes)
+                .map_err(|_| unavailable("read Managed collection section table"))?;
+            match bytes[0] {
+                0 => {
+                    bytes[0] = 1;
+                    bytes[1..].copy_from_slice(&identity.0);
+                    file.seek(SeekFrom::Start(offset))
+                        .map_err(|_| unavailable("seek Managed collection section table"))?;
+                    file.write_all(&bytes)
+                        .map_err(|_| unavailable("write Managed collection section table"))?;
+                    return Ok(true);
+                }
+                1 if bytes[1..] == identity.0 => return Ok(false),
+                1 => slot = (slot + 1) & (capacity - 1),
+                _ => return Err(corrupt("Managed collection section table is invalid")),
+            }
+        }
+        Err(corrupt("Managed collection section table is full"))
+    }
+
+    fn grow(&mut self) -> Result<(), VolumeError> {
+        let capacity = self
+            .capacity
+            .checked_mul(2)
+            .ok_or_else(|| corrupt("Managed collection section capacity overflows"))?;
+        let generation = self
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| corrupt("Managed collection section generation overflows"))?;
+        let path = self
+            .path
+            .with_file_name(format!("sections-{generation:016x}"));
+        let mut file = Self::create_table(&path, capacity)?;
+        self.file
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| unavailable("rewind Managed collection section table"))?;
+        let mut bytes = [0; SECTION_SLOT_BYTES];
+        for _ in 0..self.capacity {
+            self.file
+                .read_exact(&mut bytes)
+                .map_err(|_| unavailable("read Managed collection section table"))?;
+            match bytes[0] {
+                0 => {}
+                1 => {
+                    let mut identity = [0; SECTION_RECORD_BYTES];
+                    identity.copy_from_slice(&bytes[1..]);
+                    if !Self::insert_into(&mut file, capacity, SectionIdentity(identity))? {
+                        return Err(corrupt("Managed collection section table has duplicates"));
+                    }
+                }
+                _ => return Err(corrupt("Managed collection section table is invalid")),
+            }
+        }
+        let previous_path = std::mem::replace(&mut self.path, path);
+        let previous_file = std::mem::replace(&mut self.file, file);
+        self.capacity = capacity;
+        self.generation = generation;
+        drop(previous_file);
+        fs::remove_file(previous_path)
+            .map_err(|_| unavailable("remove old Managed collection section table"))?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+struct SectionIdentity([u8; SECTION_RECORD_BYTES]);
+
+impl SectionIdentity {
+    fn new(kind: IndexKind, section: SectionRef) -> Self {
+        let mut bytes = [0; SECTION_RECORD_BYTES];
+        bytes[0] = kind as u8;
+        bytes[1..33].copy_from_slice(section.object.as_bytes());
+        bytes[33..41].copy_from_slice(&section.object_length.to_be_bytes());
+        bytes[41..49].copy_from_slice(&section.offset.to_be_bytes());
+        bytes[49..57].copy_from_slice(&section.length.to_be_bytes());
+        bytes[57..89].copy_from_slice(section.checksum.as_bytes());
+        bytes[89] = section.section_type;
+        Self(bytes)
+    }
+
+    fn hash(self) -> u64 {
+        let digest = blake3::hash(&self.0);
+        let mut prefix = [0; 8];
+        prefix.copy_from_slice(&digest.as_bytes()[..8]);
+        u64::from_le_bytes(prefix)
     }
 }
 
