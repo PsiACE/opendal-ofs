@@ -176,15 +176,6 @@ impl ManagedVolume {
         Self { format, operator }
     }
 
-    pub(super) async fn open(
-        format: ManagedFormat,
-        operator: Operator,
-    ) -> Result<Self, VolumeError> {
-        let volume = Self::new(format, operator);
-        volume.observe().await?;
-        Ok(volume)
-    }
-
     pub const fn id(&self) -> VolumeId {
         self.format.volume_id()
     }

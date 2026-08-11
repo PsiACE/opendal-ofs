@@ -55,7 +55,9 @@ impl ManagedVolume {
             live.insert(&key, length)
         })
         .await?;
-        live.seal()?;
+        live.seal_marks()?;
+        self.inventory_candidates(&mut live).await?;
+        live.seal_candidates()?;
         let outcome = self.sweep(&mut live).await?;
         self.finish_gc(fence).await?;
         Ok(outcome)
@@ -108,6 +110,29 @@ impl ManagedVolume {
         Ok(fence)
     }
 
+    async fn inventory_candidates(&self, live: &mut LiveObjects) -> Result<(), VolumeError> {
+        let mut lister = self
+            .operator()
+            .lister_with(OBJECT_PREFIX)
+            .recursive(true)
+            .await
+            .map_err(|_| unavailable("list Managed data objects"))?;
+        while let Some(entry) = lister
+            .try_next()
+            .await
+            .map_err(|_| unavailable("list Managed data objects"))?
+        {
+            if !entry.metadata().is_file() {
+                continue;
+            }
+            let Some(identity) = ObjectIdentity::parse(entry.path()) else {
+                continue;
+            };
+            live.insert_candidate(identity, entry.metadata().content_length())?;
+        }
+        Ok(())
+    }
+
     async fn sweep(&self, live: &mut LiveObjects) -> Result<GcOutcome, VolumeError> {
         let mut outcome = GcOutcome::default();
         let mut deleter = self
@@ -122,44 +147,28 @@ impl ManagedVolume {
                 pending.extend(live.split_partition(partition)?);
                 continue;
             };
-            for kind in ObjectKind::ALL {
-                let object_prefix = kind.object_prefix(&partition.digest_prefix);
-                let mut lister = self
-                    .operator()
-                    .lister_with(&object_prefix)
-                    .recursive(true)
-                    .await
-                    .map_err(|_| unavailable("list Managed data objects"))?;
-                while let Some(entry) = lister
-                    .try_next()
-                    .await
-                    .map_err(|_| unavailable("list Managed data objects"))?
-                {
-                    if !entry.metadata().is_file() {
-                        continue;
+            let Some(path) = &partition.candidates else {
+                continue;
+            };
+            let mut candidates = MarkReader::open(path)?;
+            while let Some(candidate) = candidates.next()? {
+                outcome.scanned += 1;
+                match marks.get(&candidate.identity) {
+                    Some(expected) if *expected == candidate.length => continue,
+                    Some(_) => {
+                        return Err(corrupt("live Managed object length is invalid"));
                     }
-                    let Some(identity) = ObjectIdentity::parse(entry.path()) else {
-                        continue;
-                    };
-                    outcome.scanned += 1;
-                    let length = entry.metadata().content_length();
-                    match marks.get(&identity) {
-                        Some(expected) if *expected == length => continue,
-                        Some(_) => {
-                            return Err(corrupt("live Managed object length is invalid"));
-                        }
-                        None => {}
-                    }
-                    deleter
-                        .delete(entry.path())
-                        .await
-                        .map_err(|_| unavailable("delete Managed data object"))?;
-                    outcome.deleted += 1;
-                    outcome.deleted_bytes = outcome
-                        .deleted_bytes
-                        .checked_add(length)
-                        .ok_or_else(|| corrupt("deleted Managed data byte count overflows"))?;
+                    None => {}
                 }
+                deleter
+                    .delete(candidate.identity.object_key())
+                    .await
+                    .map_err(|_| unavailable("delete Managed data object"))?;
+                outcome.deleted += 1;
+                outcome.deleted_bytes = outcome
+                    .deleted_bytes
+                    .checked_add(candidate.length)
+                    .ok_or_else(|| corrupt("deleted Managed data byte count overflows"))?;
             }
         }
         deleter
@@ -190,7 +199,8 @@ impl ManagedVolume {
 
 struct LiveObjects {
     directory: PathBuf,
-    writers: Vec<Option<BufWriter<File>>>,
+    mark_writers: Vec<Option<BufWriter<File>>>,
+    candidate_writers: Vec<Option<BufWriter<File>>>,
 }
 
 impl LiveObjects {
@@ -200,7 +210,10 @@ impl LiveObjects {
             .map_err(|_| unavailable("create Managed collection mark store"))?;
         Ok(Self {
             directory,
-            writers: std::iter::repeat_with(|| None)
+            mark_writers: std::iter::repeat_with(|| None)
+                .take(INITIAL_PARTITIONS)
+                .collect(),
+            candidate_writers: std::iter::repeat_with(|| None)
                 .take(INITIAL_PARTITIONS)
                 .collect(),
         })
@@ -209,40 +222,44 @@ impl LiveObjects {
     fn insert(&mut self, key: &str, length: u64) -> Result<(), VolumeError> {
         let identity = ObjectIdentity::parse(key)
             .ok_or_else(|| corrupt("reachable Managed object key is invalid"))?;
-        let partition = usize::from(identity.digest[0]);
-        if self.writers[partition].is_none() {
-            let path = self.partition_path(&format!("{partition:02x}"));
-            let file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path)
-                .map_err(|_| unavailable("create Managed collection mark partition"))?;
-            self.writers[partition] = Some(BufWriter::new(file));
-        }
-        MarkRecord { identity, length }.write(
-            self.writers[partition]
-                .as_mut()
-                .expect("the mark partition writer is open"),
+        write_partition_record(
+            &self.directory,
+            "marks",
+            &mut self.mark_writers,
+            MarkRecord { identity, length },
         )
     }
 
-    fn seal(&mut self) -> Result<(), VolumeError> {
-        for writer in self.writers.iter_mut().flatten() {
-            writer
-                .flush()
-                .map_err(|_| unavailable("flush Managed collection marks"))?;
-        }
-        self.writers.clear();
-        Ok(())
+    fn insert_candidate(
+        &mut self,
+        identity: ObjectIdentity,
+        length: u64,
+    ) -> Result<(), VolumeError> {
+        write_partition_record(
+            &self.directory,
+            "candidates",
+            &mut self.candidate_writers,
+            MarkRecord { identity, length },
+        )
+    }
+
+    fn seal_marks(&mut self) -> Result<(), VolumeError> {
+        seal_partition_writers(&mut self.mark_writers)
+    }
+
+    fn seal_candidates(&mut self) -> Result<(), VolumeError> {
+        seal_partition_writers(&mut self.candidate_writers)
     }
 
     fn initial_partitions(&self) -> Vec<MarkPartition> {
         (0..INITIAL_PARTITIONS)
             .map(|partition| {
                 let digest_prefix = format!("{partition:02x}");
-                let path = self.partition_path(&digest_prefix);
+                let marks = self.partition_path("marks", &digest_prefix);
+                let candidates = self.partition_path("candidates", &digest_prefix);
                 MarkPartition {
-                    path: path.exists().then_some(path),
+                    marks: marks.exists().then_some(marks),
+                    candidates: candidates.exists().then_some(candidates),
                     digest_prefix,
                 }
             })
@@ -253,7 +270,7 @@ impl LiveObjects {
         &self,
         partition: &MarkPartition,
     ) -> Result<Option<BTreeMap<ObjectIdentity, u64>>, VolumeError> {
-        let Some(path) = &partition.path else {
+        let Some(path) = &partition.marks else {
             return Ok(Some(BTreeMap::new()));
         };
         let mut reader = MarkReader::open(path)?;
@@ -273,21 +290,42 @@ impl LiveObjects {
     }
 
     fn split_partition(&self, partition: MarkPartition) -> Result<Vec<MarkPartition>, VolumeError> {
-        let path = partition
-            .path
+        let mark_path = partition
+            .marks
             .as_ref()
             .expect("only a non-empty mark partition is split");
+        let marks = self.split_records(mark_path, &partition.digest_prefix, "marks")?;
+        let candidates = match &partition.candidates {
+            Some(path) => self.split_records(path, &partition.digest_prefix, "candidates")?,
+            None => std::iter::repeat_with(|| None).take(16).collect(),
+        };
+
+        Ok((0..16)
+            .map(|child| MarkPartition {
+                marks: marks[child].clone(),
+                candidates: candidates[child].clone(),
+                digest_prefix: format!("{}{child:x}", partition.digest_prefix),
+            })
+            .collect())
+    }
+
+    fn split_records(
+        &self,
+        path: &Path,
+        digest_prefix: &str,
+        stem: &str,
+    ) -> Result<Vec<Option<PathBuf>>, VolumeError> {
         let mut reader = MarkReader::open(path)?;
         let mut writers: Vec<Option<BufWriter<File>>> =
             std::iter::repeat_with(|| None).take(16).collect();
         while let Some(record) = reader.next()? {
-            let child = record.identity.nibble(partition.digest_prefix.len());
+            let child = record.identity.nibble(digest_prefix.len());
             if writers[child].is_none() {
-                let child_prefix = format!("{}{child:x}", partition.digest_prefix);
+                let child_prefix = format!("{digest_prefix}{child:x}");
                 let file = OpenOptions::new()
                     .write(true)
                     .create_new(true)
-                    .open(self.partition_path(&child_prefix))
+                    .open(self.partition_path(stem, &child_prefix))
                     .map_err(|_| unavailable("create Managed collection mark partition"))?;
                 writers[child] = Some(BufWriter::new(file));
             }
@@ -309,30 +347,62 @@ impl LiveObjects {
 
         Ok((0..16)
             .map(|child| {
-                let digest_prefix = format!("{}{child:x}", partition.digest_prefix);
-                let path = self.partition_path(&digest_prefix);
-                MarkPartition {
-                    path: path.exists().then_some(path),
-                    digest_prefix,
-                }
+                let child_prefix = format!("{digest_prefix}{child:x}");
+                let path = self.partition_path(stem, &child_prefix);
+                path.exists().then_some(path)
             })
             .collect())
     }
 
-    fn partition_path(&self, digest_prefix: &str) -> PathBuf {
-        self.directory.join(format!("marks-{digest_prefix}"))
+    fn partition_path(&self, stem: &str, digest_prefix: &str) -> PathBuf {
+        self.directory.join(format!("{stem}-{digest_prefix}"))
     }
 }
 
 impl Drop for LiveObjects {
     fn drop(&mut self) {
-        self.writers.clear();
+        self.mark_writers.clear();
+        self.candidate_writers.clear();
         let _ = fs::remove_dir_all(&self.directory);
     }
 }
 
+fn write_partition_record(
+    directory: &Path,
+    stem: &str,
+    writers: &mut [Option<BufWriter<File>>],
+    record: MarkRecord,
+) -> Result<(), VolumeError> {
+    let partition = usize::from(record.identity.digest[0]);
+    if writers[partition].is_none() {
+        let path = directory.join(format!("{stem}-{partition:02x}"));
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|_| unavailable("create Managed collection mark partition"))?;
+        writers[partition] = Some(BufWriter::new(file));
+    }
+    record.write(
+        writers[partition]
+            .as_mut()
+            .expect("the collection partition writer is open"),
+    )
+}
+
+fn seal_partition_writers(writers: &mut Vec<Option<BufWriter<File>>>) -> Result<(), VolumeError> {
+    for writer in writers.iter_mut().flatten() {
+        writer
+            .flush()
+            .map_err(|_| unavailable("flush Managed collection marks"))?;
+    }
+    writers.clear();
+    Ok(())
+}
+
 struct MarkPartition {
-    path: Option<PathBuf>,
+    marks: Option<PathBuf>,
+    candidates: Option<PathBuf>,
     digest_prefix: String,
 }
 
@@ -436,6 +506,22 @@ impl ObjectIdentity {
             byte & 0x0f
         })
     }
+
+    fn object_key(self) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+
+        let mut digest = String::with_capacity(64);
+        for byte in self.digest {
+            digest.push(char::from(HEX[usize::from(byte >> 4)]));
+            digest.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+        format!(
+            "{OBJECT_PREFIX}{}/{}/{}",
+            self.kind.segment(),
+            &digest[..2],
+            digest
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -447,8 +533,6 @@ enum ObjectKind {
 }
 
 impl ObjectKind {
-    const ALL: [Self; 3] = [Self::Commit, Self::Meta, Self::Raw];
-
     const fn parse(value: &str) -> Option<Self> {
         match value.as_bytes() {
             b"commit" => Some(Self::Commit),
@@ -473,14 +557,6 @@ impl ObjectKind {
             Self::Meta => "meta",
             Self::Raw => "raw",
         }
-    }
-
-    fn object_prefix(self, digest_prefix: &str) -> String {
-        format!(
-            "{OBJECT_PREFIX}{}/{}/{digest_prefix}",
-            self.segment(),
-            &digest_prefix[..2]
-        )
     }
 }
 

@@ -89,12 +89,12 @@ impl ManagedMetadata {
                 "replica state belongs to a different volume",
             ));
         }
-        ManagedVolume::open(format, self.operator.clone()).await
+        Ok(ManagedVolume::new(format, self.operator.clone()))
     }
 
     pub async fn open_unbound(&self) -> Result<ManagedVolume, VolumeError> {
         let format = self.read_format().await?;
-        ManagedVolume::open(format, self.operator.clone()).await
+        Ok(ManagedVolume::new(format, self.operator.clone()))
     }
 
     pub async fn open_for_gc(&self) -> Result<ManagedVolume, VolumeError> {

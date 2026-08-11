@@ -27,7 +27,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::filesystem::VolumeError;
 
-use super::container::{ContainerWriter, SectionRef, read_section};
+use super::container::{ContainerWriter, SectionRef, read_sections};
 use super::error::{corrupt, invalid};
 
 const LEAF_MAGIC: [u8; 8] = *b"OFSIDXL1";
@@ -35,6 +35,7 @@ const INTERNAL_MAGIC: [u8; 8] = *b"OFSIDXI1";
 const PAGE_TARGET_BYTES: usize = 128 * 1024;
 const MAX_PAGE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TREE_DEPTH: usize = 64;
+const MAX_FETCHED_PAGES: usize = 256;
 const PAGE_FIXED_BYTES: usize = LEAF_MAGIC.len() + 9;
 
 /// An exact reference to one immutable ordered-index page.
@@ -278,6 +279,20 @@ struct CollectingIndexVisitor<'a, F> {
     records: F,
 }
 
+enum TraversalTask {
+    Reference {
+        reference: PageRef,
+        depth: usize,
+        is_root: bool,
+    },
+    Fetched {
+        reference: PageRef,
+        depth: usize,
+        is_root: bool,
+        bytes: Vec<u8>,
+    },
+}
+
 impl<K, V, F> StreamingIndexVisitor<K, V> for CollectingIndexVisitor<'_, F>
 where
     F: FnMut(K, V) -> Result<(), VolumeError>,
@@ -310,18 +325,94 @@ where
     K: Clone + DeserializeOwned + Ord + Serialize,
     V: DeserializeOwned,
 {
-    let mut pending = vec![(root.clone(), 0_usize, true)];
+    let mut pending = vec![TraversalTask::Reference {
+        reference: root.clone(),
+        depth: 0,
+        is_root: true,
+    }];
     let mut previous = None::<K>;
     let mut first_key = None::<Vec<u8>>;
     let mut last_key = None::<Vec<u8>>;
 
-    while let Some((reference, depth, is_root)) = pending.pop() {
+    while let Some(task) = pending.pop() {
+        let TraversalTask::Fetched {
+            reference,
+            depth,
+            is_root,
+            bytes,
+        } = task
+        else {
+            let TraversalTask::Reference {
+                reference,
+                depth,
+                is_root,
+            } = task
+            else {
+                unreachable!();
+            };
+            if depth > MAX_TREE_DEPTH {
+                return Err(corrupt("read Managed index", "index tree is too deep"));
+            }
+            let object = reference.section.object;
+            let object_length = reference.section.object_length;
+            let mut requested_bytes = reference.section.length;
+            let mut references = vec![reference];
+            while references.len() < MAX_FETCHED_PAGES {
+                let Some(TraversalTask::Reference {
+                    reference,
+                    depth: next_depth,
+                    is_root: next_is_root,
+                }) = pending.last()
+                else {
+                    break;
+                };
+                let Some(next_bytes) = requested_bytes.checked_add(reference.section.length) else {
+                    break;
+                };
+                if *next_depth != depth
+                    || *next_is_root != is_root
+                    || reference.section.object != object
+                    || reference.section.object_length != object_length
+                    || next_bytes > object_length
+                {
+                    break;
+                }
+                let TraversalTask::Reference { reference, .. } = pending
+                    .pop()
+                    .expect("the adjacent index page reference exists")
+                else {
+                    unreachable!();
+                };
+                requested_bytes = next_bytes;
+                references.push(reference);
+            }
+            for reference in &references {
+                page_length(reference)?;
+            }
+            let sections = references
+                .iter()
+                .map(|reference| reference.section)
+                .collect::<Vec<_>>();
+            let pages = read_sections(operator, &sections).await?;
+            pending.extend(
+                references
+                    .into_iter()
+                    .zip(pages)
+                    .rev()
+                    .map(|(reference, bytes)| TraversalTask::Fetched {
+                        reference,
+                        depth,
+                        is_root,
+                        bytes,
+                    }),
+            );
+            continue;
+        };
         if depth > MAX_TREE_DEPTH {
             return Err(corrupt("read Managed index", "index tree is too deep"));
         }
         visitor.visit_section(reference.section)?;
-
-        let (kind, records) = read_page(operator, &reference).await?;
+        let (kind, records) = decode_page(&reference, &bytes)?;
         match kind {
             PageKind::Leaf => {
                 if records.is_empty() {
@@ -381,12 +472,13 @@ where
                     children.push(decode_cbor::<PageRef>(&record.0)?);
                 }
                 validate_children::<K>(&reference, &children)?;
-                pending.extend(
-                    children
-                        .into_iter()
-                        .rev()
-                        .map(|child| (child, depth + 1, false)),
-                );
+                pending.extend(children.into_iter().rev().map(|reference| {
+                    TraversalTask::Reference {
+                        reference,
+                        depth: depth + 1,
+                        is_root: false,
+                    }
+                }));
             }
         }
     }
@@ -508,16 +600,17 @@ fn page_reference(
     }
 }
 
-async fn read_page(
-    operator: &Operator,
+fn decode_page(
     reference: &PageRef,
+    bytes: &[u8],
 ) -> Result<(PageKind, Vec<EncodedRecord>), VolumeError> {
-    let length = usize::try_from(reference.section.length)
-        .ok()
-        .filter(|length| *length <= MAX_PAGE_BYTES)
-        .ok_or_else(|| corrupt("read Managed index", "index page length is invalid"))?;
-    let bytes = read_section(operator, reference.section).await?;
-    debug_assert_eq!(bytes.len(), length);
+    let length = page_length(reference)?;
+    if bytes.len() != length {
+        return Err(corrupt(
+            "read Managed index",
+            "index page length does not match its reference",
+        ));
+    }
 
     let (kind, body) = if let Some(body) = bytes.strip_prefix(&LEAF_MAGIC) {
         (PageKind::Leaf, body)
@@ -534,6 +627,13 @@ async fn read_page(
     }
     let PageBody(records) = decode_cbor(body)?;
     Ok((kind, records))
+}
+
+fn page_length(reference: &PageRef) -> Result<usize, VolumeError> {
+    usize::try_from(reference.section.length)
+        .ok()
+        .filter(|length| *length <= MAX_PAGE_BYTES)
+        .ok_or_else(|| corrupt("read Managed index", "index page length is invalid"))
 }
 
 fn validate_children<K>(parent: &PageRef, children: &[PageRef]) -> Result<(), VolumeError>
