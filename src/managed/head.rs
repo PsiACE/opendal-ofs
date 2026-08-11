@@ -21,8 +21,8 @@ use opendal::Operator;
 use serde::{Deserialize, Serialize};
 
 use crate::filesystem::{
-    ChangeCursor, DirectoryRecord, Generation, NodeAttributes, NodeId, NodeKind, NodeRecord,
-    VolumeError, VolumeErrorKind, VolumeId, VolumeSnapshot,
+    ChangeCursor, DirectoryRecord, Generation, NodeAttributes, NodeKind, NodeRecord, VolumeError,
+    VolumeErrorKind, VolumeId, VolumeSnapshot,
 };
 
 use super::format::ManagedFormat;
@@ -77,7 +77,7 @@ impl ManagedVolume {
     }
 
     pub(super) async fn initialize(&self) -> Result<(), VolumeError> {
-        let snapshot = empty_snapshot(self.id());
+        let snapshot = empty_snapshot(self.format);
         let bytes = HEAD_RECORD.encode(&Head {
             snapshot,
             maintenance: None,
@@ -190,8 +190,9 @@ impl ManagedVolume {
     }
 }
 
-fn empty_snapshot(volume_id: VolumeId) -> VolumeSnapshot {
-    let root = NodeId::generate();
+fn empty_snapshot(format: ManagedFormat) -> VolumeSnapshot {
+    let volume_id = format.volume_id();
+    let root = format.root_node_id();
     let generation = Generation::from_bytes(0_u64.to_be_bytes().to_vec());
     VolumeSnapshot {
         volume_id,

@@ -32,9 +32,9 @@ pub use head::{ManagedObservation, ManagedVolume};
 
 use opendal::Operator;
 
-use crate::filesystem::{VolumeError, VolumeId};
+use crate::filesystem::{NodeId, VolumeError, VolumeId};
 use error::{invalid, unavailable};
-use format::{MAX_SUPERBLOCK_BYTES, SUPERBLOCK_KEY};
+use format::{FORMAT_KEY, MAX_FORMAT_BYTES};
 
 /// Object Metadata authority for one Managed volume.
 #[derive(Clone)]
@@ -60,9 +60,9 @@ impl ManagedMetadata {
 
     /// Create the Managed superblock once, or return the existing format.
     pub async fn initialize(&self) -> Result<ManagedVolume, VolumeError> {
-        let desired = ManagedFormat::v1(VolumeId::generate());
+        let desired = ManagedFormat::v1(VolumeId::generate(), NodeId::generate());
         let encoded = desired.encode()?;
-        let format = if object::create(&self.operator, SUPERBLOCK_KEY, encoded).await? {
+        let format = if object::create(&self.operator, FORMAT_KEY, encoded).await? {
             desired
         } else {
             self.read_format().await?
@@ -73,7 +73,7 @@ impl ManagedMetadata {
     }
 
     pub async fn read_format(&self) -> Result<ManagedFormat, VolumeError> {
-        let bytes = object::read(&self.operator, SUPERBLOCK_KEY, MAX_SUPERBLOCK_BYTES)
+        let bytes = object::read(&self.operator, FORMAT_KEY, MAX_FORMAT_BYTES)
             .await?
             .ok_or_else(|| unavailable("open Managed volume", "Managed format does not exist"))?;
         ManagedFormat::decode(&bytes)
