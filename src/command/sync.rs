@@ -31,6 +31,16 @@ pub(super) async fn run(args: SyncArgs) -> Result<()> {
     if !root.is_dir() {
         bail!("replica is not a directory: {}", args.replica.display());
     }
+    if let Some(capability) = args
+        .require
+        .iter()
+        .find(|capability| !capability.available())
+    {
+        bail!(
+            "required filesystem capability is unavailable: {}",
+            capability.name()
+        );
+    }
 
     let metadata =
         ManagedMetadata::object(open_operator(&args.storage, args.transfer_concurrency)?)?;

@@ -18,7 +18,7 @@
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
 #[command(version, about = "OpenDAL filesystem")]
@@ -76,6 +76,10 @@ pub(crate) struct SyncArgs {
     #[arg(long, value_name = "RELATIVE-PATH")]
     pub(crate) resolve: Vec<String>,
 
+    /// Require an optional filesystem capability before synchronization starts.
+    #[arg(long, value_enum, value_name = "CAPABILITY")]
+    pub(crate) require: Vec<Capability>,
+
     /// Maximum concurrency for storage operations.
     #[arg(
         long,
@@ -84,6 +88,37 @@ pub(crate) struct SyncArgs {
         value_name = "N"
     )]
     pub(crate) transfer_concurrency: NonZeroUsize,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(crate) enum Capability {
+    Executable,
+    HardLink,
+    PortableNames,
+    StableRenameIdentity,
+    SymbolicLink,
+    Xattr,
+}
+
+impl Capability {
+    pub(crate) const fn available(self) -> bool {
+        match self {
+            Self::Executable | Self::StableRenameIdentity => cfg!(unix),
+            Self::PortableNames => true,
+            Self::HardLink | Self::SymbolicLink | Self::Xattr => false,
+        }
+    }
+
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Executable => "executable",
+            Self::HardLink => "hard-link",
+            Self::PortableNames => "portable-names",
+            Self::StableRenameIdentity => "stable-rename-identity",
+            Self::SymbolicLink => "symbolic-link",
+            Self::Xattr => "xattr",
+        }
+    }
 }
 
 #[derive(Debug, Args)]

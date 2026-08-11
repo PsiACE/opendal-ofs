@@ -1064,8 +1064,8 @@ fn admission(fixture: &Fixture) {
     let root = CaseRoot::new();
     let replica_a = root.path.join("replica-a");
     let replica_b = root.path.join("replica-b");
-    let state_a = root.path.join("state-a.json");
-    let state_b = root.path.join("state-b.json");
+    let state_a = root.path.join("state-a.db");
+    let state_b = root.path.join("state-b.db");
     fs::create_dir_all(&replica_a).expect("create replica A");
     fs::create_dir_all(&replica_b).expect("create replica B");
 
@@ -1077,9 +1077,16 @@ fn admission(fixture: &Fixture) {
         .last()
         .expect("initialization reports its volume identity")
         .to_owned();
-    run_ofs_success(
-        ofs_sync(&replica_a, &state_a, &storage_a),
-        "attach replica A",
+    let mut attach_a = ofs_sync(&replica_a, &state_a, &storage_a);
+    attach_a.args(["--require", "portable-names"]);
+    run_ofs_success(attach_a, "attach replica A with its required capability");
+
+    let mut unsupported = ofs_sync(&replica_a, &state_a, &storage_a);
+    unsupported.args(["--require", "hard-link"]);
+    let unsupported = run_ofs_failure(unsupported, "require unsupported hard links");
+    assert!(
+        output_text(&unsupported.stderr).contains("required filesystem capability is unavailable"),
+        "an unavailable required capability is rejected before synchronization"
     );
 
     let status = ManagedStatus::parse(output_text(
