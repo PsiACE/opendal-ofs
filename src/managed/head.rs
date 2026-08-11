@@ -26,7 +26,7 @@ use crate::filesystem::{
 };
 
 use super::format::ManagedFormat;
-use super::index::{PageRef, read_index, visit_index, write_index};
+use super::index::{PageRef, read_index, visit_index, write_index, write_index_reusing};
 use super::object;
 use super::record::Record;
 
@@ -45,6 +45,9 @@ pub struct ManagedObservation {
     revision: String,
     changes: BTreeMap<ChangeCursor, ChangeRecord>,
     operations: BTreeMap<OperationId, OperationRecord>,
+    commit: NamespaceCommit,
+    directory_entries: BTreeMap<DirectoryKey, DirectoryEntry>,
+    objects: IndexObjects,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -103,6 +106,16 @@ struct StoredNamespace {
     snapshot: VolumeSnapshot,
     changes: BTreeMap<ChangeCursor, ChangeRecord>,
     operations: BTreeMap<OperationId, OperationRecord>,
+    commit: NamespaceCommit,
+    directory_entries: BTreeMap<DirectoryKey, DirectoryEntry>,
+    objects: IndexObjects,
+}
+
+struct IndexObjects {
+    nodes: BTreeMap<crate::filesystem::Digest, u64>,
+    directory_entries: BTreeMap<crate::filesystem::Digest, u64>,
+    changes: BTreeMap<crate::filesystem::Digest, u64>,
+    operations: BTreeMap<crate::filesystem::Digest, u64>,
 }
 
 impl ManagedVolume {
@@ -126,7 +139,7 @@ impl ManagedVolume {
     pub(super) async fn initialize(&self) -> Result<(), VolumeError> {
         let snapshot = empty_snapshot(self.format);
         let namespace_commit = self
-            .write_namespace(&snapshot, &BTreeMap::new(), &BTreeMap::new())
+            .write_namespace(&snapshot, &BTreeMap::new(), &BTreeMap::new(), None)
             .await?;
         let bytes = HEAD_RECORD.encode(&Head {
             namespace_commit,
@@ -152,6 +165,9 @@ impl ManagedVolume {
             revision,
             changes: stored.changes,
             operations: stored.operations,
+            commit: stored.commit,
+            directory_entries: stored.directory_entries,
+            objects: stored.objects,
         })
     }
 
@@ -206,7 +222,9 @@ impl ManagedVolume {
                 cursor: target.cursor,
             },
         );
-        let namespace_commit = self.write_namespace(&target, &changes, &operations).await?;
+        let namespace_commit = self
+            .write_namespace(&target, &changes, &operations, Some(observed))
+            .await?;
         let bytes = HEAD_RECORD.encode(&Head {
             namespace_commit,
             maintenance: None,
@@ -306,6 +324,7 @@ impl ManagedVolume {
         snapshot: &VolumeSnapshot,
         changes: &BTreeMap<ChangeCursor, ChangeRecord>,
         operations: &BTreeMap<OperationId, OperationRecord>,
+        previous: Option<&ManagedObservation>,
     ) -> Result<NamespaceCommitRef, VolumeError> {
         snapshot.validate()?;
         let mut directory_entries = BTreeMap::new();
@@ -321,14 +340,58 @@ impl ManagedVolume {
             }
         }
 
+        let node_index_root = match previous {
+            Some(previous) if previous.snapshot.nodes == snapshot.nodes => {
+                previous.commit.node_index_root.clone()
+            }
+            Some(previous) => {
+                write_index_reusing(&self.operator, &snapshot.nodes, &previous.objects.nodes)
+                    .await?
+            }
+            None => write_index(&self.operator, &snapshot.nodes).await?,
+        };
+        let directory_entry_index_root = match previous {
+            Some(previous) if previous.directory_entries == directory_entries => {
+                previous.commit.directory_entry_index_root.clone()
+            }
+            Some(previous) => {
+                write_index_reusing(
+                    &self.operator,
+                    &directory_entries,
+                    &previous.objects.directory_entries,
+                )
+                .await?
+            }
+            None => write_index(&self.operator, &directory_entries).await?,
+        };
+        let change_log_root = match previous {
+            Some(previous) if previous.changes == *changes => {
+                previous.commit.change_log_root.clone()
+            }
+            Some(previous) => {
+                write_index_reusing(&self.operator, changes, &previous.objects.changes).await?
+            }
+            None => write_index(&self.operator, changes).await?,
+        };
+        let operation_result_index_root = match previous {
+            Some(previous) if previous.operations == *operations => {
+                previous.commit.operation_result_index_root.clone()
+            }
+            Some(previous) => {
+                write_index_reusing(&self.operator, operations, &previous.objects.operations)
+                    .await?
+            }
+            None => write_index(&self.operator, operations).await?,
+        };
+
         let commit = NamespaceCommit {
             volume_id: snapshot.volume_id,
             change_cursor: snapshot.cursor,
             retained_change_floor: ChangeCursor::Genesis,
-            node_index_root: write_index(&self.operator, &snapshot.nodes).await?,
-            directory_entry_index_root: write_index(&self.operator, &directory_entries).await?,
-            change_log_root: write_index(&self.operator, changes).await?,
-            operation_result_index_root: write_index(&self.operator, operations).await?,
+            node_index_root,
+            directory_entry_index_root,
+            change_log_root,
+            operation_result_index_root,
         };
         let bytes = COMMIT_RECORD.encode(&commit)?;
         let digest: [u8; 32] = blake3::hash(&bytes).into();
@@ -348,12 +411,15 @@ impl ManagedVolume {
         reference: NamespaceCommitRef,
     ) -> Result<StoredNamespace, VolumeError> {
         let commit = self.read_commit(reference).await?;
-        let nodes: BTreeMap<NodeId, NodeRecord> =
+        let (nodes, node_objects): (BTreeMap<NodeId, NodeRecord>, _) =
             read_index(&self.operator, &commit.node_index_root).await?;
-        let directory_entries: BTreeMap<DirectoryKey, DirectoryEntry> =
-            read_index(&self.operator, &commit.directory_entry_index_root).await?;
-        let changes = read_index(&self.operator, &commit.change_log_root).await?;
-        let operations = read_index(&self.operator, &commit.operation_result_index_root).await?;
+        let (directory_entries, directory_entry_objects): (
+            BTreeMap<DirectoryKey, DirectoryEntry>,
+            _,
+        ) = read_index(&self.operator, &commit.directory_entry_index_root).await?;
+        let (changes, change_objects) = read_index(&self.operator, &commit.change_log_root).await?;
+        let (operations, operation_objects) =
+            read_index(&self.operator, &commit.operation_result_index_root).await?;
 
         let mut directories = nodes
             .iter()
@@ -369,12 +435,12 @@ impl ManagedVolume {
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        for (key, entry) in directory_entries {
+        for (key, entry) in &directory_entries {
             directories
                 .get_mut(&key.parent)
                 .ok_or_else(|| corrupt("directory entry parent is missing"))?
                 .entries
-                .insert(key.name, entry);
+                .insert(key.name.clone(), *entry);
         }
         let file_versions = nodes
             .values()
@@ -394,6 +460,14 @@ impl ManagedVolume {
             snapshot,
             changes,
             operations,
+            commit,
+            directory_entries,
+            objects: IndexObjects {
+                nodes: node_objects,
+                directory_entries: directory_entry_objects,
+                changes: change_objects,
+                operations: operation_objects,
+            },
         })
     }
 

@@ -136,7 +136,31 @@ where
     K: Ord + Serialize,
     V: Serialize,
 {
-    let mut level = write_leaves(operator, entries).await?;
+    write_index_with_reuse(operator, entries, None).await
+}
+
+pub(crate) async fn write_index_reusing<K, V>(
+    operator: &Operator,
+    entries: &BTreeMap<K, V>,
+    known: &BTreeMap<crate::filesystem::Digest, u64>,
+) -> Result<PageRef, VolumeError>
+where
+    K: Ord + Serialize,
+    V: Serialize,
+{
+    write_index_with_reuse(operator, entries, Some(known)).await
+}
+
+async fn write_index_with_reuse<K, V>(
+    operator: &Operator,
+    entries: &BTreeMap<K, V>,
+    known: Option<&BTreeMap<crate::filesystem::Digest, u64>>,
+) -> Result<PageRef, VolumeError>
+where
+    K: Ord + Serialize,
+    V: Serialize,
+{
+    let mut level = write_leaves(operator, entries, known).await?;
 
     while level.len() > 1 {
         let mut items = Vec::with_capacity(level.len());
@@ -147,7 +171,7 @@ where
                 last_key: page.last_key.clone(),
             });
         }
-        level = write_pages(operator, PageKind::Internal, group_items(items, 2)).await?;
+        level = write_pages(operator, PageKind::Internal, group_items(items, 2), known).await?;
     }
 
     Ok(level
@@ -158,13 +182,17 @@ where
 async fn write_leaves<K, V>(
     operator: &Operator,
     entries: &BTreeMap<K, V>,
+    known: Option<&BTreeMap<crate::filesystem::Digest, u64>>,
 ) -> Result<Vec<PageRef>, VolumeError>
 where
     K: Ord + Serialize,
     V: Serialize,
 {
     let mut pages = Vec::new();
-    let mut containers = ContainerWriter::new(operator);
+    let mut containers = match known {
+        Some(known) => ContainerWriter::reusing(operator, known),
+        None => ContainerWriter::new(operator),
+    };
     let mut group = Vec::new();
     let mut estimated_bytes = PAGE_FIXED_BYTES;
     for (key, value) in entries {
@@ -193,18 +221,18 @@ where
 pub(crate) async fn read_index<K, V>(
     operator: &Operator,
     root: &PageRef,
-) -> Result<BTreeMap<K, V>, VolumeError>
+) -> Result<(BTreeMap<K, V>, BTreeMap<crate::filesystem::Digest, u64>), VolumeError>
 where
     K: Clone + DeserializeOwned + Ord + Serialize,
     V: DeserializeOwned,
 {
     let mut entries = BTreeMap::new();
-    visit_index(operator, root, |key, value| {
+    let objects = visit_index(operator, root, |key, value| {
         entries.insert(key, value);
         Ok(())
     })
     .await?;
-    Ok(entries)
+    Ok((entries, objects))
 }
 
 /// Visit an index in key order without materializing its records.
@@ -375,9 +403,13 @@ async fn write_pages(
     operator: &Operator,
     kind: PageKind,
     groups: Vec<Vec<PageItem>>,
+    known: Option<&BTreeMap<crate::filesystem::Digest, u64>>,
 ) -> Result<Vec<PageRef>, VolumeError> {
     let mut pages = Vec::with_capacity(groups.len());
-    let mut containers = ContainerWriter::new(operator);
+    let mut containers = match known {
+        Some(known) => ContainerWriter::reusing(operator, known),
+        None => ContainerWriter::new(operator),
+    };
     for group in groups {
         pages.extend(push_page(&mut containers, kind, group).await?);
     }

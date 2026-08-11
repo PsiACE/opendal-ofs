@@ -17,6 +17,8 @@
 
 //! Bounded immutable containers for independently readable metadata sections.
 
+use std::collections::BTreeMap;
+
 use opendal::{Buffer, ErrorKind, Operator};
 use serde::{Deserialize, Serialize};
 
@@ -58,6 +60,7 @@ struct Pending<T> {
 
 pub(crate) struct ContainerWriter<'a, T> {
     operator: &'a Operator,
+    known: Option<&'a BTreeMap<Digest, u64>>,
     pending: Vec<Pending<T>>,
     bytes: usize,
 }
@@ -66,6 +69,16 @@ impl<'a, T> ContainerWriter<'a, T> {
     pub(crate) const fn new(operator: &'a Operator) -> Self {
         Self {
             operator,
+            known: None,
+            pending: Vec::new(),
+            bytes: 0,
+        }
+    }
+
+    pub(crate) const fn reusing(operator: &'a Operator, known: &'a BTreeMap<Digest, u64>) -> Self {
+        Self {
+            operator,
+            known: Some(known),
             pending: Vec::new(),
             bytes: 0,
         }
@@ -139,7 +152,19 @@ impl<'a, T> ContainerWriter<'a, T> {
         }
         let object = Digest::from_bytes(blake3::hash(&bytes).into());
         let object_length = bytes.len() as u64;
-        object::create_immutable(self.operator, &object_key(object), Buffer::from(bytes)).await?;
+        match self.known.and_then(|known| known.get(&object)) {
+            Some(length) if *length == object_length => {}
+            Some(_) => {
+                return Err(corrupt(
+                    "write Managed metadata",
+                    "reused container has a conflicting length",
+                ));
+            }
+            None => {
+                object::create_immutable(self.operator, &object_key(object), Buffer::from(bytes))
+                    .await?;
+            }
+        }
         self.bytes = 0;
         Ok(self
             .pending
