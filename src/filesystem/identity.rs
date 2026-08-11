@@ -50,8 +50,8 @@ fixed_identity!(
     16
 );
 fixed_identity!(
-    /// BLAKE3 identity of one immutable logical file version.
-    FileVersionId,
+    /// Content identity used by immutable Managed records and file data.
+    Digest,
     32
 );
 fixed_identity!(
@@ -73,6 +73,31 @@ macro_rules! generated_identity {
 }
 
 generated_identity!(VolumeId, NodeId, OperationId);
+
+/// Identity of one immutable logical file version.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileVersionId {
+    digest: Digest,
+    logical_length: u64,
+}
+
+impl FileVersionId {
+    pub const fn new(digest: Digest, logical_length: u64) -> Self {
+        Self {
+            digest,
+            logical_length,
+        }
+    }
+
+    pub const fn digest(self) -> Digest {
+        self.digest
+    }
+
+    pub const fn logical_length(self) -> u64 {
+        self.logical_length
+    }
+}
 
 macro_rules! display_identity {
     ($($name:ident),+ $(,)?) => {

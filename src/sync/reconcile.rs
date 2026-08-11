@@ -268,7 +268,7 @@ fn conflict(
 fn digest(snapshot: &VolumeSnapshot, node: Option<NodeId>) -> Option<[u8; 32]> {
     let node = &snapshot.nodes[&node?];
     let version = snapshot.file_versions.get(&node.file_version?)?;
-    Some(version.logical_digest)
+    Some(*version.digest().as_bytes())
 }
 
 fn build_target(

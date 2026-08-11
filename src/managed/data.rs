@@ -24,7 +24,9 @@ use serde::{Deserialize, Serialize};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-use crate::filesystem::{FileVersion, FileVersionId, OperationId, VolumeError, VolumeErrorKind};
+use crate::filesystem::{
+    Digest, FileVersion, FileVersionId, OperationId, VolumeError, VolumeErrorKind,
+};
 
 use super::ManagedVolume;
 
@@ -82,10 +84,8 @@ impl ManagedVolume {
         };
         let descriptor = serde_json::to_vec(&layout)
             .map_err(|_| invalid("inspect local file", "descriptor cannot be encoded"))?;
-        Ok(FileVersion::from_parts(
-            FileVersionId::from_bytes(logical_digest),
-            logical_size,
-            logical_digest,
+        Ok(FileVersion::new(
+            FileVersionId::new(Digest::from_bytes(logical_digest), logical_size),
             descriptor,
         ))
     }
@@ -277,7 +277,7 @@ fn verify_local_identity(
     digest: [u8; 32],
     version: &FileVersion,
 ) -> Result<(), VolumeError> {
-    if length != version.logical_size || digest != version.logical_digest {
+    if length != version.logical_length() || digest != *version.digest().as_bytes() {
         return Err(invalid(
             "publish local file",
             "file changed while being published",
@@ -289,18 +289,10 @@ fn verify_local_identity(
 pub(super) fn decode_descriptor(version: &FileVersion) -> Result<Descriptor, VolumeError> {
     let layout: FileLayout = serde_json::from_slice(version.descriptor())
         .map_err(|_| corrupt("read Managed file", "file descriptor is invalid"))?;
-    if version.id.as_bytes() != &version.logical_digest {
-        return Err(corrupt(
-            "read Managed file",
-            "file identity does not match its digest",
-        ));
-    }
-    let segments = match (layout, version.logical_size) {
-        (FileLayout::Empty, 0) if version.logical_digest == *blake3::hash(&[]).as_bytes() => None,
-        (FileLayout::Whole, length) if length > 0 => Some(WholeObject {
-            digest: version.logical_digest,
-            length,
-        }),
+    let digest = *version.digest().as_bytes();
+    let segments = match (layout, version.logical_length()) {
+        (FileLayout::Empty, 0) if digest == *blake3::hash(&[]).as_bytes() => None,
+        (FileLayout::Whole, length) if length > 0 => Some(WholeObject { digest, length }),
         _ => {
             return Err(corrupt(
                 "read Managed file",

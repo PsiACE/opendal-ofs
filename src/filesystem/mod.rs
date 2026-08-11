@@ -23,6 +23,8 @@ mod namespace;
 mod snapshot;
 
 pub use error::{VolumeError, VolumeErrorKind};
-pub use identity::{ChangeCursor, FileVersionId, Generation, NodeId, OperationId, VolumeId};
+pub use identity::{
+    ChangeCursor, Digest, FileVersionId, Generation, NodeId, OperationId, VolumeId,
+};
 pub use namespace::{DirectoryEntry, NodeAttributes, NodeKind};
 pub use snapshot::{DirectoryRecord, FileVersion, NodeRecord, VolumeSnapshot};
