@@ -17,6 +17,9 @@
 
 //! Managed Sync behavior fixture.
 
+pub(crate) mod evaluation;
+pub(crate) mod scale;
+
 use std::env;
 use std::fs;
 use std::io::Read;
@@ -1167,7 +1170,8 @@ fn deterministic_bytes(length: usize, seed: u8) -> Vec<u8> {
         .collect()
 }
 
-struct Fixture {
+pub(crate) struct Fixture {
+    audit_log: Option<PathBuf>,
     compose_file: PathBuf,
     keep: bool,
     minio_port: u16,
@@ -1506,7 +1510,7 @@ impl Drop for CaseRoot {
 }
 
 impl Fixture {
-    fn new(keep: bool) -> Self {
+    pub(crate) fn new(keep: bool) -> Self {
         let minio_port = env::var("OFS_MANAGED_SYNC_MINIO_PORT")
             .map(|value| {
                 value
@@ -1516,6 +1520,7 @@ impl Fixture {
             .unwrap_or(DEFAULT_MINIO_PORT);
         let workspace = PathBuf::from(env!("CARGO_WORKSPACE_DIR"));
         Self {
+            audit_log: None,
             compose_file: workspace.join("fixtures/managed-sync/compose.yaml"),
             keep,
             minio_port,
@@ -1529,6 +1534,28 @@ impl Fixture {
         run(self.compose().args(["up", "--detach", "minio"]));
         self.wait_until_ready();
         self
+    }
+
+    pub(crate) fn start_audited(mut self, audit_log: PathBuf) -> Self {
+        fs::File::create(&audit_log).expect("create Managed Sync audit log");
+        self.audit_log = Some(audit_log);
+        self.started = true;
+        run(self.compose().args(["up", "--detach", "audit"]));
+        let deadline = Instant::now() + FIXTURE_READY_TIMEOUT;
+        while Instant::now() < deadline {
+            if self
+                .compose()
+                .args(["exec", "-T", "audit", "test", "-s", "/tmp/audit.ready"])
+                .output()
+                .is_ok_and(|output| output.status.success())
+            {
+                run(self.compose().args(["up", "--detach", "minio"]));
+                self.wait_until_ready();
+                return self;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        panic!("Managed Sync audit fixture did not become ready");
     }
 
     fn start_bub(mut self) -> Self {
@@ -1561,7 +1588,7 @@ impl Fixture {
         );
     }
 
-    fn create_bucket(&self) {
+    pub(crate) fn create_bucket(&self) {
         run(self.compose().args([
             "run",
             "--rm",
@@ -1581,7 +1608,74 @@ impl Fixture {
         ]));
     }
 
-    fn storage_url(&self, root: &str) -> String {
+    pub(crate) fn create_evaluation_user(&self) {
+        run(self.compose().args([
+            "run",
+            "--rm",
+            "--no-deps",
+            "minio-client",
+            "admin",
+            "user",
+            "add",
+            "local",
+            evaluation::PRODUCT_ACCESS_KEY,
+            evaluation::PRODUCT_SECRET_KEY,
+        ]));
+        run(self.compose().args([
+            "run",
+            "--rm",
+            "--no-deps",
+            "minio-client",
+            "admin",
+            "policy",
+            "attach",
+            "local",
+            "readwrite",
+            "--user",
+            evaluation::PRODUCT_ACCESS_KEY,
+        ]));
+    }
+
+    pub(crate) fn inventory(&self, root: &str) -> serde_json::Value {
+        let mut command = self.compose();
+        command.args([
+            "run",
+            "--rm",
+            "--no-deps",
+            "-T",
+            "minio-client",
+            "ls",
+            "--recursive",
+            "--json",
+            &format!("local/managed-sync/{root}"),
+        ]);
+        evaluation::inventory(command)
+    }
+
+    fn finish_audit(&self, marker: &str) {
+        let storage = self.storage_url(&format!("audit-barrier/{marker}"));
+        self.finish_audit_with(marker, ofs_volume_create(&storage));
+    }
+
+    pub(crate) fn finish_audit_with(&self, marker: &str, mut command: Command) {
+        let audit_log = self
+            .audit_log
+            .as_ref()
+            .expect("audited fixture has an audit log");
+        let audit_start = fs::metadata(audit_log)
+            .expect("inspect Managed Sync audit log")
+            .len();
+        evaluation::use_product_credentials(&mut command);
+        run_ofs_success(command, "publish MinIO audit barrier");
+        evaluation::wait_for_log_marker(
+            audit_log,
+            marker.as_bytes(),
+            audit_start,
+            FIXTURE_READY_TIMEOUT,
+        );
+    }
+
+    pub(crate) fn storage_url(&self, root: &str) -> String {
         format!(
             "s3://managed-sync/{root}?endpoint=http%3A%2F%2F127.0.0.1%3A{}&region=us-east-1",
             self.minio_port
@@ -1631,6 +1725,11 @@ impl Fixture {
             .env("OFS_MANAGED_SYNC_MINIO_PORT", self.minio_port.to_string())
             .args(["--project-name", &self.project, "--file"])
             .arg(&self.compose_file);
+        if let Some(audit_log) = &self.audit_log {
+            command
+                .env("OFS_MANAGED_SYNC_AUDIT_ENABLE", "on")
+                .env("OFS_MANAGED_SYNC_AUDIT_LOG", audit_log);
+        }
         command
     }
 
@@ -1641,8 +1740,8 @@ impl Fixture {
     fn stop(&self) -> bool {
         self.compose()
             .args(["down", "--volumes", "--remove-orphans"])
-            .status()
-            .is_ok_and(|status| status.success())
+            .output()
+            .is_ok_and(|output| output.status.success())
     }
 }
 
