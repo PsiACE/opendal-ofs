@@ -103,9 +103,9 @@ pub(crate) enum Capability {
 impl Capability {
     pub(crate) const fn available(self) -> bool {
         match self {
-            Self::Executable | Self::StableRenameIdentity => cfg!(unix),
+            Self::Executable => cfg!(unix),
             Self::PortableNames => true,
-            Self::HardLink | Self::SymbolicLink | Self::Xattr => false,
+            Self::HardLink | Self::StableRenameIdentity | Self::SymbolicLink | Self::Xattr => false,
         }
     }
 

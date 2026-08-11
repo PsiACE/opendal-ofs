@@ -20,12 +20,12 @@ use std::path::Path;
 
 use futures::{StreamExt as _, TryStreamExt as _};
 
-use crate::filesystem::{NodeKind, VolumeSnapshot};
-use crate::managed::ManagedVolume;
+use crate::filesystem::{ChangeCursor, NodeKind, VolumeSnapshot};
+use crate::managed::{ManagedObservation, ManagedVolume, NamespaceRevision};
 
 use super::install::{install, repair};
 use super::reconcile::reconcile;
-use super::scan::{scan, scan_native};
+use super::scan::scan;
 use super::{ReplicaState, SyncError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -61,6 +61,7 @@ impl SyncEngine {
         if !root.is_dir() {
             return Err(SyncError::new("replica path is not a directory"));
         }
+
         let observed = self.volume.observe().await?;
         let stored = ReplicaState::load(state_path)?;
         if let Some(state) = &stored {
@@ -75,19 +76,22 @@ impl SyncEngine {
                 ));
             }
         }
-        if stored.as_ref().is_some_and(ReplicaState::is_installing) {
+        if let Some((target, published)) = stored.as_ref().and_then(ReplicaState::installation) {
             return self
                 .recover_install(
                     &root,
                     state_path,
                     stored.expect("checked interrupted installation state"),
                     observed,
+                    target,
+                    published,
                 )
                 .await;
         }
+
         let mut state = match stored {
             Some(state) => state,
-            None if observed.snapshot.cursor == crate::filesystem::ChangeCursor::Genesis
+            None if observed.snapshot.cursor == ChangeCursor::Genesis
                 && !directory_is_empty(&root)? =>
             {
                 if !resolved.is_empty() {
@@ -95,7 +99,7 @@ impl SyncEngine {
                         "--resolve requires an unresolved conflict in replica state",
                     ));
                 }
-                let state = ReplicaState::new(root.clone(), observed.snapshot.clone())?;
+                let state = ReplicaState::new(root.clone(), self.volume.id(), observed.revision());
                 state.save_new(state_path)?;
                 state
             }
@@ -106,11 +110,14 @@ impl SyncEngine {
                     ));
                 }
                 require_empty(&root)?;
-                let mut state =
-                    ReplicaState::for_cold_install(root.clone(), observed.snapshot.clone())?;
+                let mut state = ReplicaState::for_cold_install(
+                    root.clone(),
+                    self.volume.id(),
+                    observed.revision(),
+                );
                 state.save_new(state_path)?;
                 install(&root, None, &observed.snapshot, &self.volume).await?;
-                state.advance(observed.snapshot.clone(), scan_native(&root)?)?;
+                state.advance(observed.revision());
                 state.save(state_path)?;
                 return Ok(SyncOutcome {
                     conflicts: 0,
@@ -119,20 +126,21 @@ impl SyncEngine {
                 });
             }
         };
-        if state.has_pending_publication() {
+        if state.pending_publication().is_some() {
             return self
                 .recover_pending(&root, state_path, state, observed)
                 .await;
         }
 
-        let local = scan(&root, state.common(), state.native(), &self.volume).await?;
-        let local_changed = local.snapshot.cursor != state.common().cursor;
-        let remote_changed = observed.snapshot.cursor != state.common().cursor;
+        let base = self.volume.snapshot(state.common_revision()).await?;
+        let local = scan(&root, &base, &self.volume).await?;
+        let local_changed = local.snapshot.cursor != base.cursor;
+        let remote_changed = observed.revision() != state.common_revision();
         match (local_changed, remote_changed) {
             (false, false) => Ok(SyncOutcome {
                 conflicts: 0,
                 published: false,
-                sequence: state.common().cursor.sequence(),
+                sequence: base.cursor.sequence(),
             }),
             (true, false) => {
                 if !resolved.is_empty() {
@@ -140,20 +148,22 @@ impl SyncEngine {
                         "--resolve requires a current local and remote conflict",
                     ));
                 }
-                state.begin(observed.snapshot.clone(), local.snapshot.clone())?;
-                state.save(state_path)?;
                 self.publish_target_files(&root, &observed.snapshot, &local.snapshot)
                     .await?;
-                self.volume
-                    .publish(&observed, local.snapshot.clone())
+                let target = self
+                    .volume
+                    .prepare_publication(&observed, local.snapshot)
                     .await?;
+                state.begin_publication(observed.revision(), target)?;
+                state.save(state_path)?;
+                self.volume.commit_publication(&observed, target).await?;
                 test_interrupt("after-publish")?;
-                state.advance(local.snapshot, local.native)?;
+                state.advance(target);
                 state.save(state_path)?;
                 Ok(SyncOutcome {
                     conflicts: 0,
                     published: true,
-                    sequence: state.common().cursor.sequence(),
+                    sequence: target.cursor().sequence(),
                 })
             }
             (false, true) => {
@@ -162,47 +172,50 @@ impl SyncEngine {
                         "--resolve requires a current local and remote conflict",
                     ));
                 }
-                let current = state.common().clone();
                 self.install_and_advance(
                     &root,
                     state_path,
                     state,
                     &observed.snapshot,
-                    Some(&current),
+                    observed.revision(),
+                    Some(&base),
                     false,
                 )
                 .await
             }
             (true, true) => {
-                let plan = reconcile(
-                    state.common(),
-                    &local.snapshot,
-                    &observed.snapshot,
-                    &resolved,
-                )?;
+                let plan = reconcile(&base, &local.snapshot, &observed.snapshot, &resolved)?;
                 if !plan.conflicts.is_empty() {
                     let conflicts = plan.conflicts.len();
-                    state.retain_conflicts(plan.conflicts, observed.snapshot.cursor);
+                    state.retain_conflicts(conflicts, observed.revision());
                     state.save(state_path)?;
                     return Ok(SyncOutcome {
                         conflicts,
                         published: false,
-                        sequence: state.common().cursor.sequence(),
+                        sequence: base.cursor.sequence(),
                     });
                 }
-                if plan.publish {
-                    state.begin(observed.snapshot.clone(), plan.target.clone())?;
-                    state.save(state_path)?;
+                let target_revision = if plan.publish {
                     self.publish_target_files(&root, &observed.snapshot, &plan.target)
                         .await?;
-                    self.volume.publish(&observed, plan.target.clone()).await?;
+                    let target = self
+                        .volume
+                        .prepare_publication(&observed, plan.target.clone())
+                        .await?;
+                    state.begin_publication(observed.revision(), target)?;
+                    state.save(state_path)?;
+                    self.volume.commit_publication(&observed, target).await?;
                     test_interrupt("after-publish")?;
-                }
+                    target
+                } else {
+                    observed.revision()
+                };
                 self.install_and_advance(
                     &root,
                     state_path,
                     state,
                     &plan.target,
+                    target_revision,
                     Some(&local.snapshot),
                     plan.publish,
                 )
@@ -216,16 +229,33 @@ impl SyncEngine {
         root: &Path,
         state_path: &Path,
         mut state: ReplicaState,
-        observed: crate::managed::ManagedObservation,
+        observed: ManagedObservation,
+        target: NamespaceRevision,
+        published: bool,
     ) -> Result<SyncOutcome, SyncError> {
-        repair(root, &observed.snapshot, &self.volume).await?;
-        let published = state.has_pending_publication();
-        state.advance(observed.snapshot, scan_native(root)?)?;
+        let snapshot = self.volume.snapshot(target).await?;
+        state.begin_install(target, published);
         state.save(state_path)?;
+        repair(root, &snapshot, &self.volume).await?;
+        state.advance(target);
+        state.save(state_path)?;
+        if observed.revision() != target {
+            return self
+                .install_and_advance(
+                    root,
+                    state_path,
+                    state,
+                    &observed.snapshot,
+                    observed.revision(),
+                    Some(&snapshot),
+                    published,
+                )
+                .await;
+        }
         Ok(SyncOutcome {
             conflicts: 0,
             published,
-            sequence: state.common().cursor.sequence(),
+            sequence: target.cursor().sequence(),
         })
     }
 
@@ -235,37 +265,19 @@ impl SyncEngine {
         state_path: &Path,
         mut state: ReplicaState,
         target: &VolumeSnapshot,
+        target_revision: NamespaceRevision,
         current: Option<&VolumeSnapshot>,
         published: bool,
     ) -> Result<SyncOutcome, SyncError> {
-        state.begin_install();
+        state.begin_install(target_revision, published);
         state.save(state_path)?;
         install(root, current, target, &self.volume).await?;
-        state.advance(target.clone(), scan_native(root)?)?;
+        state.advance(target_revision);
         state.save(state_path)?;
         Ok(SyncOutcome {
             conflicts: 0,
             published,
-            sequence: state.common().cursor.sequence(),
-        })
-    }
-
-    async fn repair_and_advance(
-        &self,
-        root: &Path,
-        state_path: &Path,
-        mut state: ReplicaState,
-        target: VolumeSnapshot,
-    ) -> Result<SyncOutcome, SyncError> {
-        state.begin_install();
-        state.save(state_path)?;
-        repair(root, &target, &self.volume).await?;
-        state.advance(target, scan_native(root)?)?;
-        state.save(state_path)?;
-        Ok(SyncOutcome {
-            conflicts: 0,
-            published: true,
-            sequence: state.common().cursor.sequence(),
+            sequence: target_revision.cursor().sequence(),
         })
     }
 
@@ -274,45 +286,40 @@ impl SyncEngine {
         root: &Path,
         state_path: &Path,
         mut state: ReplicaState,
-        observed: crate::managed::ManagedObservation,
+        observed: ManagedObservation,
     ) -> Result<SyncOutcome, SyncError> {
-        let target = state
-            .pending_target()
-            .expect("pending state has a target")
-            .clone();
-        let expected = state
-            .pending_expected()
-            .expect("pending state has an expected snapshot")
-            .clone();
-        if observed.snapshot.cursor == target.cursor {
+        let (expected, target) = state
+            .pending_publication()
+            .expect("pending state has publication references");
+        if observed.revision() == target {
             return self
-                .repair_and_advance(root, state_path, state, observed.snapshot)
+                .recover_install(root, state_path, state, observed, target, true)
                 .await;
         }
-        if observed.snapshot.cursor != expected.cursor {
-            let operation = target
-                .cursor
-                .operation()
-                .expect("pending target has an operation identity");
-            if self
-                .volume
-                .operation_committed(operation, &observed)
-                .await?
-            {
-                return self
-                    .repair_and_advance(root, state_path, state, observed.snapshot)
-                    .await;
-            }
-            state.cancel_pending(observed.snapshot.cursor);
+        let operation = target
+            .cursor()
+            .operation()
+            .expect("pending target has an operation identity");
+        if self
+            .volume
+            .operation_committed(operation, &observed)
+            .await?
+        {
+            return self
+                .recover_install(root, state_path, state, observed, target, true)
+                .await;
+        }
+        if observed.revision() != expected {
+            state.cancel_pending(observed.revision());
             state.save(state_path)?;
             return Err(SyncError::new(
                 "pending publication conflicted with a newer remote change; repeat sync to reconcile",
             ));
         }
-        self.publish_target_files(root, &expected, &target).await?;
-        self.volume.publish(&observed, target.clone()).await?;
+        self.volume.commit_publication(&observed, target).await?;
         test_interrupt("after-publish")?;
-        self.repair_and_advance(root, state_path, state, target)
+        let committed = self.volume.observe().await?;
+        self.recover_install(root, state_path, state, committed, target, true)
             .await
     }
 

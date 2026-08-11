@@ -29,7 +29,7 @@ mod record;
 
 pub use format::ManagedFormat;
 pub use gc::GcOutcome;
-pub use head::{ManagedObservation, ManagedVolume};
+pub use head::{ManagedObservation, ManagedVolume, NamespaceRevision};
 
 use opendal::Operator;
 

@@ -28,24 +28,19 @@ use crate::filesystem::{
 use crate::managed::ManagedVolume;
 
 use super::SyncError;
-use super::state::NativeIdentity;
-
 pub(crate) struct ScannedTree {
     pub(crate) snapshot: VolumeSnapshot,
-    pub(crate) native: BTreeMap<String, NativeIdentity>,
 }
 
 #[derive(Clone, Copy)]
 struct LocalEntry {
     kind: NodeKind,
     executable: bool,
-    native: NativeIdentity,
 }
 
 pub(crate) async fn scan(
     root: &Path,
     base: &VolumeSnapshot,
-    known_native: &BTreeMap<String, NativeIdentity>,
     volume: &ManagedVolume,
 ) -> Result<ScannedTree, SyncError> {
     let local = scan_paths(root)?;
@@ -57,22 +52,6 @@ pub(crate) async fn scan(
         .and_then(NonZeroU64::new)
         .ok_or_else(|| SyncError::new("Managed change sequence overflows"))?;
     let next_generation = Generation::from_bytes(next_sequence.get().to_be_bytes().to_vec());
-
-    let mut ids = BTreeMap::new();
-    ids.insert(String::new(), base.root);
-    let known_by_identity = known_native
-        .iter()
-        .map(|(path, identity)| ((identity.device, identity.inode), path))
-        .collect::<BTreeMap<_, _>>();
-    for (path, entry) in &local {
-        let node = known_by_identity
-            .get(&(entry.native.device, entry.native.inode))
-            .and_then(|known_path| base_paths.get(*known_path))
-            .copied()
-            .filter(|node| base.nodes[node].kind == entry.kind)
-            .unwrap_or_else(NodeId::generate);
-        ids.insert(path.clone(), node);
-    }
 
     let mut inspected = futures::stream::iter(
         local
@@ -91,6 +70,30 @@ pub(crate) async fn scan(
         file_versions
             .entry(version.id)
             .or_insert_with(|| version.clone());
+    }
+
+    let mut ids = BTreeMap::from([(String::new(), base.root)]);
+    let mut used = BTreeSet::from([base.root]);
+    for (path, entry) in &local {
+        if let Some(node) = base_paths
+            .get(path)
+            .copied()
+            .filter(|node| base.nodes[node].kind == entry.kind)
+        {
+            ids.insert(path.clone(), node);
+            used.insert(node);
+        }
+    }
+    reuse_unique_identities(
+        &local,
+        &file_by_path,
+        base,
+        &base_paths,
+        &mut ids,
+        &mut used,
+    );
+    for path in local.keys() {
+        ids.entry(path.clone()).or_insert_with(NodeId::generate);
     }
 
     let mut entries_by_directory = ids
@@ -193,27 +196,140 @@ pub(crate) async fn scan(
     if same_namespace(&snapshot, base) {
         return Ok(ScannedTree {
             snapshot: base.clone(),
-            native: native_map(&local),
         });
     }
 
     let operation = OperationId::generate();
     snapshot.cursor = ChangeCursor::at(next_sequence, operation);
-    Ok(ScannedTree {
-        snapshot,
-        native: native_map(&local),
-    })
+    Ok(ScannedTree { snapshot })
 }
 
-pub(crate) fn scan_native(root: &Path) -> Result<BTreeMap<String, NativeIdentity>, SyncError> {
-    scan_paths(root).map(|entries| native_map(&entries))
+fn reuse_unique_identities(
+    local: &BTreeMap<String, LocalEntry>,
+    file_by_path: &BTreeMap<String, FileVersionId>,
+    base: &VolumeSnapshot,
+    base_paths: &BTreeMap<String, NodeId>,
+    ids: &mut BTreeMap<String, NodeId>,
+    used: &mut BTreeSet<NodeId>,
+) {
+    let local_signatures = local_signatures(local, file_by_path);
+    let base_signatures = snapshot_signatures(base, base_paths);
+    let mut local_by_signature = BTreeMap::<_, Vec<&String>>::new();
+    for (path, signature) in &local_signatures {
+        if !ids.contains_key(path) {
+            local_by_signature.entry(*signature).or_default().push(path);
+        }
+    }
+    let mut base_by_signature = BTreeMap::<_, Vec<NodeId>>::new();
+    for (path, signature) in &base_signatures {
+        let node = base_paths[path];
+        if !path.is_empty() && !used.contains(&node) {
+            base_by_signature.entry(*signature).or_default().push(node);
+        }
+    }
+    for (signature, paths) in local_by_signature {
+        let Some(nodes) = base_by_signature.get(&signature) else {
+            continue;
+        };
+        if let ([path], [node]) = (paths.as_slice(), nodes.as_slice()) {
+            ids.insert((*path).clone(), *node);
+            used.insert(*node);
+        }
+    }
 }
 
-fn native_map(local: &BTreeMap<String, LocalEntry>) -> BTreeMap<String, NativeIdentity> {
-    local
-        .iter()
-        .map(|(path, entry)| (path.clone(), entry.native))
-        .collect()
+fn local_signatures(
+    local: &BTreeMap<String, LocalEntry>,
+    files: &BTreeMap<String, FileVersionId>,
+) -> BTreeMap<String, crate::filesystem::Digest> {
+    let children = child_paths(local.keys());
+    let mut signatures = BTreeMap::new();
+    for (path, entry) in local.iter().rev() {
+        let child_signatures = children
+            .get(path.as_str())
+            .into_iter()
+            .flatten()
+            .map(|(name, child)| (*name, signatures[*child]))
+            .collect::<Vec<_>>();
+        signatures.insert(
+            path.clone(),
+            entry_signature(
+                entry.kind,
+                entry.executable,
+                files.get(path).copied(),
+                &child_signatures,
+            ),
+        );
+    }
+    signatures
+}
+
+fn snapshot_signatures(
+    snapshot: &VolumeSnapshot,
+    paths: &BTreeMap<String, NodeId>,
+) -> BTreeMap<String, crate::filesystem::Digest> {
+    let children = child_paths(paths.keys());
+    let mut signatures = BTreeMap::new();
+    for (path, node_id) in paths.iter().rev() {
+        let node = &snapshot.nodes[node_id];
+        let child_signatures = children
+            .get(path.as_str())
+            .into_iter()
+            .flatten()
+            .map(|(name, child)| (*name, signatures[*child]))
+            .collect::<Vec<_>>();
+        signatures.insert(
+            path.clone(),
+            entry_signature(
+                node.kind,
+                node.attributes.executable,
+                node.file_version,
+                &child_signatures,
+            ),
+        );
+    }
+    signatures
+}
+
+fn child_paths<'a>(
+    paths: impl Iterator<Item = &'a String>,
+) -> BTreeMap<&'a str, Vec<(&'a str, &'a str)>> {
+    let mut children = BTreeMap::<_, Vec<_>>::new();
+    for path in paths {
+        if path.is_empty() {
+            continue;
+        }
+        let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+        children
+            .entry(parent)
+            .or_default()
+            .push((name, path.as_str()));
+    }
+    children
+}
+
+fn entry_signature(
+    kind: NodeKind,
+    executable: bool,
+    file: Option<FileVersionId>,
+    children: &[(&str, crate::filesystem::Digest)],
+) -> crate::filesystem::Digest {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&[match kind {
+        NodeKind::Directory => 0,
+        NodeKind::RegularFile => 1,
+    }]);
+    hasher.update(&[u8::from(executable)]);
+    if let Some(file) = file {
+        hasher.update(file.digest().as_bytes());
+        hasher.update(&file.logical_length().to_be_bytes());
+    }
+    for (name, signature) in children {
+        hasher.update(&(name.len() as u64).to_be_bytes());
+        hasher.update(name.as_bytes());
+        hasher.update(signature.as_bytes());
+    }
+    crate::filesystem::Digest::from_bytes(hasher.finalize().into())
 }
 
 fn same_namespace(left: &VolumeSnapshot, right: &VolumeSnapshot) -> bool {
@@ -277,20 +393,25 @@ fn local_entry(
     Ok(LocalEntry {
         kind,
         executable: kind == NodeKind::RegularFile && metadata.permissions().mode() & 0o111 != 0,
-        native: NativeIdentity {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-            kind,
-        },
     })
 }
 
 #[cfg(not(unix))]
 fn local_entry(
-    _metadata: &std::fs::Metadata,
+    metadata: &std::fs::Metadata,
     _file_identities: &mut BTreeSet<(u64, u64)>,
 ) -> Result<LocalEntry, SyncError> {
-    Err(SyncError::new(
-        "Managed Sync native identity is not implemented on this platform",
-    ))
+    let kind = if metadata.is_dir() {
+        NodeKind::Directory
+    } else if metadata.is_file() {
+        NodeKind::RegularFile
+    } else {
+        return Err(SyncError::new(
+            "local replica contains a symbolic link or special file",
+        ));
+    };
+    Ok(LocalEntry {
+        kind,
+        executable: false,
+    })
 }

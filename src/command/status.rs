@@ -35,9 +35,9 @@ pub(super) fn run(args: StatusArgs) -> Result<()> {
             "{}",
             serde_json::json!({
                 "access_model": "sync",
-                "conflicts": state.conflicts().len(),
-                "common_sequence": state.common().cursor.sequence(),
-                "common_operation": state.common().cursor.operation().map(|operation| operation.to_string()),
+                "conflicts": state.conflict_count(),
+                "common_sequence": state.common_revision().cursor().sequence(),
+                "common_operation": state.common_revision().cursor().operation().map(|operation| operation.to_string()),
                 "pending": state.has_pending(),
                 "remote_sequence": state.remote_cursor().sequence(),
                 "remote_operation": state.remote_cursor().operation().map(|operation| operation.to_string()),
@@ -49,7 +49,7 @@ pub(super) fn run(args: StatusArgs) -> Result<()> {
                     "namespace_publication": "generation_cas",
                     "portable_names": true,
                     "remote_durability": "explicit_sync",
-                    "stable_rename_identity": cfg!(unix),
+                    "stable_rename_identity": false,
                     "symbolic_links": false,
                 },
             })
@@ -58,9 +58,9 @@ pub(super) fn run(args: StatusArgs) -> Result<()> {
         println!(
             "managed sync volume {} at change {}, {} pending, {} conflict(s)",
             state.volume_id(),
-            state.common().cursor.sequence(),
+            state.common_revision().cursor().sequence(),
             usize::from(state.has_pending()),
-            state.conflicts().len()
+            state.conflict_count()
         );
     }
     Ok(())

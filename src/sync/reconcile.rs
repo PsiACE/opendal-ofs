@@ -265,10 +265,10 @@ fn conflict(
     }
 }
 
-fn digest(snapshot: &VolumeSnapshot, node: Option<NodeId>) -> Option<[u8; 32]> {
+fn digest(snapshot: &VolumeSnapshot, node: Option<NodeId>) -> Option<crate::filesystem::Digest> {
     let node = &snapshot.nodes[&node?];
     let version = snapshot.file_versions.get(&node.file_version?)?;
-    Some(*version.digest().as_bytes())
+    Some(version.digest())
 }
 
 fn build_target(

@@ -790,7 +790,7 @@ fn history(fixture: &Fixture) {
     assert_eq!(
         tree_fingerprint(&replica_a),
         tree_fingerprint(&replica_c),
-        "the current checkpoint is sufficient for a cold restore"
+        "the current namespace revision is sufficient for a cold restore"
     );
     for (replica, state) in [
         (&replica_a, &state_a),

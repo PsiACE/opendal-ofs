@@ -15,80 +15,66 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::Cursor;
-use std::io::Write as _;
+use std::io::{Cursor, Write as _};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::filesystem::{ChangeCursor, NodeKind, OperationId, VolumeId, VolumeSnapshot};
+use crate::filesystem::{ChangeCursor, Digest, OperationId, VolumeId};
+use crate::managed::NamespaceRevision;
 
 use super::SyncError;
 
-const FORMAT: &str = "managed-sync/1";
-const MAGIC: &[u8; 8] = b"OFSSTATE";
-const MAXIMUM_STATE_BYTES: usize = 64 * 1024 * 1024;
+const MAGIC: &[u8; 8] = b"OFSSTAT1";
+const MAXIMUM_STATE_BYTES: usize = 16 * 1024;
 
+/// A recoverable binding between one local replica and its remote namespace.
+///
+/// This record deliberately contains no namespace image or per-path identity map.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReplicaState {
-    format: String,
     root: PathBuf,
-    common: VolumeSnapshot,
-    remote: ChangeCursor,
-    native: BTreeMap<String, NativeIdentity>,
-    installing: bool,
-    pending: Option<PendingPublication>,
-    conflicts: Vec<ConflictRecord>,
+    volume_id: VolumeId,
+    common: NamespaceRevision,
+    observed: NamespaceRevision,
+    phase: SyncPhase,
+    conflicts: u64,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct PendingPublication {
-    expected: VolumeSnapshot,
-    target: VolumeSnapshot,
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SyncPhase {
+    Clean,
+    Publishing {
+        expected: NamespaceRevision,
+        target: NamespaceRevision,
+    },
+    Installing {
+        target: NamespaceRevision,
+        published: bool,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConflictRecord {
     pub path: String,
-    pub local_digest: Option<[u8; 32]>,
-    pub remote_digest: Option<[u8; 32]>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct NativeIdentity {
-    pub(crate) device: u64,
-    pub(crate) inode: u64,
-    pub(crate) kind: NodeKind,
+    pub local_digest: Option<Digest>,
+    pub remote_digest: Option<Digest>,
 }
 
 impl ReplicaState {
-    pub fn new(root: PathBuf, common: VolumeSnapshot) -> Result<Self, SyncError> {
-        Self::with_native(root, common, BTreeMap::new())
-    }
-
-    pub(crate) fn with_native(
-        root: PathBuf,
-        common: VolumeSnapshot,
-        native: BTreeMap<String, NativeIdentity>,
-    ) -> Result<Self, SyncError> {
-        common.validate()?;
-        validate_native(&common, &native)?;
-        Ok(Self {
-            format: FORMAT.to_owned(),
+    pub fn new(root: PathBuf, volume_id: VolumeId, common: NamespaceRevision) -> Self {
+        Self {
             root,
-            remote: common.cursor,
+            volume_id,
             common,
-            native,
-            installing: false,
-            pending: None,
-            conflicts: Vec::new(),
-        })
+            observed: common,
+            phase: SyncPhase::Clean,
+            conflicts: 0,
+        }
     }
 
     pub fn load(path: &Path) -> Result<Option<Self>, SyncError> {
@@ -98,32 +84,20 @@ impl ReplicaState {
             Err(error) => return Err(SyncError::io("read replica state", error)),
         };
         let state = decode(&bytes)?;
-        if state.format != FORMAT {
-            return Err(SyncError::new("replica state format is unsupported"));
-        }
-        state.common.validate()?;
-        if !state.installing {
-            validate_native(&state.common, &state.native)?;
-        }
-        if state.remote.sequence() < state.common.cursor.sequence() {
-            return Err(SyncError::new(
-                "replica remote cursor is behind its common namespace",
-            ));
-        }
+        state.validate()?;
         Ok(Some(state))
     }
 
     pub fn save_new(&self, path: &Path) -> Result<(), SyncError> {
-        if path.exists() {
-            return Err(SyncError::new(format!(
-                "cannot attach with an existing replica state: {}",
-                path.display()
-            )));
-        }
-        self.save(path)
+        self.persist(path, false)
     }
 
     pub fn save(&self, path: &Path) -> Result<(), SyncError> {
+        self.persist(path, true)
+    }
+
+    fn persist(&self, path: &Path, replace: bool) -> Result<(), SyncError> {
+        self.validate()?;
         let parent = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty());
@@ -141,10 +115,49 @@ impl ReplicaState {
         file.write_all(&bytes)
             .and_then(|()| file.sync_all())
             .map_err(|error| SyncError::io("persist replica state", error))?;
-        fs::rename(&temporary, path)
-            .map_err(|error| SyncError::io("install replica state", error))?;
-        sync_parent(path)?;
-        Ok(())
+        if replace {
+            fs::rename(&temporary, path)
+                .map_err(|error| SyncError::io("install replica state", error))?;
+        } else {
+            fs::hard_link(&temporary, path).map_err(|error| {
+                let _ = fs::remove_file(&temporary);
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    SyncError::new(format!(
+                        "cannot attach with an existing replica state: {}",
+                        path.display()
+                    ))
+                } else {
+                    SyncError::io("install new replica state", error)
+                }
+            })?;
+            fs::remove_file(&temporary)
+                .map_err(|error| SyncError::io("remove replica state temporary file", error))?;
+        }
+        sync_parent(path)
+    }
+
+    fn validate(&self) -> Result<(), SyncError> {
+        if self.observed.cursor().sequence() < self.common.cursor().sequence() {
+            return Err(SyncError::new(
+                "replica remote cursor is behind its common namespace",
+            ));
+        }
+        match self.phase {
+            SyncPhase::Clean => Ok(()),
+            SyncPhase::Publishing { expected, target }
+                if expected.cursor().sequence() >= self.common.cursor().sequence()
+                    && target.cursor().sequence() == expected.cursor().sequence() + 1
+                    && target.cursor().operation().is_some() =>
+            {
+                Ok(())
+            }
+            SyncPhase::Installing { target, .. }
+                if target.cursor().sequence() >= self.common.cursor().sequence() =>
+            {
+                Ok(())
+            }
+            _ => Err(SyncError::new("replica recovery references are invalid")),
+        }
     }
 
     pub fn root(&self) -> &Path {
@@ -152,142 +165,85 @@ impl ReplicaState {
     }
 
     pub const fn volume_id(&self) -> VolumeId {
-        self.common.volume_id
+        self.volume_id
     }
 
-    pub const fn common(&self) -> &VolumeSnapshot {
-        &self.common
+    pub const fn common_revision(&self) -> NamespaceRevision {
+        self.common
     }
 
     pub const fn remote_cursor(&self) -> ChangeCursor {
-        self.remote
+        self.observed.cursor()
     }
 
-    pub(crate) fn native(&self) -> &BTreeMap<String, NativeIdentity> {
-        &self.native
-    }
-
-    pub(crate) fn advance(
-        &mut self,
-        common: VolumeSnapshot,
-        native: BTreeMap<String, NativeIdentity>,
-    ) -> Result<(), SyncError> {
-        common.validate()?;
-        validate_native(&common, &native)?;
-        self.remote = common.cursor;
-        self.common = common;
-        self.native = native;
-        self.installing = false;
-        self.pending = None;
-        self.conflicts.clear();
-        Ok(())
+    pub const fn conflict_count(&self) -> u64 {
+        self.conflicts
     }
 
     pub const fn has_pending(&self) -> bool {
-        self.installing || self.pending.is_some()
+        !matches!(self.phase, SyncPhase::Clean)
     }
 
-    pub(crate) const fn has_pending_publication(&self) -> bool {
-        self.pending.is_some()
-    }
-
-    pub(crate) const fn is_installing(&self) -> bool {
-        self.installing
-    }
-
-    pub(crate) fn pending_target(&self) -> Option<&VolumeSnapshot> {
-        self.pending.as_ref().map(|pending| &pending.target)
-    }
-
-    pub(crate) fn pending_expected(&self) -> Option<&VolumeSnapshot> {
-        self.pending.as_ref().map(|pending| &pending.expected)
-    }
-
-    pub fn conflicts(&self) -> &[ConflictRecord] {
-        &self.conflicts
-    }
-
-    pub(crate) fn retain_conflicts(
-        &mut self,
-        conflicts: Vec<ConflictRecord>,
-        remote: ChangeCursor,
-    ) {
-        self.pending = None;
-        self.conflicts = conflicts;
-        self.remote = remote;
-    }
-
-    pub(crate) fn cancel_pending(&mut self, remote: ChangeCursor) {
-        self.pending = None;
-        self.remote = remote;
-    }
-
-    pub(crate) fn begin(
-        &mut self,
-        expected: VolumeSnapshot,
-        target: VolumeSnapshot,
-    ) -> Result<(), SyncError> {
-        expected.validate()?;
-        target.validate()?;
-        if expected.volume_id != self.volume_id()
-            || target.volume_id != self.volume_id()
-            || expected.cursor.sequence() < self.common.cursor.sequence()
-            || target.cursor.sequence() != expected.cursor.sequence() + 1
-        {
-            return Err(SyncError::new("pending publication ancestry is invalid"));
+    pub(crate) const fn pending_publication(
+        &self,
+    ) -> Option<(NamespaceRevision, NamespaceRevision)> {
+        match self.phase {
+            SyncPhase::Publishing { expected, target } => Some((expected, target)),
+            _ => None,
         }
-        self.remote = expected.cursor;
-        self.pending = Some(PendingPublication { expected, target });
-        self.conflicts.clear();
-        Ok(())
     }
 
-    pub(crate) fn begin_install(&mut self) {
-        self.installing = true;
-        self.conflicts.clear();
+    pub(crate) const fn installation(&self) -> Option<(NamespaceRevision, bool)> {
+        match self.phase {
+            SyncPhase::Installing { target, published } => Some((target, published)),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn advance(&mut self, common: NamespaceRevision) {
+        self.common = common;
+        self.observed = common;
+        self.phase = SyncPhase::Clean;
+        self.conflicts = 0;
+    }
+
+    pub(crate) fn begin_publication(
+        &mut self,
+        expected: NamespaceRevision,
+        target: NamespaceRevision,
+    ) -> Result<(), SyncError> {
+        self.phase = SyncPhase::Publishing { expected, target };
+        self.observed = expected;
+        self.conflicts = 0;
+        self.validate()
+    }
+
+    pub(crate) fn begin_install(&mut self, target: NamespaceRevision, published: bool) {
+        self.phase = SyncPhase::Installing { target, published };
+        self.observed = target;
+        self.conflicts = 0;
+    }
+
+    pub(crate) fn retain_conflicts(&mut self, conflicts: usize, remote: NamespaceRevision) {
+        self.phase = SyncPhase::Clean;
+        self.conflicts = conflicts.try_into().unwrap_or(u64::MAX);
+        self.observed = remote;
+    }
+
+    pub(crate) fn cancel_pending(&mut self, remote: NamespaceRevision) {
+        self.phase = SyncPhase::Clean;
+        self.observed = remote;
     }
 
     pub(crate) fn for_cold_install(
         root: PathBuf,
-        target: VolumeSnapshot,
-    ) -> Result<Self, SyncError> {
-        target.validate()?;
-        Ok(Self {
-            format: FORMAT.to_owned(),
-            root,
-            remote: target.cursor,
-            common: target,
-            native: BTreeMap::new(),
-            installing: true,
-            pending: None,
-            conflicts: Vec::new(),
-        })
+        volume_id: VolumeId,
+        target: NamespaceRevision,
+    ) -> Self {
+        let mut state = Self::new(root, volume_id, target);
+        state.begin_install(target, false);
+        state
     }
-}
-
-fn validate_native(
-    snapshot: &VolumeSnapshot,
-    native: &BTreeMap<String, NativeIdentity>,
-) -> Result<(), SyncError> {
-    let paths = snapshot.paths()?;
-    if paths.len() != native.len()
-        || paths.iter().any(|(path, node)| {
-            native
-                .get(path)
-                .is_none_or(|identity| identity.kind != snapshot.nodes[node].kind)
-        })
-        || native
-            .values()
-            .map(|identity| (identity.device, identity.inode))
-            .collect::<BTreeSet<_>>()
-            .len()
-            != native.len()
-    {
-        return Err(SyncError::new(
-            "replica native identities do not match the common namespace",
-        ));
-    }
-    Ok(())
 }
 
 fn encode(state: &ReplicaState) -> Result<Vec<u8>, SyncError> {
