@@ -1384,8 +1384,24 @@ fn build_ofs() {
     run(&mut command);
 }
 
+fn build_ofs_release() {
+    let mut command = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+    command.current_dir(env!("CARGO_WORKSPACE_DIR")).args([
+        "build",
+        "--release",
+        "--locked",
+        "--bin",
+        "ofs",
+    ]);
+    run(&mut command);
+}
+
 fn ofs_volume_create(storage: &str) -> Command {
-    let mut command = ofs_command();
+    ofs_volume_create_with(&ofs_debug_binary(), storage)
+}
+
+fn ofs_volume_create_with(binary: &Path, storage: &str) -> Command {
+    let mut command = ofs_command_with(binary);
     command
         .arg("volume")
         .arg("create")
@@ -1395,7 +1411,11 @@ fn ofs_volume_create(storage: &str) -> Command {
 }
 
 fn ofs_sync(replica: &Path, state: &Path, storage: &str) -> Command {
-    let mut command = ofs_command();
+    ofs_sync_with(&ofs_debug_binary(), replica, state, storage)
+}
+
+fn ofs_sync_with(binary: &Path, replica: &Path, state: &Path, storage: &str) -> Command {
+    let mut command = ofs_command_with(binary);
     command
         .arg("sync")
         .arg(storage)
@@ -1406,7 +1426,11 @@ fn ofs_sync(replica: &Path, state: &Path, storage: &str) -> Command {
 }
 
 fn ofs_status(replica: &Path, state: &Path) -> Command {
-    let mut command = ofs_command();
+    ofs_status_with(&ofs_debug_binary(), replica, state)
+}
+
+fn ofs_status_with(binary: &Path, replica: &Path, state: &Path) -> Command {
+    let mut command = ofs_command_with(binary);
     command
         .arg("status")
         .arg(replica)
@@ -1426,7 +1450,23 @@ fn ofs_gc_with_grace(
     retain_from: Option<u64>,
     orphan_grace: Option<&str>,
 ) -> Command {
-    let mut command = ofs_command();
+    ofs_gc_with_binary(
+        &ofs_debug_binary(),
+        storage,
+        resume,
+        retain_from,
+        orphan_grace,
+    )
+}
+
+fn ofs_gc_with_binary(
+    binary: &Path,
+    storage: &str,
+    resume: bool,
+    retain_from: Option<u64>,
+    orphan_grace: Option<&str>,
+) -> Command {
+    let mut command = ofs_command_with(binary);
     command.arg("gc").arg(storage);
     if let Some(orphan_grace) = orphan_grace {
         command.args(["--orphan-grace", orphan_grace]);
@@ -1448,9 +1488,16 @@ fn ofs_sync_resolve(replica: &Path, state: &Path, storage: &str, paths: &[&str])
     command
 }
 
-fn ofs_command() -> Command {
-    let mut command =
-        Command::new(PathBuf::from(env!("CARGO_WORKSPACE_DIR")).join("target/debug/ofs"));
+fn ofs_debug_binary() -> PathBuf {
+    PathBuf::from(env!("CARGO_WORKSPACE_DIR")).join("target/debug/ofs")
+}
+
+fn ofs_release_binary() -> PathBuf {
+    PathBuf::from(env!("CARGO_WORKSPACE_DIR")).join("target/release/ofs")
+}
+
+fn ofs_command_with(binary: &Path) -> Command {
+    let mut command = Command::new(binary);
     command
         .env("AWS_ACCESS_KEY_ID", "minioadmin")
         .env("AWS_SECRET_ACCESS_KEY", "minioadmin")
@@ -1650,11 +1697,6 @@ impl Fixture {
             &format!("local/managed-sync/{root}"),
         ]);
         evaluation::inventory(command)
-    }
-
-    fn finish_audit(&self, marker: &str) {
-        let storage = self.storage_url(&format!("audit-barrier/{marker}"));
-        self.finish_audit_with(marker, ofs_volume_create(&storage));
     }
 
     pub(crate) fn finish_audit_with(&self, marker: &str, mut command: Command) {

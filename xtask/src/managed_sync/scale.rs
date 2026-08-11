@@ -51,7 +51,8 @@ const MAX_REPLICA_STATE_BYTES: u64 = 16 * 1024;
 
 pub(crate) fn run(profile: &str, output: &Path, keep: bool) {
     let profile = Profile::parse(profile);
-    super::build_ofs();
+    super::build_ofs_release();
+    let binary = super::ofs_release_binary();
 
     let output = absolute_from_workspace(output);
     fs::create_dir_all(&output).expect("create scale report directory");
@@ -84,6 +85,7 @@ pub(crate) fn run(profile: &str, output: &Path, keep: bool) {
         output.join(format!("{run_name}.logs")),
         profile,
         &volume_root,
+        binary.clone(),
         keep,
     );
     runner.write_report();
@@ -91,15 +93,19 @@ pub(crate) fn run(profile: &str, output: &Path, keep: bool) {
     let generation_started = Instant::now();
     generate_initial(profile, &replica_a);
     runner.record_generation(generation_started.elapsed());
-    runner.stage("volume-create", super::ofs_volume_create(&storage), None);
+    runner.stage(
+        "volume-create",
+        super::ofs_volume_create_with(&binary, &storage),
+        None,
+    );
     runner.stage(
         "initial-publish-a",
-        super::ofs_sync(&replica_a, &state_a, &storage),
+        super::ofs_sync_with(&binary, &replica_a, &state_a, &storage),
         Some((&replica_a, &state_a)),
     );
     runner.stage(
         "cold-restore-b",
-        super::ofs_sync(&replica_b, &state_b, &storage),
+        super::ofs_sync_with(&binary, &replica_b, &state_b, &storage),
         Some((&replica_b, &state_b)),
     );
     runner.observe_equal(
@@ -116,7 +122,7 @@ pub(crate) fn run(profile: &str, output: &Path, keep: bool) {
     ] {
         let published = runner.stage(
             name,
-            super::ofs_sync(replica, state, &storage),
+            super::ofs_sync_with(&binary, replica, state, &storage),
             Some((replica, state)),
         );
         runner.require(
@@ -129,17 +135,17 @@ pub(crate) fn run(profile: &str, output: &Path, keep: bool) {
     mutate(profile, Side::B, &replica_b);
     runner.stage(
         "publish-a-update",
-        super::ofs_sync(&replica_a, &state_a, &storage),
+        super::ofs_sync_with(&binary, &replica_a, &state_a, &storage),
         Some((&replica_a, &state_a)),
     );
     runner.stage(
         "merge-b-update",
-        super::ofs_sync(&replica_b, &state_b, &storage),
+        super::ofs_sync_with(&binary, &replica_b, &state_b, &storage),
         Some((&replica_b, &state_b)),
     );
     runner.stage(
         "install-merged-a",
-        super::ofs_sync(&replica_a, &state_a, &storage),
+        super::ofs_sync_with(&binary, &replica_a, &state_a, &storage),
         Some((&replica_a, &state_a)),
     );
     runner.observe_equal(
@@ -153,12 +159,12 @@ pub(crate) fn run(profile: &str, output: &Path, keep: bool) {
     let current = runner.remote_sequence();
     runner.stage(
         "advance-horizon-and-gc",
-        super::ofs_gc(&storage, false, Some(current)),
+        super::ofs_gc_with_binary(&binary, &storage, false, Some(current), Some("0s")),
         Some((&replica_a, &state_a)),
     );
     runner.stage(
         "stateless-cold-restore-c",
-        super::ofs_sync(&replica_c, &state_c, &storage),
+        super::ofs_sync_with(&binary, &replica_c, &state_c, &storage),
         Some((&replica_c, &state_c)),
     );
     runner.observe_equal(
@@ -168,7 +174,11 @@ pub(crate) fn run(profile: &str, output: &Path, keep: bool) {
         &replica_c,
         "replica-c",
     );
-    fixture.finish_audit(&run_name);
+    let barrier_storage = fixture.storage_url(&format!("audit-barrier/{run_name}"));
+    fixture.finish_audit_with(
+        &run_name,
+        super::ofs_volume_create_with(&binary, &barrier_storage),
+    );
     runner.record_backend(
         fixture.inventory(&volume_root),
         audit_summary(&audit_log, &volume_root),
@@ -375,6 +385,7 @@ fn write_content(path: &Path, identity: &Path, revision: u8, size: u64, buffer: 
 }
 
 struct Runner {
+    binary: PathBuf,
     report: Value,
     report_path: PathBuf,
     log_directory: PathBuf,
@@ -387,6 +398,7 @@ impl Runner {
         log_directory: PathBuf,
         profile: Profile,
         volume_root: &str,
+        binary: PathBuf,
         keep: bool,
     ) -> Self {
         fs::create_dir(&log_directory).expect("create scale log directory");
@@ -410,6 +422,7 @@ impl Runner {
             "tree_observations": [],
         });
         Self {
+            binary,
             report,
             report_path,
             log_directory,
@@ -421,7 +434,8 @@ impl Runner {
         println!("scale phase: {name}");
         use_product_credentials(&mut command);
         let captured = capture_process(command, &self.log_directory, name);
-        let replica_status = replica.and_then(|(root, state)| read_status(root, state));
+        let replica_status =
+            replica.and_then(|(root, state)| read_status(&self.binary, root, state));
         let status_available = replica.is_none() || replica_status.is_some();
         if let Some(status) = &replica_status {
             self.last_status = Some(status.clone());
@@ -568,11 +582,11 @@ impl Runner {
     }
 }
 
-fn read_status(replica: &Path, state: &Path) -> Option<Value> {
+fn read_status(binary: &Path, replica: &Path, state: &Path) -> Option<Value> {
     if !state.is_file() {
         return None;
     }
-    let mut command = super::ofs_status(replica, state);
+    let mut command = super::ofs_status_with(binary, replica, state);
     use_product_credentials(&mut command);
     let output = command.output().expect("read scale replica status");
     if !output.status.success() {

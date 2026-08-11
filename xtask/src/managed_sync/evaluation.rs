@@ -308,7 +308,7 @@ pub(crate) fn inventory(mut command: Command) -> Value {
         {
             continue;
         }
-        let record: Value = serde_json::from_str(&line).expect("object inventory line is JSON");
+        let record: Value = serde_json::from_str(line).expect("object inventory line is JSON");
         if record.get("type").and_then(Value::as_str) != Some("file") {
             continue;
         }
