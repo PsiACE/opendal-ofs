@@ -1802,13 +1802,21 @@ impl Fixture {
         evaluation::inventory(command)
     }
 
-    pub(crate) fn finish_audit_with(&self, marker: &str, mut command: Command) {
+    pub(crate) fn publish_audit_marker_with(&self, mut command: Command) {
+        assert!(
+            self.audit_state.is_some(),
+            "Managed Sync audit fixture has audit state"
+        );
+        evaluation::use_product_credentials(&mut command);
+        run_ofs_success(command, "publish MinIO audit barrier");
+    }
+
+    pub(crate) fn finish_audit_with(&self, marker: &str, command: Command) {
         let audit_state = self
             .audit_state
             .as_ref()
             .expect("audited fixture has audit state");
-        evaluation::use_product_credentials(&mut command);
-        run_ofs_success(command, "publish MinIO audit barrier");
+        self.publish_audit_marker_with(command);
         evaluation::wait_for_audit_marker(audit_state, marker, FIXTURE_READY_TIMEOUT);
     }
 

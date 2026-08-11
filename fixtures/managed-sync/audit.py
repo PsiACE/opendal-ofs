@@ -18,6 +18,7 @@
 """Aggregate MinIO audit events for Managed Sync evaluation."""
 
 import argparse
+import copy
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -32,6 +33,7 @@ class AuditState:
         self.path = path
         self.lock = threading.Lock()
         self.markers: set[str] = set()
+        self.snapshots: dict[str, dict[str, object]] = {}
         self.volumes: dict[str, dict[str, object]] = {}
 
     def record(self, events: list[dict[str, object]]) -> None:
@@ -57,7 +59,13 @@ class AuditState:
         if len(parts) < 4 or parts[1] != "managed-sync":
             return
         if parts[2] == "audit-barrier":
-            self.markers.add(parts[3])
+            marker = parts[3]
+            self.markers.add(marker)
+            if len(parts) >= 6:
+                root = "/".join(parts[4:6])
+                volume = self.volumes.get(root)
+                if volume is not None:
+                    self.snapshots.setdefault(marker, copy.deepcopy(volume))
             return
         if parts[2] not in {"calibration", "scale"}:
             return
@@ -100,7 +108,11 @@ class AuditState:
         temporary = self.path.with_suffix(".tmp")
         temporary.write_text(
             json.dumps(
-                {"markers": sorted(self.markers), "volumes": self.volumes},
+                {
+                    "markers": sorted(self.markers),
+                    "snapshots": self.snapshots,
+                    "volumes": self.volumes,
+                },
                 separators=(",", ":"),
                 sort_keys=True,
             ),

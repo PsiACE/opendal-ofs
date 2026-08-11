@@ -35,8 +35,11 @@ use super::evaluation::GitProvenance;
 use super::evaluation::STREAM_BUFFER_SIZE;
 use super::evaluation::TreeSummary;
 use super::evaluation::absolute_from_workspace;
+use super::evaluation::audit_delta;
+use super::evaluation::audit_snapshot;
 use super::evaluation::audit_summary;
 use super::evaluation::capture_process;
+use super::evaluation::empty_audit_summary;
 use super::evaluation::log_contains;
 use super::evaluation::short_log_excerpt;
 use super::evaluation::tree_summary;
@@ -93,6 +96,8 @@ pub(crate) fn run(profile: &str, output: &Path, keep: bool) {
         output.join(format!("{run_name}.logs")),
         profile,
         &volume_root,
+        &audit_state,
+        &fixture,
         binary.clone(),
         keep,
         &candidate,
@@ -588,27 +593,33 @@ fn write_content(path: &Path, identity: &Path, revision: u8, size: u64, buffer: 
     );
 }
 
-struct Runner {
+struct Runner<'a> {
     binary: PathBuf,
+    fixture: &'a Fixture,
+    audit_state: PathBuf,
+    volume_root: String,
+    audit_markers: Vec<String>,
     report: Value,
     report_path: PathBuf,
     log_directory: PathBuf,
     last_status: Option<Value>,
 }
 
-impl Runner {
+impl<'a> Runner<'a> {
     fn new(
         report_path: PathBuf,
         log_directory: PathBuf,
         profile: Profile,
         volume_root: &str,
+        audit_state: &Path,
+        fixture: &'a Fixture,
         binary: PathBuf,
         keep: bool,
         candidate: &GitProvenance,
     ) -> Self {
         fs::create_dir(&log_directory).expect("create scale log directory");
         let report = json!({
-            "schema": "ofs.managed-sync.scale/2",
+            "schema": "ofs.managed-sync.scale/3",
             "status": "running",
             "source_provenance": {
                 "candidate": candidate.document(),
@@ -633,6 +644,10 @@ impl Runner {
         });
         Self {
             binary,
+            fixture,
+            audit_state: audit_state.to_owned(),
+            volume_root: volume_root.to_owned(),
+            audit_markers: Vec::new(),
             report,
             report_path,
             log_directory,
@@ -671,6 +686,16 @@ impl Runner {
         let stdout_log = self.relative_log(&captured.stdout_log);
         let stderr_log = self.relative_log(&captured.stderr_log);
         let published = log_contains(&captured.stdout_log, b"(published)");
+        let marker = format!("scale-{}-{}", std::process::id(), self.audit_markers.len());
+        let barrier_storage = self
+            .fixture
+            .storage_url(&format!("audit-barrier/{marker}/{}", self.volume_root));
+        self.fixture
+            .publish_audit_marker_with(scale_command(super::ofs_volume_create_with(
+                &self.binary,
+                &barrier_storage,
+            )));
+        self.audit_markers.push(marker);
         self.report["phases"]
             .as_array_mut()
             .expect("phase report is an array")
@@ -787,6 +812,24 @@ impl Runner {
     }
 
     fn record_backend(&mut self, inventory: Value, audit: Value, audit_state: Option<String>) {
+        let mut previous = empty_audit_summary();
+        let phases = self.report["phases"]
+            .as_array_mut()
+            .expect("phase report is an array");
+        assert_eq!(
+            phases.len(),
+            self.audit_markers.len(),
+            "every scale phase has an audit marker"
+        );
+        for (phase, marker) in phases.iter_mut().zip(&self.audit_markers) {
+            let current = audit_snapshot(&self.audit_state, marker);
+            phase["backend_requests"] = audit_delta(&previous, &current);
+            previous = current;
+        }
+        assert_eq!(
+            previous, audit,
+            "final MinIO audit totals differ from the last scale phase snapshot"
+        );
         self.report["object_inventory"] = inventory;
         self.report["backend_requests"] = audit;
         self.report["audit_state_retained"] = audit_state.map_or(Value::Null, Value::String);

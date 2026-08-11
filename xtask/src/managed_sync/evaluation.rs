@@ -397,6 +397,80 @@ pub(crate) fn audit_summary(path: &Path, volume_root: &str) -> Value {
     summary.clone()
 }
 
+pub(crate) fn audit_snapshot(path: &Path, marker: &str) -> Value {
+    let document: Value = serde_json::from_slice(&fs::read(path).expect("read MinIO audit state"))
+        .expect("MinIO audit state is JSON");
+    document
+        .get("snapshots")
+        .and_then(|snapshots| snapshots.get(marker))
+        .unwrap_or_else(|| panic!("MinIO audit state has no snapshot {marker}"))
+        .clone()
+}
+
+pub(crate) fn audit_delta(previous: &Value, current: &Value) -> Value {
+    let mut groups = serde_json::Map::new();
+    let current_groups = current
+        .get("groups")
+        .and_then(Value::as_object)
+        .expect("current MinIO audit snapshot has groups");
+    let previous_groups = previous
+        .get("groups")
+        .and_then(Value::as_object)
+        .expect("previous MinIO audit snapshot has groups");
+    for key in previous_groups.keys() {
+        assert!(
+            current_groups.contains_key(key),
+            "MinIO audit group disappeared between snapshots"
+        );
+    }
+    for (key, current_group) in current_groups {
+        let previous_group = previous_groups.get(key);
+        let group = audit_totals_delta(previous_group, current_group);
+        if group
+            .get("requests")
+            .and_then(Value::as_u64)
+            .is_some_and(|requests| requests > 0)
+        {
+            groups.insert(key.clone(), group);
+        }
+    }
+    let mut total = audit_totals_delta(Some(previous), current);
+    total["groups"] = Value::Object(groups);
+    total
+}
+
+pub(crate) fn empty_audit_summary() -> Value {
+    json!({
+        "requests": 0,
+        "request_bytes": 0,
+        "response_bytes": 0,
+        "groups": {},
+    })
+}
+
+fn audit_totals_delta(previous: Option<&Value>, current: &Value) -> Value {
+    let mut result = serde_json::Map::new();
+    for field in ["requests", "request_bytes", "response_bytes"] {
+        let current = current
+            .get(field)
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| panic!("current MinIO audit totals have no {field}"));
+        let previous = previous
+            .and_then(|value| value.get(field))
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        result.insert(
+            field.into(),
+            Value::from(
+                current
+                    .checked_sub(previous)
+                    .unwrap_or_else(|| panic!("MinIO audit total {field} moved backwards")),
+            ),
+        );
+    }
+    Value::Object(result)
+}
+
 #[derive(Default)]
 struct ObjectTotal {
     objects: u64,
