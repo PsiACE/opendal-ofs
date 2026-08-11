@@ -41,6 +41,50 @@ pub(crate) const PRODUCT_ACCESS_KEY: &str = "ofs-evaluation";
 pub(crate) const PRODUCT_SECRET_KEY: &str = "ofs-evaluation-password";
 const PROCESS_SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GitProvenance {
+    git_revision: String,
+    workspace_dirty: bool,
+}
+
+impl GitProvenance {
+    pub(crate) fn capture(workspace: &Path) -> Self {
+        let revision = Command::new("git")
+            .current_dir(workspace)
+            .args(["rev-parse", "--verify", "HEAD^{commit}"])
+            .output()
+            .expect("resolve candidate Git revision");
+        assert!(
+            revision.status.success(),
+            "cannot resolve candidate Git revision: {}",
+            String::from_utf8_lossy(&revision.stderr).trim()
+        );
+
+        let status = Command::new("git")
+            .current_dir(workspace)
+            .args(["status", "--porcelain=v1", "--untracked-files=all"])
+            .output()
+            .expect("inspect candidate Git workspace");
+        assert!(
+            status.status.success(),
+            "cannot inspect candidate Git workspace: {}",
+            String::from_utf8_lossy(&status.stderr).trim()
+        );
+
+        Self {
+            git_revision: String::from_utf8_lossy(&revision.stdout).trim().into(),
+            workspace_dirty: !status.stdout.is_empty(),
+        }
+    }
+
+    pub(crate) fn document(&self) -> Value {
+        json!({
+            "git_revision": self.git_revision,
+            "workspace_dirty": self.workspace_dirty,
+        })
+    }
+}
+
 pub(crate) fn write_xof_file(
     path: &Path,
     identity: &[u8],

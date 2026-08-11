@@ -33,9 +33,9 @@ use serde_json::json;
 
 use crate::managed_sync::Fixture;
 use crate::managed_sync::evaluation::{
-    STREAM_BUFFER_SIZE, TreeSummary, absolute_from_workspace, audit_summary, capture_process,
-    log_contains, short_log_excerpt, tree_summary, use_product_credentials, write_json_atomic,
-    write_xof, write_xof_file,
+    GitProvenance, STREAM_BUFFER_SIZE, TreeSummary, absolute_from_workspace, audit_summary,
+    capture_process, log_contains, short_log_excerpt, tree_summary, use_product_credentials,
+    write_json_atomic, write_xof, write_xof_file,
 };
 
 pub(crate) const DEFAULT_REFERENCE: &str = "managed-sync-layers";
@@ -52,6 +52,7 @@ const EDIT_BYTES: u64 = 64 * 1024;
 pub(crate) fn run(reference: &str, samples: usize, output: Option<&Path>, keep: bool) {
     assert!(samples > 0, "--samples must be greater than zero");
     let workspace = PathBuf::from(env!("CARGO_WORKSPACE_DIR"));
+    let candidate = GitProvenance::capture(&workspace);
     let output = output
         .map(absolute_from_workspace)
         .unwrap_or_else(|| default_output(&workspace));
@@ -64,7 +65,6 @@ pub(crate) fn run(reference: &str, samples: usize, output: Option<&Path>, keep: 
     );
 
     let reference_revision = revision(&workspace, reference);
-    let candidate_revision = revision(&workspace, "HEAD");
     let mut build = Build::new(&workspace, &output, &reference_revision, keep);
     build.compile();
 
@@ -116,7 +116,7 @@ pub(crate) fn run(reference: &str, samples: usize, output: Option<&Path>, keep: 
         &report(
             reference,
             &reference_revision,
-            &candidate_revision,
+            &candidate,
             samples,
             keep.then(|| audit_state.to_string_lossy().into_owned()),
             &runs,
@@ -585,18 +585,21 @@ fn same_tree(left: &TreeSummary, right: &TreeSummary, action: &str) {
 fn report(
     reference: &str,
     reference_revision: &str,
-    candidate_revision: &str,
+    candidate: &GitProvenance,
     samples: usize,
     audit_state: Option<String>,
     runs: &[Sample],
 ) -> Value {
     json!({
-        "schema": "ofs.managed-sync.calibration/1",
+        "schema": "ofs.managed-sync.calibration/2",
         "status": "passed",
-        "revisions": {
-            "reference_ref": reference,
-            "reference": reference_revision,
-            "candidate": candidate_revision,
+        "source_provenance": {
+            "candidate": candidate.document(),
+            "reference": {
+                "requested_ref": reference,
+                "git_revision": reference_revision,
+                "detached_worktree": true,
+            },
         },
         "workload": {
             "samples_per_revision": samples,

@@ -30,6 +30,7 @@ use serde_json::Value;
 use serde_json::json;
 
 use super::Fixture;
+use super::evaluation::GitProvenance;
 use super::evaluation::STREAM_BUFFER_SIZE;
 use super::evaluation::TreeSummary;
 use super::evaluation::absolute_from_workspace;
@@ -52,6 +53,8 @@ const TRANSFER_CONCURRENCY: usize = 16;
 
 pub(crate) fn run(profile: &str, output: &Path, keep: bool) {
     let profile = Profile::parse(profile);
+    let workspace = PathBuf::from(env!("CARGO_WORKSPACE_DIR"));
+    let candidate = GitProvenance::capture(&workspace);
     super::build_ofs_release();
     let binary = super::ofs_release_binary();
 
@@ -89,6 +92,7 @@ pub(crate) fn run(profile: &str, output: &Path, keep: bool) {
         &volume_root,
         binary.clone(),
         keep,
+        &candidate,
     );
     runner.write_report();
 
@@ -419,11 +423,15 @@ impl Runner {
         volume_root: &str,
         binary: PathBuf,
         keep: bool,
+        candidate: &GitProvenance,
     ) -> Self {
         fs::create_dir(&log_directory).expect("create scale log directory");
         let report = json!({
-            "schema": "ofs.managed-sync.scale/1",
+            "schema": "ofs.managed-sync.scale/2",
             "status": "running",
+            "source_provenance": {
+                "candidate": candidate.document(),
+            },
             "profile": {
                 "name": profile.name(),
                 "file_count": profile.file_count(),
