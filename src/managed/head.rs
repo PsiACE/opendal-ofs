@@ -47,6 +47,7 @@ pub struct ManagedVolume {
 
 pub struct ManagedObservation {
     pub snapshot: VolumeSnapshot,
+    head_revision: String,
     namespace_revision: NamespaceRevision,
     reclamation_watermark: ChangeCursor,
     maintenance_generation: u64,
@@ -204,7 +205,7 @@ impl ManagedVolume {
     }
 
     pub async fn observe(&self) -> Result<ManagedObservation, VolumeError> {
-        let (head, _) = self.read_head().await?;
+        let (head, revision) = self.read_head().await?;
         if head.maintenance.is_some() {
             return Err(VolumeError::new(
                 VolumeErrorKind::Conflict,
@@ -214,6 +215,7 @@ impl ManagedVolume {
         let stored = self.read_namespace(head.namespace_commit).await?;
         Ok(ManagedObservation {
             snapshot: stored.snapshot,
+            head_revision: revision,
             namespace_revision: head.namespace_commit,
             reclamation_watermark: head.reclamation_watermark,
             maintenance_generation: head.maintenance_generation,
@@ -304,23 +306,13 @@ impl ManagedVolume {
                 "publish Managed namespace: prepared publication ancestry is invalid",
             ));
         }
-        let (current_head, current_revision) = self.read_head().await?;
-        if current_head.maintenance.is_some()
-            || current_head.namespace_commit != observed.namespace_revision
-            || current_head.maintenance_generation != observed.maintenance_generation
-        {
-            return Err(VolumeError::new(
-                VolumeErrorKind::Conflict,
-                "publish Managed namespace: observed generation changed",
-            ));
-        }
         let bytes = HEAD_RECORD.encode(&Head {
             namespace_commit: target,
-            reclamation_watermark: current_head.reclamation_watermark,
-            maintenance_generation: current_head.maintenance_generation,
+            reclamation_watermark: observed.reclamation_watermark,
+            maintenance_generation: observed.maintenance_generation,
             maintenance: None,
         })?;
-        if object::replace(&self.operator, HEAD_KEY, &current_revision, bytes).await? {
+        if object::replace(&self.operator, HEAD_KEY, &observed.head_revision, bytes).await? {
             return Ok(());
         }
         let (current_head, _) = self.read_head().await?;

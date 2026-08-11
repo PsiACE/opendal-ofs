@@ -284,10 +284,15 @@ impl SyncEngine {
                 sequence: observed.snapshot.cursor.sequence(),
             });
         }
-        let snapshot = self.volume.snapshot(target).await?;
+        let loaded_snapshot = if observed.revision() == target {
+            None
+        } else {
+            Some(self.volume.snapshot(target).await?)
+        };
+        let snapshot = loaded_snapshot.as_ref().unwrap_or(&observed.snapshot);
         state.begin_install(target, published);
         state.save(state_path)?;
-        repair(root, &snapshot, &self.volume, self.transfer_concurrency).await?;
+        repair(root, snapshot, &self.volume, self.transfer_concurrency).await?;
         state.advance(target);
         state.save(state_path)?;
         if observed.revision() != target {
@@ -298,7 +303,7 @@ impl SyncEngine {
                     state,
                     &observed.snapshot,
                     observed.revision(),
-                    Some(&snapshot),
+                    Some(snapshot),
                     published,
                 )
                 .await;
@@ -457,23 +462,38 @@ impl SyncEngine {
         common: &VolumeSnapshot,
         target: &VolumeSnapshot,
     ) -> Result<(), SyncError> {
-        futures::stream::iter(target.paths()?)
+        let mut new_versions = BTreeSet::new();
+        let mut files = Vec::new();
+        for (path, node_id) in target.paths()? {
+            let node = &target.nodes[&node_id];
+            if node.kind != NodeKind::RegularFile {
+                continue;
+            }
+            let version = node
+                .file_version
+                .and_then(|id| target.file_versions.get(&id))
+                .ok_or_else(|| SyncError::new("pending file has no file version"))?;
+            if common.file_versions.get(&version.id) == Some(version) {
+                continue;
+            }
+            let publish = new_versions.insert(version.id);
+            files.push((path, version, publish));
+        }
+
+        futures::stream::iter(files)
             .map(Ok::<_, SyncError>)
-            .try_for_each_concurrent(self.transfer_concurrency, |(path, node_id)| async move {
-                let node = &target.nodes[&node_id];
-                if node.kind != NodeKind::RegularFile {
-                    return Ok(());
-                }
-                let version = node
-                    .file_version
-                    .and_then(|id| target.file_versions.get(&id))
-                    .ok_or_else(|| SyncError::new("pending file has no file version"))?;
-                if common.file_versions.get(&version.id) == Some(version) {
-                    return Ok(());
-                }
-                self.volume.publish_file(&root.join(path), version).await?;
-                Ok(())
-            })
+            .try_for_each_concurrent(
+                self.transfer_concurrency,
+                |(path, version, publish)| async move {
+                    let path = root.join(path);
+                    if publish {
+                        self.volume.publish_file(&path, version).await?;
+                    } else if self.volume.inspect_file(&path).await? != *version {
+                        return Err(SyncError::new("local file changed while being published"));
+                    }
+                    Ok(())
+                },
+            )
             .await
     }
 }
