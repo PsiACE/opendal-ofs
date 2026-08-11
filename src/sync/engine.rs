@@ -26,7 +26,7 @@ use crate::managed::{ManagedObservation, ManagedVolume, NamespaceRevision};
 
 use super::install::{install, repair};
 use super::reconcile::{changed_paths, reconcile};
-use super::scan::scan;
+use super::scan::{ScannedTree, scan};
 use super::{ReplicaState, SyncError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -144,33 +144,35 @@ impl SyncEngine {
                 .await;
         }
 
-        if !observed.retains(state.common_revision()) {
+        if !observed.can_read_revision(state.common_revision()) {
             return self
                 .conservative_rebase(&root, state_path, state, observed, &resolved)
                 .await;
         }
-        let base = self.volume.snapshot(state.common_revision()).await?;
-        let local = scan(&root, &base, &self.volume).await?;
-        let local_changed = local.snapshot.cursor != base.cursor;
-        let remote_changed = observed.revision() != state.common_revision();
-        match (local_changed, remote_changed) {
-            (false, false) => Ok(SyncOutcome {
+        let common_revision = state.common_revision();
+        let loaded_base = if observed.revision() == common_revision {
+            None
+        } else {
+            Some(self.volume.snapshot(common_revision).await?)
+        };
+        let base = loaded_base.as_ref().unwrap_or(&observed.snapshot);
+        let local = scan(&root, base, &self.volume).await?;
+        let remote_changed = observed.revision() != common_revision;
+        match (local, remote_changed) {
+            (ScannedTree::Unchanged, false) => Ok(SyncOutcome {
                 conflicts: 0,
                 published: false,
                 sequence: base.cursor.sequence(),
             }),
-            (true, false) => {
+            (ScannedTree::Changed(local), false) => {
                 if !resolved.is_empty() {
                     return Err(SyncError::new(
                         "--resolve requires a current local and remote conflict",
                     ));
                 }
-                self.publish_target_files(&root, &observed.snapshot, &local.snapshot)
+                self.publish_target_files(&root, &observed.snapshot, &local)
                     .await?;
-                let target = self
-                    .volume
-                    .prepare_publication(&observed, local.snapshot)
-                    .await?;
+                let target = self.volume.prepare_publication(&observed, local).await?;
                 state.begin_publication(observed.revision(), target)?;
                 state.save(state_path)?;
                 test_interrupt("before-publish")?;
@@ -184,7 +186,7 @@ impl SyncEngine {
                     sequence: target.cursor().sequence(),
                 })
             }
-            (false, true) => {
+            (ScannedTree::Unchanged, true) => {
                 if !resolved.is_empty() {
                     return Err(SyncError::new(
                         "--resolve requires a current local and remote conflict",
@@ -196,13 +198,13 @@ impl SyncEngine {
                     state,
                     &observed.snapshot,
                     observed.revision(),
-                    Some(&base),
+                    Some(base),
                     false,
                 )
                 .await
             }
-            (true, true) => {
-                let plan = reconcile(&base, &local.snapshot, &observed.snapshot, &resolved)?;
+            (ScannedTree::Changed(local), true) => {
+                let plan = reconcile(base, &local, &observed.snapshot, &resolved)?;
                 if !plan.conflicts.is_empty() {
                     let conflicts = plan.conflicts.len();
                     state.retain_conflicts(conflicts, observed.revision(), false);
@@ -235,7 +237,7 @@ impl SyncEngine {
                     state,
                     &plan.target,
                     target_revision,
-                    Some(&local.snapshot),
+                    Some(&local),
                     plan.publish,
                 )
                 .await
@@ -252,7 +254,7 @@ impl SyncEngine {
         target: NamespaceRevision,
         published: bool,
     ) -> Result<SyncOutcome, SyncError> {
-        if !observed.retains(target) {
+        if !observed.can_read_revision(target) {
             state.begin_install(observed.revision(), false);
             state.save(state_path)?;
             repair(
@@ -304,8 +306,19 @@ impl SyncEngine {
         observed: ManagedObservation,
         resolved: &BTreeSet<String>,
     ) -> Result<SyncOutcome, SyncError> {
-        let local = scan(root, &observed.snapshot, &self.volume).await?;
-        let ambiguous = changed_paths(&observed.snapshot, &local.snapshot)?;
+        let local = match scan(root, &observed.snapshot, &self.volume).await? {
+            ScannedTree::Unchanged => {
+                state.advance(observed.revision());
+                state.save(state_path)?;
+                return Ok(SyncOutcome {
+                    conflicts: 0,
+                    published: false,
+                    sequence: observed.snapshot.cursor.sequence(),
+                });
+            }
+            ScannedTree::Changed(snapshot) => snapshot,
+        };
+        let ambiguous = changed_paths(&observed.snapshot, &local)?;
         if ambiguous.is_empty() {
             state.advance(observed.revision());
             state.save(state_path)?;
@@ -326,12 +339,9 @@ impl SyncEngine {
             });
         }
 
-        self.publish_target_files(root, &observed.snapshot, &local.snapshot)
+        self.publish_target_files(root, &observed.snapshot, &local)
             .await?;
-        let target = self
-            .volume
-            .prepare_publication(&observed, local.snapshot)
-            .await?;
+        let target = self.volume.prepare_publication(&observed, local).await?;
         state.begin_publication(observed.revision(), target)?;
         state.save(state_path)?;
         test_interrupt("before-publish")?;

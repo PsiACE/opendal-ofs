@@ -46,8 +46,8 @@ pub(crate) fn run_fixture(keep: bool, case: Option<&str>) {
         Some("admission") => admission(&fixture),
         Some("gc") => gc(&fixture),
         Some("growing") => growing(&fixture),
-        Some("history") => history(&fixture),
         Some("install-recovery") => install_recovery(&fixture),
+        Some("offline-gc") => offline_gc(&fixture),
         Some("reconcile") => reconcile(&fixture),
         Some("recovery-gc") => recovery_gc(&fixture),
         Some("rename") => rename(&fixture),
@@ -58,7 +58,7 @@ pub(crate) fn run_fixture(keep: bool, case: Option<&str>) {
             smoke(&fixture);
             reconcile(&fixture);
             rename(&fixture);
-            history(&fixture);
+            offline_gc(&fixture);
             install_recovery(&fixture);
             recovery_gc(&fixture);
             growing(&fixture);
@@ -610,10 +610,7 @@ fn gc(fixture: &Fixture) {
         "publish replacement before GC",
     );
 
-    run_ofs_success(
-        ofs_gc(&storage, false, Some(2)),
-        "collect unreachable objects",
-    );
+    run_ofs_success(ofs_gc(&storage, false), "collect unreachable objects");
     run_ofs_success(
         ofs_sync(&replica_b, &state_b, &storage),
         "cold restore after collection",
@@ -623,7 +620,7 @@ fn gc(fixture: &Fixture) {
         tree_fingerprint(&replica_b),
         "collection preserves every object needed for cold restore"
     );
-    run_ofs_success(ofs_gc(&storage, false, None), "repeat completed collection");
+    run_ofs_success(ofs_gc(&storage, false), "repeat completed collection");
 }
 
 fn recovery_gc(fixture: &Fixture) {
@@ -645,27 +642,18 @@ fn recovery_gc(fixture: &Fixture) {
     let mut prepared = ofs_sync(&replica_a, &state_a, &storage);
     prepared.env("OFS_INTERNAL_TEST_INTERRUPT", "before-publish");
     run_ofs_failure(prepared, "interrupt prepared publication");
-    let protected = run_ofs_success(
-        ofs_gc_with_grace(&storage, false, None, None),
-        "protect a recent prepared publication",
+    let collected = run_ofs_success(
+        ofs_gc(&storage, false),
+        "collect an interrupted prepared publication",
     );
     assert!(
-        output_text(&protected.stdout).contains("deleted 0 object"),
-        "default orphan grace protects a recent prepared publication: {}",
-        output_text(&protected.stdout)
+        !output_text(&collected.stdout).contains("deleted 0 object"),
+        "collection reclaims an interrupted prepared publication: {}",
+        output_text(&collected.stdout)
     );
     run_ofs_failure(
         ofs_sync(&replica_a, &state_a, &storage),
         "invalidate a prepared publication across collection",
-    );
-    let collected = run_ofs_success(
-        ofs_gc(&storage, false, None),
-        "collect the invalidated prepared publication",
-    );
-    assert!(
-        !output_text(&collected.stdout).contains("deleted 0 object"),
-        "zero grace collection reclaims an invalidated prepared publication: {}",
-        output_text(&collected.stdout)
     );
     run_ofs_success(
         ofs_sync(&replica_a, &state_a, &storage),
@@ -674,6 +662,35 @@ fn recovery_gc(fixture: &Fixture) {
     run_ofs_success(
         ofs_sync(&replica_b, &state_b, &storage),
         "attach recovery peer",
+    );
+
+    let mut interrupted_collection = ofs_gc(&storage, false);
+    interrupted_collection.env("OFS_INTERNAL_TEST_INTERRUPT", "after-gc-fence");
+    run_ofs_failure(
+        interrupted_collection,
+        "interrupt collection after freezing the namespace",
+    );
+    run_ofs_success(
+        ofs_gc(&storage, true),
+        "resume interrupted namespace collection",
+    );
+    fs::write(
+        replica_a.join("after-resume.txt"),
+        b"collection recovery keeps publication available\n",
+    )
+    .expect("write after collection recovery");
+    run_ofs_success(
+        ofs_sync(&replica_a, &state_a, &storage),
+        "publish after collection recovery",
+    );
+    run_ofs_success(
+        ofs_sync(&replica_b, &state_b, &storage),
+        "install publication after collection recovery",
+    );
+    assert_eq!(
+        tree_fingerprint(&replica_a),
+        tree_fingerprint(&replica_b),
+        "collection recovery preserves the namespace and later publication"
     );
 
     fs::write(
@@ -698,18 +715,15 @@ fn recovery_gc(fixture: &Fixture) {
         ofs_sync(&replica_b, &state_b, &storage),
         "advance beyond interrupted publication",
     );
-    run_ofs_success(
-        ofs_gc(&storage, false, Some(3)),
-        "collect superseded objects",
-    );
+    run_ofs_success(ofs_gc(&storage, false), "collect superseded objects");
     fs::write(
         replica_b.join("after-collection.txt"),
-        b"operation receipt must outlive retained history\n",
+        b"operation receipt must survive namespace collection\n",
     )
     .expect("write post-collection change");
     run_ofs_success(
         ofs_sync(&replica_b, &state_b, &storage),
-        "publish after advancing the retained horizon",
+        "publish after namespace collection",
     );
 
     run_ofs_success(
@@ -796,7 +810,7 @@ fn install_recovery(fixture: &Fixture) {
     );
 }
 
-fn history(fixture: &Fixture) {
+fn offline_gc(fixture: &Fixture) {
     let root = CaseRoot::new();
     let replica_a = root.path.join("replica-a");
     let replica_b = root.path.join("replica-b");
@@ -808,52 +822,52 @@ fn history(fixture: &Fixture) {
     let state_c = root.path.join("state-c");
     let state_expired = root.path.join("state-expired");
     let state_restored = root.path.join("state-restored");
-    fs::create_dir_all(&replica_a).expect("create history replica A");
-    fs::create_dir_all(&replica_b).expect("create history replica B");
-    fs::create_dir_all(&replica_c).expect("create history replica C");
-    fs::create_dir_all(&replica_expired).expect("create expired history replica");
-    fs::create_dir_all(&replica_restored).expect("create restored history replica");
-    let storage = fixture.storage_url("history");
+    fs::create_dir_all(&replica_a).expect("create offline GC replica A");
+    fs::create_dir_all(&replica_b).expect("create offline GC replica B");
+    fs::create_dir_all(&replica_c).expect("create offline GC replica C");
+    fs::create_dir_all(&replica_expired).expect("create old-base replica");
+    fs::create_dir_all(&replica_restored).expect("create restored replica");
+    let storage = fixture.storage_url("offline-gc");
 
-    run_ofs_success(ofs_volume_create(&storage), "create history volume");
+    run_ofs_success(ofs_volume_create(&storage), "create offline GC volume");
     fs::write(
         replica_a.join("cursor.txt"),
         deterministic_bytes(512 * 1024, 17),
     )
-    .expect("write history base");
+    .expect("write first common base");
     run_ofs_success(
         ofs_sync(&replica_a, &state_a, &storage),
-        "publish history base",
+        "publish first common base",
     );
     run_ofs_success(
         ofs_sync(&replica_expired, &state_expired, &storage),
-        "attach replica before the retained horizon",
+        "attach replica before collection",
     );
 
     fs::write(
         replica_a.join("cursor.txt"),
         deterministic_bytes(512 * 1024, 31),
     )
-    .expect("advance retained history base");
+    .expect("write collection base");
     run_ofs_success(
         ofs_sync(&replica_a, &state_a, &storage),
-        "publish retained history base",
+        "publish collection base",
     );
     run_ofs_success(
         ofs_sync(&replica_b, &state_b, &storage),
-        "attach replica at the retained horizon",
+        "attach replica at the collection base",
     );
     let collected = run_ofs_success(
-        ofs_gc(&storage, false, Some(2)),
-        "advance the retained horizon and collect older data",
+        ofs_gc(&storage, false),
+        "collect from the current namespace",
     );
     assert!(
         !output_text(&collected.stdout).contains("deleted 0 object"),
-        "advancing the retained horizon reclaims superseded data"
+        "collection reclaims superseded data"
     );
     run_ofs_success(
         ofs_sync(&replica_c, &state_c, &storage),
-        "cold restore after advancing the retained horizon",
+        "cold restore after collection",
     );
     assert_eq!(
         tree_fingerprint(&replica_a),
@@ -862,31 +876,32 @@ fn history(fixture: &Fixture) {
     );
 
     fs::write(replica_a.join("remote.txt"), b"remote change\n")
-        .expect("write remote history change");
+        .expect("write remote change after collection");
     run_ofs_success(
         ofs_sync(&replica_a, &state_a, &storage),
-        "publish change beyond the retained horizon",
+        "publish change after collection",
     );
-    fs::write(replica_b.join("local.txt"), b"local change\n").expect("write local history change");
+    fs::write(replica_b.join("local.txt"), b"local change\n")
+        .expect("write local change from the collection base");
     run_ofs_success(
         ofs_sync(&replica_b, &state_b, &storage),
-        "merge from the retained horizon",
+        "merge from the collection base",
     );
     run_ofs_success(
         ofs_sync(&replica_a, &state_a, &storage),
-        "install the merged history",
+        "install the merged namespace",
     );
     assert_eq!(
         tree_fingerprint(&replica_a),
         tree_fingerprint(&replica_b),
-        "a replica at the retained horizon performs an exact three-way merge"
+        "a replica at the collection base performs an exact three-way merge"
     );
 
     fs::write(
         replica_expired.join("cursor.txt"),
         b"expired local change\n",
     )
-    .expect("write change on expired history base");
+    .expect("write change on an unavailable common base");
     run_ofs_failure(
         ofs_sync(&replica_expired, &state_expired, &storage),
         "report an expired reconciliation base",
@@ -894,13 +909,13 @@ fn history(fixture: &Fixture) {
     let expired_status = ManagedStatus::parse(output_text(
         &run_ofs_success(
             ofs_status(&replica_expired, &state_expired),
-            "read expired history status",
+            "read unavailable-base status",
         )
         .stdout,
     ));
     assert!(
         expired_status.base_expired && expired_status.conflicts != 0 && !expired_status.pending,
-        "a replica before the retained horizon reports an expired base without publishing"
+        "a replica from before collection reports an unavailable base without publishing"
     );
 
     run_ofs_success(
@@ -914,7 +929,7 @@ fn history(fixture: &Fixture) {
     );
     for (replica, state) in [(&replica_a, &state_a), (&replica_b, &state_b)] {
         let status = ManagedStatus::parse(output_text(
-            &run_ofs_success(ofs_status(replica, state), "read converged history status").stdout,
+            &run_ofs_success(ofs_status(replica, state), "read converged status").stdout,
         ));
         assert!(
             !status.pending
@@ -1440,42 +1455,15 @@ fn ofs_status_with(binary: &Path, replica: &Path, state: &Path) -> Command {
     command
 }
 
-fn ofs_gc(storage: &str, resume: bool, retain_from: Option<u64>) -> Command {
-    ofs_gc_with_grace(storage, resume, retain_from, Some("0s"))
+fn ofs_gc(storage: &str, resume: bool) -> Command {
+    ofs_gc_with_binary(&ofs_debug_binary(), storage, resume)
 }
 
-fn ofs_gc_with_grace(
-    storage: &str,
-    resume: bool,
-    retain_from: Option<u64>,
-    orphan_grace: Option<&str>,
-) -> Command {
-    ofs_gc_with_binary(
-        &ofs_debug_binary(),
-        storage,
-        resume,
-        retain_from,
-        orphan_grace,
-    )
-}
-
-fn ofs_gc_with_binary(
-    binary: &Path,
-    storage: &str,
-    resume: bool,
-    retain_from: Option<u64>,
-    orphan_grace: Option<&str>,
-) -> Command {
+fn ofs_gc_with_binary(binary: &Path, storage: &str, resume: bool) -> Command {
     let mut command = ofs_command_with(binary);
     command.arg("gc").arg(storage);
-    if let Some(orphan_grace) = orphan_grace {
-        command.args(["--orphan-grace", orphan_grace]);
-    }
     if resume {
         command.arg("--resume");
-    }
-    if let Some(sequence) = retain_from {
-        command.arg("--retain-from").arg(sequence.to_string());
     }
     command
 }

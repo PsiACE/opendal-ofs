@@ -29,7 +29,8 @@ use crate::filesystem::{
 use super::container::{self, SectionRef};
 use super::format::ManagedFormat;
 use super::index::{
-    IndexVisitor, PageRef, read_index, visit_index_once, write_index, write_index_reusing,
+    PageRef, StreamingIndexVisitor, read_index, visit_index_streaming, write_index,
+    write_index_reusing,
 };
 use super::object;
 use super::record::Record;
@@ -47,7 +48,7 @@ pub struct ManagedVolume {
 pub struct ManagedObservation {
     pub snapshot: VolumeSnapshot,
     namespace_revision: NamespaceRevision,
-    retention_horizon: NamespaceRevision,
+    reclamation_watermark: NamespaceRevision,
     maintenance_generation: u64,
     changes: BTreeMap<ChangeCursor, ChangeRecord>,
     operations: BTreeMap<OperationId, OperationRecord>,
@@ -65,8 +66,8 @@ impl ManagedObservation {
         revision.prepared_during(self.maintenance_generation)
     }
 
-    pub(crate) const fn retains(&self, revision: NamespaceRevision) -> bool {
-        revision.cursor.sequence() >= self.retention_horizon.cursor.sequence()
+    pub(crate) const fn can_read_revision(&self, revision: NamespaceRevision) -> bool {
+        revision.cursor.sequence() >= self.reclamation_watermark.cursor.sequence()
             && revision.cursor.sequence() <= self.namespace_revision.cursor.sequence()
     }
 }
@@ -75,7 +76,8 @@ impl ManagedObservation {
 #[serde(deny_unknown_fields)]
 pub(super) struct Head {
     pub(super) namespace_commit: NamespaceRevision,
-    pub(super) retention_horizon: NamespaceRevision,
+    /// Oldest namespace revision whose graph remains guaranteed after collection.
+    pub(super) reclamation_watermark: NamespaceRevision,
     pub(super) maintenance_generation: u64,
     pub(super) maintenance: Option<GcFence>,
 }
@@ -104,7 +106,6 @@ impl NamespaceRevision {
 pub(super) struct GcFence {
     pub(super) owner: OperationId,
     pub(super) namespace_commit: NamespaceRevision,
-    pub(super) retention_horizon: NamespaceRevision,
     pub(super) maintenance_generation: u64,
 }
 
@@ -114,6 +115,7 @@ struct NamespaceCommit {
     volume_id: VolumeId,
     change_cursor: ChangeCursor,
     change_log_floor: ChangeCursor,
+    /// Reconciliation history is weak before the Head reclamation watermark.
     previous: Option<NamespaceRevision>,
     node_index_root: PageRef,
     directory_entry_index_root: PageRef,
@@ -156,37 +158,21 @@ struct IndexObjects {
     operations: BTreeMap<crate::filesystem::Digest, u64>,
 }
 
-#[derive(Clone, Copy)]
-#[repr(u8)]
-pub(super) enum IndexKind {
-    Nodes,
-    DirectoryEntries,
-    ChangeLog,
-    OperationResults,
-}
-
-struct ReachableIndexVisitor<'a, S, R> {
-    kind: IndexKind,
-    sections: &'a mut S,
+struct ReachableIndexVisitor<'a, R> {
     objects: &'a mut dyn FnMut(String, u64) -> Result<(), VolumeError>,
     records: R,
 }
 
-impl<K, V, S, R> IndexVisitor<K, V> for ReachableIndexVisitor<'_, S, R>
+impl<K, V, R> StreamingIndexVisitor<K, V> for ReachableIndexVisitor<'_, R>
 where
-    S: FnMut(IndexKind, SectionRef) -> Result<bool, VolumeError>,
     R: FnMut(
         &mut dyn FnMut(String, u64) -> Result<(), VolumeError>,
         K,
         V,
     ) -> Result<(), VolumeError>,
 {
-    fn visit_section(&mut self, section: SectionRef) -> Result<bool, VolumeError> {
-        let first_visit = (self.sections)(self.kind, section)?;
-        if first_visit {
-            (self.objects)(container::object_key(section.object), section.object_length)?;
-        }
-        Ok(first_visit)
+    fn visit_section(&mut self, section: SectionRef) -> Result<(), VolumeError> {
+        (self.objects)(container::object_key(section.object), section.object_length)
     }
 
     fn visit_record(&mut self, key: K, value: V) -> Result<(), VolumeError> {
@@ -226,7 +212,7 @@ impl ManagedVolume {
             .await?;
         let bytes = HEAD_RECORD.encode(&Head {
             namespace_commit,
-            retention_horizon: namespace_commit,
+            reclamation_watermark: namespace_commit,
             maintenance_generation: 0,
             maintenance: None,
         })?;
@@ -248,7 +234,7 @@ impl ManagedVolume {
         Ok(ManagedObservation {
             snapshot: stored.snapshot,
             namespace_revision: head.namespace_commit,
-            retention_horizon: head.retention_horizon,
+            reclamation_watermark: head.reclamation_watermark,
             maintenance_generation: head.maintenance_generation,
             changes: stored.changes,
             operations: stored.operations,
@@ -272,16 +258,12 @@ impl ManagedVolume {
             )
         })?;
         let head: Head = HEAD_RECORD.decode(&bytes)?;
-        if head.retention_horizon.cursor.sequence() > head.namespace_commit.cursor.sequence()
+        if head.reclamation_watermark.cursor.sequence() > head.namespace_commit.cursor.sequence()
             || head.namespace_commit.maintenance_generation > head.maintenance_generation
-            || head.retention_horizon.maintenance_generation > head.maintenance_generation
+            || head.reclamation_watermark.maintenance_generation > head.maintenance_generation
             || head.maintenance.is_some_and(|fence| {
                 fence.namespace_commit != head.namespace_commit
                     || fence.maintenance_generation != head.maintenance_generation
-                    || fence.retention_horizon.cursor.sequence()
-                        < head.retention_horizon.cursor.sequence()
-                    || fence.retention_horizon.cursor.sequence()
-                        > fence.namespace_commit.cursor.sequence()
             })
         {
             return Err(corrupt("namespace head references are invalid"));
@@ -323,7 +305,7 @@ impl ManagedVolume {
                 cursor: target.cursor,
             },
         );
-        let change_log_floor = observed.retention_horizon.cursor;
+        let change_log_floor = observed.reclamation_watermark.cursor;
         changes.retain(|cursor, _| *cursor >= change_log_floor);
         self.write_namespace(
             &target,
@@ -362,7 +344,7 @@ impl ManagedVolume {
         }
         let bytes = HEAD_RECORD.encode(&Head {
             namespace_commit: target,
-            retention_horizon: current_head.retention_horizon,
+            reclamation_watermark: current_head.reclamation_watermark,
             maintenance_generation: current_head.maintenance_generation,
             maintenance: None,
         })?;
@@ -431,115 +413,59 @@ impl ManagedVolume {
     pub(super) async fn visit_reachable_objects(
         &self,
         reference: NamespaceRevision,
-        retention_horizon: NamespaceRevision,
         mut visit: impl FnMut(String, u64) -> Result<(), VolumeError>,
-        mut visit_section: impl FnMut(IndexKind, SectionRef) -> Result<bool, VolumeError>,
     ) -> Result<(), VolumeError> {
-        let mut current = Some(reference);
-        loop {
-            let Some(reference) = current else {
-                return Err(corrupt("retention horizon is not in the commit history"));
-            };
-            let commit = self.read_commit(reference).await?;
-            visit(commit_key(reference.commit), reference.encoded_length)?;
+        let commit = self.read_commit(reference).await?;
+        visit(commit_key(reference.commit), reference.encoded_length)?;
 
-            let mut index_visitor = ReachableIndexVisitor {
-                kind: IndexKind::Nodes,
-                sections: &mut visit_section,
-                objects: &mut visit,
-                records: |visit: &mut dyn FnMut(String, u64) -> Result<(), VolumeError>,
-                          _: NodeId,
-                          node: NodeRecord| {
-                    if let Some(version) = node.file_version
-                        && let Some(object) = super::data::whole_object(&FileVersion::new(version))?
-                    {
-                        visit(super::data::whole_object_key(object.digest), object.length)?;
-                    }
-                    Ok(())
-                },
-            };
-            visit_index_once(&self.operator, &commit.node_index_root, &mut index_visitor).await?;
+        let mut index_visitor = ReachableIndexVisitor {
+            objects: &mut visit,
+            records: |visit: &mut dyn FnMut(String, u64) -> Result<(), VolumeError>,
+                      _: NodeId,
+                      node: NodeRecord| {
+                if let Some(version) = node.file_version
+                    && let Some(object) = super::data::whole_object(&FileVersion::new(version))?
+                {
+                    visit(super::data::whole_object_key(object.digest), object.length)?;
+                }
+                Ok(())
+            },
+        };
+        visit_index_streaming(&self.operator, &commit.node_index_root, &mut index_visitor).await?;
 
-            let mut index_visitor = ReachableIndexVisitor {
-                kind: IndexKind::DirectoryEntries,
-                sections: &mut visit_section,
-                objects: &mut visit,
-                records: |_: &mut dyn FnMut(String, u64) -> Result<(), VolumeError>,
-                          _: DirectoryKey,
-                          _: DirectoryEntry| Ok(()),
-            };
-            visit_index_once(
-                &self.operator,
-                &commit.directory_entry_index_root,
-                &mut index_visitor,
-            )
-            .await?;
+        let mut index_visitor = ReachableIndexVisitor {
+            objects: &mut visit,
+            records: |_: &mut dyn FnMut(String, u64) -> Result<(), VolumeError>,
+                      _: DirectoryKey,
+                      _: DirectoryEntry| Ok(()),
+        };
+        visit_index_streaming(
+            &self.operator,
+            &commit.directory_entry_index_root,
+            &mut index_visitor,
+        )
+        .await?;
 
-            let mut index_visitor = ReachableIndexVisitor {
-                kind: IndexKind::ChangeLog,
-                sections: &mut visit_section,
-                objects: &mut visit,
-                records: |_: &mut dyn FnMut(String, u64) -> Result<(), VolumeError>,
-                          _: ChangeCursor,
-                          _: ChangeRecord| Ok(()),
-            };
-            visit_index_once(&self.operator, &commit.change_log_root, &mut index_visitor).await?;
+        let mut index_visitor = ReachableIndexVisitor {
+            objects: &mut visit,
+            records: |_: &mut dyn FnMut(String, u64) -> Result<(), VolumeError>,
+                      _: ChangeCursor,
+                      _: ChangeRecord| Ok(()),
+        };
+        visit_index_streaming(&self.operator, &commit.change_log_root, &mut index_visitor).await?;
 
-            let mut index_visitor = ReachableIndexVisitor {
-                kind: IndexKind::OperationResults,
-                sections: &mut visit_section,
-                objects: &mut visit,
-                records: |_: &mut dyn FnMut(String, u64) -> Result<(), VolumeError>,
-                          _: OperationId,
-                          _: OperationRecord| Ok(()),
-            };
-            visit_index_once(
-                &self.operator,
-                &commit.operation_result_index_root,
-                &mut index_visitor,
-            )
-            .await?;
-            if reference == retention_horizon {
-                break;
-            }
-            if commit
-                .previous
-                .is_some_and(|previous| previous.cursor.sequence() >= reference.cursor.sequence())
-            {
-                return Err(corrupt("namespace commit ancestry is not ordered"));
-            }
-            current = commit.previous;
-        }
-        Ok(())
-    }
-
-    pub(super) async fn retention_horizon_at(
-        &self,
-        head: &Head,
-        sequence: u64,
-    ) -> Result<NamespaceRevision, VolumeError> {
-        let current_sequence = head.namespace_commit.cursor.sequence();
-        let retained_sequence = head.retention_horizon.cursor.sequence();
-        if sequence < retained_sequence || sequence > current_sequence {
-            return Err(VolumeError::new(
-                VolumeErrorKind::Invalid,
-                "collect Managed data: retained change is outside the available history",
-            ));
-        }
-        let mut reference = head.namespace_commit;
-        loop {
-            if reference.cursor.sequence() == sequence {
-                return Ok(reference);
-            }
-            let commit = self.read_commit(reference).await?;
-            let previous = commit
-                .previous
-                .ok_or_else(|| corrupt("retained change is not in the namespace commit history"))?;
-            if previous.cursor.sequence() >= reference.cursor.sequence() {
-                return Err(corrupt("namespace commit ancestry is not ordered"));
-            }
-            reference = previous;
-        }
+        let mut index_visitor = ReachableIndexVisitor {
+            objects: &mut visit,
+            records: |_: &mut dyn FnMut(String, u64) -> Result<(), VolumeError>,
+                      _: OperationId,
+                      _: OperationRecord| Ok(()),
+        };
+        visit_index_streaming(
+            &self.operator,
+            &commit.operation_result_index_root,
+            &mut index_visitor,
+        )
+        .await
     }
 
     async fn write_namespace(

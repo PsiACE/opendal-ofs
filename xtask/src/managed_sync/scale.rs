@@ -168,16 +168,9 @@ pub(crate) fn run(profile: &str, output: &Path, keep: bool) {
         "replica-b",
     );
 
-    let current = runner.remote_sequence();
     runner.stage(
-        "advance-horizon-and-gc",
-        scale_command(super::ofs_gc_with_binary(
-            &binary,
-            &storage,
-            false,
-            Some(current),
-            Some("0s"),
-        )),
+        "collect-current-namespace",
+        scale_command(super::ofs_gc_with_binary(&binary, &storage, false)),
         Some((&replica_a, &state_a)),
     );
     runner.stage(
@@ -553,16 +546,6 @@ impl Runner {
                 && summaries[0].bytes == summaries[1].bytes,
             &format!("tree mismatch at {name}"),
         );
-    }
-
-    fn remote_sequence(&mut self) -> u64 {
-        let sequence = self
-            .last_status
-            .as_ref()
-            .and_then(|status| status.get("remote_sequence"))
-            .and_then(Value::as_u64);
-        self.require(sequence.is_some(), "replica status has no remote sequence");
-        sequence.expect("remote sequence was checked")
     }
 
     fn require(&mut self, condition: bool, message: &str) {

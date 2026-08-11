@@ -246,7 +246,7 @@ where
     V: DeserializeOwned,
 {
     let mut objects = BTreeMap::new();
-    let mut visitor = CompleteIndexVisitor {
+    let mut visitor = CollectingIndexVisitor {
         objects: &mut objects,
         records: visitor,
     };
@@ -254,17 +254,17 @@ where
     Ok(objects)
 }
 
-pub(crate) trait IndexVisitor<K, V> {
-    fn visit_section(&mut self, section: SectionRef) -> Result<bool, VolumeError>;
+pub(crate) trait StreamingIndexVisitor<K, V> {
+    fn visit_section(&mut self, section: SectionRef) -> Result<(), VolumeError>;
 
     fn visit_record(&mut self, key: K, value: V) -> Result<(), VolumeError>;
 }
 
-/// Visit each admitted index section before reading it from storage.
-pub(crate) async fn visit_index_once<K, V>(
+/// Visit index sections and records without accumulating container identities.
+pub(crate) async fn visit_index_streaming<K, V>(
     operator: &Operator,
     root: &PageRef,
-    visitor: &mut impl IndexVisitor<K, V>,
+    visitor: &mut impl StreamingIndexVisitor<K, V>,
 ) -> Result<(), VolumeError>
 where
     K: Clone + DeserializeOwned + Ord + Serialize,
@@ -273,16 +273,16 @@ where
     traverse_index(operator, root, visitor).await
 }
 
-struct CompleteIndexVisitor<'a, F> {
+struct CollectingIndexVisitor<'a, F> {
     objects: &'a mut BTreeMap<crate::filesystem::Digest, u64>,
     records: F,
 }
 
-impl<K, V, F> IndexVisitor<K, V> for CompleteIndexVisitor<'_, F>
+impl<K, V, F> StreamingIndexVisitor<K, V> for CollectingIndexVisitor<'_, F>
 where
     F: FnMut(K, V) -> Result<(), VolumeError>,
 {
-    fn visit_section(&mut self, section: SectionRef) -> Result<bool, VolumeError> {
+    fn visit_section(&mut self, section: SectionRef) -> Result<(), VolumeError> {
         if self
             .objects
             .insert(section.object, section.object_length)
@@ -293,7 +293,7 @@ where
                 "metadata container has conflicting lengths",
             ));
         }
-        Ok(true)
+        Ok(())
     }
 
     fn visit_record(&mut self, key: K, value: V) -> Result<(), VolumeError> {
@@ -304,7 +304,7 @@ where
 async fn traverse_index<K, V>(
     operator: &Operator,
     root: &PageRef,
-    visitor: &mut impl IndexVisitor<K, V>,
+    visitor: &mut impl StreamingIndexVisitor<K, V>,
 ) -> Result<(), VolumeError>
 where
     K: Clone + DeserializeOwned + Ord + Serialize,
@@ -319,16 +319,7 @@ where
         if depth > MAX_TREE_DEPTH {
             return Err(corrupt("read Managed index", "index tree is too deep"));
         }
-        if !visitor.visit_section(reference.section)? {
-            advance_over_known_page::<K>(
-                &reference,
-                is_root,
-                &mut previous,
-                &mut first_key,
-                &mut last_key,
-            )?;
-            continue;
-        }
+        visitor.visit_section(reference.section)?;
 
         let (kind, records) = read_page(operator, &reference).await?;
         match kind {
@@ -417,43 +408,6 @@ where
             ));
         }
     }
-    Ok(())
-}
-
-fn advance_over_known_page<K>(
-    reference: &PageRef,
-    is_root: bool,
-    previous: &mut Option<K>,
-    first_key: &mut Option<Vec<u8>>,
-    last_key: &mut Option<Vec<u8>>,
-) -> Result<(), VolumeError>
-where
-    K: DeserializeOwned + Ord + Serialize,
-{
-    if reference.first_key.is_empty() || reference.last_key.is_empty() {
-        if is_root && reference.first_key.is_empty() && reference.last_key.is_empty() {
-            return Ok(());
-        }
-        return Err(corrupt(
-            "read Managed index",
-            "known index page has an invalid key range",
-        ));
-    }
-    let first: K = decode_cbor(&reference.first_key)?;
-    let last: K = decode_cbor(&reference.last_key)?;
-    if first > last
-        || encode_cbor(&first)?.as_slice() != reference.first_key.as_ref()
-        || encode_cbor(&last)?.as_slice() != reference.last_key.as_ref()
-        || previous.as_ref().is_some_and(|previous| previous >= &first)
-    {
-        return Err(corrupt(
-            "read Managed index",
-            "known index page range is invalid",
-        ));
-    }
-    first_key.get_or_insert_with(|| reference.first_key.to_vec());
-    *last_key = Some(reference.last_key.to_vec());
-    *previous = Some(last);
     Ok(())
 }
 

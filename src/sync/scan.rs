@@ -22,14 +22,16 @@ use std::path::Path;
 use futures::StreamExt as _;
 
 use crate::filesystem::{
-    ChangeCursor, DirectoryEntry, DirectoryRecord, FileVersionId, Generation, NodeAttributes,
-    NodeId, NodeKind, NodeRecord, OperationId, VolumeSnapshot,
+    ChangeCursor, DirectoryEntry, DirectoryRecord, FileVersion, FileVersionId, Generation,
+    NodeAttributes, NodeId, NodeKind, NodeRecord, OperationId, VolumeSnapshot,
 };
 use crate::managed::ManagedVolume;
 
 use super::SyncError;
-pub(crate) struct ScannedTree {
-    pub(crate) snapshot: VolumeSnapshot,
+
+pub(crate) enum ScannedTree {
+    Unchanged,
+    Changed(VolumeSnapshot),
 }
 
 #[derive(Clone, Copy)]
@@ -45,13 +47,6 @@ pub(crate) async fn scan(
 ) -> Result<ScannedTree, SyncError> {
     let local = scan_paths(root)?;
     let base_paths = base.paths()?;
-    let next_sequence = base
-        .cursor
-        .sequence()
-        .checked_add(1)
-        .and_then(NonZeroU64::new)
-        .ok_or_else(|| SyncError::new("Managed change sequence overflows"))?;
-    let next_generation = Generation::from_bytes(next_sequence.get().to_be_bytes().to_vec());
 
     let mut inspected = futures::stream::iter(
         local
@@ -62,16 +57,22 @@ pub(crate) async fn scan(
         Ok::<_, SyncError>((path, volume.inspect_file(&root.join(path)).await?))
     })
     .buffer_unordered(32);
-    let mut file_versions = BTreeMap::new();
     let mut file_by_path = BTreeMap::<String, FileVersionId>::new();
     while let Some(result) = inspected.next().await {
         let (path, version) = result?;
         file_by_path.insert(path.clone(), version.id);
-        file_versions
-            .entry(version.id)
-            .or_insert_with(|| version.clone());
     }
 
+    if same_local_namespace(&local, &file_by_path, base, &base_paths) {
+        return Ok(ScannedTree::Unchanged);
+    }
+
+    let next_sequence = base
+        .cursor
+        .sequence()
+        .checked_add(1)
+        .and_then(NonZeroU64::new)
+        .ok_or_else(|| SyncError::new("Managed change sequence overflows"))?;
     let mut ids = BTreeMap::from([(String::new(), base.root)]);
     let mut used = BTreeSet::from([base.root]);
     for (path, entry) in &local {
@@ -96,6 +97,7 @@ pub(crate) async fn scan(
         ids.entry(path.clone()).or_insert_with(NodeId::generate);
     }
 
+    let next_generation = Generation::from_bytes(next_sequence.get().to_be_bytes().to_vec());
     let mut entries_by_directory = ids
         .iter()
         .filter(|(path, _)| path.is_empty() || local[*path].kind == NodeKind::Directory)
@@ -184,6 +186,11 @@ pub(crate) async fn scan(
         );
     }
 
+    let file_versions = file_by_path
+        .values()
+        .copied()
+        .map(|id| (id, FileVersion::new(id)))
+        .collect();
     let mut snapshot = VolumeSnapshot {
         volume_id: base.volume_id,
         cursor: base.cursor,
@@ -193,15 +200,33 @@ pub(crate) async fn scan(
         file_versions,
     };
     snapshot.validate()?;
-    if same_namespace(&snapshot, base) {
-        return Ok(ScannedTree {
-            snapshot: base.clone(),
-        });
-    }
-
     let operation = OperationId::generate();
     snapshot.cursor = ChangeCursor::at(next_sequence, operation);
-    Ok(ScannedTree { snapshot })
+    Ok(ScannedTree::Changed(snapshot))
+}
+
+fn same_local_namespace(
+    local: &BTreeMap<String, LocalEntry>,
+    files: &BTreeMap<String, FileVersionId>,
+    base: &VolumeSnapshot,
+    base_paths: &BTreeMap<String, NodeId>,
+) -> bool {
+    if local.len() != base_paths.len()
+        || base.nodes[&base.root].attributes != NodeAttributes::default()
+    {
+        return false;
+    }
+    local.iter().all(|(path, entry)| {
+        let Some(node) = base_paths.get(path).and_then(|node| base.nodes.get(node)) else {
+            return false;
+        };
+        node.kind == entry.kind
+            && node.attributes
+                == NodeAttributes {
+                    executable: entry.executable,
+                }
+            && node.file_version == files.get(path).copied()
+    })
 }
 
 fn reuse_unique_identities(
@@ -212,6 +237,14 @@ fn reuse_unique_identities(
     ids: &mut BTreeMap<String, NodeId>,
     used: &mut BTreeSet<NodeId>,
 ) {
+    let has_unassigned_local = local.keys().any(|path| !ids.contains_key(path));
+    let has_unused_base = base_paths
+        .iter()
+        .any(|(path, node)| !path.is_empty() && !used.contains(node));
+    if !has_unassigned_local || !has_unused_base {
+        return;
+    }
+
     let local_signatures = local_signatures(local, file_by_path);
     let base_signatures = snapshot_signatures(base, base_paths);
     let mut local_by_signature = BTreeMap::<_, Vec<&String>>::new();
@@ -330,13 +363,6 @@ fn entry_signature(
         hasher.update(signature.as_bytes());
     }
     crate::filesystem::Digest::from_bytes(hasher.finalize().into())
-}
-
-fn same_namespace(left: &VolumeSnapshot, right: &VolumeSnapshot) -> bool {
-    left.root == right.root
-        && left.nodes == right.nodes
-        && left.directories == right.directories
-        && left.file_versions == right.file_versions
 }
 
 fn scan_paths(root: &Path) -> Result<BTreeMap<String, LocalEntry>, SyncError> {
