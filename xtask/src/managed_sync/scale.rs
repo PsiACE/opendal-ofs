@@ -48,6 +48,7 @@ const TINY_CHANGE_COUNT: u64 = 4_096;
 const LARGE_FILE_COUNT: u64 = 3;
 const LARGE_FILE_SIZE: u64 = 10 * 1024 * 1024 * 1024;
 const MAX_REPLICA_STATE_BYTES: u64 = 16 * 1024;
+const TRANSFER_CONCURRENCY: usize = 16;
 
 pub(crate) fn run(profile: &str, output: &Path, keep: bool) {
     let profile = Profile::parse(profile);
@@ -96,17 +97,21 @@ pub(crate) fn run(profile: &str, output: &Path, keep: bool) {
     runner.record_generation(generation_started.elapsed());
     runner.stage(
         "volume-create",
-        super::ofs_volume_create_with(&binary, &storage),
+        scale_command(super::ofs_volume_create_with(&binary, &storage)),
         None,
     );
     runner.stage(
         "initial-publish-a",
-        super::ofs_sync_with(&binary, &replica_a, &state_a, &storage),
+        scale_command(super::ofs_sync_with(
+            &binary, &replica_a, &state_a, &storage,
+        )),
         Some((&replica_a, &state_a)),
     );
     runner.stage(
         "cold-restore-b",
-        super::ofs_sync_with(&binary, &replica_b, &state_b, &storage),
+        scale_command(super::ofs_sync_with(
+            &binary, &replica_b, &state_b, &storage,
+        )),
         Some((&replica_b, &state_b)),
     );
     runner.observe_equal(
@@ -123,7 +128,7 @@ pub(crate) fn run(profile: &str, output: &Path, keep: bool) {
     ] {
         let published = runner.stage(
             name,
-            super::ofs_sync_with(&binary, replica, state, &storage),
+            scale_command(super::ofs_sync_with(&binary, replica, state, &storage)),
             Some((replica, state)),
         );
         runner.require(
@@ -136,17 +141,23 @@ pub(crate) fn run(profile: &str, output: &Path, keep: bool) {
     mutate(profile, Side::B, &replica_b);
     runner.stage(
         "publish-a-update",
-        super::ofs_sync_with(&binary, &replica_a, &state_a, &storage),
+        scale_command(super::ofs_sync_with(
+            &binary, &replica_a, &state_a, &storage,
+        )),
         Some((&replica_a, &state_a)),
     );
     runner.stage(
         "merge-b-update",
-        super::ofs_sync_with(&binary, &replica_b, &state_b, &storage),
+        scale_command(super::ofs_sync_with(
+            &binary, &replica_b, &state_b, &storage,
+        )),
         Some((&replica_b, &state_b)),
     );
     runner.stage(
         "install-merged-a",
-        super::ofs_sync_with(&binary, &replica_a, &state_a, &storage),
+        scale_command(super::ofs_sync_with(
+            &binary, &replica_a, &state_a, &storage,
+        )),
         Some((&replica_a, &state_a)),
     );
     runner.observe_equal(
@@ -160,12 +171,20 @@ pub(crate) fn run(profile: &str, output: &Path, keep: bool) {
     let current = runner.remote_sequence();
     runner.stage(
         "advance-horizon-and-gc",
-        super::ofs_gc_with_binary(&binary, &storage, false, Some(current), Some("0s")),
+        scale_command(super::ofs_gc_with_binary(
+            &binary,
+            &storage,
+            false,
+            Some(current),
+            Some("0s"),
+        )),
         Some((&replica_a, &state_a)),
     );
     runner.stage(
         "stateless-cold-restore-c",
-        super::ofs_sync_with(&binary, &replica_c, &state_c, &storage),
+        scale_command(super::ofs_sync_with(
+            &binary, &replica_c, &state_c, &storage,
+        )),
         Some((&replica_c, &state_c)),
     );
     runner.observe_equal(
@@ -178,7 +197,7 @@ pub(crate) fn run(profile: &str, output: &Path, keep: bool) {
     let barrier_storage = fixture.storage_url(&format!("audit-barrier/{run_name}"));
     fixture.finish_audit_with(
         &run_name,
-        super::ofs_volume_create_with(&binary, &barrier_storage),
+        scale_command(super::ofs_volume_create_with(&binary, &barrier_storage)),
     );
     runner.record_backend(
         fixture.inventory(&volume_root),
@@ -411,6 +430,7 @@ impl Runner {
                 "file_count": profile.file_count(),
                 "file_size_bytes": profile.file_size(),
                 "logical_bytes": profile.file_count() * profile.file_size(),
+                "transfer_concurrency": TRANSFER_CONCURRENCY,
                 "mutated_paths": {
                     "replica_a": profile.mutation_count(Side::A),
                     "replica_b": profile.mutation_count(Side::B),
@@ -581,6 +601,13 @@ impl Runner {
         .to_string_lossy()
         .into_owned()
     }
+}
+
+fn scale_command(mut command: Command) -> Command {
+    command
+        .arg("--transfer-concurrency")
+        .arg(TRANSFER_CONCURRENCY.to_string());
+    command
 }
 
 fn read_status(binary: &Path, replica: &Path, state: &Path) -> Option<Value> {
