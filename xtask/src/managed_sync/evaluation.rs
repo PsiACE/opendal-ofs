@@ -71,10 +71,15 @@ impl GitProvenance {
             String::from_utf8_lossy(&status.stderr).trim()
         );
 
-        Self {
+        let provenance = Self {
             git_revision: String::from_utf8_lossy(&revision.stdout).trim().into(),
             workspace_dirty: !status.stdout.is_empty(),
-        }
+        };
+        assert!(
+            !provenance.workspace_dirty,
+            "evaluation requires a clean candidate workspace so every report binds exact source"
+        );
+        provenance
     }
 
     pub(crate) fn document(&self) -> Value {

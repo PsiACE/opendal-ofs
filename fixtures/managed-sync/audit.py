@@ -47,6 +47,13 @@ class AuditState:
         if not isinstance(request_path, str):
             return
         parts = request_path.split("/")
+        if len(parts) < 4:
+            request_query = event.get("requestQuery")
+            prefix = request_query.get("prefix") if isinstance(request_query, dict) else None
+            if not isinstance(prefix, str):
+                return
+            request_path = f"{request_path.rstrip('/')}/{prefix.lstrip('/')}"
+            parts = request_path.split("/")
         if len(parts) < 4 or parts[1] != "managed-sync":
             return
         if parts[2] == "audit-barrier":

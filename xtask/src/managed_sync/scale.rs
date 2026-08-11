@@ -18,6 +18,7 @@
 //! Fixed-scale Managed Sync acceptance profiles.
 
 use std::fs;
+use std::io::Read as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -48,6 +49,8 @@ const TINY_FILE_SIZE: u64 = 4 * 1024;
 const TINY_CHANGE_COUNT: u64 = 4_096;
 const LARGE_FILE_COUNT: u64 = 3;
 const LARGE_FILE_SIZE: u64 = 10 * 1024 * 1024 * 1024;
+const TINY_FINAL_DIRECTORY_COUNT: u64 = 4_480;
+const LARGE_FINAL_DIRECTORY_COUNT: u64 = 3;
 const MAX_REPLICA_STATE_BYTES: u64 = 16 * 1024;
 const TRANSFER_CONCURRENCY: usize = 16;
 
@@ -141,6 +144,7 @@ pub(crate) fn run(profile: &str, output: &Path, keep: bool) {
         );
     }
 
+    let expected = ExpectedTree::new(profile);
     mutate(profile, Side::A, &replica_a);
     mutate(profile, Side::B, &replica_b);
     runner.stage(
@@ -157,6 +161,7 @@ pub(crate) fn run(profile: &str, output: &Path, keep: bool) {
         )),
         Some((&replica_b, &state_b)),
     );
+    runner.observe_expected("merged-tree-oracle", &replica_b, "replica-b", &expected);
     runner.stage(
         "install-merged-a",
         scale_command(super::ofs_sync_with(
@@ -164,13 +169,7 @@ pub(crate) fn run(profile: &str, output: &Path, keep: bool) {
         )),
         Some((&replica_a, &state_a)),
     );
-    runner.observe_equal(
-        "bidirectional-convergence",
-        &replica_a,
-        "replica-a",
-        &replica_b,
-        "replica-b",
-    );
+    runner.observe_expected("installed-tree-oracle", &replica_a, "replica-a", &expected);
 
     runner.stage(
         "collect-current-namespace",
@@ -184,12 +183,11 @@ pub(crate) fn run(profile: &str, output: &Path, keep: bool) {
         )),
         Some((&replica_c, &state_c)),
     );
-    runner.observe_equal(
+    runner.observe_expected(
         "post-collection-cold-restore",
-        &replica_a,
-        "replica-a",
         &replica_c,
         "replica-c",
+        &expected,
     );
     let barrier_storage = fixture.storage_url(&format!("audit-barrier/{run_name}"));
     fixture.finish_audit_with(
@@ -297,6 +295,189 @@ impl Side {
             Self::A => 2,
             Self::B => 3,
         }
+    }
+}
+
+struct ExpectedTree {
+    profile: Profile,
+}
+
+impl ExpectedTree {
+    const fn new(profile: Profile) -> Self {
+        Self { profile }
+    }
+
+    const fn files(&self) -> u64 {
+        self.profile.file_count()
+    }
+
+    const fn directories(&self) -> u64 {
+        match self.profile {
+            Profile::TinyFiles => TINY_FINAL_DIRECTORY_COUNT,
+            Profile::LargeFiles => LARGE_FINAL_DIRECTORY_COUNT,
+        }
+    }
+
+    const fn bytes(&self) -> u64 {
+        self.profile.file_count() * self.profile.file_size()
+    }
+
+    const fn checked_files(&self) -> u64 {
+        match self.profile {
+            Profile::TinyFiles => TINY_CHANGE_COUNT * 3 * 2,
+            Profile::LargeFiles => LARGE_FILE_COUNT,
+        }
+    }
+
+    const fn checked_absent_paths(&self) -> u64 {
+        match self.profile {
+            Profile::TinyFiles => TINY_CHANGE_COUNT * 2 * 2,
+            Profile::LargeFiles => 0,
+        }
+    }
+
+    fn verify(&self, root: &Path, summary: &TreeSummary) -> Result<(), String> {
+        if summary.files != self.files()
+            || summary.directories != self.directories()
+            || summary.bytes != self.bytes()
+        {
+            return Err(format!(
+                "tree shape differs from the fixed {} oracle: expected {} files, {} directories, and {} bytes; observed {}, {}, and {}",
+                self.profile.name(),
+                self.files(),
+                self.directories(),
+                self.bytes(),
+                summary.files,
+                summary.directories,
+                summary.bytes,
+            ));
+        }
+
+        let mut verifier = ContentVerifier::new();
+        match self.profile {
+            Profile::TinyFiles => verify_tiny_tree(root, &mut verifier),
+            Profile::LargeFiles => verify_large_tree(root, &mut verifier),
+        }
+    }
+}
+
+struct ContentVerifier {
+    actual: Vec<u8>,
+    expected: Vec<u8>,
+}
+
+impl ContentVerifier {
+    fn new() -> Self {
+        Self {
+            actual: vec![0; STREAM_BUFFER_SIZE],
+            expected: vec![0; STREAM_BUFFER_SIZE],
+        }
+    }
+
+    fn file(
+        &mut self,
+        root: &Path,
+        relative: &Path,
+        identity: &Path,
+        revision: u8,
+        size: u64,
+    ) -> Result<(), String> {
+        let path = root.join(relative);
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| format!("expected file {} is unavailable: {error}", path.display()))?;
+        if !metadata.file_type().is_file() || metadata.len() != size {
+            return Err(format!(
+                "expected regular file {} to contain {size} bytes",
+                path.display()
+            ));
+        }
+
+        let mut seed = blake3::Hasher::new();
+        seed.update(b"ofs-managed-sync-evaluation-content\0");
+        seed.update(identity.to_string_lossy().as_bytes());
+        seed.update(&[revision]);
+        let mut expected = seed.finalize_xof();
+        let mut file = fs::File::open(&path)
+            .map_err(|error| format!("cannot open expected file {}: {error}", path.display()))?;
+        let mut remaining = size;
+        while remaining != 0 {
+            let length = remaining.min(self.actual.len() as u64) as usize;
+            file.read_exact(&mut self.actual[..length])
+                .map_err(|error| {
+                    format!("cannot read expected file {}: {error}", path.display())
+                })?;
+            expected.fill(&mut self.expected[..length]);
+            if self.actual[..length] != self.expected[..length] {
+                return Err(format!(
+                    "file {} does not contain its expected fixed-profile content",
+                    path.display()
+                ));
+            }
+            remaining -= length as u64;
+        }
+        Ok(())
+    }
+}
+
+fn verify_tiny_tree(root: &Path, verifier: &mut ContentVerifier) -> Result<(), String> {
+    for side in [Side::A, Side::B] {
+        let offset = match side {
+            Side::A => 0,
+            Side::B => 4,
+        };
+        for change in 0..TINY_CHANGE_COUNT {
+            let base = change * 16 + offset;
+
+            let modified = data_path("data", base);
+            verifier.file(root, &modified, &modified, side.seed(), TINY_FILE_SIZE)?;
+
+            let renamed = data_path("data", base + 1);
+            require_missing(root, &renamed)?;
+            verifier.file(
+                root,
+                &data_path(&format!("renamed/{}", side.name()), base + 1),
+                &renamed,
+                1,
+                TINY_FILE_SIZE,
+            )?;
+
+            require_missing(root, &data_path("data", base + 2))?;
+
+            let created_index = TINY_FILE_COUNT
+                + change
+                + match side {
+                    Side::A => 0,
+                    Side::B => TINY_CHANGE_COUNT,
+                };
+            let created = data_path(&format!("created/{}", side.name()), created_index);
+            verifier.file(root, &created, &created, side.seed(), TINY_FILE_SIZE)?;
+        }
+    }
+    Ok(())
+}
+
+fn verify_large_tree(root: &Path, verifier: &mut ContentVerifier) -> Result<(), String> {
+    for (side, files) in [(Side::A, &[0][..]), (Side::B, &[1, 2][..])] {
+        for index in files {
+            let relative = data_path("data", *index);
+            verifier.file(root, &relative, &relative, side.seed(), LARGE_FILE_SIZE)?;
+        }
+    }
+    Ok(())
+}
+
+fn require_missing(root: &Path, relative: &Path) -> Result<(), String> {
+    let path = root.join(relative);
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "cannot inspect expected-absent path {}: {error}",
+            path.display()
+        )),
+        Ok(_) => Err(format!(
+            "path {} should be absent in the fixed-profile result",
+            path.display()
+        )),
     }
 }
 
@@ -447,6 +628,7 @@ impl Runner {
             "volume_root": volume_root,
             "work_tree_retained": keep,
             "phases": [],
+            "semantic_oracles": [],
             "tree_observations": [],
         });
         Self {
@@ -560,6 +742,33 @@ impl Runner {
                 && summaries[0].bytes == summaries[1].bytes,
             &format!("tree mismatch at {name}"),
         );
+    }
+
+    fn observe_expected(&mut self, name: &str, root: &Path, label: &str, expected: &ExpectedTree) {
+        let mut summaries = self.observe(name, &[(root, label)]);
+        let summary = summaries.pop().expect("expected-tree observation exists");
+        let failure = expected.verify(root, &summary).err();
+        self.report["semantic_oracles"]
+            .as_array_mut()
+            .expect("semantic oracle report is an array")
+            .push(json!({
+                "name": name,
+                "tree": label,
+                "checked_files": expected.checked_files(),
+                "checked_absent_paths": expected.checked_absent_paths(),
+                "expected_files": expected.files(),
+                "expected_directories": expected.directories(),
+                "expected_bytes": expected.bytes(),
+                "passed": failure.is_none(),
+                "failure": failure,
+            }));
+        self.write_report();
+        if let Some(failure) = failure {
+            self.require(
+                false,
+                &format!("semantic oracle failed at {name}: {failure}"),
+            );
+        }
     }
 
     fn require(&mut self, condition: bool, message: &str) {
