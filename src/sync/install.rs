@@ -138,6 +138,7 @@ async fn apply(
             durability.changed_parent(&destination);
             test_interrupt()?;
         }
+        durability.changed_parent(&destination);
         files.push((destination, version.clone(), node.attributes.executable));
     }
     futures::stream::iter(files)
@@ -146,8 +147,10 @@ async fn apply(
             transfer_concurrency,
             |(destination, version, executable)| async move {
                 volume.materialize_file(&version, &destination).await?;
-                set_executable(&destination, executable)?;
-                sync_file(&destination)?;
+                if executable {
+                    set_executable(&destination, true)?;
+                    sync_file(&destination)?;
+                }
                 test_interrupt()?;
                 Ok(())
             },

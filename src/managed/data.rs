@@ -166,9 +166,6 @@ impl ManagedVolume {
             tokio::fs::rename(&temporary, destination)
                 .await
                 .map_err(|_| unavailable("materialize Managed file"))?;
-            std::fs::File::open(parent)
-                .and_then(|directory| directory.sync_all())
-                .map_err(|_| unavailable("materialize Managed file"))?;
             Ok(())
         }
         .await;
