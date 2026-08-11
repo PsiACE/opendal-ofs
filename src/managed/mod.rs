@@ -17,6 +17,7 @@
 
 //! Managed volume authority and durable storage format.
 
+mod container;
 mod data;
 mod error;
 mod format;

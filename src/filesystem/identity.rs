@@ -55,6 +55,11 @@ fixed_identity!(
     32
 );
 fixed_identity!(
+    /// Integrity value used to verify one independently readable record.
+    Checksum,
+    32
+);
+fixed_identity!(
     /// Idempotency identity of one publication attempt.
     OperationId,
     16

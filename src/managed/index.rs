@@ -21,29 +21,27 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::Cursor;
 
-use opendal::{Buffer, Operator};
+use opendal::Operator;
 use serde::de::{DeserializeOwned, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::filesystem::VolumeError;
 
+use super::container::{ContainerWriter, SectionRef, read_section};
 use super::error::{corrupt, invalid};
-use super::object;
 
 const LEAF_MAGIC: [u8; 8] = *b"OFSIDXL1";
 const INTERNAL_MAGIC: [u8; 8] = *b"OFSIDXI1";
-const CHECKSUM_BYTES: usize = 32;
 const PAGE_TARGET_BYTES: usize = 128 * 1024;
 const MAX_PAGE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TREE_DEPTH: usize = 64;
-const PAGE_FIXED_BYTES: usize = LEAF_MAGIC.len() + CHECKSUM_BYTES + 9;
+const PAGE_FIXED_BYTES: usize = LEAF_MAGIC.len() + 9;
 
 /// An exact reference to one immutable ordered-index page.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PageRef {
-    pub(crate) digest: [u8; 32],
-    pub(crate) encoded_length: u64,
+    pub(crate) section: SectionRef,
     pub(crate) first_key: Box<[u8]>,
     pub(crate) last_key: Box<[u8]>,
 }
@@ -59,6 +57,13 @@ impl PageKind {
         match self {
             Self::Leaf => LEAF_MAGIC,
             Self::Internal => INTERNAL_MAGIC,
+        }
+    }
+
+    const fn section_type(self) -> u8 {
+        match self {
+            Self::Leaf => 1,
+            Self::Internal => 2,
         }
     }
 }
@@ -131,22 +136,7 @@ where
     K: Ord + Serialize,
     V: Serialize,
 {
-    let mut leaf_items = Vec::with_capacity(entries.len());
-    for (key, value) in entries {
-        let key = encode_cbor(key)?;
-        leaf_items.push(PageItem {
-            record: EncodedRecord(encode_cbor(&(EncodedRecord(key.clone()), value))?),
-            first_key: key.clone().into_boxed_slice(),
-            last_key: key.into_boxed_slice(),
-        });
-    }
-
-    let leaf_groups = if leaf_items.is_empty() {
-        vec![Vec::new()]
-    } else {
-        group_items(leaf_items, 1)
-    };
-    let mut level = write_pages(operator, PageKind::Leaf, leaf_groups).await?;
+    let mut level = write_leaves(operator, entries).await?;
 
     while level.len() > 1 {
         let mut items = Vec::with_capacity(level.len());
@@ -163,6 +153,40 @@ where
     Ok(level
         .pop()
         .expect("an index always has one leaf or internal root"))
+}
+
+async fn write_leaves<K, V>(
+    operator: &Operator,
+    entries: &BTreeMap<K, V>,
+) -> Result<Vec<PageRef>, VolumeError>
+where
+    K: Ord + Serialize,
+    V: Serialize,
+{
+    let mut pages = Vec::new();
+    let mut containers = ContainerWriter::new(operator);
+    let mut group = Vec::new();
+    let mut estimated_bytes = PAGE_FIXED_BYTES;
+    for (key, value) in entries {
+        let key = encode_cbor(key)?;
+        let item = PageItem {
+            record: EncodedRecord(encode_cbor(&(EncodedRecord(key.clone()), value))?),
+            first_key: key.clone().into_boxed_slice(),
+            last_key: key.into_boxed_slice(),
+        };
+        let item_bytes = item.record.0.len() + cbor_bytes_header(item.record.0.len());
+        if !group.is_empty() && estimated_bytes.saturating_add(item_bytes) > PAGE_TARGET_BYTES {
+            pages.extend(
+                push_page(&mut containers, PageKind::Leaf, std::mem::take(&mut group)).await?,
+            );
+            estimated_bytes = PAGE_FIXED_BYTES;
+        }
+        estimated_bytes = estimated_bytes.saturating_add(item_bytes);
+        group.push(item);
+    }
+    pages.extend(push_page(&mut containers, PageKind::Leaf, group).await?);
+    pages.extend(containers.finish().await?.into_iter().map(page_reference));
+    Ok(pages)
 }
 
 /// Read and verify a complete persistent ordered index.
@@ -182,7 +206,11 @@ where
         if depth > MAX_TREE_DEPTH {
             return Err(corrupt("read Managed index", "index tree is too deep"));
         }
-        if !visited.insert(reference.digest) {
+        if !visited.insert((
+            reference.section.object,
+            reference.section.offset,
+            reference.section.length,
+        )) {
             return Err(corrupt(
                 "read Managed index",
                 "index page is referenced more than once",
@@ -319,31 +347,40 @@ async fn write_pages(
     groups: Vec<Vec<PageItem>>,
 ) -> Result<Vec<PageRef>, VolumeError> {
     let mut pages = Vec::with_capacity(groups.len());
+    let mut containers = ContainerWriter::new(operator);
     for group in groups {
-        let first_key = group
-            .first()
-            .map_or_else(Box::default, |item| item.first_key.clone());
-        let last_key = group
-            .last()
-            .map_or_else(Box::default, |item| item.last_key.clone());
-        let records = group.into_iter().map(|item| item.record).collect();
-        pages.push(write_page(operator, kind, records, first_key, last_key).await?);
+        pages.extend(push_page(&mut containers, kind, group).await?);
     }
+    pages.extend(containers.finish().await?.into_iter().map(page_reference));
     Ok(pages)
 }
 
-async fn write_page(
-    operator: &Operator,
+async fn push_page(
+    containers: &mut ContainerWriter<'_, (Box<[u8]>, Box<[u8]>)>,
     kind: PageKind,
-    records: Vec<EncodedRecord>,
-    first_key: Box<[u8]>,
-    last_key: Box<[u8]>,
-) -> Result<PageRef, VolumeError> {
+    group: Vec<PageItem>,
+) -> Result<Vec<PageRef>, VolumeError> {
+    let first_key = group
+        .first()
+        .map_or_else(Box::default, |item| item.first_key.clone());
+    let last_key = group
+        .last()
+        .map_or_else(Box::default, |item| item.last_key.clone());
+    let records = group.into_iter().map(|item| item.record).collect();
+    let bytes = encode_page(kind, records)?;
+    Ok(containers
+        .push(kind.section_type(), bytes, (first_key, last_key))
+        .await?
+        .into_iter()
+        .map(page_reference)
+        .collect())
+}
+
+fn encode_page(kind: PageKind, records: Vec<EncodedRecord>) -> Result<Vec<u8>, VolumeError> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&kind.magic());
     ciborium::into_writer(&PageBody(records), &mut bytes)
         .map_err(|_| invalid("write Managed index", "index page cannot be encoded"))?;
-    bytes.extend_from_slice(blake3::hash(&bytes).as_bytes());
     if bytes.len() > MAX_PAGE_BYTES {
         return Err(invalid(
             "write Managed index",
@@ -351,35 +388,29 @@ async fn write_page(
         ));
     }
 
-    let digest: [u8; 32] = blake3::hash(&bytes).into();
-    let encoded_length = u64::try_from(bytes.len())
-        .map_err(|_| invalid("write Managed index", "index page length overflows"))?;
-    object::create_immutable(operator, &page_key(digest), Buffer::from(bytes)).await?;
-    Ok(PageRef {
-        digest,
-        encoded_length,
+    Ok(bytes)
+}
+
+fn page_reference(
+    ((first_key, last_key), section): ((Box<[u8]>, Box<[u8]>), SectionRef),
+) -> PageRef {
+    PageRef {
+        section,
         first_key,
         last_key,
-    })
+    }
 }
 
 async fn read_page(
     operator: &Operator,
     reference: &PageRef,
 ) -> Result<(PageKind, Vec<EncodedRecord>), VolumeError> {
-    let length = usize::try_from(reference.encoded_length)
+    let length = usize::try_from(reference.section.length)
         .ok()
         .filter(|length| *length <= MAX_PAGE_BYTES)
         .ok_or_else(|| corrupt("read Managed index", "index page length is invalid"))?;
-    let bytes = object::read(operator, &page_key(reference.digest), length)
-        .await?
-        .ok_or_else(|| corrupt("read Managed index", "referenced index page is missing"))?;
-    if bytes.len() != length || blake3::hash(&bytes).as_bytes() != &reference.digest {
-        return Err(corrupt(
-            "read Managed index",
-            "index page does not match its reference",
-        ));
-    }
+    let bytes = read_section(operator, reference.section).await?;
+    debug_assert_eq!(bytes.len(), length);
 
     let (kind, body) = if let Some(body) = bytes.strip_prefix(&LEAF_MAGIC) {
         (PageKind::Leaf, body)
@@ -388,20 +419,10 @@ async fn read_page(
     } else {
         return Err(corrupt("read Managed index", "index page magic is invalid"));
     };
-    let body = body
-        .get(
-            ..body
-                .len()
-                .checked_sub(CHECKSUM_BYTES)
-                .ok_or_else(|| corrupt("read Managed index", "index page checksum is missing"))?,
-        )
-        .ok_or_else(|| corrupt("read Managed index", "index page checksum is missing"))?;
-    if blake3::hash(&bytes[..bytes.len() - CHECKSUM_BYTES]).as_bytes()
-        != &bytes[bytes.len() - CHECKSUM_BYTES..]
-    {
+    if kind.section_type() != reference.section.section_type {
         return Err(corrupt(
             "read Managed index",
-            "index page checksum is invalid",
+            "index page type does not match its reference",
         ));
     }
     let PageBody(records) = decode_cbor(body)?;
@@ -482,9 +503,4 @@ fn cbor_bytes_header(length: usize) -> usize {
         0x1_0000..=0xffff_ffff => 5,
         _ => 9,
     }
-}
-
-fn page_key(digest: [u8; 32]) -> String {
-    let digest = blake3::Hash::from_bytes(digest).to_hex();
-    format!("managed/1/objects/meta/{}/{digest}", &digest[..2])
 }
