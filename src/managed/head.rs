@@ -50,7 +50,7 @@ pub struct ManagedObservation {
     namespace_revision: NamespaceRevision,
     reclamation_watermark: ChangeCursor,
     maintenance_generation: u64,
-    changes: BTreeMap<ChangeCursor, ()>,
+    publication_cursors: BTreeMap<ChangeCursor, ()>,
     operations: BTreeMap<OperationId, OperationRecord>,
     commit: NamespaceCommit,
     directory_entries: BTreeMap<DirectoryKey, DirectoryEntry>,
@@ -113,10 +113,10 @@ pub(super) struct GcFence {
 struct NamespaceCommit {
     volume_id: VolumeId,
     change_cursor: ChangeCursor,
-    change_log_floor: ChangeCursor,
+    publication_floor: ChangeCursor,
     node_index_root: PageRef,
     directory_entry_index_root: PageRef,
-    change_log_root: PageRef,
+    publication_cursor_index_root: PageRef,
     operation_result_index_root: PageRef,
 }
 
@@ -135,7 +135,7 @@ struct OperationRecord {
 
 struct StoredNamespace {
     snapshot: VolumeSnapshot,
-    changes: BTreeMap<ChangeCursor, ()>,
+    publication_cursors: BTreeMap<ChangeCursor, ()>,
     operations: BTreeMap<OperationId, OperationRecord>,
     commit: NamespaceCommit,
     directory_entries: BTreeMap<DirectoryKey, DirectoryEntry>,
@@ -145,7 +145,7 @@ struct StoredNamespace {
 struct IndexObjects {
     nodes: BTreeMap<crate::filesystem::Digest, u64>,
     directory_entries: BTreeMap<crate::filesystem::Digest, u64>,
-    changes: BTreeMap<crate::filesystem::Digest, u64>,
+    publication_cursors: BTreeMap<crate::filesystem::Digest, u64>,
     operations: BTreeMap<crate::filesystem::Digest, u64>,
 }
 
@@ -226,7 +226,7 @@ impl ManagedVolume {
             namespace_revision: head.namespace_commit,
             reclamation_watermark: head.reclamation_watermark,
             maintenance_generation: head.maintenance_generation,
-            changes: stored.changes,
+            publication_cursors: stored.publication_cursors,
             operations: stored.operations,
             commit: stored.commit,
             directory_entries: stored.directory_entries,
@@ -279,8 +279,8 @@ impl ManagedVolume {
             .cursor
             .operation()
             .expect("validated publication has an operation identity");
-        let mut changes = observed.changes.clone();
-        changes.insert(target.cursor, ());
+        let mut publication_cursors = observed.publication_cursors.clone();
+        publication_cursors.insert(target.cursor, ());
         let mut operations = observed.operations.clone();
         operations.insert(
             operation,
@@ -288,13 +288,13 @@ impl ManagedVolume {
                 cursor: target.cursor,
             },
         );
-        let change_log_floor = observed.reclamation_watermark;
-        changes.retain(|cursor, _| *cursor >= change_log_floor);
+        let publication_floor = observed.reclamation_watermark;
+        publication_cursors.retain(|cursor, _| *cursor >= publication_floor);
         self.write_namespace(
             &target,
-            &changes,
+            &publication_cursors,
             &operations,
-            change_log_floor,
+            publication_floor,
             Some(observed),
         )
         .await
@@ -433,7 +433,12 @@ impl ManagedVolume {
                       _: ChangeCursor,
                       _: ()| Ok(()),
         };
-        visit_index_streaming(&self.operator, &commit.change_log_root, &mut index_visitor).await?;
+        visit_index_streaming(
+            &self.operator,
+            &commit.publication_cursor_index_root,
+            &mut index_visitor,
+        )
+        .await?;
 
         let mut index_visitor = ReachableIndexVisitor {
             objects: &mut visit,
@@ -452,9 +457,9 @@ impl ManagedVolume {
     async fn write_namespace(
         &self,
         snapshot: &VolumeSnapshot,
-        changes: &BTreeMap<ChangeCursor, ()>,
+        publication_cursors: &BTreeMap<ChangeCursor, ()>,
         operations: &BTreeMap<OperationId, OperationRecord>,
-        change_log_floor: ChangeCursor,
+        publication_floor: ChangeCursor,
         previous: Option<&ManagedObservation>,
     ) -> Result<NamespaceRevision, VolumeError> {
         snapshot.validate()?;
@@ -495,14 +500,19 @@ impl ManagedVolume {
             }
             None => write_index(&self.operator, &directory_entries).await?,
         };
-        let change_log_root = match previous {
-            Some(previous) if previous.changes == *changes => {
-                previous.commit.change_log_root.clone()
+        let publication_cursor_index_root = match previous {
+            Some(previous) if previous.publication_cursors == *publication_cursors => {
+                previous.commit.publication_cursor_index_root.clone()
             }
             Some(previous) => {
-                write_index_reusing(&self.operator, changes, &previous.objects.changes).await?
+                write_index_reusing(
+                    &self.operator,
+                    publication_cursors,
+                    &previous.objects.publication_cursors,
+                )
+                .await?
             }
-            None => write_index(&self.operator, changes).await?,
+            None => write_index(&self.operator, publication_cursors).await?,
         };
         let operation_result_index_root = match previous {
             Some(previous) if previous.operations == *operations => {
@@ -518,10 +528,10 @@ impl ManagedVolume {
         let commit = NamespaceCommit {
             volume_id: snapshot.volume_id,
             change_cursor: snapshot.cursor,
-            change_log_floor,
+            publication_floor,
             node_index_root,
             directory_entry_index_root,
-            change_log_root,
+            publication_cursor_index_root,
             operation_result_index_root,
         };
         let bytes = COMMIT_RECORD.encode(&commit)?;
@@ -556,11 +566,15 @@ impl ManagedVolume {
             BTreeMap<DirectoryKey, DirectoryEntry>,
             _,
         ) = read_index(&self.operator, &commit.directory_entry_index_root).await?;
-        let (changes, change_objects): (BTreeMap<ChangeCursor, ()>, _) =
-            read_index(&self.operator, &commit.change_log_root).await?;
+        let (publication_cursors, publication_cursor_objects): (BTreeMap<ChangeCursor, ()>, _) =
+            read_index(&self.operator, &commit.publication_cursor_index_root).await?;
         let (operations, operation_objects): (BTreeMap<OperationId, OperationRecord>, _) =
             read_index(&self.operator, &commit.operation_result_index_root).await?;
-        validate_change_log(commit.change_log_floor, commit.change_cursor, &changes)?;
+        validate_publication_cursors(
+            commit.publication_floor,
+            commit.change_cursor,
+            &publication_cursors,
+        )?;
 
         let mut directories = nodes
             .iter()
@@ -599,14 +613,14 @@ impl ManagedVolume {
         snapshot.validate()?;
         Ok(StoredNamespace {
             snapshot,
-            changes,
+            publication_cursors,
             operations,
             commit,
             directory_entries,
             objects: IndexObjects {
                 nodes: node_objects,
                 directory_entries: directory_entry_objects,
-                changes: change_objects,
+                publication_cursors: publication_cursor_objects,
                 operations: operation_objects,
             },
         })
@@ -686,36 +700,41 @@ fn commit_key(digest: Digest) -> String {
     format!("managed/1/objects/commit/{}/{digest}", &digest[..2])
 }
 
-fn validate_change_log(
+fn validate_publication_cursors(
     floor: ChangeCursor,
     current: ChangeCursor,
-    changes: &BTreeMap<ChangeCursor, ()>,
+    publication_cursors: &BTreeMap<ChangeCursor, ()>,
 ) -> Result<(), VolumeError> {
     if current == ChangeCursor::Genesis {
-        if floor != ChangeCursor::Genesis || !changes.is_empty() {
-            return Err(corrupt("genesis namespace has an invalid change log"));
+        if floor != ChangeCursor::Genesis || !publication_cursors.is_empty() {
+            return Err(corrupt("genesis namespace has invalid publication cursors"));
         }
         return Ok(());
     }
     if floor.sequence() > current.sequence() {
-        return Err(corrupt("change-log floor is ahead of the namespace"));
+        return Err(corrupt(
+            "publication floor is ahead of the namespace cursor",
+        ));
     }
 
     let first_sequence = floor.sequence().max(1);
     let expected_records = current.sequence() - first_sequence + 1;
-    if u64::try_from(changes.len()).ok() != Some(expected_records)
-        || floor != ChangeCursor::Genesis && changes.keys().next().copied() != Some(floor)
-        || changes.keys().next_back().copied() != Some(current)
+    if u64::try_from(publication_cursors.len()).ok() != Some(expected_records)
+        || floor != ChangeCursor::Genesis
+            && publication_cursors.keys().next().copied() != Some(floor)
+        || publication_cursors.keys().next_back().copied() != Some(current)
     {
         return Err(corrupt(
-            "change log does not cover its declared cursor range",
+            "publication cursor index does not cover its declared range",
         ));
     }
-    for (offset, cursor) in changes.keys().enumerate() {
+    for (offset, cursor) in publication_cursors.keys().enumerate() {
         let offset =
-            u64::try_from(offset).map_err(|_| corrupt("change-log record count overflows"))?;
+            u64::try_from(offset).map_err(|_| corrupt("publication cursor count overflows"))?;
         if cursor.sequence() != first_sequence + offset || *cursor == ChangeCursor::Genesis {
-            return Err(corrupt("change log is not a continuous cursor sequence"));
+            return Err(corrupt(
+                "publication cursor index is not a continuous sequence",
+            ));
         }
     }
     Ok(())
