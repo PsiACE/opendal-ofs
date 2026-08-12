@@ -79,7 +79,7 @@ pub(crate) struct StreamRef {
     pub(crate) object: ObjectRef,
     pub(crate) payload_length: u64,
     pub(crate) payload_digest: PayloadDigest,
-    pub(crate) footer: ChecksummedRange,
+    pub(crate) footer_range: ChecksummedRange,
 }
 super::wire::tuple_wire!(StreamRef {
     kind: StreamKind,
@@ -87,7 +87,7 @@ super::wire::tuple_wire!(StreamRef {
     object: ObjectRef,
     payload_length: u64,
     payload_digest: PayloadDigest,
-    footer: ChecksummedRange,
+    footer_range: ChecksummedRange,
 });
 
 #[derive(Debug)]
@@ -342,7 +342,7 @@ pub(crate) async fn copy_byte_range(
         .offset
         .checked_add(projection.object_range.length);
     if projection.object_range.offset < reference.payload_length
-        || projection_end.is_none_or(|end| end > reference.footer.offset)
+        || projection_end.is_none_or(|end| end > reference.footer_range.offset)
     {
         return copy_byte_range_by_scanning(operator, reference, range, destination).await;
     }
@@ -666,7 +666,7 @@ async fn finish_stream(
         object,
         payload_length,
         payload_digest: digest,
-        footer: ChecksummedRange {
+        footer_range: ChecksummedRange {
             offset: footer_offset,
             length: footer_length,
             checksum: footer_checksum,
@@ -706,9 +706,9 @@ async fn read_footer(operator: &Operator, reference: StreamRef) -> Result<Stream
     let footer_length = u64::from_le_bytes(trailer[20..28].try_into().expect("fixed length"));
     if schema_version != reference.schema_version
         || kind != reference.kind
-        || footer_offset != reference.footer.offset
-        || footer_length != reference.footer.length
-        || &trailer[28..60] != reference.footer.checksum.as_bytes()
+        || footer_offset != reference.footer_range.offset
+        || footer_length != reference.footer_range.length
+        || &trailer[28..60] != reference.footer_range.checksum.as_bytes()
         || footer_offset.checked_add(footer_length) != Some(trailer_start)
     {
         return Err(Error::corrupt(
@@ -722,7 +722,7 @@ async fn read_footer(operator: &Operator, reference: StreamRef) -> Result<Stream
         footer_offset..footer_offset + footer_length,
     )
     .await?;
-    if checksum(&footer_bytes) != reference.footer.checksum {
+    if checksum(&footer_bytes) != reference.footer_range.checksum {
         return Err(Error::corrupt(
             "read Managed stream",
             "stream footer checksum is invalid",

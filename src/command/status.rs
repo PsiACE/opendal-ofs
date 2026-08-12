@@ -38,10 +38,8 @@ pub(super) fn run(args: StatusArgs) -> Result<()> {
                 "base_expired": state.base_expired(),
                 "conflicts": state.conflict_count(),
                 "common_sequence": state.common_revision().cursor().sequence(),
-                "common_operation": state.common_revision().cursor().operation().map(|operation| operation.to_string()),
                 "pending": state.has_pending(),
                 "remote_sequence": state.remote_cursor().sequence(),
-                "remote_operation": state.remote_cursor().operation().map(|operation| operation.to_string()),
                 "volume_id": state.volume_id().to_string(),
                 "volume_model": "managed",
                 "capabilities": {

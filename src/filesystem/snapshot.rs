@@ -68,7 +68,7 @@ impl VolumeSnapshot {
                     } else {
                         format!("{path}/{name}")
                     };
-                    pending.push((child, entry.node));
+                    pending.push((child, entry.node_id));
                 }
             }
             if !path.is_empty() {
@@ -134,7 +134,7 @@ impl VolumeSnapshot {
                     )
                 })?;
                 for (name, entry) in directory.entries.iter().rev() {
-                    let child = self.nodes.get(&entry.node).ok_or_else(|| {
+                    let child = self.nodes.get(&entry.node_id).ok_or_else(|| {
                         Error::invalid(
                             "validate filesystem snapshot",
                             "directory entry references a missing node",
@@ -151,7 +151,7 @@ impl VolumeSnapshot {
                     } else {
                         format!("{path}/{name}")
                     };
-                    pending.push((child_path, entry.node));
+                    pending.push((child_path, entry.node_id));
                 }
             }
             if !path.is_empty() {

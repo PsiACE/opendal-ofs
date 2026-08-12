@@ -192,14 +192,39 @@ macro_rules! display_identity {
 display_identity!(VolumeId, FileVersionId, OperationId);
 
 /// A position in a Managed volume's ordered change stream.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ChangeCursor {
     Genesis,
     At {
         sequence: NonZeroU64,
         operation: OperationId,
     },
+}
+
+impl Serialize for ChangeCursor {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_u64(self.sequence())
+    }
+}
+
+impl<'de> Deserialize<'de> for ChangeCursor {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let sequence = u64::deserialize(deserializer)?;
+        if sequence == 0 {
+            Ok(Self::Genesis)
+        } else {
+            Ok(Self::At {
+                sequence: NonZeroU64::new(sequence).expect("nonzero cursor"),
+                operation: OperationId::from_bytes([0; 16]),
+            })
+        }
+    }
 }
 
 impl ChangeCursor {
@@ -220,7 +245,21 @@ impl ChangeCursor {
     pub const fn operation(self) -> Option<OperationId> {
         match self {
             Self::Genesis => None,
-            Self::At { operation, .. } => Some(operation),
+            Self::At { operation, .. } if !operation.is_zero() => Some(operation),
+            Self::At { .. } => None,
         }
+    }
+}
+
+impl OperationId {
+    const fn is_zero(self) -> bool {
+        let mut index = 0;
+        while index < self.0.len() {
+            if self.0[index] != 0 {
+                return false;
+            }
+            index += 1;
+        }
+        true
     }
 }

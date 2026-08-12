@@ -49,6 +49,7 @@ enum SyncPhase {
     Clean,
     Publishing {
         target: NamespaceRevision,
+        operation_id: OperationId,
         maintenance_generation: u64,
     },
     Installing {
@@ -158,8 +159,7 @@ impl ReplicaState {
             SyncPhase::Clean => Ok(()),
             SyncPhase::Publishing { target, .. }
                 if self.observed.cursor().sequence() >= self.common.cursor().sequence()
-                    && target.cursor().sequence() == self.observed.cursor().sequence() + 1
-                    && target.cursor().operation().is_some() =>
+                    && target.cursor().sequence() == self.observed.cursor().sequence() + 1 =>
             {
                 Ok(())
             }
@@ -205,12 +205,13 @@ impl ReplicaState {
 
     pub(crate) const fn pending_publication(
         &self,
-    ) -> Option<(NamespaceRevision, NamespaceRevision, u64)> {
+    ) -> Option<(NamespaceRevision, NamespaceRevision, OperationId, u64)> {
         match self.phase {
             SyncPhase::Publishing {
                 target,
+                operation_id,
                 maintenance_generation,
-            } => Some((self.observed, target, maintenance_generation)),
+            } => Some((self.observed, target, operation_id, maintenance_generation)),
             _ => None,
         }
     }
@@ -234,10 +235,12 @@ impl ReplicaState {
         &mut self,
         expected: NamespaceRevision,
         target: NamespaceRevision,
+        operation_id: OperationId,
         maintenance_generation: u64,
     ) -> Result<(), Error> {
         self.phase = SyncPhase::Publishing {
             target,
+            operation_id,
             maintenance_generation,
         };
         self.observed = expected;

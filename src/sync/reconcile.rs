@@ -331,7 +331,7 @@ fn build_target(
         directory_entries.entry(parent_id).or_default().insert(
             name.to_owned(),
             DirectoryEntry {
-                node: *node_id,
+                node_id: *node_id,
                 kind: nodes[node_id].kind,
             },
         );

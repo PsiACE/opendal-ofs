@@ -103,7 +103,7 @@ pub(crate) async fn scan(root: &Path, base: &VolumeSnapshot) -> Result<ScannedTr
             .insert(
                 name.to_owned(),
                 DirectoryEntry {
-                    node: ids[child_path],
+                    node_id: ids[child_path],
                     kind: child.kind,
                 },
             );

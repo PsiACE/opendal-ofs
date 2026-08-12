@@ -77,7 +77,7 @@ impl<'de> Deserialize<'de> for NodeAttributes {
 /// One named edge from a directory to a filesystem node.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DirectoryEntry {
-    pub node: NodeId,
+    pub node_id: NodeId,
     pub kind: NodeKind,
 }
 
@@ -86,7 +86,7 @@ impl Serialize for DirectoryEntry {
     where
         S: serde::Serializer,
     {
-        (self.node, self.kind).serialize(serializer)
+        (self.node_id, self.kind).serialize(serializer)
     }
 }
 
@@ -95,7 +95,7 @@ impl<'de> Deserialize<'de> for DirectoryEntry {
     where
         D: serde::Deserializer<'de>,
     {
-        let (node, kind) = Deserialize::deserialize(deserializer)?;
-        Ok(Self { node, kind })
+        let (node_id, kind) = Deserialize::deserialize(deserializer)?;
+        Ok(Self { node_id, kind })
     }
 }

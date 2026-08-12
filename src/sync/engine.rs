@@ -186,14 +186,21 @@ impl SyncEngine {
                     .volume
                     .prepare_publication(&observed, local, manifests)
                     .await?;
+                let operation = target
+                    .cursor()
+                    .operation()
+                    .expect("prepared publication has an operation identity");
                 state.begin_publication(
                     observed.revision(),
                     target,
+                    operation,
                     observed.maintenance_generation(),
                 )?;
                 state.save(state_path)?;
                 test_interrupt("before-publish")?;
-                self.volume.commit_publication(&observed, target).await?;
+                self.volume
+                    .commit_publication(&observed, target, operation)
+                    .await?;
                 test_interrupt("after-publish")?;
                 state.advance(target);
                 state.save(state_path)?;
@@ -245,14 +252,21 @@ impl SyncEngine {
                         .volume
                         .prepare_publication(&observed, plan.target.clone(), manifests)
                         .await?;
+                    let operation = target
+                        .cursor()
+                        .operation()
+                        .expect("prepared publication has an operation identity");
                     state.begin_publication(
                         observed.revision(),
                         target,
+                        operation,
                         observed.maintenance_generation(),
                     )?;
                     state.save(state_path)?;
                     test_interrupt("before-publish")?;
-                    self.volume.commit_publication(&observed, target).await?;
+                    self.volume
+                        .commit_publication(&observed, target, operation)
+                        .await?;
                     test_interrupt("after-publish")?;
                     target
                 } else {
@@ -376,14 +390,21 @@ impl SyncEngine {
             .volume
             .prepare_publication(&observed, local, manifests)
             .await?;
+        let operation = target
+            .cursor()
+            .operation()
+            .expect("prepared publication has an operation identity");
         state.begin_publication(
             observed.revision(),
             target,
+            operation,
             observed.maintenance_generation(),
         )?;
         state.save(state_path)?;
         test_interrupt("before-publish")?;
-        self.volume.commit_publication(&observed, target).await?;
+        self.volume
+            .commit_publication(&observed, target, operation)
+            .await?;
         test_interrupt("after-publish")?;
         state.advance(target);
         state.save(state_path)?;
@@ -430,7 +451,7 @@ impl SyncEngine {
         mut state: ReplicaState,
         observed: ManagedObservation,
     ) -> Result<SyncOutcome, Error> {
-        let (expected, target, maintenance_generation) = state
+        let (expected, target, operation, maintenance_generation) = state
             .pending_publication()
             .expect("pending state has publication references");
         if observed.revision() == target {
@@ -438,10 +459,6 @@ impl SyncEngine {
                 .recover_install(root, state_path, state, observed, target, true)
                 .await;
         }
-        let operation = target
-            .cursor()
-            .operation()
-            .expect("pending target has an operation identity");
         if self
             .volume
             .operation_committed(operation, &observed)
@@ -468,7 +485,9 @@ impl SyncEngine {
             ));
         }
         test_interrupt("before-publish")?;
-        self.volume.commit_publication(&observed, target).await?;
+        self.volume
+            .commit_publication(&observed, target, operation)
+            .await?;
         test_interrupt("after-publish")?;
         let committed = self.volume.observe().await?;
         self.recover_install(root, state_path, state, committed, target, true)
