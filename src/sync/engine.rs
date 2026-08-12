@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 use std::path::Path;
 
@@ -30,6 +30,8 @@ use super::install::{install, repair};
 use super::reconcile::{changed_paths, reconcile};
 use super::scan::{ScannedTree, scan};
 use super::transfer::{inspect_file, publish_file};
+
+const FILE_RECORD_BATCH_FILES: usize = 8 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SyncOutcome {
@@ -507,7 +509,7 @@ impl SyncEngine {
         root: &Path,
         observed: &ManagedObservation,
         target: &VolumeSnapshot,
-    ) -> Result<BTreeMap<crate::filesystem::FileVersionId, crate::managed::FileLayout>, Error> {
+    ) -> Result<crate::managed::StagedFileRecords, Error> {
         let mut new_versions = BTreeSet::new();
         let common_versions = observed
             .snapshot
@@ -542,34 +544,45 @@ impl SyncEngine {
             files.push((path, version, fingerprint, base_version, publish));
         }
 
-        let layouts = futures::stream::iter(files)
-            .map(
-                |(path, version, fingerprint, base_version, publish)| async move {
-                    let path = root.join(path);
-                    if publish {
-                        let layout = publish_file(
-                            &self.volume,
-                            &path,
-                            fingerprint,
-                            base_version,
-                            observed.gc_epoch(),
-                        )
-                        .await?;
-                        Ok(Some((version, layout)))
-                    } else if inspect_file(&path).await? != fingerprint {
-                        Err(Error::conflict(
-                            "publish Managed files",
-                            "local file changed while being published",
-                        ))
-                    } else {
-                        Ok(None)
-                    }
-                },
-            )
-            .buffer_unordered(self.transfer_concurrency)
-            .try_collect::<Vec<_>>()
-            .await?;
-        Ok(layouts.into_iter().flatten().collect())
+        let mut staged = crate::managed::StagedFileRecords::default();
+        for batch in files.chunks(FILE_RECORD_BATCH_FILES) {
+            let layouts = futures::stream::iter(batch.iter().cloned())
+                .map(
+                    |(path, version, fingerprint, base_version, publish)| async move {
+                        let path = root.join(path);
+                        if publish {
+                            let layout = publish_file(
+                                &self.volume,
+                                &path,
+                                fingerprint,
+                                base_version,
+                                observed.gc_epoch(),
+                            )
+                            .await?;
+                            Ok(Some((version, fingerprint, layout)))
+                        } else if inspect_file(&path).await? != fingerprint {
+                            Err(Error::conflict(
+                                "publish Managed files",
+                                "local file changed while being published",
+                            ))
+                        } else {
+                            Ok(None)
+                        }
+                    },
+                )
+                .buffer_unordered(self.transfer_concurrency)
+                .try_collect::<Vec<_>>()
+                .await?;
+            staged.extend(
+                self.volume
+                    .stage_file_records(
+                        observed.gc_epoch(),
+                        layouts.into_iter().flatten().collect(),
+                    )
+                    .await?,
+            );
+        }
+        Ok(staged)
     }
 }
 

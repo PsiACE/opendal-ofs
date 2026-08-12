@@ -56,7 +56,19 @@ pub struct ManagedObservation {
     commit: NamespaceCommit,
     node_values: BTreeMap<NodeId, NodeValue>,
     directory_entries: BTreeMap<DirectoryKey, DirectoryEntry>,
-    file_versions: BTreeMap<FileVersionId, FileVersionRecord>,
+}
+
+#[derive(Default)]
+pub(crate) struct StagedFileRecords {
+    file_versions: Vec<StreamRef>,
+    file_extents: Vec<StreamRef>,
+}
+
+impl StagedFileRecords {
+    pub(crate) fn extend(&mut self, other: Self) {
+        self.file_versions.extend(other.file_versions);
+        self.file_extents.extend(other.file_extents);
+    }
 }
 
 impl ManagedObservation {
@@ -728,7 +740,6 @@ impl ManagedVolume {
             commit: stored.commit,
             node_values: stored.node_values,
             directory_entries: stored.directory_entries,
-            file_versions: stored.file_versions,
         })
     }
 
@@ -754,7 +765,7 @@ impl ManagedVolume {
         &self,
         observed: &ManagedObservation,
         target: VolumeSnapshot,
-        layouts: BTreeMap<FileVersionId, FileLayout>,
+        files: StagedFileRecords,
     ) -> Result<NamespaceRevision, Error> {
         target.validate()?;
         if target.volume_id != self.id()
@@ -767,7 +778,44 @@ impl ManagedVolume {
                 "publication ancestry is invalid",
             ));
         }
-        self.write_namespace(observed, &target, layouts).await
+        self.write_namespace(observed, &target, files).await
+    }
+
+    pub(crate) async fn stage_file_records(
+        &self,
+        gc_epoch: GcEpoch,
+        files: Vec<(FileVersionId, FileFingerprint, FileLayout)>,
+    ) -> Result<StagedFileRecords, Error> {
+        let mut file_versions = Vec::with_capacity(files.len());
+        let mut file_extents = Vec::new();
+        for (version, fingerprint, layout) in files {
+            file_versions.push(FileVersionRecord {
+                file_version: version,
+                file_size: fingerprint.logical_length(),
+                content_fingerprint: fingerprint,
+            });
+            file_extents.extend(Self::extent_records(version, layout));
+        }
+        let mut staged = StagedFileRecords::default();
+        append_stream(
+            &self.operator,
+            gc_epoch,
+            &mut staged.file_versions,
+            ObjectClass::FileVersionSegment,
+            StreamKind::FILE_VERSION_RECORDS,
+            file_versions,
+        )
+        .await?;
+        append_stream(
+            &self.operator,
+            gc_epoch,
+            &mut staged.file_extents,
+            ObjectClass::FileExtentSegment,
+            StreamKind::FILE_EXTENT_RECORDS,
+            file_extents,
+        )
+        .await?;
+        Ok(staged)
     }
 
     pub async fn commit_publication(
@@ -1003,7 +1051,7 @@ impl ManagedVolume {
         &self,
         observed: &ManagedObservation,
         target: &VolumeSnapshot,
-        mut layouts: BTreeMap<FileVersionId, FileLayout>,
+        files: StagedFileRecords,
     ) -> Result<NamespaceRevision, Error> {
         let cursor = target.cursor;
         let operation = cursor
@@ -1099,36 +1147,6 @@ impl ManagedVolume {
             });
         }
 
-        let mut file_version_records = Vec::new();
-        let mut file_extent_records = Vec::new();
-        let mut recorded_versions = BTreeSet::new();
-        for node in target.nodes.values() {
-            let Some(version) = node.file_version else {
-                continue;
-            };
-            if observed.file_versions.contains_key(&version) || !recorded_versions.insert(version) {
-                continue;
-            }
-            let layout = layouts.remove(&version).ok_or_else(|| {
-                Error::invalid(
-                    "publish Managed namespace",
-                    "new file version has no durable layout",
-                )
-            })?;
-            let fingerprint = node.file_fingerprint.ok_or_else(|| {
-                Error::invalid(
-                    "publish Managed namespace",
-                    "new file version has no content fingerprint",
-                )
-            })?;
-            file_version_records.push(FileVersionRecord {
-                file_version: version,
-                file_size: fingerprint.logical_length(),
-                content_fingerprint: fingerprint,
-            });
-            file_extent_records.extend(Self::extent_records(version, layout));
-        }
-
         let mut changes = Vec::new();
         for mutation in &node_mutations {
             let event = match &mutation.value {
@@ -1199,6 +1217,8 @@ impl ManagedVolume {
 
         let mut commit = observed.commit.clone();
         commit.change_cursor = cursor;
+        commit.file_versions.extend(files.file_versions);
+        commit.file_extents.extend(files.file_extents);
         append_stream(
             &self.operator,
             observed.gc_epoch,
@@ -1215,24 +1235,6 @@ impl ManagedVolume {
             ObjectClass::DirectorySegment,
             StreamKind::DIRECTORY_MUTATIONS,
             directory_mutations,
-        )
-        .await?;
-        append_stream(
-            &self.operator,
-            observed.gc_epoch,
-            &mut commit.file_versions,
-            ObjectClass::FileVersionSegment,
-            StreamKind::FILE_VERSION_RECORDS,
-            file_version_records,
-        )
-        .await?;
-        append_stream(
-            &self.operator,
-            observed.gc_epoch,
-            &mut commit.file_extents,
-            ObjectClass::FileExtentSegment,
-            StreamKind::FILE_EXTENT_RECORDS,
-            file_extent_records,
         )
         .await?;
         append_stream(
