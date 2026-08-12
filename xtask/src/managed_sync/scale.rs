@@ -359,23 +359,23 @@ fn stage(name: &str, action: impl FnOnce()) {
 
 fn report_inventory(fixture: &Fixture, profile: Profile) {
     const CLASSES: &[&str] = &[
-        "namespace-commit",
-        "namespace-segment",
-        "operation-result-segment",
-        "file-data",
+        "01-namespace-commit",
+        "02-namespace-segment",
+        "03-operation-receipt-segment",
+        "04-file-data",
     ];
     let mut metadata_objects = 0_u64;
     let mut metadata_bytes = 0_u64;
     for class in CLASSES {
         let target = format!(
-            "local/managed-sync/scale/{}/managed/1/objects/0/{class}",
+            "local/managed-sync/scale/{}/managed/1/objects/00000000000000000000/{class}",
             profile.name()
         );
         let (objects, bytes) = fixture.storage_usage(&target);
         println!(
             "scale inventory: phase=initial class={class} objects={objects} encoded_bytes={bytes}"
         );
-        if *class == "file-data" {
+        if *class == "04-file-data" {
             println!(
                 "scale inventory: phase=initial payload_objects={objects} payload_encoded_bytes={bytes}"
             );
