@@ -154,6 +154,14 @@ impl SyncEngine {
                 .await;
         }
 
+        if state.common_revision() != observed.revision()
+            && state.common_revision().cursor().sequence()
+                == observed.revision().cursor().sequence()
+        {
+            state.rebase_equivalent(observed.revision())?;
+            state.save(state_path)?;
+        }
+
         if !observed.can_read_revision(state.common_revision()) {
             return self
                 .conservative_rebase(&root, state_path, state, observed, &resolved)

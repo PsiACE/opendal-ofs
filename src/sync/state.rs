@@ -231,6 +231,20 @@ impl ReplicaState {
         self.base_expired = false;
     }
 
+    pub(crate) fn rebase_equivalent(&mut self, common: NamespaceRevision) -> Result<(), Error> {
+        if !matches!(self.phase, SyncPhase::Clean)
+            || common.cursor().sequence() != self.common.cursor().sequence()
+        {
+            return Err(Error::corrupt(
+                "synchronize replica",
+                "equivalent namespace rebase changed the logical cursor",
+            ));
+        }
+        self.common = common;
+        self.observed = common;
+        self.validate()
+    }
+
     pub(crate) fn begin_publication(
         &mut self,
         expected: NamespaceRevision,
@@ -270,6 +284,9 @@ impl ReplicaState {
 
     pub(crate) fn cancel_pending(&mut self, remote: NamespaceRevision) {
         self.phase = SyncPhase::Clean;
+        if remote.cursor().sequence() == self.common.cursor().sequence() {
+            self.common = remote;
+        }
         self.observed = remote;
         self.base_expired = false;
     }

@@ -43,7 +43,7 @@ impl ManagedVolume {
     /// Rotate the upload epoch, then reclaim unreachable objects from older epochs.
     pub async fn collect_unreachable(&self) -> Result<GcOutcome, Error> {
         let (mut head, revision) = self.read_head().await?;
-        let collection_commit = head.current_commit;
+        let previous_commit = head.current_commit;
         let collection_epoch = head.gc_epoch.next()?;
         head.gc_epoch = collection_epoch;
         if !self.replace_head(&revision, &head).await? {
@@ -54,6 +54,26 @@ impl ManagedVolume {
             ));
         }
         test_interrupt("after-gc-epoch-rotation")?;
+
+        let (mut rotated, revision) = self.read_head().await?;
+        if rotated.gc_epoch != collection_epoch || rotated.current_commit != previous_commit {
+            return Err(Error::new(
+                ErrorKind::Conflict,
+                "collect Managed objects",
+                "namespace authority changed before metadata compaction",
+            ));
+        }
+        let collection_commit = self
+            .compact_for_collection(previous_commit, collection_epoch)
+            .await?;
+        rotated.current_commit = collection_commit;
+        if !self.replace_head(&revision, &rotated).await? {
+            return Err(Error::new(
+                ErrorKind::Conflict,
+                "collect Managed objects",
+                "namespace authority changed while publishing compacted metadata",
+            ));
+        }
 
         let mut inventory = PartitionedInventory::create(OperationId::generate())?;
         self.visit_reachable_objects(collection_commit, |reference| inventory.mark(reference))
