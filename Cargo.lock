@@ -1092,9 +1092,19 @@ name = "ofs"
 version = "0.0.24"
 dependencies = [
  "anyhow",
+ "clap",
+ "ofs-core",
+ "opendal",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "ofs-core"
+version = "0.0.24"
+dependencies = [
  "blake3",
  "ciborium",
- "clap",
  "futures",
  "opendal",
  "serde",
@@ -1103,6 +1113,13 @@ dependencies = [
  "unicode-casefold",
  "unicode-normalization",
  "uuid",
+]
+
+[[package]]
+name = "ofs-extras"
+version = "0.0.24"
+dependencies = [
+ "ofs-core",
 ]
 
 [[package]]

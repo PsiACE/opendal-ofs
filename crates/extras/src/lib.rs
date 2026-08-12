@@ -15,6 +15,4 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Apache OpenDAL™ File System.
-
-pub use ofs_core::*;
+//! Optional Managed extension layers.

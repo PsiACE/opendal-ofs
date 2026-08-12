@@ -15,6 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Apache OpenDAL™ File System.
+//! RFC 0016 Managed filesystem core.
 
-pub use ofs_core::*;
+mod error;
+mod fault;
+mod namespace;
+
+pub mod filesystem;
+pub mod managed;
+pub mod sync;
+mod workset;
+
+pub use error::{Error, ErrorKind, Result};
