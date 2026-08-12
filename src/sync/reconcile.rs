@@ -15,15 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::BTreeSet;
-use std::num::NonZeroU64;
-
 use serde::de::DeserializeOwned;
+use std::collections::BTreeSet;
 
 use crate::Error;
-use crate::filesystem::{
-    NamespaceNode, NamespaceRecord, NodeKind, OperationId, validate_portable_path,
-};
+use crate::filesystem::{NamespaceNode, NamespaceRecord, NodeKind, validate_portable_path};
 use crate::managed::StreamRef;
 use crate::workset::{Namespace, SpoolReader, Workspace};
 
@@ -180,16 +176,14 @@ pub(crate) fn reconcile(
         });
     }
 
-    let sequence = remote
-        .cursor
-        .sequence()
-        .checked_add(1)
-        .and_then(NonZeroU64::new)
-        .ok_or_else(|| Error::corrupt("reconcile replica", "Managed change sequence overflows"))?;
+    let sequence =
+        remote.cursor.sequence().checked_add(1).ok_or_else(|| {
+            Error::corrupt("reconcile replica", "Managed change sequence overflows")
+        })?;
     Ok(ReconcilePlan {
         target: Namespace {
             volume_id: remote.volume_id,
-            cursor: crate::filesystem::ChangeCursor::at(sequence, OperationId::generate()),
+            cursor: crate::filesystem::ChangeCursor::from_sequence(sequence),
             root: remote.root,
             entries: target.finish()?,
         },

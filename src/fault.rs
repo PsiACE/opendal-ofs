@@ -15,13 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod engine;
-mod install;
-mod reconcile;
-mod scan;
-mod state;
-mod transfer;
+use crate::Error;
 
-pub use engine::{SyncEngine, SyncOutcome};
-pub(crate) use state::ConflictRecord;
-pub use state::ReplicaState;
+#[cfg(debug_assertions)]
+pub(crate) fn check(point: &str) -> Result<(), Error> {
+    if std::env::var("OFS_INTERNAL_TEST_INTERRUPT").as_deref() == Ok(point) {
+        return Err(Error::invalid(
+            "run Managed operation",
+            "internal test interrupted the operation",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+pub(crate) const fn check(_point: &str) -> Result<(), Error> {
+    Ok(())
+}

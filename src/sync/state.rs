@@ -59,14 +59,14 @@ enum SyncPhase {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct ConflictRecord {
-    pub path: String,
-    pub local_digest: Option<Digest>,
-    pub remote_digest: Option<Digest>,
+pub(crate) struct ConflictRecord {
+    pub(crate) path: String,
+    pub(crate) local_digest: Option<Digest>,
+    pub(crate) remote_digest: Option<Digest>,
 }
 
 impl ReplicaState {
-    pub fn new(root: PathBuf, volume_id: VolumeId, common: NamespaceRevision) -> Self {
+    pub(crate) fn new(root: PathBuf, volume_id: VolumeId, common: NamespaceRevision) -> Self {
         Self {
             root,
             volume_id,
@@ -91,11 +91,11 @@ impl ReplicaState {
         Ok(Some(state))
     }
 
-    pub fn save_new(&self, path: &Path) -> Result<(), Error> {
+    pub(crate) fn save_new(&self, path: &Path) -> Result<(), Error> {
         self.persist(path, false)
     }
 
-    pub fn save(&self, path: &Path) -> Result<(), Error> {
+    pub(crate) fn save(&self, path: &Path) -> Result<(), Error> {
         self.persist(path, true)
     }
 

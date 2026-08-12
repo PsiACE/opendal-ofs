@@ -26,11 +26,14 @@ mod record;
 mod stream;
 mod wire;
 
-pub use format::ManagedFormat;
+pub(crate) use format::ManagedFormat;
 pub use gc::GcOutcome;
-pub use head::{ManagedObservation, ManagedVolume, NamespaceRevision};
+pub(crate) use head::ManagedObservation;
+pub use head::{ManagedVolume, NamespaceRevision};
 pub(crate) use object::GcEpoch;
 pub(crate) use stream::StreamRef;
+
+use std::num::NonZeroUsize;
 
 use opendal::Operator;
 
@@ -42,10 +45,11 @@ use format::{FORMAT_KEY, MAX_FORMAT_BYTES};
 #[derive(Clone)]
 pub struct ManagedMetadata {
     operator: Operator,
+    stream_concurrency: usize,
 }
 
 impl ManagedMetadata {
-    pub fn object(operator: Operator) -> Result<Self, Error> {
+    pub fn new(operator: Operator, stream_concurrency: NonZeroUsize) -> Result<Self, Error> {
         let capability = operator.info().full_capability();
         if !(capability.read
             && capability.write
@@ -58,7 +62,10 @@ impl ManagedMetadata {
                 "storage lacks conditional record operations",
             ));
         }
-        Ok(Self { operator })
+        Ok(Self {
+            operator,
+            stream_concurrency: stream_concurrency.get(),
+        })
     }
 
     /// Create the Managed superblock once, or return the existing format.
@@ -77,12 +84,12 @@ impl ManagedMetadata {
         } else {
             self.read_format().await?
         };
-        let volume = ManagedVolume::new(format, self.operator.clone());
+        let volume = ManagedVolume::new(format, self.operator.clone(), self.stream_concurrency);
         volume.initialize().await?;
         Ok(volume)
     }
 
-    pub async fn read_format(&self) -> Result<ManagedFormat, Error> {
+    async fn read_format(&self) -> Result<ManagedFormat, Error> {
         let control = object::read_control(&self.operator, FORMAT_KEY, MAX_FORMAT_BYTES)
             .await?
             .ok_or_else(|| {
@@ -104,6 +111,10 @@ impl ManagedMetadata {
                 "replica state belongs to a different volume",
             ));
         }
-        Ok(ManagedVolume::new(format, self.operator.clone()))
+        Ok(ManagedVolume::new(
+            format,
+            self.operator.clone(),
+            self.stream_concurrency,
+        ))
     }
 }

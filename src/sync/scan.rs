@@ -17,7 +17,6 @@
 
 use std::cmp::Ordering;
 use std::fs::ReadDir;
-use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 
 use futures::stream::{FuturesUnordered, StreamExt as _};
@@ -29,7 +28,7 @@ use super::transfer::inspect_file;
 use crate::Error;
 use crate::filesystem::{
     ChangeCursor, FileFingerprint, FileVersionId, NamespaceNode, NamespaceRecord, NamespaceValue,
-    NodeAttributes, NodeId, NodeKind, OperationId, validate_portable_path,
+    NodeAttributes, NodeId, NodeKind, validate_portable_path,
 };
 use crate::managed::{self, StreamRef};
 use crate::workset;
@@ -80,13 +79,11 @@ pub(crate) async fn scan(
 ) -> Result<ScannedTree, Error> {
     let workspace = workset::Workspace::create()?;
     let local = scan_local(&workspace, root, concurrency).await?;
-    let operation = OperationId::generate();
     let next_cursor = base
         .cursor
         .sequence()
         .checked_add(1)
-        .and_then(NonZeroU64::new)
-        .map(|sequence| ChangeCursor::at(sequence, operation));
+        .map(ChangeCursor::from_sequence);
     let record_cursor = next_cursor.unwrap_or(base.cursor);
 
     let mut output = workspace.writer("scanned-namespace")?;
@@ -400,22 +397,18 @@ fn queue_new_local(
     cursor: ChangeCursor,
 ) -> Result<(), Error> {
     match local.kind {
-        NodeKind::Directory => output
-            .write(&NamespaceRecord {
-                path: local.path,
-                change_cursor: cursor,
-                value: Some(new_directory()),
-            })
-            .map(drop),
-        NodeKind::RegularFile => candidates
-            .write(&LocalRenameCandidate {
-                path: local.path,
-                executable: local.executable,
-                fingerprint: local
-                    .fingerprint
-                    .expect("a local regular file has a fingerprint"),
-            })
-            .map(drop),
+        NodeKind::Directory => output.write(&NamespaceRecord {
+            path: local.path,
+            change_cursor: cursor,
+            value: Some(new_directory()),
+        }),
+        NodeKind::RegularFile => candidates.write(&LocalRenameCandidate {
+            path: local.path,
+            executable: local.executable,
+            fingerprint: local
+                .fingerprint
+                .expect("a local regular file has a fingerprint"),
+        }),
     }
 }
 
@@ -437,13 +430,11 @@ fn queue_removed_node(
     let Some((_, fingerprint, _)) = node.file() else {
         return Ok(());
     };
-    candidates
-        .write(&BaseRenameCandidate {
-            path,
-            fingerprint,
-            node,
-        })
-        .map(drop)
+    candidates.write(&BaseRenameCandidate {
+        path,
+        fingerprint,
+        node,
+    })
 }
 
 fn resolve_file_renames(
@@ -564,24 +555,22 @@ fn write_new_file(
     local: LocalRenameCandidate,
     cursor: ChangeCursor,
 ) -> Result<(), Error> {
-    output
-        .write(&NamespaceRecord {
-            path: local.path,
-            change_cursor: cursor,
-            value: Some(NamespaceNode {
-                node_id: NodeId::generate(),
-                generation: 1,
-                attributes: NodeAttributes {
-                    executable: local.executable,
-                },
-                value: NamespaceValue::RegularFile {
-                    version: FileVersionId::generate(),
-                    fingerprint: local.fingerprint,
-                    content: None,
-                },
-            }),
-        })
-        .map(drop)
+    output.write(&NamespaceRecord {
+        path: local.path,
+        change_cursor: cursor,
+        value: Some(NamespaceNode {
+            node_id: NodeId::generate(),
+            generation: 1,
+            attributes: NodeAttributes {
+                executable: local.executable,
+            },
+            value: NamespaceValue::RegularFile {
+                version: FileVersionId::generate(),
+                fingerprint: local.fingerprint,
+                content: None,
+            },
+        }),
+    })
 }
 
 fn write_renamed_file(
@@ -610,22 +599,20 @@ fn write_renamed_file(
     } else {
         next_generation(node.generation)?
     };
-    output
-        .write(&NamespaceRecord {
-            path: local.path,
-            change_cursor: cursor,
-            value: Some(NamespaceNode {
-                node_id: node.node_id,
-                generation,
-                attributes,
-                value: NamespaceValue::RegularFile {
-                    version,
-                    fingerprint,
-                    content: Some(content),
-                },
-            }),
-        })
-        .map(drop)
+    output.write(&NamespaceRecord {
+        path: local.path,
+        change_cursor: cursor,
+        value: Some(NamespaceNode {
+            node_id: node.node_id,
+            generation,
+            attributes,
+            value: NamespaceValue::RegularFile {
+                version,
+                fingerprint,
+                content: Some(content),
+            },
+        }),
+    })
 }
 
 fn new_directory() -> NamespaceNode<Option<StreamRef>> {

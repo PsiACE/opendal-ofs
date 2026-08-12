@@ -31,11 +31,10 @@ use serde::de::DeserializeOwned;
 use crate::Error;
 use crate::filesystem::{ChangeCursor, NamespaceRecord, NodeId, OperationId, VolumeId};
 
-// SlateDB uses a 64 MiB L0 flush budget by default. The workset uses the same
-// order of magnitude for run generation, but this is a local resource policy
-// and never enters the Managed wire format.
-const SORT_MEMORY_BYTES: usize = 64 * 1024 * 1024;
-const MERGE_FAN_IN: usize = 32;
+// A soft in-memory target for one sorted run. Larger inputs spill into more
+// runs, and one record larger than the target forms a run by itself. This is a
+// local execution policy, not a Managed format or dataset limit.
+const SORT_RUN_TARGET_BYTES: usize = 64 * 1024 * 1024;
 
 struct WorkspaceInner {
     path: PathBuf,
@@ -158,14 +157,14 @@ impl<T> Drop for SpoolWriter<T> {
 }
 
 impl<T: Serialize> SpoolWriter<T> {
-    pub(crate) fn write(&mut self, value: &T) -> Result<usize, Error> {
+    pub(crate) fn write(&mut self, value: &T) -> Result<(), Error> {
         let mut bytes = Vec::new();
         ciborium::into_writer(value, &mut bytes)
             .map_err(|_| Error::invalid("write Sync record stream", "record cannot be encoded"))?;
         self.write_frame(&bytes)
     }
 
-    fn write_frame(&mut self, bytes: &[u8]) -> Result<usize, Error> {
+    fn write_frame(&mut self, bytes: &[u8]) -> Result<(), Error> {
         let length = u32::try_from(bytes.len())
             .map_err(|_| Error::invalid("write Sync record stream", "record is too large"))?;
         let writer = self.writer.as_mut().expect("unfinished Sync record writer");
@@ -173,7 +172,7 @@ impl<T: Serialize> SpoolWriter<T> {
             .write_all(&length.to_le_bytes())
             .and_then(|()| writer.write_all(bytes))
             .map_err(|error| Error::from_io("write Sync record stream", Some(&self.path), error))?;
-        Ok(bytes.len() + size_of::<u32>())
+        Ok(())
     }
 
     pub(crate) fn finish(mut self) -> Result<Spool<T>, Error> {
@@ -290,11 +289,11 @@ where
     loop {
         let mut records = Vec::new();
         let mut encoded_bytes = 0_usize;
-        while encoded_bytes < SORT_MEMORY_BYTES {
+        while encoded_bytes < SORT_RUN_TARGET_BYTES {
             let Some(frame_bytes) = source.peek_frame_bytes()? else {
                 break;
             };
-            if encoded_bytes != 0 && frame_bytes > SORT_MEMORY_BYTES - encoded_bytes {
+            if encoded_bytes != 0 && frame_bytes > SORT_RUN_TARGET_BYTES - encoded_bytes {
                 break;
             }
             let bytes = source
@@ -319,26 +318,27 @@ where
         runs.push(run.finish()?);
     }
 
-    if runs.is_empty() {
-        return workspace.writer("sorted")?.finish();
-    }
-    while runs.len() > 1 {
-        let mut merged = Vec::new();
-        let mut inputs = runs.into_iter();
-        loop {
-            let mut group = inputs.by_ref().take(MERGE_FAN_IN).collect::<Vec<_>>();
-            if group.is_empty() {
-                break;
-            }
-            if group.len() == 1 {
-                merged.push(group.pop().expect("one sort run remains"));
+    balanced_merge(runs, |left, right| merge_runs(workspace, left, right, key))?
+        .map_or_else(|| workspace.writer("sorted")?.finish(), Ok)
+}
+
+pub(crate) fn balanced_merge<T>(
+    mut inputs: Vec<T>,
+    mut merge: impl FnMut(&T, &T) -> Result<T, Error>,
+) -> Result<Option<T>, Error> {
+    while inputs.len() > 1 {
+        let mut output = Vec::with_capacity(inputs.len().div_ceil(2));
+        let mut pairs = inputs.into_iter();
+        while let Some(left) = pairs.next() {
+            if let Some(right) = pairs.next() {
+                output.push(merge(&left, &right)?);
             } else {
-                merged.push(merge_runs(workspace, &group, key)?);
+                output.push(left);
             }
         }
-        runs = merged;
+        inputs = output;
     }
-    Ok(runs.pop().expect("one sorted run remains"))
+    Ok(inputs.pop())
 }
 
 struct RecordItem<K> {
@@ -372,15 +372,16 @@ impl<K: Ord> Ord for RecordItem<K> {
 
 fn merge_runs<T, K>(
     workspace: &Workspace,
-    runs: &[Spool<T>],
+    left: &Spool<T>,
+    right: &Spool<T>,
     key: impl Fn(&T) -> K + Copy,
 ) -> Result<Spool<T>, Error>
 where
     T: DeserializeOwned + Serialize,
     K: Ord,
 {
-    let mut readers = runs
-        .iter()
+    let mut readers = [left, right]
+        .into_iter()
         .map(Spool::reader)
         .collect::<Result<Vec<_>, Error>>()?;
     let mut heap = BinaryHeap::new();

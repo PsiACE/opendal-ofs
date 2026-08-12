@@ -81,7 +81,7 @@ async fn apply<C: DeserializeOwned>(
         let destination = root.join(path.to_path_buf());
         remove_path(&destination)?;
         durability.changed_parent(&destination)?;
-        test_interrupt()?;
+        crate::fault::check("during-install")?;
     }
 
     let mut directories = target.reader()?;
@@ -98,13 +98,13 @@ async fn apply<C: DeserializeOwned>(
             Some(_) => {
                 remove_path(&destination)?;
                 durability.changed_parent(&destination)?;
-                test_interrupt()?;
+                crate::fault::check("during-install")?;
                 create_directory(&destination, &mut durability)?;
-                test_interrupt()?;
+                crate::fault::check("during-install")?;
             }
             None => {
                 create_directory(&destination, &mut durability)?;
-                test_interrupt()?;
+                crate::fault::check("during-install")?;
             }
         }
     }
@@ -163,7 +163,7 @@ async fn apply<C: DeserializeOwned>(
                 Error::from_io("replace replica directory", Some(&destination), error)
             })?;
             durability.changed_parent(&destination)?;
-            test_interrupt()?;
+            crate::fault::check("during-install")?;
         }
         durability.changed_parent(&destination)?;
         file_installations.write(&FileInstallation {
@@ -188,7 +188,7 @@ async fn apply<C: DeserializeOwned>(
                 set_executable(&destination, true)?;
                 sync_file(&destination)?;
             }
-            test_interrupt()?;
+            crate::fault::check("during-install")?;
             Ok(())
         })
         .await?;
@@ -461,23 +461,6 @@ fn sync_file(path: &Path) -> Result<(), Error> {
     File::open(path)
         .and_then(|file| file.sync_all())
         .map_err(|error| Error::from_io("persist replica file attributes", Some(path), error))
-}
-
-#[cfg(debug_assertions)]
-fn test_interrupt() -> Result<(), Error> {
-    if std::env::var_os("OFS_INTERNAL_TEST_INTERRUPT").as_deref() == Some("during-install".as_ref())
-    {
-        return Err(Error::invalid(
-            "synchronize replica",
-            "internal test interrupted replica installation",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(not(debug_assertions))]
-const fn test_interrupt() -> Result<(), Error> {
-    Ok(())
 }
 
 fn remove_path(path: &Path) -> Result<(), Error> {

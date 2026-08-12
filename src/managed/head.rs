@@ -19,7 +19,7 @@ use crate::filesystem::{
     ChangeCursor, NamespaceNode, NamespaceRecord, NamespaceValue, OperationId, VolumeId,
     validate_portable_path,
 };
-use crate::workset::{Namespace, Spool, Workspace};
+use crate::workset::{Namespace, Spool, Workspace, balanced_merge};
 use crate::{Error, ErrorKind};
 use futures::StreamExt as _;
 use opendal::Operator;
@@ -32,17 +32,15 @@ use super::stream::{self, RecordStreamReader, RecordStreamWriter, StreamKind, St
 const HEAD_KEY: &str = "managed/1/head";
 const HEAD_RECORD: Record = Record::new(*b"OFSHEAD1", 64 * 1024);
 const COMMIT_RECORD: Record = Record::new(*b"OFSCMIT1", 4 * 1024 * 1024);
-// Bound cold-read requests and merge width like SlateDB bounds level-zero runs.
-// Compaction replaces the active deltas before the ninth stream is published.
-const MAX_NAMESPACE_STREAMS: usize = 8;
 
 #[derive(Clone)]
 pub struct ManagedVolume {
     format: ManagedFormat,
     operator: Operator,
+    stream_concurrency: usize,
 }
 
-pub struct ManagedObservation {
+pub(crate) struct ManagedObservation {
     pub(crate) namespace: Namespace<StreamRef>,
     head_revision: String,
     namespace_revision: NamespaceRevision,
@@ -52,7 +50,7 @@ pub struct ManagedObservation {
 }
 
 impl ManagedObservation {
-    pub const fn revision(&self) -> NamespaceRevision {
+    pub(crate) const fn revision(&self) -> NamespaceRevision {
         self.namespace_revision
     }
 
@@ -121,7 +119,7 @@ impl NamespaceCommit {
     fn genesis(volume_id: VolumeId, namespace: StreamRef) -> Self {
         Self {
             volume_id,
-            change_cursor: ChangeCursor::Genesis,
+            change_cursor: ChangeCursor::GENESIS,
             namespace: vec![namespace],
             operation_results: Vec::new(),
         }
@@ -146,8 +144,16 @@ super::wire::tuple_wire!(OperationRecord {
 });
 
 impl ManagedVolume {
-    pub(super) const fn new(format: ManagedFormat, operator: Operator) -> Self {
-        Self { format, operator }
+    pub(super) const fn new(
+        format: ManagedFormat,
+        operator: Operator,
+        stream_concurrency: usize,
+    ) -> Self {
+        Self {
+            format,
+            operator,
+            stream_concurrency,
+        }
     }
 
     pub const fn id(&self) -> VolumeId {
@@ -168,7 +174,7 @@ impl ManagedVolume {
 
         let root = NamespaceRecord::<StreamRef> {
             path: String::new(),
-            change_cursor: ChangeCursor::Genesis,
+            change_cursor: ChangeCursor::GENESIS,
             value: Some(NamespaceNode {
                 node_id: self.format.root_node_id(),
                 generation: 1,
@@ -189,7 +195,7 @@ impl ManagedVolume {
         let head = Head {
             current_commit: revision,
             gc_epoch: GcEpoch::ZERO,
-            minimum_retained_cursor: ChangeCursor::Genesis,
+            minimum_retained_cursor: ChangeCursor::GENESIS,
         };
         if object::write_control(
             &self.operator,
@@ -205,7 +211,7 @@ impl ManagedVolume {
         }
     }
 
-    pub async fn observe(&self) -> Result<ManagedObservation, Error> {
+    pub(crate) async fn observe(&self) -> Result<ManagedObservation, Error> {
         let (head, head_revision) = self.read_head().await?;
         let commit = self.read_commit(head.current_commit).await?;
         let namespace = self
@@ -243,11 +249,11 @@ impl ManagedVolume {
         &self,
         observed: &ManagedObservation,
         target: &Namespace<StreamRef>,
+        operation: OperationId,
     ) -> Result<NamespaceRevision, Error> {
         if target.volume_id != self.id()
             || target.root != self.format.root_node_id()
             || target.cursor.sequence() != observed.namespace.cursor.sequence() + 1
-            || target.cursor.operation().is_none()
         {
             return Err(Error::invalid(
                 "publish Managed namespace",
@@ -257,7 +263,9 @@ impl ManagedVolume {
 
         let mut commit = observed.commit.clone();
         commit.change_cursor = target.cursor;
-        if commit.namespace.len() >= MAX_NAMESPACE_STREAMS {
+        let compact = commit.namespace.len() >= self.stream_concurrency
+            || commit.operation_results.len() >= self.stream_concurrency;
+        if compact {
             commit.namespace = vec![self.write_full_namespace(target, observed.gc_epoch).await?];
         } else if let Some(delta) = self
             .write_namespace_delta(&observed.namespace, target, observed.gc_epoch)
@@ -271,26 +279,31 @@ impl ManagedVolume {
             ));
         }
 
-        let operation = target
-            .cursor
-            .operation()
-            .expect("validated publication has an operation identity");
-        let operation_stream = stream::write_records(
-            &self.operator,
-            observed.gc_epoch,
-            ObjectClass::OperationResultSegment,
-            StreamKind::OPERATION_RESULTS,
-            [OperationRecord {
-                operation_id: operation,
-                change_cursor: target.cursor,
-            }],
-        )
-        .await?;
-        commit.operation_results.push(operation_stream);
+        let operation_record = OperationRecord {
+            operation_id: operation,
+            change_cursor: target.cursor,
+        };
+        if compact {
+            commit.operation_results = self
+                .copy_operations(&commit, observed.gc_epoch, Some(operation_record))
+                .await?
+                .into_iter()
+                .collect();
+        } else {
+            let operation_stream = stream::write_records(
+                &self.operator,
+                observed.gc_epoch,
+                ObjectClass::OperationResultSegment,
+                StreamKind::OPERATION_RESULTS,
+                [operation_record],
+            )
+            .await?;
+            commit.operation_results.push(operation_stream);
+        }
         self.write_commit(observed.gc_epoch, &commit).await
     }
 
-    pub async fn commit_publication(
+    pub(crate) async fn commit_publication(
         &self,
         observed: &ManagedObservation,
         target: NamespaceRevision,
@@ -354,7 +367,7 @@ impl ManagedVolume {
             .await
     }
 
-    pub async fn operation_committed(
+    pub(crate) async fn operation_committed(
         &self,
         operation: OperationId,
         observed: &ManagedObservation,
@@ -441,7 +454,7 @@ impl ManagedVolume {
             namespace: vec![self.write_full_namespace(&namespace, gc_epoch).await?],
             operation_results: Vec::new(),
         };
-        if let Some(operations) = self.copy_operations(&source, gc_epoch).await? {
+        if let Some(operations) = self.copy_operations(&source, gc_epoch, None).await? {
             commit.operation_results.push(operations);
         }
         self.write_commit(gc_epoch, &commit).await
@@ -451,6 +464,7 @@ impl ManagedVolume {
         &self,
         source: &NamespaceCommit,
         gc_epoch: GcEpoch,
+        extra: Option<OperationRecord>,
     ) -> Result<Option<StreamRef>, Error> {
         let mut writer = None;
         for reference in &source.operation_results {
@@ -479,6 +493,24 @@ impl ManagedVolume {
                     .write(&record)
                     .await?;
             }
+        }
+        if let Some(record) = extra {
+            if writer.is_none() {
+                writer = Some(
+                    RecordStreamWriter::open(
+                        &self.operator,
+                        gc_epoch,
+                        ObjectClass::OperationResultSegment,
+                        StreamKind::OPERATION_RESULTS,
+                    )
+                    .await?,
+                );
+            }
+            writer
+                .as_mut()
+                .expect("operation writer is open")
+                .write(&record)
+                .await?;
         }
         match writer {
             Some(writer) => writer.close().await.map(Some),
@@ -577,12 +609,6 @@ impl ManagedVolume {
         commit: &NamespaceCommit,
         view_cursor: ChangeCursor,
     ) -> Result<Namespace<StreamRef>, Error> {
-        if commit.namespace.is_empty() || commit.namespace.len() > MAX_NAMESPACE_STREAMS {
-            return Err(Error::corrupt(
-                "read Managed namespace",
-                "namespace stream count is invalid",
-            ));
-        }
         let workspace = Workspace::create()?;
         let mut output = workspace.writer("namespace")?;
         let mut streams = Vec::with_capacity(commit.namespace.len());
@@ -590,47 +616,19 @@ impl ManagedVolume {
             .map(|reference| {
                 self.download_namespace_stream(&workspace, reference, commit.change_cursor)
             })
-            .buffer_unordered(MAX_NAMESPACE_STREAMS);
+            .buffer_unordered(self.stream_concurrency);
         futures::pin_mut!(downloads);
         while let Some(stream) = downloads.next().await {
             streams.push(stream?);
         }
-        let mut readers = streams
-            .iter()
-            .map(|stream| stream.reader())
-            .collect::<Result<Vec<_>, Error>>()?;
-        let mut heads = Vec::with_capacity(readers.len());
-        for reader in &mut readers {
-            heads.push(reader.next()?);
-        }
+        let merged = merge_namespace_streams(&workspace, streams, view_cursor)?;
+        let mut records = merged.reader()?;
         let mut previous_output = None::<String>;
         let mut root_seen = false;
-        while let Some(path) = heads
-            .iter()
-            .filter_map(|record| record.as_ref().map(|record| record.path.as_str()))
-            .min()
-            .map(str::to_owned)
-        {
-            let mut selected = None;
-            for (index, head) in heads.iter_mut().enumerate() {
-                if head.as_ref().is_none_or(|record| record.path != path) {
-                    continue;
-                }
-                let record = head.take().expect("matching namespace record exists");
-                if record.change_cursor.sequence() <= view_cursor.sequence()
-                    && selected
-                        .as_ref()
-                        .is_none_or(|current: &NamespaceRecord<StreamRef>| {
-                            current.change_cursor.sequence() < record.change_cursor.sequence()
-                        })
-                {
-                    selected = Some(record);
-                }
-                *head = readers[index].next()?;
-            }
-            let Some(record) = selected else {
+        while let Some(record) = records.next()? {
+            if record.change_cursor > view_cursor {
                 continue;
-            };
+            }
             let Some(node) = record.value.as_ref() else {
                 continue;
             };
@@ -741,7 +739,10 @@ impl ManagedVolume {
         )
         .await?;
         let commit: NamespaceCommit = COMMIT_RECORD.decode(&bytes)?;
-        if commit.volume_id != self.id() || commit.change_cursor != reference.change_cursor {
+        if commit.volume_id != self.id()
+            || commit.change_cursor != reference.change_cursor
+            || commit.namespace.is_empty()
+        {
             return Err(Error::corrupt(
                 "read Managed namespace",
                 "namespace commit does not match its reference",
@@ -749,6 +750,68 @@ impl ManagedVolume {
         }
         Ok(commit)
     }
+}
+
+fn merge_namespace_streams(
+    workspace: &Workspace,
+    streams: Vec<Spool<NamespaceRecord<StreamRef>>>,
+    view_cursor: ChangeCursor,
+) -> Result<Spool<NamespaceRecord<StreamRef>>, Error> {
+    balanced_merge(streams, |left, right| {
+        merge_namespace_pair(workspace, left, right, view_cursor)
+    })?
+    .ok_or_else(|| Error::corrupt("read Managed namespace", "namespace has no streams"))
+}
+
+fn merge_namespace_pair(
+    workspace: &Workspace,
+    left: &Spool<NamespaceRecord<StreamRef>>,
+    right: &Spool<NamespaceRecord<StreamRef>>,
+    view_cursor: ChangeCursor,
+) -> Result<Spool<NamespaceRecord<StreamRef>>, Error> {
+    let mut readers = [left, right]
+        .into_iter()
+        .map(Spool::reader)
+        .collect::<Result<Vec<_>, Error>>()?;
+    let mut heads = readers
+        .iter_mut()
+        .map(|reader| reader.next())
+        .collect::<Result<Vec<_>, Error>>()?;
+    let mut output = workspace.writer("namespace-merge")?;
+
+    while let Some(path) = heads
+        .iter()
+        .filter_map(|record| record.as_ref().map(|record| record.path.as_str()))
+        .min()
+        .map(str::to_owned)
+    {
+        let mut selected = None::<NamespaceRecord<StreamRef>>;
+        for (index, head) in heads.iter_mut().enumerate() {
+            if head.as_ref().is_none_or(|record| record.path != path) {
+                continue;
+            }
+            let record = head.take().expect("matching namespace record exists");
+            if record.change_cursor <= view_cursor {
+                match selected.as_ref() {
+                    Some(current) if current.change_cursor == record.change_cursor => {
+                        if current.value != record.value {
+                            return Err(Error::corrupt(
+                                "read Managed namespace",
+                                "one change cursor has conflicting namespace records",
+                            ));
+                        }
+                    }
+                    Some(current) if current.change_cursor > record.change_cursor => {}
+                    _ => selected = Some(record),
+                }
+            }
+            *head = readers[index].next()?;
+        }
+        if let Some(record) = selected {
+            output.write(&record)?;
+        }
+    }
+    output.finish()
 }
 
 fn validate_content(node: &NamespaceNode<StreamRef>) -> Result<(), Error> {

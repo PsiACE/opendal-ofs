@@ -23,7 +23,7 @@ use futures::TryStreamExt as _;
 use serde::de::DeserializeOwned;
 
 use crate::Error;
-use crate::filesystem::{ChangeCursor, NamespaceValue};
+use crate::filesystem::{ChangeCursor, NamespaceValue, OperationId};
 use crate::managed::{ManagedObservation, ManagedVolume, NamespaceRevision, StreamRef};
 use crate::workset::{Namespace, Workspace};
 
@@ -106,7 +106,7 @@ impl SyncEngine {
 
         let mut state = match stored {
             Some(state) => state,
-            None if observed.namespace.cursor == ChangeCursor::Genesis
+            None if observed.namespace.cursor == ChangeCursor::GENESIS
                 && !directory_is_empty(&root)? =>
             {
                 if !resolved.is_empty() {
@@ -267,11 +267,11 @@ impl SyncEngine {
         observed: &ManagedObservation,
         target: &Namespace<StreamRef>,
     ) -> Result<NamespaceRevision, Error> {
-        let revision = self.volume.prepare_publication(observed, target).await?;
-        let operation = revision
-            .cursor()
-            .operation()
-            .expect("prepared publication has an operation identity");
+        let operation = OperationId::generate();
+        let revision = self
+            .volume
+            .prepare_publication(observed, target, operation)
+            .await?;
         state.begin_publication(
             observed.revision(),
             revision,
@@ -279,11 +279,11 @@ impl SyncEngine {
             observed.maintenance_generation(),
         )?;
         state.save(state_path)?;
-        test_interrupt("before-publish")?;
+        crate::fault::check("before-publish")?;
         self.volume
             .commit_publication(observed, revision, operation)
             .await?;
-        test_interrupt("after-publish")?;
+        crate::fault::check("after-publish")?;
         Ok(revision)
     }
 
@@ -469,11 +469,11 @@ impl SyncEngine {
                 "pending publication conflicted with a newer remote change; repeat sync to reconcile",
             ));
         }
-        test_interrupt("before-publish")?;
+        crate::fault::check("before-publish")?;
         self.volume
             .commit_publication(&observed, target, operation)
             .await?;
-        test_interrupt("after-publish")?;
+        crate::fault::check("after-publish")?;
         let committed = self.volume.observe().await?;
         self.recover_install(root, state_path, state, committed, target, true)
             .await
@@ -530,22 +530,6 @@ impl SyncEngine {
             entries: output.finish()?,
         })
     }
-}
-
-#[cfg(debug_assertions)]
-fn test_interrupt(point: &str) -> Result<(), Error> {
-    if std::env::var("OFS_INTERNAL_TEST_INTERRUPT").as_deref() == Ok(point) {
-        return Err(Error::invalid(
-            "synchronize replica",
-            "internal test interrupted replica synchronization",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(not(debug_assertions))]
-const fn test_interrupt(_point: &str) -> Result<(), Error> {
-    Ok(())
 }
 
 fn require_empty(root: &Path) -> Result<(), Error> {

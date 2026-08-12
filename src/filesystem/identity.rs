@@ -15,10 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::fmt;
-use std::num::NonZeroU64;
-
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 macro_rules! fixed_identity {
     ($(#[$meta:meta])* $name:ident, $length:literal) => {
@@ -193,20 +191,14 @@ display_identity!(VolumeId, FileVersionId, OperationId);
 
 /// A position in a Managed volume's ordered change stream.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum ChangeCursor {
-    Genesis,
-    At {
-        sequence: NonZeroU64,
-        operation: OperationId,
-    },
-}
+pub struct ChangeCursor(u64);
 
 impl Serialize for ChangeCursor {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
-        serializer.serialize_u64(self.sequence())
+        serializer.serialize_u64(self.0)
     }
 }
 
@@ -215,51 +207,18 @@ impl<'de> Deserialize<'de> for ChangeCursor {
     where
         D: serde::Deserializer<'de>,
     {
-        let sequence = u64::deserialize(deserializer)?;
-        if sequence == 0 {
-            Ok(Self::Genesis)
-        } else {
-            Ok(Self::At {
-                sequence: NonZeroU64::new(sequence).expect("nonzero cursor"),
-                operation: OperationId::from_bytes([0; 16]),
-            })
-        }
+        u64::deserialize(deserializer).map(Self)
     }
 }
 
 impl ChangeCursor {
-    pub const fn at(sequence: NonZeroU64, operation: OperationId) -> Self {
-        Self::At {
-            sequence,
-            operation,
-        }
-    }
+    pub const GENESIS: Self = Self(0);
 
     pub const fn sequence(self) -> u64 {
-        match self {
-            Self::Genesis => 0,
-            Self::At { sequence, .. } => sequence.get(),
-        }
+        self.0
     }
 
-    pub const fn operation(self) -> Option<OperationId> {
-        match self {
-            Self::Genesis => None,
-            Self::At { operation, .. } if !operation.is_zero() => Some(operation),
-            Self::At { .. } => None,
-        }
-    }
-}
-
-impl OperationId {
-    const fn is_zero(self) -> bool {
-        let mut index = 0;
-        while index < self.0.len() {
-            if self.0[index] != 0 {
-                return false;
-            }
-            index += 1;
-        }
-        true
+    pub const fn from_sequence(sequence: u64) -> Self {
+        Self(sequence)
     }
 }

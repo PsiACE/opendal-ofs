@@ -48,7 +48,7 @@ impl ManagedVolume {
                 "namespace authority changed while rotating the GC epoch",
             ));
         }
-        test_interrupt("after-gc-epoch-rotation")?;
+        crate::fault::check("after-gc-epoch-rotation")?;
 
         let (mut rotated, revision) = self.read_head().await?;
         if rotated.gc_epoch != collection_epoch || rotated.current_commit != previous_commit {
@@ -88,7 +88,7 @@ impl ManagedVolume {
     ) -> Result<Spool<ObjectRecord>, Error> {
         let mut records = workspace.writer("gc-reachable")?;
         self.visit_reachable_objects(commit, |reference| {
-            records.write(&ObjectRecord::from_ref(reference)).map(drop)
+            records.write(&ObjectRecord::from_ref(reference))
         })
         .await?;
         workset::sort(workspace, &records.finish()?, |record| record.identity)
@@ -281,20 +281,4 @@ impl ObjectRecord {
             length: reference.encoded_length,
         }
     }
-}
-
-#[cfg(debug_assertions)]
-fn test_interrupt(point: &str) -> Result<(), Error> {
-    if std::env::var("OFS_INTERNAL_TEST_INTERRUPT").as_deref() == Ok(point) {
-        return Err(Error::invalid(
-            "collect Managed objects",
-            "internal test interrupted Managed collection",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(not(debug_assertions))]
-const fn test_interrupt(_point: &str) -> Result<(), Error> {
-    Ok(())
 }
