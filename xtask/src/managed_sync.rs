@@ -1696,6 +1696,7 @@ impl Fixture {
                 "run",
                 "--rm",
                 "--no-deps",
+                "-T",
                 "minio-client",
                 "du",
                 "--json",
