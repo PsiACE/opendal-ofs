@@ -19,10 +19,10 @@
 
 mod identity;
 mod namespace;
-mod snapshot;
+mod record;
 
 pub use identity::{
     ChangeCursor, Checksum, Digest, FileFingerprint, FileVersionId, NodeId, OperationId, VolumeId,
 };
-pub use namespace::{DirectoryEntry, NodeAttributes, NodeKind};
-pub use snapshot::{DirectoryRecord, NodeRecord, VolumeSnapshot};
+pub use namespace::{NodeAttributes, NodeKind};
+pub use record::{NamespaceNode, NamespaceRecord, NamespaceValue, validate_portable_path};

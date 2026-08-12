@@ -28,7 +28,6 @@ mod wire;
 
 pub use format::ManagedFormat;
 pub use gc::GcOutcome;
-pub(crate) use head::StagedFileRecords;
 pub use head::{ManagedObservation, ManagedVolume, NamespaceRevision};
 pub(crate) use object::GcEpoch;
 pub(crate) use stream::StreamRef;

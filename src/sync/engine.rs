@@ -19,19 +19,19 @@ use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 use std::path::Path;
 
-use futures::{StreamExt as _, TryStreamExt as _};
+use futures::TryStreamExt as _;
+use serde::de::DeserializeOwned;
 
 use crate::Error;
-use crate::filesystem::{ChangeCursor, NodeKind, VolumeSnapshot};
-use crate::managed::{ManagedObservation, ManagedVolume, NamespaceRevision};
+use crate::filesystem::{ChangeCursor, NamespaceValue};
+use crate::managed::{ManagedObservation, ManagedVolume, NamespaceRevision, StreamRef};
+use crate::workset::{Namespace, Workspace};
 
 use super::ReplicaState;
 use super::install::{install, repair};
 use super::reconcile::{changed_paths, reconcile};
 use super::scan::{ScannedTree, scan};
-use super::transfer::{inspect_file, publish_file};
-
-const FILE_RECORD_BATCH_FILES: usize = 8 * 1024;
+use super::transfer::publish_file;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SyncOutcome {
@@ -106,7 +106,7 @@ impl SyncEngine {
 
         let mut state = match stored {
             Some(state) => state,
-            None if observed.snapshot.cursor == ChangeCursor::Genesis
+            None if observed.namespace.cursor == ChangeCursor::Genesis
                 && !directory_is_empty(&root)? =>
             {
                 if !resolved.is_empty() {
@@ -133,10 +133,10 @@ impl SyncEngine {
                     observed.revision(),
                 );
                 state.save_new(state_path)?;
-                install(
+                install::<StreamRef>(
                     &root,
                     None,
-                    &observed.snapshot,
+                    &observed.namespace,
                     &self.volume,
                     self.transfer_concurrency,
                 )
@@ -146,7 +146,7 @@ impl SyncEngine {
                 return Ok(SyncOutcome {
                     conflict_paths: Vec::new(),
                     published: false,
-                    sequence: observed.snapshot.cursor.sequence(),
+                    sequence: observed.namespace.cursor.sequence(),
                 });
             }
         };
@@ -163,20 +163,20 @@ impl SyncEngine {
             state.rebase_equivalent(observed.revision())?;
             state.save(state_path)?;
         }
-
         if !observed.can_read_revision(state.common_revision()) {
             return self
                 .conservative_rebase(&root, state_path, state, observed, &resolved)
                 .await;
         }
+
         let common_revision = state.common_revision();
         let loaded_base = if observed.revision() == common_revision {
             None
         } else {
-            Some(self.volume.snapshot(common_revision).await?)
+            Some(self.volume.namespace(common_revision).await?)
         };
-        let base = loaded_base.as_ref().unwrap_or(&observed.snapshot);
-        let local = scan(&root, base).await?;
+        let base = loaded_base.as_ref().unwrap_or(&observed.namespace);
+        let local = scan(&root, base, self.transfer_concurrency).await?;
         let remote_changed = observed.revision() != common_revision;
         match (local, remote_changed) {
             (ScannedTree::Unchanged, false) => Ok(SyncOutcome {
@@ -191,33 +191,16 @@ impl SyncEngine {
                         "--resolve requires a current local and remote conflict",
                     ));
                 }
-                let layouts = self.publish_target_files(&root, &observed, &local).await?;
-                let target = self
-                    .volume
-                    .prepare_publication(&observed, local, layouts)
+                let target = self.publish_files(&root, &observed, &local).await?;
+                let revision = self
+                    .prepare_and_commit(state_path, &mut state, &observed, &target)
                     .await?;
-                let operation = target
-                    .cursor()
-                    .operation()
-                    .expect("prepared publication has an operation identity");
-                state.begin_publication(
-                    observed.revision(),
-                    target,
-                    operation,
-                    observed.maintenance_generation(),
-                )?;
-                state.save(state_path)?;
-                test_interrupt("before-publish")?;
-                self.volume
-                    .commit_publication(&observed, target, operation)
-                    .await?;
-                test_interrupt("after-publish")?;
-                state.advance(target);
+                state.advance(revision);
                 state.save(state_path)?;
                 Ok(SyncOutcome {
                     conflict_paths: Vec::new(),
                     published: true,
-                    sequence: target.cursor().sequence(),
+                    sequence: revision.cursor().sequence(),
                 })
             }
             (ScannedTree::Unchanged, true) => {
@@ -231,7 +214,7 @@ impl SyncEngine {
                     &root,
                     state_path,
                     state,
-                    &observed.snapshot,
+                    &observed.namespace,
                     observed.revision(),
                     Some(base),
                     false,
@@ -239,7 +222,7 @@ impl SyncEngine {
                 .await
             }
             (ScannedTree::Changed(local), true) => {
-                let plan = reconcile(base, &local, &observed.snapshot, &resolved)?;
+                let plan = reconcile(base, &local, &observed.namespace, &resolved)?;
                 if !plan.conflicts.is_empty() {
                     let conflict_paths = plan
                         .conflicts
@@ -254,46 +237,54 @@ impl SyncEngine {
                         sequence: base.cursor.sequence(),
                     });
                 }
-                let target_revision = if plan.publish {
-                    let layouts = self
-                        .publish_target_files(&root, &observed, &plan.target)
+                let (target, revision) = if plan.publish {
+                    let target = self.publish_files(&root, &observed, &plan.target).await?;
+                    let revision = self
+                        .prepare_and_commit(state_path, &mut state, &observed, &target)
                         .await?;
-                    let target = self
-                        .volume
-                        .prepare_publication(&observed, plan.target.clone(), layouts)
-                        .await?;
-                    let operation = target
-                        .cursor()
-                        .operation()
-                        .expect("prepared publication has an operation identity");
-                    state.begin_publication(
-                        observed.revision(),
-                        target,
-                        operation,
-                        observed.maintenance_generation(),
-                    )?;
-                    state.save(state_path)?;
-                    test_interrupt("before-publish")?;
-                    self.volume
-                        .commit_publication(&observed, target, operation)
-                        .await?;
-                    test_interrupt("after-publish")?;
-                    target
+                    (target, revision)
                 } else {
-                    observed.revision()
+                    (observed.namespace.clone(), observed.revision())
                 };
                 self.install_and_advance(
                     &root,
                     state_path,
                     state,
-                    &plan.target,
-                    target_revision,
+                    &target,
+                    revision,
                     Some(&local),
                     plan.publish,
                 )
                 .await
             }
         }
+    }
+
+    async fn prepare_and_commit(
+        &self,
+        state_path: &Path,
+        state: &mut ReplicaState,
+        observed: &ManagedObservation,
+        target: &Namespace<StreamRef>,
+    ) -> Result<NamespaceRevision, Error> {
+        let revision = self.volume.prepare_publication(observed, target).await?;
+        let operation = revision
+            .cursor()
+            .operation()
+            .expect("prepared publication has an operation identity");
+        state.begin_publication(
+            observed.revision(),
+            revision,
+            operation,
+            observed.maintenance_generation(),
+        )?;
+        state.save(state_path)?;
+        test_interrupt("before-publish")?;
+        self.volume
+            .commit_publication(observed, revision, operation)
+            .await?;
+        test_interrupt("after-publish")?;
+        Ok(revision)
     }
 
     async fn recover_install(
@@ -310,7 +301,7 @@ impl SyncEngine {
             state.save(state_path)?;
             repair(
                 root,
-                &observed.snapshot,
+                &observed.namespace,
                 &self.volume,
                 self.transfer_concurrency,
             )
@@ -320,18 +311,24 @@ impl SyncEngine {
             return Ok(SyncOutcome {
                 conflict_paths: Vec::new(),
                 published: false,
-                sequence: observed.snapshot.cursor.sequence(),
+                sequence: observed.namespace.cursor.sequence(),
             });
         }
-        let loaded_snapshot = if observed.revision() == target {
+        let loaded = if observed.revision() == target {
             None
         } else {
-            Some(self.volume.snapshot(target).await?)
+            Some(self.volume.namespace(target).await?)
         };
-        let snapshot = loaded_snapshot.as_ref().unwrap_or(&observed.snapshot);
+        let target_namespace = loaded.as_ref().unwrap_or(&observed.namespace);
         state.begin_install(target, published);
         state.save(state_path)?;
-        repair(root, snapshot, &self.volume, self.transfer_concurrency).await?;
+        repair(
+            root,
+            target_namespace,
+            &self.volume,
+            self.transfer_concurrency,
+        )
+        .await?;
         state.advance(target);
         state.save(state_path)?;
         if observed.revision() != target {
@@ -340,9 +337,9 @@ impl SyncEngine {
                     root,
                     state_path,
                     state,
-                    &observed.snapshot,
+                    &observed.namespace,
                     observed.revision(),
-                    Some(snapshot),
+                    Some(target_namespace),
                     published,
                 )
                 .await;
@@ -362,26 +359,26 @@ impl SyncEngine {
         observed: ManagedObservation,
         resolved: &BTreeSet<String>,
     ) -> Result<SyncOutcome, Error> {
-        let local = match scan(root, &observed.snapshot).await? {
+        let local = match scan(root, &observed.namespace, self.transfer_concurrency).await? {
             ScannedTree::Unchanged => {
                 state.advance(observed.revision());
                 state.save(state_path)?;
                 return Ok(SyncOutcome {
                     conflict_paths: Vec::new(),
                     published: false,
-                    sequence: observed.snapshot.cursor.sequence(),
+                    sequence: observed.namespace.cursor.sequence(),
                 });
             }
-            ScannedTree::Changed(snapshot) => snapshot,
+            ScannedTree::Changed(namespace) => namespace,
         };
-        let ambiguous = changed_paths(&observed.snapshot, &local)?;
+        let ambiguous = changed_paths(&observed.namespace, &local)?;
         if ambiguous.is_empty() {
             state.advance(observed.revision());
             state.save(state_path)?;
             return Ok(SyncOutcome {
                 conflict_paths: Vec::new(),
                 published: false,
-                sequence: observed.snapshot.cursor.sequence(),
+                sequence: observed.namespace.cursor.sequence(),
             });
         }
         if resolved != &ambiguous {
@@ -394,45 +391,27 @@ impl SyncEngine {
                 sequence: state.common_revision().cursor().sequence(),
             });
         }
-
-        let layouts = self.publish_target_files(root, &observed, &local).await?;
-        let target = self
-            .volume
-            .prepare_publication(&observed, local, layouts)
+        let target = self.publish_files(root, &observed, &local).await?;
+        let revision = self
+            .prepare_and_commit(state_path, &mut state, &observed, &target)
             .await?;
-        let operation = target
-            .cursor()
-            .operation()
-            .expect("prepared publication has an operation identity");
-        state.begin_publication(
-            observed.revision(),
-            target,
-            operation,
-            observed.maintenance_generation(),
-        )?;
-        state.save(state_path)?;
-        test_interrupt("before-publish")?;
-        self.volume
-            .commit_publication(&observed, target, operation)
-            .await?;
-        test_interrupt("after-publish")?;
-        state.advance(target);
+        state.advance(revision);
         state.save(state_path)?;
         Ok(SyncOutcome {
             conflict_paths: Vec::new(),
             published: true,
-            sequence: target.cursor().sequence(),
+            sequence: revision.cursor().sequence(),
         })
     }
 
-    async fn install_and_advance(
+    async fn install_and_advance<C: DeserializeOwned>(
         &self,
         root: &Path,
         state_path: &Path,
         mut state: ReplicaState,
-        target: &VolumeSnapshot,
+        target: &Namespace<StreamRef>,
         target_revision: NamespaceRevision,
-        current: Option<&VolumeSnapshot>,
+        current: Option<&Namespace<C>>,
         published: bool,
     ) -> Result<SyncOutcome, Error> {
         state.begin_install(target_revision, published);
@@ -464,15 +443,11 @@ impl SyncEngine {
         let (expected, target, operation, maintenance_generation) = state
             .pending_publication()
             .expect("pending state has publication references");
-        if observed.revision() == target {
-            return self
-                .recover_install(root, state_path, state, observed, target, true)
-                .await;
-        }
-        if self
-            .volume
-            .operation_committed(operation, &observed)
-            .await?
+        if observed.revision() == target
+            || self
+                .volume
+                .operation_committed(operation, &observed)
+                .await?
         {
             return self
                 .recover_install(root, state_path, state, observed, target, true)
@@ -504,73 +479,56 @@ impl SyncEngine {
             .await
     }
 
-    async fn publish_target_files(
+    async fn publish_files(
         &self,
         root: &Path,
         observed: &ManagedObservation,
-        target: &VolumeSnapshot,
-    ) -> Result<crate::managed::StagedFileRecords, Error> {
-        let mut new_versions = BTreeSet::new();
-        let common_versions = observed
-            .snapshot
-            .nodes
-            .values()
-            .filter_map(|node| node.file_version)
-            .collect::<BTreeSet<_>>();
-        let mut files = Vec::new();
-        for (path, node_id) in target.paths()? {
-            let node = &target.nodes[&node_id];
-            if node.kind != NodeKind::RegularFile {
-                continue;
-            }
-            let version = node.file_version.ok_or_else(|| {
-                Error::corrupt("publish Managed files", "pending file has no file version")
-            })?;
-            let fingerprint = node.file_fingerprint.ok_or_else(|| {
-                Error::corrupt(
-                    "publish Managed files",
-                    "pending file has no content fingerprint",
-                )
-            })?;
-            if common_versions.contains(&version) {
-                continue;
-            }
-            let publish = new_versions.insert(version);
-            files.push((path, version, fingerprint, publish));
+        target: &Namespace<Option<StreamRef>>,
+    ) -> Result<Namespace<StreamRef>, Error> {
+        let workspace = Workspace::create()?;
+        let mut output = workspace.writer("published-namespace")?;
+        let publications = target
+            .entries
+            .stream()?
+            .map_ok(|record| async move {
+                let Some(node) = record.value.as_ref() else {
+                    return Err(Error::corrupt(
+                        "publish Managed files",
+                        "current namespace contains a tombstone",
+                    ));
+                };
+                let content = match &node.value {
+                    NamespaceValue::Directory { .. } => None,
+                    NamespaceValue::RegularFile {
+                        fingerprint,
+                        content,
+                        ..
+                    } => match content {
+                        Some(reference) => Some(*reference),
+                        None => Some(
+                            publish_file(
+                                &self.volume,
+                                &root.join(&record.path),
+                                *fingerprint,
+                                observed.gc_epoch(),
+                            )
+                            .await?,
+                        ),
+                    },
+                };
+                Ok::<_, Error>(record.map_content(|_| content.expect("regular file content")))
+            })
+            .try_buffered(self.transfer_concurrency);
+        futures::pin_mut!(publications);
+        while let Some(record) = publications.try_next().await? {
+            output.write(&record)?;
         }
-
-        let mut staged = crate::managed::StagedFileRecords::default();
-        for batch in files.chunks(FILE_RECORD_BATCH_FILES) {
-            let layouts = futures::stream::iter(batch.iter().cloned())
-                .map(|(path, version, fingerprint, publish)| async move {
-                    let path = root.join(path);
-                    if publish {
-                        let layout =
-                            publish_file(&self.volume, &path, fingerprint, observed.gc_epoch())
-                                .await?;
-                        Ok(Some((version, fingerprint, layout)))
-                    } else if inspect_file(&path).await? != fingerprint {
-                        Err(Error::conflict(
-                            "publish Managed files",
-                            "local file changed while being published",
-                        ))
-                    } else {
-                        Ok(None)
-                    }
-                })
-                .buffer_unordered(self.transfer_concurrency)
-                .try_collect::<Vec<_>>()
-                .await?;
-            staged.extend(
-                self.volume
-                    .stage_file_records(
-                        observed.gc_epoch(),
-                        layouts.into_iter().flatten().collect(),
-                    )
-                    .await?,
-            );
-        }
-        Ok(staged)
+        Ok(Namespace {
+            volume_id: target.volume_id,
+            cursor: target.cursor,
+            root: target.root,
+            entries: output.finish()?,
+        })
     }
 }
 

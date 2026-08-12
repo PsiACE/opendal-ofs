@@ -15,22 +15,35 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::BTreeSet;
+use std::cmp::Reverse;
+#[cfg(any(unix, windows))]
+use std::ffi::OsString;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
-use futures::{StreamExt as _, TryStreamExt as _};
+use futures::TryStreamExt as _;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 
 use crate::Error;
-use crate::filesystem::{NodeKind, VolumeSnapshot};
-use crate::managed::ManagedVolume;
+use crate::filesystem::{FileFingerprint, NamespaceValue, NodeKind};
+use crate::managed::{ManagedVolume, StreamRef};
+use crate::workset::{self, Namespace, Spool, SpoolWriter, Workspace};
 
 use super::transfer::{inspect_file, materialize_file};
 
-pub(crate) async fn install(
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct FileInstallation {
+    destination: StoredPath,
+    fingerprint: FileFingerprint,
+    content: StreamRef,
+    executable: bool,
+}
+
+pub(crate) async fn install<C: DeserializeOwned>(
     root: &Path,
-    current: Option<&VolumeSnapshot>,
-    target: &VolumeSnapshot,
+    current: Option<&Namespace<C>>,
+    target: &Namespace<StreamRef>,
     volume: &ManagedVolume,
     transfer_concurrency: usize,
 ) -> Result<(), Error> {
@@ -40,61 +53,51 @@ pub(crate) async fn install(
 /// Repair an interrupted installation from the current authoritative snapshot.
 pub(crate) async fn repair(
     root: &Path,
-    target: &VolumeSnapshot,
+    target: &Namespace<StreamRef>,
     volume: &ManagedVolume,
     transfer_concurrency: usize,
 ) -> Result<(), Error> {
-    apply(root, None, target, volume, transfer_concurrency, true).await
+    apply::<StreamRef>(root, None, target, volume, transfer_concurrency, true).await
 }
 
-async fn apply(
+async fn apply<C: DeserializeOwned>(
     root: &Path,
-    current: Option<&VolumeSnapshot>,
-    target: &VolumeSnapshot,
+    current: Option<&Namespace<C>>,
+    target: &Namespace<StreamRef>,
     volume: &ManagedVolume,
     transfer_concurrency: usize,
     authoritative: bool,
 ) -> Result<(), Error> {
-    let target_paths = target.paths()?;
-    let current_paths = current.map(VolumeSnapshot::paths).transpose()?;
-    let mut durability = Durability::default();
-
-    let mut removed = if authoritative {
-        actual_paths(root)?
-            .into_iter()
-            .filter(|path| {
-                path.to_str()
-                    .is_none_or(|path| !target_paths.contains_key(path))
-            })
-            .map(|path| root.join(path))
-            .collect::<Vec<_>>()
+    let workspace = Workspace::create()?;
+    let removals = if authoritative {
+        repair_removals(root, target, &workspace)?
     } else {
-        current_paths
-            .iter()
-            .flat_map(|paths| paths.keys())
-            .filter(|path| !target_paths.contains_key(*path))
-            .map(|path| root.join(path))
-            .collect::<Vec<_>>()
+        namespace_removals(current, target, &workspace)?
     };
-    removed.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
-    for destination in removed {
+    let mut durability = Durability::create(&workspace)?;
+    let removals = workset::sort(&workspace, &removals, |path| Reverse(path.clone()))?;
+    let mut removals = removals.reader()?;
+    while let Some(path) = removals.next()? {
+        let destination = root.join(path.to_path_buf());
         remove_path(&destination)?;
-        durability.changed_parent(&destination);
+        durability.changed_parent(&destination)?;
         test_interrupt()?;
     }
 
-    let mut directories = target_paths
-        .iter()
-        .filter(|(_, node)| target.nodes[node].kind == NodeKind::Directory)
-        .collect::<Vec<_>>();
-    directories.sort_by_key(|(path, _)| path.matches('/').count());
-    for (path, _) in directories {
-        let destination = root.join(path);
+    let mut directories = target.reader()?;
+    while let Some(record) = directories.next()? {
+        let Some(node) = record.value else {
+            continue;
+        };
+        if record.path.is_empty() || node.kind() != NodeKind::Directory {
+            continue;
+        }
+        let destination = root.join(&record.path);
         match path_metadata(&destination)? {
             Some(metadata) if metadata.is_dir() => {}
             Some(_) => {
                 remove_path(&destination)?;
-                durability.changed_parent(&destination);
+                durability.changed_parent(&destination)?;
                 test_interrupt()?;
                 create_directory(&destination, &mut durability)?;
                 test_interrupt()?;
@@ -106,29 +109,49 @@ async fn apply(
         }
     }
 
-    let mut files = Vec::new();
-    for (path, node_id) in &target_paths {
-        let node = &target.nodes[node_id];
-        if node.kind != NodeKind::RegularFile {
-            continue;
+    let transfer_concurrency = transfer_concurrency.max(1);
+    let mut file_installations = workspace.writer("file-installations")?;
+    let mut current_reader = current.map(Namespace::reader).transpose()?;
+    let mut current_record = current_reader
+        .as_mut()
+        .map(|reader| reader.next())
+        .transpose()?
+        .flatten();
+    let mut target_reader = target.reader()?;
+    while let Some(record) = target_reader.next()? {
+        while current_record
+            .as_ref()
+            .is_some_and(|current| current.path < record.path)
+        {
+            current_record = current_reader
+                .as_mut()
+                .expect("current record requires a reader")
+                .next()?;
         }
-        let destination = root.join(path);
-        let version = node
-            .file_version
-            .ok_or_else(|| Error::corrupt("install replica", "remote file has no file version"))?;
-        let fingerprint = node.file_fingerprint.ok_or_else(|| {
-            Error::corrupt("install replica", "remote file has no content fingerprint")
-        })?;
+        let matching_current = current_record
+            .as_ref()
+            .filter(|current| current.path == record.path);
+        let Some(node) = record.value else {
+            continue;
+        };
+        let NamespaceValue::RegularFile {
+            version,
+            fingerprint,
+            content,
+        } = node.value
+        else {
+            continue;
+        };
+        let destination = root.join(&record.path);
         let unchanged = if authoritative {
             local_file_matches(&destination, fingerprint, node.attributes.executable).await?
         } else {
-            current_paths.as_ref().is_some_and(|paths| {
-                paths.get(path).is_some_and(|current_id| {
-                    let current_node =
-                        &current.expect("current paths require a snapshot").nodes[current_id];
-                    current_node.kind == NodeKind::RegularFile
-                        && current_node.file_version == node.file_version
-                        && current_node.attributes == node.attributes
+            matching_current.is_some_and(|current| {
+                current.value.as_ref().is_some_and(|current| {
+                    current.attributes == node.attributes
+                        && current
+                            .file()
+                            .is_some_and(|(current_version, _, _)| current_version == version)
                 })
             })
         };
@@ -139,28 +162,37 @@ async fn apply(
             std::fs::remove_dir_all(&destination).map_err(|error| {
                 Error::from_io("replace replica directory", Some(&destination), error)
             })?;
-            durability.changed_parent(&destination);
+            durability.changed_parent(&destination)?;
             test_interrupt()?;
         }
-        durability.changed_parent(&destination);
-        files.push((destination, version, node.attributes.executable));
+        durability.changed_parent(&destination)?;
+        file_installations.write(&FileInstallation {
+            destination: StoredPath::from_path(&destination)?,
+            fingerprint,
+            content,
+            executable: node.attributes.executable,
+        })?;
     }
-    futures::stream::iter(files)
-        .map(Ok::<_, Error>)
-        .try_for_each_concurrent(
-            transfer_concurrency,
-            |(destination, version, executable)| async move {
-                materialize_file(volume, version, &destination).await?;
-                if executable {
-                    set_executable(&destination, true)?;
-                    sync_file(&destination)?;
-                }
-                test_interrupt()?;
-                Ok(())
-            },
-        )
+    file_installations
+        .finish()?
+        .stream()?
+        .try_for_each_concurrent(transfer_concurrency, |installation| async move {
+            let destination = installation.destination.to_path_buf();
+            materialize_file(
+                volume,
+                (installation.fingerprint, installation.content),
+                &destination,
+            )
+            .await?;
+            if installation.executable {
+                set_executable(&destination, true)?;
+                sync_file(&destination)?;
+            }
+            test_interrupt()?;
+            Ok(())
+        })
         .await?;
-    durability.sync()?;
+    durability.sync(&workspace)?;
     Ok(())
 }
 
@@ -180,32 +212,114 @@ async fn local_file_matches(
     Ok(inspect_file(path).await? == expected)
 }
 
-fn actual_paths(root: &Path) -> Result<Vec<PathBuf>, Error> {
-    let mut paths = Vec::new();
-    let mut pending = vec![root.to_owned()];
-    while let Some(directory) = pending.pop() {
-        let children = std::fs::read_dir(&directory).map_err(|error| {
-            Error::from_io("scan interrupted installation", Some(&directory), error)
-        })?;
-        for child in children {
-            let child = child.map_err(|error| {
-                Error::from_io("scan interrupted installation", Some(&directory), error)
-            })?;
-            let path = child.path();
-            let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
-                Error::from_io("inspect interrupted installation", Some(&path), error)
-            })?;
-            if metadata.is_dir() {
-                pending.push(path.clone());
+fn namespace_removals<C: DeserializeOwned>(
+    current: Option<&Namespace<C>>,
+    target: &Namespace<StreamRef>,
+    workspace: &Workspace,
+) -> Result<Spool<StoredPath>, Error> {
+    let mut removed = workspace.writer("removed")?;
+    let Some(current) = current else {
+        return removed.finish();
+    };
+    let mut current = current.reader()?;
+    let mut target = target.reader()?;
+    let mut left = current.next()?;
+    let mut right = target.next()?;
+    while let Some(record) = left.as_ref() {
+        match right.as_ref().map(|target| record.path.cmp(&target.path)) {
+            None | Some(std::cmp::Ordering::Less) => {
+                if !record.path.is_empty() {
+                    removed.write(&StoredPath::from_path(Path::new(&record.path))?)?;
+                }
+                left = current.next()?;
             }
-            paths.push(
-                path.strip_prefix(root)
-                    .expect("walked installation path is below its root")
-                    .to_owned(),
-            );
+            Some(std::cmp::Ordering::Equal) => {
+                left = current.next()?;
+                right = target.next()?;
+            }
+            Some(std::cmp::Ordering::Greater) => {
+                right = target.next()?;
+            }
         }
     }
-    Ok(paths)
+    removed.finish()
+}
+
+fn repair_removals(
+    root: &Path,
+    target: &Namespace<StreamRef>,
+    workspace: &Workspace,
+) -> Result<Spool<StoredPath>, Error> {
+    let mut actual = workspace.writer("actual-paths")?;
+    let mut removed = workspace.writer("removed")?;
+    scan_actual_paths(root, &mut actual, &mut removed)?;
+    let actual = workset::sort(workspace, &actual.finish()?, String::clone)?;
+    let mut actual = actual.reader()?;
+    let mut target = target.reader()?;
+    let mut left = actual.next()?;
+    let mut right = target.next()?;
+    while let Some(path) = left.as_ref() {
+        match right.as_ref().map(|target| path.cmp(&target.path)) {
+            None | Some(std::cmp::Ordering::Less) => {
+                removed.write(&StoredPath::from_path(Path::new(path))?)?;
+                left = actual.next()?;
+            }
+            Some(std::cmp::Ordering::Equal) => {
+                left = actual.next()?;
+                right = target.next()?;
+            }
+            Some(std::cmp::Ordering::Greater) => {
+                right = target.next()?;
+            }
+        }
+    }
+    removed.finish()
+}
+
+fn scan_actual_paths(
+    root: &Path,
+    actual: &mut SpoolWriter<String>,
+    removed: &mut SpoolWriter<StoredPath>,
+) -> Result<(), Error> {
+    let root_entries = std::fs::read_dir(root)
+        .map_err(|error| Error::from_io("scan interrupted installation", Some(root), error))?;
+    let mut pending = vec![root_entries];
+    while let Some(children) = pending.last_mut() {
+        let Some(child) = children.next() else {
+            pending.pop();
+            continue;
+        };
+        let child = child
+            .map_err(|error| Error::from_io("scan interrupted installation", Some(root), error))?;
+        let path = child.path();
+        let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+            Error::from_io("inspect interrupted installation", Some(&path), error)
+        })?;
+        let relative = path
+            .strip_prefix(root)
+            .expect("walked installation path is below its root");
+        match portable_replica_path(relative) {
+            Some(path) => {
+                actual.write(&path)?;
+            }
+            None => {
+                removed.write(&StoredPath::from_path(relative)?)?;
+            }
+        }
+        if metadata.is_dir() {
+            pending.push(std::fs::read_dir(&path).map_err(|error| {
+                Error::from_io("scan interrupted installation", Some(&path), error)
+            })?);
+        }
+    }
+    Ok(())
+}
+
+fn portable_replica_path(path: &Path) -> Option<String> {
+    let path = path.to_str()?;
+    #[cfg(windows)]
+    let path = path.replace('\\', "/");
+    Some(path.to_owned())
 }
 
 fn create_directory(path: &Path, durability: &mut Durability) -> Result<(), Error> {
@@ -221,28 +335,47 @@ fn create_directory(path: &Path, durability: &mut Durability) -> Result<(), Erro
     std::fs::create_dir_all(path)
         .map_err(|error| Error::from_io("create replica directory", Some(path), error))?;
     for directory in missing {
-        durability.directories.insert(directory.clone());
-        durability.changed_parent(&directory);
+        durability.record(&directory)?;
+        durability.changed_parent(&directory)?;
     }
     Ok(())
 }
 
-#[derive(Default)]
 struct Durability {
-    directories: BTreeSet<PathBuf>,
+    directories: SpoolWriter<StoredPath>,
 }
 
 impl Durability {
-    fn changed_parent(&mut self, path: &Path) {
-        if let Some(parent) = path.parent() {
-            self.directories.insert(parent.to_owned());
-        }
+    fn create(workspace: &Workspace) -> Result<Self, Error> {
+        Ok(Self {
+            directories: workspace.writer("durability")?,
+        })
     }
 
-    fn sync(self) -> Result<(), Error> {
-        let mut directories = self.directories.into_iter().collect::<Vec<_>>();
-        directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
-        for directory in directories {
+    fn record(&mut self, path: &Path) -> Result<(), Error> {
+        self.directories.write(&StoredPath::from_path(path)?)?;
+        Ok(())
+    }
+
+    fn changed_parent(&mut self, path: &Path) -> Result<(), Error> {
+        if let Some(parent) = path.parent() {
+            self.record(parent)?;
+        }
+        Ok(())
+    }
+
+    fn sync(self, workspace: &Workspace) -> Result<(), Error> {
+        let directories = workset::sort(workspace, &self.directories.finish()?, |path| {
+            Reverse(path.clone())
+        })?;
+        let mut directories = directories.reader()?;
+        let mut previous = None;
+        while let Some(directory) = directories.next()? {
+            if previous.as_ref() == Some(&directory) {
+                continue;
+            }
+            previous = Some(directory.clone());
+            let directory = directory.to_path_buf();
             if path_metadata(&directory)?.is_none_or(|metadata| !metadata.is_dir()) {
                 continue;
             }
@@ -253,6 +386,74 @@ impl Durability {
                 })?;
         }
         Ok(())
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+struct StoredPath(Vec<u8>);
+
+#[cfg(unix)]
+impl StoredPath {
+    fn from_path(path: &Path) -> Result<Self, Error> {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        Ok(Self(path.as_os_str().as_bytes().to_vec()))
+    }
+
+    fn to_path_buf(&self) -> PathBuf {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        PathBuf::from(OsString::from_vec(self.0.clone()))
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+struct StoredPath(Vec<u16>);
+
+#[cfg(windows)]
+impl StoredPath {
+    fn from_path(path: &Path) -> Result<Self, Error> {
+        use std::os::windows::ffi::OsStrExt as _;
+
+        Ok(Self(
+            path.as_os_str()
+                .encode_wide()
+                .map(|unit| {
+                    if unit == b'\\' as u16 {
+                        b'/' as u16
+                    } else {
+                        unit
+                    }
+                })
+                .collect(),
+        ))
+    }
+
+    fn to_path_buf(&self) -> PathBuf {
+        use std::os::windows::ffi::OsStringExt as _;
+
+        PathBuf::from(OsString::from_wide(&self.0))
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+struct StoredPath(String);
+
+#[cfg(not(any(unix, windows)))]
+impl StoredPath {
+    fn from_path(path: &Path) -> Result<Self, Error> {
+        path.to_str()
+            .map(|path| Self(path.to_owned()))
+            .ok_or_else(|| {
+                Error::unsupported("record replica path", "platform path is not Unicode")
+            })
+    }
+
+    fn to_path_buf(&self) -> PathBuf {
+        PathBuf::from(&self.0)
     }
 }
 

@@ -20,7 +20,7 @@ use std::ops::{Bound, RangeBounds};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::Error;
-use crate::filesystem::{FileFingerprint, FileVersionId};
+use crate::filesystem::FileFingerprint;
 
 use super::ManagedVolume;
 use super::object::{GcEpoch, ObjectClass};
@@ -45,14 +45,14 @@ impl ManagedVolume {
     }
 
     /// Read one logical byte range and verify complete-file reads.
-    pub async fn read_data(
+    pub(crate) async fn read_data(
         &self,
-        version: FileVersionId,
+        content: (FileFingerprint, StreamRef),
         range: impl RangeBounds<u64>,
         destination: &mut (impl AsyncWrite + Unpin),
     ) -> Result<(), Error> {
-        let record = self.file_version_record(version)?;
-        let file_size = record.content_fingerprint.logical_length();
+        let (fingerprint, stream) = content;
+        let file_size = fingerprint.logical_length();
         let start = match range.start_bound() {
             Bound::Included(offset) => *offset,
             Bound::Excluded(offset) => offset.checked_add(1).ok_or_else(|| {
@@ -73,15 +73,14 @@ impl ManagedVolume {
                 "logical byte range is invalid",
             ));
         }
-        let stream = record.data;
         if stream.kind != StreamKind::FILE_BYTES
             || stream.object.class != ObjectClass::FileData
             || stream.payload_length != file_size
-            || stream.payload_digest != record.content_fingerprint.digest()
+            || stream.payload_digest != fingerprint.digest()
         {
             return Err(Error::corrupt(
                 "read Managed file",
-                "file data does not match its version",
+                "file data does not match its fingerprint",
             ));
         }
         stream::copy_byte_stream(self.operator(), stream, start..end, destination).await

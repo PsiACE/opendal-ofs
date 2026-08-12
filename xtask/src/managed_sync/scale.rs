@@ -359,10 +359,7 @@ fn stage(name: &str, action: impl FnOnce()) {
 fn report_inventory(fixture: &Fixture, profile: Profile) {
     const CLASSES: &[&str] = &[
         "namespace-commit",
-        "node-segment",
-        "directory-segment",
-        "file-version-segment",
-        "change-segment",
+        "namespace-segment",
         "operation-result-segment",
         "file-data",
     ];

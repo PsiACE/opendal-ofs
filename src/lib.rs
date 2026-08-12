@@ -24,5 +24,6 @@ mod error;
 pub mod filesystem;
 pub mod managed;
 pub mod sync;
+mod workset;
 
 pub use error::{Error, ErrorKind, Result};

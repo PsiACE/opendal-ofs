@@ -35,7 +35,10 @@ const TRAILER_MAGIC: [u8; 8] = *b"OFSSTR01";
 const FRAME_HEADER_BYTES: usize = 4 + 8 + 4 + 32;
 const FOOTER_BYTES: usize = 8 + 32;
 const TRAILER_BYTES: usize = 8 + 2 + 8 + 8 + 32 + 32;
-const MAXIMUM_FRAME_BYTES: usize = 4 * 1024 * 1024;
+// Metadata frames remain small enough for selective range reads. This is the
+// upper end of SlateDB's production SST block range; OpenDAL may coalesce
+// adjacent frame ranges according to the storage backend.
+const MAXIMUM_FRAME_BYTES: usize = 64 * 1024;
 const SOURCE_BUFFER_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Copy, Debug, serde::Deserialize, Eq, PartialEq, Serialize)]
@@ -43,12 +46,9 @@ const SOURCE_BUFFER_BYTES: usize = 256 * 1024;
 pub(crate) struct StreamKind(u16);
 
 impl StreamKind {
-    pub(crate) const NODE_MUTATIONS: Self = Self(1);
-    pub(crate) const DIRECTORY_MUTATIONS: Self = Self(2);
-    pub(crate) const FILE_VERSION_RECORDS: Self = Self(3);
-    pub(crate) const CHANGE_RECORDS: Self = Self(4);
-    pub(crate) const OPERATION_RESULTS: Self = Self(5);
-    pub(crate) const FILE_BYTES: Self = Self(6);
+    pub(crate) const NAMESPACE_RECORDS: Self = Self(1);
+    pub(crate) const OPERATION_RESULTS: Self = Self(2);
+    pub(crate) const FILE_BYTES: Self = Self(3);
 
     pub(crate) const fn value(self) -> u16 {
         self.0
@@ -97,52 +97,58 @@ pub(crate) async fn write_records<T: Serialize>(
     writer.close().await
 }
 
-pub(crate) async fn rewrite_records<T: DeserializeOwned + Serialize>(
-    operator: &Operator,
-    references: &[StreamRef],
-    gc_epoch: GcEpoch,
-    class: ObjectClass,
-    kind: StreamKind,
-    mut keep: impl FnMut(&T) -> bool,
-) -> Result<Option<StreamRef>, Error> {
-    let mut writer = None;
-    for reference in references {
-        read_footer(operator, *reference).await?;
-        let mut reader = open_payload_reader(operator, *reference).await?;
-        let mut payload_hasher = blake3::Hasher::new();
-        let mut offset = 0_u64;
-        while offset < reference.payload_length {
-            let (frame, end) = read_next_frame(&mut reader, *reference, offset).await?;
-            payload_hasher.update(&frame);
-            for record in decode_frame::<T>(&frame)? {
-                if !keep(&record) {
-                    continue;
-                }
-                if writer.is_none() {
-                    writer = Some(RecordStreamWriter::open(operator, gc_epoch, class, kind).await?);
-                }
-                writer
-                    .as_mut()
-                    .expect("record writer is open")
-                    .write(&record)
-                    .await?;
-            }
-            offset = end;
-        }
-        if Digest::from_bytes(payload_hasher.finalize().into()) != reference.payload_digest {
-            return Err(Error::corrupt(
-                "read Managed stream",
-                "stream payload does not match its reference",
-            ));
-        }
+pub(crate) struct RecordStreamReader<T> {
+    reference: StreamRef,
+    reader: opendal::FuturesAsyncReader,
+    payload_hasher: blake3::Hasher,
+    offset: u64,
+    records: std::vec::IntoIter<T>,
+    completed: bool,
+}
+
+impl<T: DeserializeOwned> RecordStreamReader<T> {
+    pub(crate) async fn open(operator: &Operator, reference: StreamRef) -> Result<Self, Error> {
+        read_footer(operator, reference).await?;
+        Ok(Self {
+            reference,
+            reader: open_payload_reader(operator, reference).await?,
+            payload_hasher: blake3::Hasher::new(),
+            offset: 0,
+            records: Vec::new().into_iter(),
+            completed: false,
+        })
     }
-    match writer {
-        Some(writer) => writer.close().await.map(Some),
-        None => Ok(None),
+
+    pub(crate) async fn next(&mut self) -> Result<Option<T>, Error> {
+        loop {
+            if let Some(record) = self.records.next() {
+                return Ok(Some(record));
+            }
+            if self.completed {
+                return Ok(None);
+            }
+            if self.offset == self.reference.payload_length {
+                if Digest::from_bytes(self.payload_hasher.finalize().into())
+                    != self.reference.payload_digest
+                {
+                    return Err(Error::corrupt(
+                        "read Managed stream",
+                        "stream payload does not match its reference",
+                    ));
+                }
+                self.completed = true;
+                return Ok(None);
+            }
+            let (frame, end) =
+                read_next_frame(&mut self.reader, self.reference, self.offset).await?;
+            self.payload_hasher.update(&frame);
+            self.records = decode_frame(&frame)?.into_iter();
+            self.offset = end;
+        }
     }
 }
 
-struct RecordStreamWriter {
+pub(crate) struct RecordStreamWriter {
     writer: ImmutableWriter,
     kind: StreamKind,
     payload_hasher: blake3::Hasher,
@@ -152,7 +158,7 @@ struct RecordStreamWriter {
 }
 
 impl RecordStreamWriter {
-    async fn open(
+    pub(crate) async fn open(
         operator: &Operator,
         gc_epoch: GcEpoch,
         class: ObjectClass,
@@ -168,12 +174,18 @@ impl RecordStreamWriter {
         })
     }
 
-    async fn write(&mut self, record: &impl Serialize) -> Result<(), Error> {
+    pub(crate) async fn write(&mut self, record: &impl Serialize) -> Result<(), Error> {
         let mut encoded = Vec::new();
         ciborium::into_writer(record, &mut encoded)
             .map_err(|_| Error::invalid("write Managed stream", "record cannot be encoded"))?;
         let encoded_length = u32::try_from(encoded.len())
             .map_err(|_| Error::invalid("write Managed stream", "one record is too large"))?;
+        if encoded.len().saturating_add(size_of::<u32>()) > MAXIMUM_FRAME_BYTES {
+            return Err(Error::invalid(
+                "write Managed stream",
+                "one metadata record exceeds the frame range unit",
+            ));
+        }
         if !self.frame.is_empty()
             && self
                 .frame
@@ -209,7 +221,7 @@ impl RecordStreamWriter {
         Ok(())
     }
 
-    async fn close(mut self) -> Result<StreamRef, Error> {
+    pub(crate) async fn close(mut self) -> Result<StreamRef, Error> {
         self.flush_frame().await?;
         finish_stream(
             self.writer,
@@ -342,32 +354,6 @@ async fn write_frame(
         .checked_add(FRAME_HEADER_BYTES as u64)
         .and_then(|length| length.checked_add(frame_length))
         .ok_or_else(|| Error::invalid("write Managed stream", "payload length overflows"))?;
-    Ok(())
-}
-
-pub(crate) async fn visit_records<T: DeserializeOwned>(
-    operator: &Operator,
-    reference: StreamRef,
-    mut visit: impl FnMut(T) -> Result<(), Error>,
-) -> Result<(), Error> {
-    read_footer(operator, reference).await?;
-    let mut reader = open_payload_reader(operator, reference).await?;
-    let mut payload_hasher = blake3::Hasher::new();
-    let mut offset = 0_u64;
-    while offset < reference.payload_length {
-        let (frame, end) = read_next_frame(&mut reader, reference, offset).await?;
-        payload_hasher.update(&frame);
-        for record in decode_frame(&frame)? {
-            visit(record)?;
-        }
-        offset = end;
-    }
-    if Digest::from_bytes(payload_hasher.finalize().into()) != reference.payload_digest {
-        return Err(Error::corrupt(
-            "read Managed stream",
-            "stream payload does not match its reference",
-        ));
-    }
     Ok(())
 }
 

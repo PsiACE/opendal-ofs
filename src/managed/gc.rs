@@ -15,22 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read as _, Write as _};
-use std::path::{Path, PathBuf};
-
 use futures::TryStreamExt as _;
+use serde::{Deserialize, Serialize};
 
-use crate::filesystem::OperationId;
+use crate::workset::{self, Spool, Workspace};
 use crate::{Error, ErrorKind};
 
 use super::ManagedVolume;
 use super::object::{GcEpoch, ObjectClass, ObjectId, ObjectRef};
 
 const OBJECT_PREFIX: &str = "managed/1/objects/";
-const PARTITIONS: usize = 256;
-const RECORD_BYTES: usize = 8 + 1 + 16 + 8;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct GcOutcome {
@@ -40,7 +34,8 @@ pub struct GcOutcome {
 }
 
 impl ManagedVolume {
-    /// Rotate the upload epoch, then reclaim unreachable objects from older epochs.
+    /// Rotate the upload epoch, compact live metadata, then merge a streamed
+    /// inventory against the streamed reachability set.
     pub async fn collect_unreachable(&self) -> Result<GcOutcome, Error> {
         let (mut head, revision) = self.read_head().await?;
         let previous_commit = head.current_commit;
@@ -75,108 +70,46 @@ impl ManagedVolume {
             ));
         }
 
-        let mut inventory = PartitionedInventory::create(OperationId::generate())?;
-        self.visit_reachable_objects(collection_commit, |reference| inventory.mark(reference))
+        let workspace = Workspace::create()?;
+        let marks = self
+            .reachable_workset(&workspace, collection_commit)
             .await?;
-        inventory.seal_marks()?;
-        self.inventory_old_epochs(collection_epoch, &mut inventory)
-            .await?;
-        inventory.seal_candidates()?;
-        let outcome = self.sweep_partitions(&inventory).await?;
+        let candidates = self.inventory_workset(&workspace, collection_epoch).await?;
+        let outcome = self.sweep_worksets(&marks, &candidates).await?;
         self.advance_reclamation_watermark(collection_commit.cursor())
             .await?;
         Ok(outcome)
     }
 
-    async fn inventory_old_epochs(
+    async fn reachable_workset(
         &self,
+        workspace: &Workspace,
+        commit: super::NamespaceRevision,
+    ) -> Result<Spool<ObjectRecord>, Error> {
+        let mut records = workspace.writer("gc-reachable")?;
+        self.visit_reachable_objects(commit, |reference| {
+            records.write(&ObjectRecord::from_ref(reference)).map(drop)
+        })
+        .await?;
+        workset::sort(workspace, &records.finish()?, |record| record.identity)
+    }
+
+    async fn inventory_workset(
+        &self,
+        workspace: &Workspace,
         current_epoch: GcEpoch,
-        inventory: &mut PartitionedInventory,
-    ) -> Result<(), Error> {
-        for epoch in self.old_gc_epochs(current_epoch).await? {
-            for class in ObjectClass::ALL {
-                let class_prefix =
-                    format!("{OBJECT_PREFIX}{}/{}/", epoch.value(), class.key_segment());
-                for prefix in self.object_id_prefixes(&class_prefix).await? {
-                    self.inventory_partition(epoch, class, prefix, inventory)
-                        .await?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn old_gc_epochs(&self, current: GcEpoch) -> Result<Vec<GcEpoch>, Error> {
-        let mut epochs = BTreeSet::new();
+    ) -> Result<Spool<ObjectRecord>, Error> {
+        let mut records = workspace.writer("gc-inventory")?;
         let mut lister = self
             .operator()
-            .lister(OBJECT_PREFIX)
-            .await
-            .map_err(|error| Error::from_storage("list Managed GC epochs", error))?;
-        while let Some(entry) = lister
-            .try_next()
-            .await
-            .map_err(|error| Error::from_storage("list Managed GC epochs", error))?
-        {
-            let Some(segment) = child_segment(OBJECT_PREFIX, entry.path()) else {
-                continue;
-            };
-            let Ok(value) = segment.parse::<u64>() else {
-                continue;
-            };
-            if value < current.value() {
-                epochs.insert(GcEpoch::from_value(value));
-            }
-        }
-        Ok(epochs.into_iter().collect())
-    }
-
-    async fn object_id_prefixes(&self, class_prefix: &str) -> Result<Vec<u8>, Error> {
-        let mut prefixes = BTreeSet::new();
-        let mut lister = self
-            .operator()
-            .lister(class_prefix)
-            .await
-            .map_err(|error| Error::from_storage("list Managed object prefixes", error))?;
-        while let Some(entry) = lister
-            .try_next()
-            .await
-            .map_err(|error| Error::from_storage("list Managed object prefixes", error))?
-        {
-            let Some(segment) = child_segment(class_prefix, entry.path()) else {
-                continue;
-            };
-            if segment.len() == 2
-                && let Ok(prefix) = u8::from_str_radix(segment, 16)
-            {
-                prefixes.insert(prefix);
-            }
-        }
-        Ok(prefixes.into_iter().collect())
-    }
-
-    async fn inventory_partition(
-        &self,
-        epoch: GcEpoch,
-        class: ObjectClass,
-        prefix: u8,
-        inventory: &mut PartitionedInventory,
-    ) -> Result<(), Error> {
-        let path = format!(
-            "{OBJECT_PREFIX}{}/{}/{prefix:02x}/",
-            epoch.value(),
-            class.key_segment()
-        );
-        let mut lister = self
-            .operator()
-            .lister_with(&path)
+            .lister_with(OBJECT_PREFIX)
             .recursive(true)
             .await
-            .map_err(|error| Error::from_storage("list Managed object partition", error))?;
+            .map_err(|error| Error::from_storage("list Managed objects", error))?;
         while let Some(entry) = lister
             .try_next()
             .await
-            .map_err(|error| Error::from_storage("list Managed object partition", error))?
+            .map_err(|error| Error::from_storage("list Managed objects", error))?
         {
             if !entry.metadata().is_file() {
                 continue;
@@ -184,62 +117,66 @@ impl ManagedVolume {
             let identity = ObjectIdentity::parse(entry.path()).ok_or_else(|| {
                 Error::corrupt("collect Managed objects", "object key is invalid")
             })?;
-            if identity.gc_epoch != epoch
-                || identity.class != class
-                || identity.id.as_bytes()[0] != prefix
-            {
-                return Err(Error::corrupt(
-                    "collect Managed objects",
-                    "listed object is outside its GC partition",
-                ));
+            if identity.gc_epoch.value() >= current_epoch.value() {
+                continue;
             }
-            inventory.candidate(identity, entry.metadata().content_length())?;
+            records.write(&ObjectRecord {
+                identity,
+                length: entry.metadata().content_length(),
+            })?;
         }
-        Ok(())
+        workset::sort(workspace, &records.finish()?, |record| record.identity)
     }
 
-    async fn sweep_partitions(&self, inventory: &PartitionedInventory) -> Result<GcOutcome, Error> {
+    async fn sweep_worksets(
+        &self,
+        marks: &Spool<ObjectRecord>,
+        candidates: &Spool<ObjectRecord>,
+    ) -> Result<GcOutcome, Error> {
+        let mut marks = marks.reader()?;
+        let mut mark = marks.next()?;
+        let mut candidates = candidates.reader()?;
         let mut outcome = GcOutcome::default();
         let mut deleter = self
             .operator()
             .deleter()
             .await
             .map_err(|error| Error::from_storage("open Managed object deleter", error))?;
-        for partition in 0..PARTITIONS {
-            let marks = inventory.load_marks(partition)?;
-            let path = inventory.candidate_path(partition);
-            if !path.exists() {
+
+        while let Some(candidate) = candidates.next()? {
+            outcome.scanned = outcome.scanned.checked_add(1).ok_or_else(|| {
+                Error::corrupt("collect Managed objects", "scanned object count overflows")
+            })?;
+            while mark
+                .as_ref()
+                .is_some_and(|mark| mark.identity < candidate.identity)
+            {
+                mark = next_unique_mark(&mut marks, mark.take())?;
+            }
+            if let Some(reachable) = mark.as_ref()
+                && reachable.identity == candidate.identity
+            {
+                if reachable.length != candidate.length {
+                    return Err(Error::corrupt(
+                        "collect Managed objects",
+                        "reachable object length changed",
+                    ));
+                }
                 continue;
             }
-            let mut candidates = RecordReader::open(&path)?;
-            while let Some(candidate) = candidates.next()? {
-                outcome.scanned = outcome.scanned.checked_add(1).ok_or_else(|| {
-                    Error::corrupt("collect Managed objects", "scanned object count overflows")
+            deleter
+                .delete(candidate.identity.key())
+                .await
+                .map_err(|error| Error::from_storage("delete Managed object", error))?;
+            outcome.deleted = outcome.deleted.checked_add(1).ok_or_else(|| {
+                Error::corrupt("collect Managed objects", "deleted object count overflows")
+            })?;
+            outcome.deleted_bytes = outcome
+                .deleted_bytes
+                .checked_add(candidate.length)
+                .ok_or_else(|| {
+                    Error::corrupt("collect Managed objects", "deleted byte count overflows")
                 })?;
-                match marks.get(&candidate.identity) {
-                    Some(length) if *length == candidate.length => continue,
-                    Some(_) => {
-                        return Err(Error::corrupt(
-                            "collect Managed objects",
-                            "reachable object length changed",
-                        ));
-                    }
-                    None => {}
-                }
-                deleter
-                    .delete(candidate.identity.key())
-                    .await
-                    .map_err(|error| Error::from_storage("delete Managed object", error))?;
-                outcome.deleted = outcome.deleted.checked_add(1).ok_or_else(|| {
-                    Error::corrupt("collect Managed objects", "deleted object count overflows")
-                })?;
-                outcome.deleted_bytes = outcome
-                    .deleted_bytes
-                    .checked_add(candidate.length)
-                    .ok_or_else(|| {
-                        Error::corrupt("collect Managed objects", "deleted byte count overflows")
-                    })?;
-            }
         }
         deleter
             .close()
@@ -270,198 +207,27 @@ impl ManagedVolume {
     }
 }
 
-fn child_segment<'a>(parent: &str, path: &'a str) -> Option<&'a str> {
-    let relative = path.strip_prefix(parent)?;
-    let segment = relative.split('/').next()?;
-    (!segment.is_empty()).then_some(segment)
-}
-
-struct PartitionedInventory {
-    directory: PathBuf,
-    marks: Vec<Option<BufWriter<File>>>,
-    candidates: Vec<Option<BufWriter<File>>>,
-}
-
-impl PartitionedInventory {
-    fn create(operation: OperationId) -> Result<Self, Error> {
-        let directory = std::env::temp_dir().join(format!("ofs-managed-gc-{operation}"));
-        fs::create_dir(&directory).map_err(|error| {
-            Error::from_io("create Managed GC workspace", Some(&directory), error)
-        })?;
-        Ok(Self {
-            directory,
-            marks: std::iter::repeat_with(|| None).take(PARTITIONS).collect(),
-            candidates: std::iter::repeat_with(|| None).take(PARTITIONS).collect(),
-        })
-    }
-
-    fn mark(&mut self, reference: ObjectRef) -> Result<(), Error> {
-        self.write(
-            true,
-            ObjectRecord {
-                identity: ObjectIdentity::from_ref(reference),
-                length: reference.encoded_length,
-            },
-        )
-    }
-
-    fn candidate(&mut self, identity: ObjectIdentity, length: u64) -> Result<(), Error> {
-        self.write(false, ObjectRecord { identity, length })
-    }
-
-    fn write(&mut self, mark: bool, record: ObjectRecord) -> Result<(), Error> {
-        let partition = usize::from(record.identity.id.as_bytes()[0]);
-        let stem = if mark { "marks" } else { "candidates" };
-        let directory = self.directory.clone();
-        let writers = if mark {
-            &mut self.marks
-        } else {
-            &mut self.candidates
-        };
-        if writers[partition].is_none() {
-            let path = directory.join(format!("{stem}-{partition:02x}"));
-            let file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-                .map_err(|error| {
-                    Error::from_io("create Managed GC partition", Some(&path), error)
-                })?;
-            writers[partition] = Some(BufWriter::new(file));
+fn next_unique_mark(
+    reader: &mut workset::SpoolReader<ObjectRecord>,
+    previous: Option<ObjectRecord>,
+) -> Result<Option<ObjectRecord>, Error> {
+    let mut next = reader.next()?;
+    while let (Some(previous), Some(current)) = (previous, next) {
+        if previous.identity != current.identity {
+            return Ok(Some(current));
         }
-        record.write(
-            writers[partition]
-                .as_mut()
-                .expect("partition writer is open"),
-        )
-    }
-
-    fn seal_marks(&mut self) -> Result<(), Error> {
-        seal(&mut self.marks)
-    }
-
-    fn seal_candidates(&mut self) -> Result<(), Error> {
-        seal(&mut self.candidates)
-    }
-
-    fn load_marks(&self, partition: usize) -> Result<BTreeMap<ObjectIdentity, u64>, Error> {
-        let path = self.directory.join(format!("marks-{partition:02x}"));
-        if !path.exists() {
-            return Ok(BTreeMap::new());
-        }
-        let mut reader = RecordReader::open(&path)?;
-        let mut marks = BTreeMap::new();
-        while let Some(record) = reader.next()? {
-            if marks
-                .insert(record.identity, record.length)
-                .is_some_and(|length| length != record.length)
-            {
-                return Err(Error::corrupt(
-                    "collect Managed objects",
-                    "one reachable object has conflicting lengths",
-                ));
-            }
-        }
-        Ok(marks)
-    }
-
-    fn candidate_path(&self, partition: usize) -> PathBuf {
-        self.directory.join(format!("candidates-{partition:02x}"))
-    }
-}
-
-impl Drop for PartitionedInventory {
-    fn drop(&mut self) {
-        self.marks.clear();
-        self.candidates.clear();
-        let _ = fs::remove_dir_all(&self.directory);
-    }
-}
-
-fn seal(writers: &mut Vec<Option<BufWriter<File>>>) -> Result<(), Error> {
-    for writer in writers.iter_mut().flatten() {
-        writer
-            .flush()
-            .map_err(|error| Error::io("flush Managed GC partition", error))?;
-    }
-    writers.clear();
-    Ok(())
-}
-
-#[derive(Clone, Copy)]
-struct ObjectRecord {
-    identity: ObjectIdentity,
-    length: u64,
-}
-
-impl ObjectRecord {
-    fn write(self, writer: &mut BufWriter<File>) -> Result<(), Error> {
-        let mut bytes = [0; RECORD_BYTES];
-        bytes[..8].copy_from_slice(&self.identity.gc_epoch.value().to_be_bytes());
-        bytes[8] = self.identity.class.code();
-        bytes[9..25].copy_from_slice(self.identity.id.as_bytes());
-        bytes[25..].copy_from_slice(&self.length.to_be_bytes());
-        writer
-            .write_all(&bytes)
-            .map_err(|error| Error::io("write Managed GC record", error))
-    }
-
-    fn decode(bytes: [u8; RECORD_BYTES]) -> Result<Self, Error> {
-        let epoch = u64::from_be_bytes(bytes[..8].try_into().expect("fixed epoch"));
-        let class = ObjectClass::from_code(bytes[8])
-            .ok_or_else(|| Error::corrupt("read Managed GC record", "object class is invalid"))?;
-        let id = ObjectId::from_bytes(bytes[9..25].try_into().expect("fixed object id"));
-        let length = u64::from_be_bytes(bytes[25..].try_into().expect("fixed length"));
-        Ok(Self {
-            identity: ObjectIdentity {
-                gc_epoch: GcEpoch::from_value(epoch),
-                class,
-                id,
-            },
-            length,
-        })
-    }
-}
-
-struct RecordReader {
-    reader: BufReader<File>,
-    remaining: u64,
-}
-
-impl RecordReader {
-    fn open(path: &Path) -> Result<Self, Error> {
-        let file = File::open(path)
-            .map_err(|error| Error::from_io("open Managed GC partition", Some(path), error))?;
-        let length = file
-            .metadata()
-            .map_err(|error| Error::from_io("inspect Managed GC partition", Some(path), error))?
-            .len();
-        if length % RECORD_BYTES as u64 != 0 {
+        if previous.length != current.length {
             return Err(Error::corrupt(
-                "read Managed GC partition",
-                "partition length is invalid",
+                "collect Managed objects",
+                "one reachable object has conflicting lengths",
             ));
         }
-        Ok(Self {
-            reader: BufReader::new(file),
-            remaining: length / RECORD_BYTES as u64,
-        })
+        next = reader.next()?;
     }
-
-    fn next(&mut self) -> Result<Option<ObjectRecord>, Error> {
-        if self.remaining == 0 {
-            return Ok(None);
-        }
-        let mut bytes = [0; RECORD_BYTES];
-        self.reader
-            .read_exact(&mut bytes)
-            .map_err(|error| Error::io("read Managed GC record", error))?;
-        self.remaining -= 1;
-        ObjectRecord::decode(bytes).map(Some)
-    }
+    Ok(next)
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 struct ObjectIdentity {
     gc_epoch: GcEpoch,
     class: ObjectClass,
@@ -478,24 +244,19 @@ impl ObjectIdentity {
     }
 
     fn parse(path: &str) -> Option<Self> {
-        let suffix = path.strip_prefix(OBJECT_PREFIX)?;
-        let mut parts = suffix.split('/');
+        let mut parts = path.strip_prefix(OBJECT_PREFIX)?.split('/');
         let gc_epoch = GcEpoch::from_value(parts.next()?.parse().ok()?);
         let class = ObjectClass::parse(parts.next()?)?;
         let prefix = parts.next()?;
-        let encoded_id = parts.next()?;
-        if parts.next().is_some()
-            || prefix.len() != 2
-            || encoded_id.len() != 32
-            || prefix != &encoded_id[..2]
-        {
+        let encoded = parts.next()?;
+        if parts.next().is_some() || prefix.len() != 2 || encoded.len() != 32 {
             return None;
         }
-        let mut id = [0; 16];
-        for (byte, pair) in id.iter_mut().zip(encoded_id.as_bytes().chunks_exact(2)) {
-            *byte = hex(pair[0])?.checked_shl(4)? | hex(pair[1])?;
+        let mut id = [0_u8; 16];
+        for (index, byte) in id.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&encoded[index * 2..index * 2 + 2], 16).ok()?;
         }
-        Some(Self {
+        (format!("{:02x}", id[0]) == prefix).then_some(Self {
             gc_epoch,
             class,
             id: ObjectId::from_bytes(id),
@@ -503,30 +264,31 @@ impl ObjectIdentity {
     }
 
     fn key(self) -> String {
-        format!(
-            "{OBJECT_PREFIX}{}/{}/{:02x}/{}",
-            self.gc_epoch.value(),
-            self.class.key_segment(),
-            self.id.as_bytes()[0],
-            self.id
-        )
+        super::object::object_key(self.gc_epoch, self.class, self.id)
     }
 }
 
-const fn hex(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        _ => None,
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+struct ObjectRecord {
+    identity: ObjectIdentity,
+    length: u64,
+}
+
+impl ObjectRecord {
+    const fn from_ref(reference: ObjectRef) -> Self {
+        Self {
+            identity: ObjectIdentity::from_ref(reference),
+            length: reference.encoded_length,
+        }
     }
 }
 
 #[cfg(debug_assertions)]
 fn test_interrupt(point: &str) -> Result<(), Error> {
     if std::env::var("OFS_INTERNAL_TEST_INTERRUPT").as_deref() == Ok(point) {
-        return Err(Error::unavailable(
+        return Err(Error::invalid(
             "collect Managed objects",
-            "internal test interrupted Managed object collection",
+            "internal test interrupted Managed collection",
         ));
     }
     Ok(())

@@ -100,21 +100,15 @@ impl GcEpoch {
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum ObjectClass {
     NamespaceCommit,
-    NodeSegment,
-    DirectorySegment,
-    FileVersionSegment,
-    ChangeSegment,
+    NamespaceSegment,
     OperationResultSegment,
     FileData,
 }
 
 impl ObjectClass {
-    pub(crate) const ALL: [Self; 7] = [
+    pub(crate) const ALL: [Self; 4] = [
         Self::NamespaceCommit,
-        Self::NodeSegment,
-        Self::DirectorySegment,
-        Self::FileVersionSegment,
-        Self::ChangeSegment,
+        Self::NamespaceSegment,
         Self::OperationResultSegment,
         Self::FileData,
     ];
@@ -122,24 +116,9 @@ impl ObjectClass {
     pub(crate) const fn key_segment(self) -> &'static str {
         match self {
             Self::NamespaceCommit => "namespace-commit",
-            Self::NodeSegment => "node-segment",
-            Self::DirectorySegment => "directory-segment",
-            Self::FileVersionSegment => "file-version-segment",
-            Self::ChangeSegment => "change-segment",
+            Self::NamespaceSegment => "namespace-segment",
             Self::OperationResultSegment => "operation-result-segment",
             Self::FileData => "file-data",
-        }
-    }
-
-    pub(crate) const fn code(self) -> u8 {
-        match self {
-            Self::NamespaceCommit => 0,
-            Self::NodeSegment => 1,
-            Self::DirectorySegment => 2,
-            Self::FileVersionSegment => 3,
-            Self::ChangeSegment => 4,
-            Self::OperationResultSegment => 5,
-            Self::FileData => 6,
         }
     }
 
@@ -147,19 +126,6 @@ impl ObjectClass {
         Self::ALL
             .into_iter()
             .find(|class| class.key_segment() == value)
-    }
-
-    pub(crate) const fn from_code(value: u8) -> Option<Self> {
-        match value {
-            0 => Some(Self::NamespaceCommit),
-            1 => Some(Self::NodeSegment),
-            2 => Some(Self::DirectorySegment),
-            3 => Some(Self::FileVersionSegment),
-            4 => Some(Self::ChangeSegment),
-            5 => Some(Self::OperationResultSegment),
-            6 => Some(Self::FileData),
-            _ => None,
-        }
     }
 }
 
@@ -386,7 +352,7 @@ fn missing_object(operation: &'static str, error: opendal::Error) -> Error {
     }
 }
 
-fn object_key(gc_epoch: GcEpoch, class: ObjectClass, id: ObjectId) -> String {
+pub(crate) fn object_key(gc_epoch: GcEpoch, class: ObjectClass, id: ObjectId) -> String {
     let prefix = id.as_bytes()[0];
     format!(
         "{OBJECT_PREFIX}{}/{}/{prefix:02x}/{id}",

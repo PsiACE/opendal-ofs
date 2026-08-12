@@ -17,8 +17,6 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::NodeId;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NodeKind {
     Directory,
@@ -71,31 +69,5 @@ impl<'de> Deserialize<'de> for NodeAttributes {
     {
         let (executable,) = Deserialize::deserialize(deserializer)?;
         Ok(Self { executable })
-    }
-}
-
-/// One named edge from a directory to a filesystem node.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DirectoryEntry {
-    pub node_id: NodeId,
-    pub kind: NodeKind,
-}
-
-impl Serialize for DirectoryEntry {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        (self.node_id, self.kind).serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for DirectoryEntry {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let (node_id, kind) = Deserialize::deserialize(deserializer)?;
-        Ok(Self { node_id, kind })
     }
 }
