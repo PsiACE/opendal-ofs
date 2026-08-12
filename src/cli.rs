@@ -45,6 +45,12 @@ pub(crate) struct GcArgs {
     #[arg(env = "OFS_STORAGE_URL", value_name = "VOLUME")]
     pub(crate) storage: String,
 
+    #[command(flatten)]
+    pub(crate) resources: ManagedResourceArgs,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ManagedResourceArgs {
     /// Maximum concurrency for storage operations.
     #[arg(
         long,
@@ -53,6 +59,15 @@ pub(crate) struct GcArgs {
         value_name = "N"
     )]
     pub(crate) transfer_concurrency: NonZeroUsize,
+
+    /// Memory target for each external-sort run, in MiB.
+    #[arg(
+        long,
+        env = "OFS_WORK_MEMORY_MIB",
+        default_value = "64",
+        value_name = "MIB"
+    )]
+    pub(crate) work_memory_mib: NonZeroUsize,
 }
 
 #[derive(Debug, Args)]
@@ -76,14 +91,8 @@ pub(crate) struct SyncArgs {
     #[arg(long, value_enum, value_name = "CAPABILITY")]
     pub(crate) require: Vec<Capability>,
 
-    /// Maximum concurrency for storage operations.
-    #[arg(
-        long,
-        env = "OFS_TRANSFER_CONCURRENCY",
-        default_value = "4",
-        value_name = "N"
-    )]
-    pub(crate) transfer_concurrency: NonZeroUsize,
+    #[command(flatten)]
+    pub(crate) resources: ManagedResourceArgs,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -153,12 +162,6 @@ pub(crate) struct VolumeCreateArgs {
     #[arg(long, value_parser = ["managed"], value_name = "MODEL")]
     pub(crate) model: String,
 
-    /// Maximum concurrency for storage operations.
-    #[arg(
-        long,
-        env = "OFS_TRANSFER_CONCURRENCY",
-        default_value = "4",
-        value_name = "N"
-    )]
-    pub(crate) transfer_concurrency: NonZeroUsize,
+    #[command(flatten)]
+    pub(crate) resources: ManagedResourceArgs,
 }

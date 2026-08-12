@@ -21,7 +21,7 @@ use std::collections::BTreeSet;
 use crate::Error;
 use crate::filesystem::{NamespaceNode, NamespaceRecord, NodeKind, validate_portable_path};
 use crate::managed::StreamRef;
-use crate::workset::{Namespace, SpoolReader, Workspace};
+use crate::workset::{Namespace, SpoolReader, WorksetOptions, Workspace};
 
 use super::ConflictRecord;
 
@@ -54,6 +54,7 @@ pub(crate) fn reconcile(
     local: &Namespace<Option<StreamRef>>,
     remote: &Namespace<StreamRef>,
     resolved: &BTreeSet<String>,
+    worksets: WorksetOptions,
 ) -> Result<ReconcilePlan, Error> {
     require_same_volume(common, local)?;
     require_same_volume(common, remote)?;
@@ -65,7 +66,7 @@ pub(crate) fn reconcile(
     }
 
     let directory_conflicts = directory_conflicts(common, local, remote)?;
-    let workspace = Workspace::create()?;
+    let workspace = Workspace::create(worksets)?;
     let mut target = workspace.writer("reconciled-namespace")?;
     let mut common_records = OrderedRecords::open(common)?;
     let mut local_records = OrderedRecords::open(local)?;

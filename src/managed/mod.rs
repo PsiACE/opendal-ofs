@@ -38,6 +38,7 @@ use std::num::NonZeroUsize;
 use opendal::Operator;
 
 use crate::filesystem::{NodeId, VolumeId};
+use crate::workset::WorksetOptions;
 use crate::{Error, ErrorKind};
 use format::{FORMAT_KEY, MAX_FORMAT_BYTES};
 
@@ -46,10 +47,15 @@ use format::{FORMAT_KEY, MAX_FORMAT_BYTES};
 pub struct ManagedMetadata {
     operator: Operator,
     stream_concurrency: usize,
+    worksets: WorksetOptions,
 }
 
 impl ManagedMetadata {
-    pub fn new(operator: Operator, stream_concurrency: NonZeroUsize) -> Result<Self, Error> {
+    pub fn new(
+        operator: Operator,
+        stream_concurrency: NonZeroUsize,
+        work_memory_mib: NonZeroUsize,
+    ) -> Result<Self, Error> {
         let capability = operator.info().full_capability();
         if !(capability.read
             && capability.write
@@ -65,6 +71,7 @@ impl ManagedMetadata {
         Ok(Self {
             operator,
             stream_concurrency: stream_concurrency.get(),
+            worksets: WorksetOptions::from_mib(work_memory_mib.get())?,
         })
     }
 
@@ -84,7 +91,12 @@ impl ManagedMetadata {
         } else {
             self.read_format().await?
         };
-        let volume = ManagedVolume::new(format, self.operator.clone(), self.stream_concurrency);
+        let volume = ManagedVolume::new(
+            format,
+            self.operator.clone(),
+            self.stream_concurrency,
+            self.worksets,
+        );
         volume.initialize().await?;
         Ok(volume)
     }
@@ -115,6 +127,7 @@ impl ManagedMetadata {
             format,
             self.operator.clone(),
             self.stream_concurrency,
+            self.worksets,
         ))
     }
 }

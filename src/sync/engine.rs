@@ -176,7 +176,13 @@ impl SyncEngine {
             Some(self.volume.namespace(common_revision).await?)
         };
         let base = loaded_base.as_ref().unwrap_or(&observed.namespace);
-        let local = scan(&root, base, self.transfer_concurrency).await?;
+        let local = scan(
+            &root,
+            base,
+            self.transfer_concurrency,
+            self.volume.workset_options(),
+        )
+        .await?;
         let remote_changed = observed.revision() != common_revision;
         match (local, remote_changed) {
             (ScannedTree::Unchanged, false) => Ok(SyncOutcome {
@@ -222,7 +228,13 @@ impl SyncEngine {
                 .await
             }
             (ScannedTree::Changed(local), true) => {
-                let plan = reconcile(base, &local, &observed.namespace, &resolved)?;
+                let plan = reconcile(
+                    base,
+                    &local,
+                    &observed.namespace,
+                    &resolved,
+                    self.volume.workset_options(),
+                )?;
                 if !plan.conflicts.is_empty() {
                     let conflict_paths = plan
                         .conflicts
@@ -359,7 +371,14 @@ impl SyncEngine {
         observed: ManagedObservation,
         resolved: &BTreeSet<String>,
     ) -> Result<SyncOutcome, Error> {
-        let local = match scan(root, &observed.namespace, self.transfer_concurrency).await? {
+        let local = match scan(
+            root,
+            &observed.namespace,
+            self.transfer_concurrency,
+            self.volume.workset_options(),
+        )
+        .await?
+        {
             ScannedTree::Unchanged => {
                 state.advance(observed.revision());
                 state.save(state_path)?;
@@ -485,7 +504,7 @@ impl SyncEngine {
         observed: &ManagedObservation,
         target: &Namespace<Option<StreamRef>>,
     ) -> Result<Namespace<StreamRef>, Error> {
-        let workspace = Workspace::create()?;
+        let workspace = Workspace::create(self.volume.workset_options())?;
         let mut output = workspace.writer("published-namespace")?;
         let publications = target
             .entries

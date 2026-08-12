@@ -19,7 +19,7 @@ use crate::filesystem::{
     ChangeCursor, NamespaceNode, NamespaceRecord, NamespaceValue, OperationId, VolumeId,
     validate_portable_path,
 };
-use crate::workset::{Namespace, Spool, Workspace, balanced_merge};
+use crate::workset::{Namespace, Spool, WorksetOptions, Workspace, balanced_merge};
 use crate::{Error, ErrorKind};
 use futures::StreamExt as _;
 use opendal::Operator;
@@ -38,6 +38,7 @@ pub struct ManagedVolume {
     format: ManagedFormat,
     operator: Operator,
     stream_concurrency: usize,
+    worksets: WorksetOptions,
 }
 
 pub(crate) struct ManagedObservation {
@@ -148,11 +149,13 @@ impl ManagedVolume {
         format: ManagedFormat,
         operator: Operator,
         stream_concurrency: usize,
+        worksets: WorksetOptions,
     ) -> Self {
         Self {
             format,
             operator,
             stream_concurrency,
+            worksets,
         }
     }
 
@@ -393,6 +396,10 @@ impl ManagedVolume {
         &self.operator
     }
 
+    pub(crate) const fn workset_options(&self) -> WorksetOptions {
+        self.worksets
+    }
+
     pub(super) async fn replace_head(
         &self,
         expected_revision: &str,
@@ -609,7 +616,7 @@ impl ManagedVolume {
         commit: &NamespaceCommit,
         view_cursor: ChangeCursor,
     ) -> Result<Namespace<StreamRef>, Error> {
-        let workspace = Workspace::create()?;
+        let workspace = Workspace::create(self.worksets)?;
         let mut output = workspace.writer("namespace")?;
         let mut streams = Vec::with_capacity(commit.namespace.len());
         let downloads = futures::stream::iter(commit.namespace.iter().copied())

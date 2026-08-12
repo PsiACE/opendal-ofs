@@ -43,15 +43,16 @@ pub(super) async fn run(args: SyncArgs) -> Result<()> {
     }
 
     let metadata = ManagedMetadata::new(
-        open_operator(&args.storage, args.transfer_concurrency)?,
-        args.transfer_concurrency,
+        open_operator(&args.storage, args.resources.transfer_concurrency)?,
+        args.resources.transfer_concurrency,
+        args.resources.work_memory_mib,
     )?;
     let stored = ReplicaState::load(&args.state)?;
     let volume = match &stored {
         Some(state) => metadata.open(Some(state.volume_id())).await?,
         None => metadata.open(None).await?,
     };
-    let result = SyncEngine::new(volume.clone(), args.transfer_concurrency)
+    let result = SyncEngine::new(volume.clone(), args.resources.transfer_concurrency)
         .sync(&root, &args.state, &args.resolve)
         .await?;
     if !result.conflict_paths.is_empty() {

@@ -31,13 +31,27 @@ use serde::de::DeserializeOwned;
 use crate::Error;
 use crate::filesystem::{ChangeCursor, NamespaceRecord, NodeId, OperationId, VolumeId};
 
-// A soft in-memory target for one sorted run. Larger inputs spill into more
-// runs, and one record larger than the target forms a run by itself. This is a
-// local execution policy, not a Managed format or dataset limit.
-const SORT_RUN_TARGET_BYTES: usize = 64 * 1024 * 1024;
+const MEBIBYTE: usize = 1024 * 1024;
+
+#[derive(Clone, Copy)]
+pub(crate) struct WorksetOptions {
+    sort_run_target_bytes: usize,
+}
+
+impl WorksetOptions {
+    pub(crate) fn from_mib(memory_mib: usize) -> Result<Self, Error> {
+        let sort_run_target_bytes = memory_mib.checked_mul(MEBIBYTE).ok_or_else(|| {
+            Error::invalid("configure local worksets", "--work-memory-mib overflows")
+        })?;
+        Ok(Self {
+            sort_run_target_bytes,
+        })
+    }
+}
 
 struct WorkspaceInner {
     path: PathBuf,
+    options: WorksetOptions,
 }
 
 impl Drop for WorkspaceInner {
@@ -66,12 +80,12 @@ impl<C: DeserializeOwned> Namespace<C> {
 }
 
 impl Workspace {
-    pub(crate) fn create() -> Result<Self, Error> {
+    pub(crate) fn create(options: WorksetOptions) -> Result<Self, Error> {
         let path = std::env::temp_dir().join(format!("ofs-sync-{}", OperationId::generate()));
         fs::create_dir(&path)
             .map_err(|error| Error::from_io("create Sync workspace", Some(&path), error))?;
         Ok(Self {
-            inner: Arc::new(WorkspaceInner { path }),
+            inner: Arc::new(WorkspaceInner { path, options }),
         })
     }
 
@@ -289,11 +303,13 @@ where
     loop {
         let mut records = Vec::new();
         let mut encoded_bytes = 0_usize;
-        while encoded_bytes < SORT_RUN_TARGET_BYTES {
+        while encoded_bytes < workspace.inner.options.sort_run_target_bytes {
             let Some(frame_bytes) = source.peek_frame_bytes()? else {
                 break;
             };
-            if encoded_bytes != 0 && frame_bytes > SORT_RUN_TARGET_BYTES - encoded_bytes {
+            if encoded_bytes != 0
+                && frame_bytes > workspace.inner.options.sort_run_target_bytes - encoded_bytes
+            {
                 break;
             }
             let bytes = source

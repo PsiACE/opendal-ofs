@@ -68,7 +68,7 @@ async fn apply<C: DeserializeOwned>(
     transfer_concurrency: usize,
     authoritative: bool,
 ) -> Result<(), Error> {
-    let workspace = Workspace::create()?;
+    let workspace = Workspace::create(volume.workset_options())?;
     let removals = if authoritative {
         repair_removals(root, target, &workspace)?
     } else {

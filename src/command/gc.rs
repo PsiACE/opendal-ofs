@@ -24,8 +24,9 @@ use super::provider::open_operator;
 
 pub(super) async fn run(args: GcArgs) -> Result<()> {
     let metadata = ManagedMetadata::new(
-        open_operator(&args.storage, args.transfer_concurrency)?,
-        args.transfer_concurrency,
+        open_operator(&args.storage, args.resources.transfer_concurrency)?,
+        args.resources.transfer_concurrency,
+        args.resources.work_memory_mib,
     )?;
     let volume = metadata.open(None).await?;
     let outcome = volume.collect_unreachable().await?;

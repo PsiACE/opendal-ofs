@@ -70,7 +70,7 @@ impl ManagedVolume {
             ));
         }
 
-        let workspace = Workspace::create()?;
+        let workspace = Workspace::create(self.workset_options())?;
         let marks = self
             .reachable_workset(&workspace, collection_commit)
             .await?;

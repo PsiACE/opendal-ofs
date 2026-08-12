@@ -76,8 +76,9 @@ pub(crate) async fn scan(
     root: &Path,
     base: &workset::Namespace<managed::StreamRef>,
     concurrency: usize,
+    worksets: workset::WorksetOptions,
 ) -> Result<ScannedTree, Error> {
-    let workspace = workset::Workspace::create()?;
+    let workspace = workset::Workspace::create(worksets)?;
     let local = scan_local(&workspace, root, concurrency).await?;
     let next_cursor = base
         .cursor

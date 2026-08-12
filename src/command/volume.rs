@@ -31,8 +31,9 @@ pub(super) async fn run(args: VolumeArgs) -> Result<()> {
 async fn create(args: VolumeCreateArgs) -> Result<()> {
     debug_assert_eq!(args.model, "managed");
     let metadata = ManagedMetadata::new(
-        open_operator(&args.storage, args.transfer_concurrency)?,
-        args.transfer_concurrency,
+        open_operator(&args.storage, args.resources.transfer_concurrency)?,
+        args.resources.transfer_concurrency,
+        args.resources.work_memory_mib,
     )?;
     let volume = metadata.initialize().await?;
     println!("created managed volume {}", volume.id());
