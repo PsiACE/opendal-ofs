@@ -41,6 +41,7 @@ const WRITER_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 const DATA_BLOCK_BYTES: u64 = 4 * 1024 * 1024;
 const RANGE_FETCH_BLOCKS: usize = 16;
 const BLOCK_CHECKSUM_INDEX: &str = "block-checksum-index";
+const FRAME_RANGE_INDEX: &str = "frame-range-index";
 
 #[derive(Clone, Copy, Debug, serde::Deserialize, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
@@ -130,6 +131,14 @@ struct EmbeddedProjection {
     bytes: Vec<u8>,
 }
 
+#[derive(Debug)]
+struct FrameRangeIndex {
+    frames: Vec<ChecksummedRange>,
+}
+super::wire::tuple_wire!(FrameRangeIndex {
+    frames: Vec<ChecksummedRange>,
+});
+
 pub(crate) async fn write_records<T: Serialize>(
     operator: &Operator,
     gc_epoch: GcEpoch,
@@ -143,6 +152,7 @@ pub(crate) async fn write_records<T: Serialize>(
     let mut payload_length = 0_u64;
     let mut frame = Vec::new();
     let mut frame_records = 0_u32;
+    let mut frames = Vec::new();
 
     for record in records {
         let mut encoded = Vec::new();
@@ -157,15 +167,17 @@ pub(crate) async fn write_records<T: Serialize>(
                 .saturating_add(encoded.len())
                 > MAXIMUM_FRAME_BYTES
         {
-            write_frame(
-                &mut writer,
-                schema_version,
-                &mut payload_hasher,
-                &mut payload_length,
-                frame_records,
-                &frame,
-            )
-            .await?;
+            frames.push(
+                write_frame(
+                    &mut writer,
+                    schema_version,
+                    &mut payload_hasher,
+                    &mut payload_length,
+                    frame_records,
+                    &frame,
+                )
+                .await?,
+            );
             frame.clear();
             frame_records = 0;
         }
@@ -176,16 +188,22 @@ pub(crate) async fn write_records<T: Serialize>(
         })?;
     }
     if frame_records != 0 {
-        write_frame(
-            &mut writer,
-            schema_version,
-            &mut payload_hasher,
-            &mut payload_length,
-            frame_records,
-            &frame,
-        )
-        .await?;
+        frames.push(
+            write_frame(
+                &mut writer,
+                schema_version,
+                &mut payload_hasher,
+                &mut payload_length,
+                frame_records,
+                &frame,
+            )
+            .await?,
+        );
     }
+
+    let mut frame_index = Vec::new();
+    ciborium::into_writer(&FrameRangeIndex { frames }, &mut frame_index)
+        .map_err(|_| Error::invalid("write Managed stream", "frame index cannot be encoded"))?;
 
     finish_stream(
         writer,
@@ -193,7 +211,11 @@ pub(crate) async fn write_records<T: Serialize>(
         schema_version,
         payload_length,
         PayloadDigest::from_bytes(payload_hasher.finalize().into()),
-        Vec::new(),
+        vec![EmbeddedProjection {
+            kind: FRAME_RANGE_INDEX,
+            schema_version: 1,
+            bytes: frame_index,
+        }],
     )
     .await
 }
@@ -478,7 +500,8 @@ async fn write_frame(
     payload_length: &mut u64,
     record_count: u32,
     frame: &[u8],
-) -> Result<(), Error> {
+) -> Result<ChecksummedRange, Error> {
+    let offset = *payload_length;
     let frame_length = u64::try_from(frame.len())
         .map_err(|_| Error::invalid("write Managed stream", "frame length overflows"))?;
     let mut header = Vec::with_capacity(FRAME_HEADER_BYTES);
@@ -487,6 +510,9 @@ async fn write_frame(
     header.extend_from_slice(&frame_length.to_le_bytes());
     header.extend_from_slice(&record_count.to_le_bytes());
     header.extend_from_slice(checksum(frame).as_bytes());
+    let mut frame_checksum = blake3::Hasher::new();
+    frame_checksum.update(&header);
+    frame_checksum.update(frame);
     writer.write(&header).await?;
     writer.write(frame).await?;
     payload_hasher.update(&header);
@@ -495,7 +521,11 @@ async fn write_frame(
         .checked_add(header.len() as u64)
         .and_then(|length| length.checked_add(frame_length))
         .ok_or_else(|| Error::invalid("write Managed stream", "payload length overflows"))?;
-    Ok(())
+    Ok(ChecksummedRange {
+        offset,
+        length: header.len() as u64 + frame_length,
+        checksum: RangeChecksum::from_bytes(frame_checksum.finalize().into()),
+    })
 }
 
 pub(crate) async fn read_records<T: DeserializeOwned>(
@@ -517,6 +547,42 @@ pub(crate) async fn visit_records<T: DeserializeOwned>(
     mut visit: impl FnMut(T) -> Result<(), Error>,
 ) -> Result<(), Error> {
     let footer = read_footer(operator, reference).await?;
+    if let Some(frames) = read_frame_index(operator, reference, &footer).await? {
+        let reader = operator
+            .reader_with(&reference.object.key())
+            .content_length_hint(reference.object.encoded_length)
+            .concurrent(4)
+            .gap(0)
+            .await
+            .map_err(|error| Error::from_storage("read Managed stream", error))?;
+        let ranges = frames
+            .iter()
+            .map(|frame| frame.offset..frame.offset + frame.length)
+            .collect();
+        let buffers = reader
+            .fetch(ranges)
+            .await
+            .map_err(|error| Error::from_storage("read Managed stream", error))?;
+        let mut payload_hasher = blake3::Hasher::new();
+        for (frame, buffer) in frames.iter().zip(buffers) {
+            let bytes = buffer.to_vec();
+            if bytes.len() as u64 != frame.length || checksum(&bytes) != frame.checksum {
+                return Err(Error::corrupt(
+                    "read Managed stream",
+                    "indexed frame checksum is invalid",
+                ));
+            }
+            payload_hasher.update(&bytes);
+            visit_frame(&bytes, reference.schema_version, &mut visit)?;
+        }
+        if PayloadDigest::from_bytes(payload_hasher.finalize().into()) != footer.payload_digest {
+            return Err(Error::corrupt(
+                "read Managed stream",
+                "stream payload does not match its reference",
+            ));
+        }
+        return Ok(());
+    }
     let mut payload_hasher = blake3::Hasher::new();
     let mut offset = 0_u64;
     while offset < reference.payload_length {
@@ -597,6 +663,123 @@ pub(crate) async fn visit_records<T: DeserializeOwned>(
         return Err(Error::corrupt(
             "read Managed stream",
             "stream payload does not match its reference",
+        ));
+    }
+    Ok(())
+}
+
+async fn read_frame_index(
+    operator: &Operator,
+    reference: StreamRef,
+    footer: &StreamFooter,
+) -> Result<Option<Vec<ChecksummedRange>>, Error> {
+    let Some(projection) = footer.projections.iter().find(|projection| {
+        projection.kind == FRAME_RANGE_INDEX
+            && projection.schema_version == 1
+            && projection.source == reference.payload_digest
+    }) else {
+        return Ok(None);
+    };
+    let Some(projection_end) = projection
+        .object_range
+        .offset
+        .checked_add(projection.object_range.length)
+    else {
+        return Ok(None);
+    };
+    if projection.object_range.offset < reference.payload_length
+        || projection_end > reference.footer_range.offset
+    {
+        return Ok(None);
+    }
+    let bytes = match read_range(
+        operator,
+        reference.object,
+        projection.object_range.offset..projection_end,
+    )
+    .await
+    {
+        Ok(bytes) if checksum(&bytes) == projection.object_range.checksum => bytes,
+        _ => return Ok(None),
+    };
+    let Ok(index) = ciborium::from_reader::<FrameRangeIndex, _>(Cursor::new(bytes)) else {
+        return Ok(None);
+    };
+    let mut offset = 0_u64;
+    for frame in &index.frames {
+        let Some(end) = frame.offset.checked_add(frame.length) else {
+            return Ok(None);
+        };
+        if frame.offset != offset || frame.length < FRAME_HEADER_BYTES as u64 {
+            return Ok(None);
+        }
+        offset = end;
+    }
+    Ok((offset == reference.payload_length).then_some(index.frames))
+}
+
+fn visit_frame<T: DeserializeOwned>(
+    bytes: &[u8],
+    schema_version: u16,
+    visit: &mut impl FnMut(T) -> Result<(), Error>,
+) -> Result<(), Error> {
+    if bytes.len() < FRAME_HEADER_BYTES || bytes[..4] != FRAME_MAGIC {
+        return Err(Error::corrupt("read Managed stream", "frame is invalid"));
+    }
+    let version = u16::from_le_bytes(bytes[4..6].try_into().expect("fixed version"));
+    if version != schema_version {
+        return Err(Error::unsupported(
+            "read Managed stream",
+            "frame schema version is unsupported",
+        ));
+    }
+    let payload_length = usize::try_from(u64::from_le_bytes(
+        bytes[6..14].try_into().expect("fixed frame length"),
+    ))
+    .ok()
+    .filter(|length| *length <= MAXIMUM_FRAME_BYTES)
+    .ok_or_else(|| Error::corrupt("read Managed stream", "frame length is invalid"))?;
+    if bytes.len() != FRAME_HEADER_BYTES + payload_length
+        || checksum(&bytes[FRAME_HEADER_BYTES..]).as_bytes() != &bytes[18..50]
+    {
+        return Err(Error::corrupt(
+            "read Managed stream",
+            "frame payload is invalid",
+        ));
+    }
+    let record_count = u32::from_le_bytes(bytes[14..18].try_into().expect("fixed count"));
+    let payload = &bytes[FRAME_HEADER_BYTES..];
+    let mut record_offset = 0_usize;
+    for _ in 0..record_count {
+        let length_end = record_offset
+            .checked_add(size_of::<u32>())
+            .filter(|end| *end <= payload.len())
+            .ok_or_else(|| Error::corrupt("read Managed stream", "record is truncated"))?;
+        let length = u32::from_le_bytes(
+            payload[record_offset..length_end]
+                .try_into()
+                .expect("fixed record length"),
+        ) as usize;
+        let record_end = length_end
+            .checked_add(length)
+            .filter(|end| *end <= payload.len())
+            .ok_or_else(|| Error::corrupt("read Managed stream", "record is truncated"))?;
+        let mut input = Cursor::new(&payload[length_end..record_end]);
+        let record = ciborium::from_reader(&mut input)
+            .map_err(|_| Error::corrupt("read Managed stream", "record body is invalid"))?;
+        if input.position() != length as u64 {
+            return Err(Error::corrupt(
+                "read Managed stream",
+                "record has trailing bytes",
+            ));
+        }
+        visit(record)?;
+        record_offset = record_end;
+    }
+    if record_offset != payload.len() {
+        return Err(Error::corrupt(
+            "read Managed stream",
+            "frame contains trailing bytes",
         ));
     }
     Ok(())
