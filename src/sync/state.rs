@@ -48,12 +48,10 @@ pub struct ReplicaState {
 enum SyncPhase {
     Clean,
     Publishing {
-        expected: NamespaceRevision,
         target: NamespaceRevision,
         maintenance_generation: u64,
     },
     Installing {
-        target: NamespaceRevision,
         published: bool,
     },
 }
@@ -158,16 +156,15 @@ impl ReplicaState {
         }
         match self.phase {
             SyncPhase::Clean => Ok(()),
-            SyncPhase::Publishing {
-                expected, target, ..
-            } if expected.cursor().sequence() >= self.common.cursor().sequence()
-                && target.cursor().sequence() == expected.cursor().sequence() + 1
-                && target.cursor().operation().is_some() =>
+            SyncPhase::Publishing { target, .. }
+                if self.observed.cursor().sequence() >= self.common.cursor().sequence()
+                    && target.cursor().sequence() == self.observed.cursor().sequence() + 1
+                    && target.cursor().operation().is_some() =>
             {
                 Ok(())
             }
-            SyncPhase::Installing { target, .. }
-                if target.cursor().sequence() >= self.common.cursor().sequence() =>
+            SyncPhase::Installing { .. }
+                if self.observed.cursor().sequence() >= self.common.cursor().sequence() =>
             {
                 Ok(())
             }
@@ -211,17 +208,16 @@ impl ReplicaState {
     ) -> Option<(NamespaceRevision, NamespaceRevision, u64)> {
         match self.phase {
             SyncPhase::Publishing {
-                expected,
                 target,
                 maintenance_generation,
-            } => Some((expected, target, maintenance_generation)),
+            } => Some((self.observed, target, maintenance_generation)),
             _ => None,
         }
     }
 
     pub(crate) const fn installation(&self) -> Option<(NamespaceRevision, bool)> {
         match self.phase {
-            SyncPhase::Installing { target, published } => Some((target, published)),
+            SyncPhase::Installing { published } => Some((self.observed, published)),
             _ => None,
         }
     }
@@ -241,7 +237,6 @@ impl ReplicaState {
         maintenance_generation: u64,
     ) -> Result<(), Error> {
         self.phase = SyncPhase::Publishing {
-            expected,
             target,
             maintenance_generation,
         };
@@ -252,7 +247,7 @@ impl ReplicaState {
     }
 
     pub(crate) fn begin_install(&mut self, target: NamespaceRevision, published: bool) {
-        self.phase = SyncPhase::Installing { target, published };
+        self.phase = SyncPhase::Installing { published };
         self.observed = target;
         self.conflicts = 0;
         self.base_expired = false;

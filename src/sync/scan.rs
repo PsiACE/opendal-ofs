@@ -24,8 +24,8 @@ use futures::StreamExt as _;
 use super::transfer::inspect_file;
 use crate::Error;
 use crate::filesystem::{
-    ChangeCursor, DirectoryEntry, DirectoryRecord, FileVersion, FileVersionId, Generation,
-    NodeAttributes, NodeId, NodeKind, NodeRecord, OperationId, VolumeSnapshot,
+    ChangeCursor, DirectoryEntry, DirectoryRecord, FileVersionId, NodeAttributes, NodeId, NodeKind,
+    NodeRecord, OperationId, VolumeSnapshot,
 };
 
 pub(crate) enum ScannedTree {
@@ -53,7 +53,7 @@ pub(crate) async fn scan(root: &Path, base: &VolumeSnapshot) -> Result<ScannedTr
     let mut file_by_path = BTreeMap::<String, FileVersionId>::new();
     while let Some(result) = inspected.next().await {
         let (path, version) = result?;
-        file_by_path.insert(path.clone(), version.id);
+        file_by_path.insert(path.clone(), version);
     }
 
     if same_local_namespace(&local, &file_by_path, base, &base_paths) {
@@ -90,7 +90,6 @@ pub(crate) async fn scan(root: &Path, base: &VolumeSnapshot) -> Result<ScannedTr
         ids.entry(path.clone()).or_insert_with(NodeId::generate);
     }
 
-    let next_generation = Generation::from_bytes(next_sequence.get().to_be_bytes().to_vec());
     let mut entries_by_directory = ids
         .iter()
         .filter(|(path, _)| path.is_empty() || local[*path].kind == NodeKind::Directory)
@@ -123,22 +122,7 @@ pub(crate) async fn scan(root: &Path, base: &VolumeSnapshot) -> Result<ScannedTr
         let entries = entries_by_directory
             .remove(node)
             .expect("every local directory has an entry set");
-        let generation = base
-            .directories
-            .get(node)
-            .filter(|record| record.entries == entries)
-            .map_or_else(
-                || next_generation.clone(),
-                |record| record.generation.clone(),
-            );
-        directories.insert(
-            *node,
-            DirectoryRecord {
-                node: *node,
-                generation,
-                entries,
-            },
-        );
+        directories.insert(*node, DirectoryRecord { entries });
     }
 
     let mut nodes = BTreeMap::new();
@@ -155,23 +139,9 @@ pub(crate) async fn scan(root: &Path, base: &VolumeSnapshot) -> Result<ScannedTr
                 file_by_path.get(path).copied(),
             )
         };
-        let generation = base
-            .nodes
-            .get(node)
-            .filter(|record| {
-                record.kind == kind
-                    && record.attributes == attributes
-                    && record.file_version == file_version
-            })
-            .map_or_else(
-                || next_generation.clone(),
-                |record| record.generation.clone(),
-            );
         nodes.insert(
             *node,
             NodeRecord {
-                id: *node,
-                generation,
                 kind,
                 attributes,
                 file_version,
@@ -179,18 +149,12 @@ pub(crate) async fn scan(root: &Path, base: &VolumeSnapshot) -> Result<ScannedTr
         );
     }
 
-    let file_versions = file_by_path
-        .values()
-        .copied()
-        .map(|id| (id, FileVersion::new(id)))
-        .collect();
     let mut snapshot = VolumeSnapshot {
         volume_id: base.volume_id,
         cursor: base.cursor,
         root: base.root,
         nodes,
         directories,
-        file_versions,
     };
     snapshot.validate()?;
     let operation = OperationId::generate();

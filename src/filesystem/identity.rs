@@ -121,21 +121,6 @@ macro_rules! display_identity {
 
 display_identity!(VolumeId, OperationId);
 
-/// An opaque optimistic-concurrency token owned by the metadata authority.
-#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-#[serde(transparent)]
-pub struct Generation(Box<[u8]>);
-
-impl Generation {
-    pub fn from_bytes(bytes: impl Into<Box<[u8]>>) -> Self {
-        Self(bytes.into())
-    }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
-    }
-}
-
 /// A position in a Managed volume's ordered change stream.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]

@@ -24,35 +24,12 @@ use unicode_normalization::UnicodeNormalization as _;
 use crate::Error;
 
 use super::{
-    ChangeCursor, DirectoryEntry, FileVersionId, Generation, NodeAttributes, NodeId, NodeKind,
-    VolumeId,
+    ChangeCursor, DirectoryEntry, FileVersionId, NodeAttributes, NodeId, NodeKind, VolumeId,
 };
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct FileVersion {
-    pub id: FileVersionId,
-}
-
-impl FileVersion {
-    pub const fn new(id: FileVersionId) -> Self {
-        Self { id }
-    }
-
-    pub const fn logical_length(&self) -> u64 {
-        self.id.logical_length()
-    }
-
-    pub const fn digest(&self) -> super::Digest {
-        self.id.digest()
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct NodeRecord {
-    pub id: NodeId,
-    pub generation: Generation,
     pub kind: NodeKind,
     pub attributes: NodeAttributes,
     pub file_version: Option<FileVersionId>,
@@ -61,8 +38,6 @@ pub struct NodeRecord {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DirectoryRecord {
-    pub node: NodeId,
-    pub generation: Generation,
     pub entries: BTreeMap<String, DirectoryEntry>,
 }
 
@@ -75,7 +50,6 @@ pub struct VolumeSnapshot {
     pub root: NodeId,
     pub nodes: BTreeMap<NodeId, NodeRecord>,
     pub directories: BTreeMap<NodeId, DirectoryRecord>,
-    pub file_versions: BTreeMap<FileVersionId, FileVersion>,
 }
 
 impl VolumeSnapshot {
@@ -114,20 +88,11 @@ impl VolumeSnapshot {
         }
 
         for (id, node) in &self.nodes {
-            if *id != node.id {
-                return Err(Error::invalid(
-                    "validate filesystem snapshot",
-                    "node key does not match its identity",
-                ));
-            }
             match node.kind {
                 NodeKind::Directory
                     if node.file_version.is_none() && self.directories.contains_key(id) => {}
                 NodeKind::RegularFile
-                    if node
-                        .file_version
-                        .is_some_and(|version| self.file_versions.contains_key(&version))
-                        && !self.directories.contains_key(id) => {}
+                    if node.file_version.is_some() && !self.directories.contains_key(id) => {}
                 _ => {
                     return Err(Error::invalid(
                         "validate filesystem snapshot",
@@ -162,12 +127,6 @@ impl VolumeSnapshot {
                         "directory has no backing record",
                     )
                 })?;
-                if directory.node != node_id {
-                    return Err(Error::invalid(
-                        "validate filesystem snapshot",
-                        "directory key does not match its identity",
-                    ));
-                }
                 for (name, entry) in directory.entries.iter().rev() {
                     let child = self.nodes.get(&entry.node).ok_or_else(|| {
                         Error::invalid(
@@ -198,22 +157,6 @@ impl VolumeSnapshot {
             return Err(Error::invalid(
                 "validate filesystem snapshot",
                 "namespace contains unreachable nodes",
-            ));
-        }
-        let referenced_versions = self
-            .nodes
-            .values()
-            .filter_map(|node| node.file_version)
-            .collect::<BTreeSet<_>>();
-        if referenced_versions.len() != self.file_versions.len()
-            || self
-                .file_versions
-                .iter()
-                .any(|(id, version)| *id != version.id)
-        {
-            return Err(Error::invalid(
-                "validate filesystem snapshot",
-                "file-version key does not match its identity",
             ));
         }
         validate_portable_paths(paths.iter().map(String::as_str))

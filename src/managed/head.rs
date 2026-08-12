@@ -21,8 +21,8 @@ use opendal::{Buffer, Operator};
 use serde::{Deserialize, Serialize};
 
 use crate::filesystem::{
-    ChangeCursor, Digest, DirectoryEntry, DirectoryRecord, FileVersion, Generation, NodeAttributes,
-    NodeId, NodeKind, NodeRecord, OperationId, VolumeId, VolumeSnapshot,
+    ChangeCursor, Digest, DirectoryEntry, DirectoryRecord, NodeAttributes, NodeId, NodeKind,
+    NodeRecord, OperationId, VolumeId, VolumeSnapshot,
 };
 use crate::{Error, ErrorKind};
 
@@ -51,7 +51,6 @@ pub struct ManagedObservation {
     namespace_revision: NamespaceRevision,
     reclamation_watermark: ChangeCursor,
     maintenance_generation: u64,
-    publication_cursors: BTreeMap<ChangeCursor, ()>,
     operations: BTreeMap<OperationId, OperationRecord>,
     commit: NamespaceCommit,
     directory_entries: BTreeMap<DirectoryKey, DirectoryEntry>,
@@ -114,10 +113,8 @@ pub(super) struct GcFence {
 struct NamespaceCommit {
     volume_id: VolumeId,
     change_cursor: ChangeCursor,
-    publication_floor: ChangeCursor,
     node_index_root: PageRef,
     directory_entry_index_root: PageRef,
-    publication_cursor_index_root: PageRef,
     operation_result_index_root: PageRef,
 }
 
@@ -136,7 +133,6 @@ struct OperationRecord {
 
 struct StoredNamespace {
     snapshot: VolumeSnapshot,
-    publication_cursors: BTreeMap<ChangeCursor, ()>,
     operations: BTreeMap<OperationId, OperationRecord>,
     commit: NamespaceCommit,
     directory_entries: BTreeMap<DirectoryKey, DirectoryEntry>,
@@ -146,7 +142,6 @@ struct StoredNamespace {
 struct IndexObjects {
     nodes: BTreeMap<crate::filesystem::Digest, u64>,
     directory_entries: BTreeMap<crate::filesystem::Digest, u64>,
-    publication_cursors: BTreeMap<crate::filesystem::Digest, u64>,
     operations: BTreeMap<crate::filesystem::Digest, u64>,
 }
 
@@ -180,13 +175,7 @@ impl ManagedVolume {
     pub(super) async fn initialize(&self) -> Result<(), Error> {
         let snapshot = empty_snapshot(self.format);
         let namespace_commit = self
-            .write_namespace(
-                &snapshot,
-                &BTreeMap::new(),
-                &BTreeMap::new(),
-                ChangeCursor::Genesis,
-                None,
-            )
+            .write_namespace(&snapshot, &BTreeMap::new(), None)
             .await?;
         let bytes = HEAD_RECORD.encode(&Head {
             namespace_commit,
@@ -216,7 +205,6 @@ impl ManagedVolume {
             namespace_revision: head.namespace_commit,
             reclamation_watermark: head.reclamation_watermark,
             maintenance_generation: head.maintenance_generation,
-            publication_cursors: stored.publication_cursors,
             operations: stored.operations,
             commit: stored.commit,
             directory_entries: stored.directory_entries,
@@ -274,8 +262,6 @@ impl ManagedVolume {
             .cursor
             .operation()
             .expect("validated publication has an operation identity");
-        let mut publication_cursors = observed.publication_cursors.clone();
-        publication_cursors.insert(target.cursor, ());
         let mut operations = observed.operations.clone();
         operations.insert(
             operation,
@@ -283,16 +269,8 @@ impl ManagedVolume {
                 cursor: target.cursor,
             },
         );
-        let publication_floor = observed.reclamation_watermark;
-        publication_cursors.retain(|cursor, _| *cursor >= publication_floor);
-        self.write_namespace(
-            &target,
-            &publication_cursors,
-            &operations,
-            publication_floor,
-            Some(observed),
-        )
-        .await
+        self.write_namespace(&target, &operations, Some(observed))
+            .await
     }
 
     pub async fn commit_publication(
@@ -390,7 +368,7 @@ impl ManagedVolume {
                       _: NodeId,
                       node: NodeRecord| {
                 if let Some(version) = node.file_version
-                    && let Some(object) = super::data::whole_object(&FileVersion::new(version))?
+                    && let Some(object) = super::data::whole_object(version)?
                 {
                     visit(super::data::whole_object_key(object.digest), object.length)?;
                 }
@@ -415,19 +393,6 @@ impl ManagedVolume {
         let mut index_visitor = ReachableIndexVisitor {
             objects: &mut visit,
             records: |_: &mut dyn FnMut(String, u64) -> Result<(), Error>,
-                      _: ChangeCursor,
-                      _: ()| Ok(()),
-        };
-        visit_index_streaming(
-            &self.operator,
-            &commit.publication_cursor_index_root,
-            &mut index_visitor,
-        )
-        .await?;
-
-        let mut index_visitor = ReachableIndexVisitor {
-            objects: &mut visit,
-            records: |_: &mut dyn FnMut(String, u64) -> Result<(), Error>,
                       _: OperationId,
                       _: OperationRecord| Ok(()),
         };
@@ -442,9 +407,7 @@ impl ManagedVolume {
     async fn write_namespace(
         &self,
         snapshot: &VolumeSnapshot,
-        publication_cursors: &BTreeMap<ChangeCursor, ()>,
         operations: &BTreeMap<OperationId, OperationRecord>,
-        publication_floor: ChangeCursor,
         previous: Option<&ManagedObservation>,
     ) -> Result<NamespaceRevision, Error> {
         snapshot.validate()?;
@@ -485,20 +448,6 @@ impl ManagedVolume {
             }
             None => write_index(&self.operator, &directory_entries).await?,
         };
-        let publication_cursor_index_root = match previous {
-            Some(previous) if previous.publication_cursors == *publication_cursors => {
-                previous.commit.publication_cursor_index_root.clone()
-            }
-            Some(previous) => {
-                write_index_reusing(
-                    &self.operator,
-                    publication_cursors,
-                    &previous.objects.publication_cursors,
-                )
-                .await?
-            }
-            None => write_index(&self.operator, publication_cursors).await?,
-        };
         let operation_result_index_root = match previous {
             Some(previous) if previous.operations == *operations => {
                 previous.commit.operation_result_index_root.clone()
@@ -513,10 +462,8 @@ impl ManagedVolume {
         let commit = NamespaceCommit {
             volume_id: snapshot.volume_id,
             change_cursor: snapshot.cursor,
-            publication_floor,
             node_index_root,
             directory_entry_index_root,
-            publication_cursor_index_root,
             operation_result_index_root,
         };
         let bytes = COMMIT_RECORD.encode(&commit)?;
@@ -550,25 +497,16 @@ impl ManagedVolume {
             BTreeMap<DirectoryKey, DirectoryEntry>,
             _,
         ) = read_index(&self.operator, &commit.directory_entry_index_root).await?;
-        let (publication_cursors, publication_cursor_objects): (BTreeMap<ChangeCursor, ()>, _) =
-            read_index(&self.operator, &commit.publication_cursor_index_root).await?;
         let (operations, operation_objects): (BTreeMap<OperationId, OperationRecord>, _) =
             read_index(&self.operator, &commit.operation_result_index_root).await?;
-        validate_publication_cursors(
-            commit.publication_floor,
-            commit.change_cursor,
-            &publication_cursors,
-        )?;
 
         let mut directories = nodes
             .iter()
             .filter(|(_, node)| node.kind == NodeKind::Directory)
-            .map(|(id, node)| {
+            .map(|(id, _)| {
                 (
                     *id,
                     DirectoryRecord {
-                        node: *id,
-                        generation: node.generation.clone(),
                         entries: BTreeMap::new(),
                     },
                 )
@@ -586,30 +524,22 @@ impl ManagedVolume {
                 .entries
                 .insert(key.name.clone(), *entry);
         }
-        let file_versions = nodes
-            .values()
-            .filter_map(|node| node.file_version)
-            .map(|id| (id, FileVersion::new(id)))
-            .collect();
         let snapshot = VolumeSnapshot {
             volume_id: commit.volume_id,
             cursor: commit.change_cursor,
             root: self.format.root_node_id(),
             nodes,
             directories,
-            file_versions,
         };
         snapshot.validate()?;
         Ok(StoredNamespace {
             snapshot,
-            publication_cursors,
             operations,
             commit,
             directory_entries,
             objects: IndexObjects {
                 nodes: node_objects,
                 directory_entries: directory_entry_objects,
-                publication_cursors: publication_cursor_objects,
                 operations: operation_objects,
             },
         })
@@ -666,7 +596,6 @@ impl ManagedVolume {
 fn empty_snapshot(format: ManagedFormat) -> VolumeSnapshot {
     let volume_id = format.volume_id();
     let root = format.root_node_id();
-    let generation = Generation::from_bytes(0_u64.to_be_bytes().to_vec());
     VolumeSnapshot {
         volume_id,
         cursor: ChangeCursor::Genesis,
@@ -674,8 +603,6 @@ fn empty_snapshot(format: ManagedFormat) -> VolumeSnapshot {
         nodes: BTreeMap::from([(
             root,
             NodeRecord {
-                id: root,
-                generation: generation.clone(),
                 kind: NodeKind::Directory,
                 attributes: NodeAttributes::default(),
                 file_version: None,
@@ -684,66 +611,13 @@ fn empty_snapshot(format: ManagedFormat) -> VolumeSnapshot {
         directories: BTreeMap::from([(
             root,
             DirectoryRecord {
-                node: root,
-                generation,
                 entries: BTreeMap::new(),
             },
         )]),
-        file_versions: BTreeMap::new(),
     }
 }
 
 fn commit_key(digest: Digest) -> String {
     let digest = blake3::Hash::from_bytes(*digest.as_bytes()).to_hex();
     format!("managed/1/objects/commit/{}/{digest}", &digest[..2])
-}
-
-fn validate_publication_cursors(
-    floor: ChangeCursor,
-    current: ChangeCursor,
-    publication_cursors: &BTreeMap<ChangeCursor, ()>,
-) -> Result<(), Error> {
-    if current == ChangeCursor::Genesis {
-        if floor != ChangeCursor::Genesis || !publication_cursors.is_empty() {
-            return Err(Error::corrupt(
-                "read Managed namespace",
-                "genesis namespace has invalid publication cursors",
-            ));
-        }
-        return Ok(());
-    }
-    if floor.sequence() > current.sequence() {
-        return Err(Error::corrupt(
-            "read Managed namespace",
-            "publication floor is ahead of the namespace cursor",
-        ));
-    }
-
-    let first_sequence = floor.sequence().max(1);
-    let expected_records = current.sequence() - first_sequence + 1;
-    if u64::try_from(publication_cursors.len()).ok() != Some(expected_records)
-        || floor != ChangeCursor::Genesis
-            && publication_cursors.keys().next().copied() != Some(floor)
-        || publication_cursors.keys().next_back().copied() != Some(current)
-    {
-        return Err(Error::corrupt(
-            "read Managed namespace",
-            "publication cursor index does not cover its declared range",
-        ));
-    }
-    for (offset, cursor) in publication_cursors.keys().enumerate() {
-        let offset = u64::try_from(offset).map_err(|_| {
-            Error::corrupt(
-                "read Managed namespace",
-                "publication cursor count overflows",
-            )
-        })?;
-        if cursor.sequence() != first_sequence + offset || *cursor == ChangeCursor::Genesis {
-            return Err(Error::corrupt(
-                "read Managed namespace",
-                "publication cursor index is not a continuous sequence",
-            ));
-        }
-    }
-    Ok(())
 }

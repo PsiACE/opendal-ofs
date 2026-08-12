@@ -115,7 +115,6 @@ async fn apply(
         let destination = root.join(path);
         let version = node
             .file_version
-            .and_then(|id| target.file_versions.get(&id))
             .ok_or_else(|| Error::corrupt("install replica", "remote file has no file version"))?;
         let unchanged = if authoritative {
             local_file_matches(&destination, version, node.attributes.executable).await?
@@ -141,14 +140,14 @@ async fn apply(
             test_interrupt()?;
         }
         durability.changed_parent(&destination);
-        files.push((destination, version.clone(), node.attributes.executable));
+        files.push((destination, version, node.attributes.executable));
     }
     futures::stream::iter(files)
         .map(Ok::<_, Error>)
         .try_for_each_concurrent(
             transfer_concurrency,
             |(destination, version, executable)| async move {
-                materialize_file(volume, &version, &destination).await?;
+                materialize_file(volume, version, &destination).await?;
                 if executable {
                     set_executable(&destination, true)?;
                     sync_file(&destination)?;
@@ -164,7 +163,7 @@ async fn apply(
 
 async fn local_file_matches(
     path: &Path,
-    expected: &crate::filesystem::FileVersion,
+    expected: crate::filesystem::FileVersionId,
     executable: bool,
 ) -> Result<bool, Error> {
     let metadata = match std::fs::symlink_metadata(path) {
@@ -175,7 +174,7 @@ async fn local_file_matches(
     if !supported_regular_file(&metadata) || is_executable(&metadata) != executable {
         return Ok(false);
     }
-    Ok(inspect_file(path).await? == *expected)
+    Ok(inspect_file(path).await? == expected)
 }
 
 fn actual_paths(root: &Path) -> Result<Vec<PathBuf>, Error> {

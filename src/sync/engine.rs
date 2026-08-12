@@ -477,22 +477,24 @@ impl SyncEngine {
         target: &VolumeSnapshot,
     ) -> Result<(), Error> {
         let mut new_versions = BTreeSet::new();
+        let common_versions = common
+            .nodes
+            .values()
+            .filter_map(|node| node.file_version)
+            .collect::<BTreeSet<_>>();
         let mut files = Vec::new();
         for (path, node_id) in target.paths()? {
             let node = &target.nodes[&node_id];
             if node.kind != NodeKind::RegularFile {
                 continue;
             }
-            let version = node
-                .file_version
-                .and_then(|id| target.file_versions.get(&id))
-                .ok_or_else(|| {
-                    Error::corrupt("publish Managed files", "pending file has no file version")
-                })?;
-            if common.file_versions.get(&version.id) == Some(version) {
+            let version = node.file_version.ok_or_else(|| {
+                Error::corrupt("publish Managed files", "pending file has no file version")
+            })?;
+            if common_versions.contains(&version) {
                 continue;
             }
-            let publish = new_versions.insert(version.id);
+            let publish = new_versions.insert(version);
             files.push((path, version, publish));
         }
 
@@ -504,7 +506,7 @@ impl SyncEngine {
                     let path = root.join(path);
                     if publish {
                         publish_file(&self.volume, &path, version).await?;
-                    } else if inspect_file(&path).await? != *version {
+                    } else if inspect_file(&path).await? != version {
                         return Err(Error::conflict(
                             "publish Managed files",
                             "local file changed while being published",

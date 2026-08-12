@@ -22,12 +22,12 @@ use tokio::fs::File;
 use tokio::io::AsyncReadExt as _;
 
 use crate::Error;
-use crate::filesystem::{Digest, FileVersion, FileVersionId, OperationId};
+use crate::filesystem::{Digest, FileVersionId, OperationId};
 use crate::managed::ManagedVolume;
 
 const IO_BUFFER_BYTES: usize = 256 * 1024;
 
-pub(super) async fn inspect_file(path: &Path) -> Result<FileVersion, Error> {
+pub(super) async fn inspect_file(path: &Path) -> Result<FileVersionId, Error> {
     let mut file = File::open(path)
         .await
         .map_err(|error| Error::from_io("inspect local file", Some(path), error))?;
@@ -47,16 +47,16 @@ pub(super) async fn inspect_file(path: &Path) -> Result<FileVersion, Error> {
             .checked_add(read as u64)
             .ok_or_else(|| Error::invalid("inspect local file", "file length overflows"))?;
     }
-    Ok(FileVersion::new(FileVersionId::new(
+    Ok(FileVersionId::new(
         Digest::from_bytes(hasher.finalize().into()),
         length,
-    )))
+    ))
 }
 
 pub(super) async fn publish_file(
     volume: &ManagedVolume,
     path: &Path,
-    version: &FileVersion,
+    version: FileVersionId,
 ) -> Result<(), Error> {
     let mut file = File::open(path)
         .await
@@ -69,7 +69,7 @@ pub(super) async fn publish_file(
 
 pub(super) async fn materialize_file(
     volume: &ManagedVolume,
-    version: &FileVersion,
+    version: FileVersionId,
     destination: &Path,
 ) -> Result<(), Error> {
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));

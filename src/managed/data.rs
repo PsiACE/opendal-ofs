@@ -20,7 +20,7 @@ use futures::StreamExt as _;
 use opendal::{Buffer, ErrorKind as StorageErrorKind, Operator};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
-use crate::filesystem::FileVersion;
+use crate::filesystem::FileVersionId;
 use crate::{Error, ErrorKind};
 
 use super::ManagedVolume;
@@ -39,7 +39,7 @@ impl ManagedVolume {
     pub(crate) async fn publish_data(
         &self,
         source: &mut (impl AsyncRead + Unpin),
-        version: &FileVersion,
+        version: FileVersionId,
     ) -> Result<(), Error> {
         let object = whole_object(version)?;
         let mut writer = if let Some(object) = object {
@@ -129,7 +129,7 @@ impl ManagedVolume {
     /// Read and verify one immutable whole-file object into a destination.
     pub(crate) async fn read_data(
         &self,
-        version: &FileVersion,
+        version: FileVersionId,
         destination: &mut (impl AsyncWrite + Unpin),
     ) -> Result<(), Error> {
         if let Some(object) = whole_object(version)? {
@@ -195,7 +195,7 @@ async fn stream_object(
 fn verify_source_identity(
     length: u64,
     digest: [u8; 32],
-    version: &FileVersion,
+    version: FileVersionId,
 ) -> Result<(), Error> {
     if length != version.logical_length() || digest != *version.digest().as_bytes() {
         return Err(Error::invalid(
@@ -206,7 +206,7 @@ fn verify_source_identity(
     Ok(())
 }
 
-pub(super) fn whole_object(version: &FileVersion) -> Result<Option<WholeObject>, Error> {
+pub(super) fn whole_object(version: FileVersionId) -> Result<Option<WholeObject>, Error> {
     let digest = *version.digest().as_bytes();
     match version.logical_length() {
         0 if digest == *blake3::hash(&[]).as_bytes() => Ok(None),

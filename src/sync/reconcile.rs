@@ -20,8 +20,7 @@ use std::num::NonZeroU64;
 
 use crate::Error;
 use crate::filesystem::{
-    ChangeCursor, DirectoryEntry, DirectoryRecord, Generation, NodeId, NodeKind, OperationId,
-    VolumeSnapshot,
+    ChangeCursor, DirectoryEntry, DirectoryRecord, NodeId, NodeKind, OperationId, VolumeSnapshot,
 };
 
 use super::ConflictRecord;
@@ -268,13 +267,7 @@ fn same_entry(
     left_id == right_id
         && left_node.kind == right_node.kind
         && left_node.attributes == right_node.attributes
-        && match (left_node.file_version, right_node.file_version) {
-            (Some(left_version), Some(right_version)) => {
-                left.file_versions[&left_version] == right.file_versions[&right_version]
-            }
-            (None, None) => true,
-            _ => false,
-        }
+        && left_node.file_version == right_node.file_version
 }
 
 fn conflict(
@@ -293,8 +286,7 @@ fn conflict(
 
 fn digest(snapshot: &VolumeSnapshot, node: Option<NodeId>) -> Option<crate::filesystem::Digest> {
     let node = &snapshot.nodes[&node?];
-    let version = snapshot.file_versions.get(&node.file_version?)?;
-    Some(version.digest())
+    Some(node.file_version?.digest())
 }
 
 fn build_target(
@@ -302,19 +294,7 @@ fn build_target(
     remote: &VolumeSnapshot,
     selected: BTreeMap<String, (Source, NodeId)>,
 ) -> Result<VolumeSnapshot, Error> {
-    let next_generation = Generation::from_bytes(
-        remote
-            .cursor
-            .sequence()
-            .checked_add(1)
-            .ok_or_else(|| {
-                Error::corrupt("reconcile replica", "Managed change sequence overflows")
-            })?
-            .to_be_bytes()
-            .to_vec(),
-    );
     let mut nodes = BTreeMap::new();
-    let mut file_versions = BTreeMap::new();
     nodes.insert(remote.root, remote.nodes[&remote.root].clone());
     for (source, node_id) in selected.values() {
         let snapshot = match source {
@@ -322,11 +302,6 @@ fn build_target(
             Source::Remote => remote,
         };
         let node = snapshot.nodes[node_id].clone();
-        if let Some(version_id) = node.file_version {
-            file_versions
-                .entry(version_id)
-                .or_insert_with(|| snapshot.file_versions[&version_id].clone());
-        }
         nodes.insert(*node_id, node);
     }
 
@@ -364,28 +339,7 @@ fn build_target(
 
     let mut directories = BTreeMap::new();
     for (node, entries) in directory_entries {
-        let generation = local
-            .directories
-            .get(&node)
-            .filter(|directory| directory.entries == entries)
-            .or_else(|| {
-                remote
-                    .directories
-                    .get(&node)
-                    .filter(|directory| directory.entries == entries)
-            })
-            .map_or_else(
-                || next_generation.clone(),
-                |directory| directory.generation.clone(),
-            );
-        directories.insert(
-            node,
-            DirectoryRecord {
-                node,
-                generation,
-                entries,
-            },
-        );
+        directories.insert(node, DirectoryRecord { entries });
     }
 
     let target = VolumeSnapshot {
@@ -394,15 +348,11 @@ fn build_target(
         root: remote.root,
         nodes,
         directories,
-        file_versions,
     };
     target.validate()?;
     Ok(target)
 }
 
 fn same_namespace(left: &VolumeSnapshot, right: &VolumeSnapshot) -> bool {
-    left.root == right.root
-        && left.nodes == right.nodes
-        && left.directories == right.directories
-        && left.file_versions == right.file_versions
+    left.root == right.root && left.nodes == right.nodes && left.directories == right.directories
 }
