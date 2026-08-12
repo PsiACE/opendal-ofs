@@ -424,10 +424,9 @@ impl ScaleRoot {
             .duration_since(UNIX_EPOCH)
             .expect("system clock is after the Unix epoch")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "opendal-ofs-managed-sync-scale-{}-{nonce}",
-            std::process::id()
-        ));
+        let scale_root = Path::new(env!("CARGO_WORKSPACE_DIR")).join(".local/scale");
+        fs::create_dir_all(&scale_root).expect("create Managed Sync scale parent");
+        let path = scale_root.join(format!("{}-{nonce}", std::process::id()));
         fs::create_dir(&path).expect("create Managed Sync scale root");
         Self { path, keep }
     }
