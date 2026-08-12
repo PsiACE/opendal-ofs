@@ -17,6 +17,10 @@
 
 //! Managed Sync behavior fixture.
 
+mod scale;
+
+pub(crate) use scale::run as run_scale;
+
 use std::env;
 use std::fs;
 use std::io::Read;

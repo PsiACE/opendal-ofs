@@ -45,6 +45,7 @@ impl Command {
             SubCommand::E2e(cmd) => cmd.run(),
             SubCommand::Licenses(cmd) => cmd.run(),
             SubCommand::Lint(cmd) => cmd.run(),
+            SubCommand::Scale(cmd) => cmd.run(),
             SubCommand::Test(cmd) => cmd.run(),
         }
     }
@@ -64,8 +65,47 @@ enum SubCommand {
     Licenses(CommandLicenses),
     #[clap(about = "Run source and documentation linters.")]
     Lint(CommandLint),
+    #[clap(about = "Run fixed-scale acceptance scenarios.")]
+    Scale(CommandScale),
     #[clap(about = "Run all workspace tests.")]
     Test(CommandTest),
+}
+
+#[derive(Parser)]
+#[clap(name = "scale")]
+struct CommandScale {
+    #[command(subcommand)]
+    target: ScaleTarget,
+}
+
+impl CommandScale {
+    fn run(self) {
+        match self.target {
+            ScaleTarget::ManagedSync(cmd) => cmd.run(),
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum ScaleTarget {
+    #[clap(about = "Run Managed Sync scale acceptance.")]
+    ManagedSync(CommandManagedSyncScale),
+}
+
+#[derive(Parser)]
+#[clap(name = "managed-sync")]
+struct CommandManagedSyncScale {
+    #[arg(value_parser = ["tiny-files", "large-files"])]
+    profile: String,
+
+    #[arg(long, help = "Leave the fixture and generated files after completion.")]
+    keep: bool,
+}
+
+impl CommandManagedSyncScale {
+    fn run(self) {
+        managed_sync::run_scale(&self.profile, self.keep);
+    }
 }
 
 #[derive(Parser)]
