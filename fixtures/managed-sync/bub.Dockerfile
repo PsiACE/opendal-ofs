@@ -19,6 +19,7 @@ FROM rust:1.91-bookworm AS ofs-builder
 ENV RUSTUP_TOOLCHAIN=1.91.1
 WORKDIR /source
 COPY Cargo.toml Cargo.lock LICENSE NOTICE README.md ./
+COPY crates ./crates
 COPY src ./src
 COPY xtask/Cargo.toml ./xtask/Cargo.toml
 COPY xtask/src/main.rs ./xtask/src/main.rs
