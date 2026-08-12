@@ -152,6 +152,21 @@ pub(crate) enum ObjectClass {
 }
 
 impl ObjectClass {
+    pub(crate) const ALL: [Self; 12] = [
+        Self::NamespaceCommit,
+        Self::NodeSegment,
+        Self::DirectorySegment,
+        Self::FileVersionSegment,
+        Self::ChangeSegment,
+        Self::OperationResultSegment,
+        Self::FileExtentSegment,
+        Self::FileShard,
+        Self::ProjectionManifest,
+        Self::ProjectionSegment,
+        Self::ExtensionManifest,
+        Self::ExtensionData,
+    ];
+
     pub(crate) const fn key_segment(self) -> &'static str {
         match self {
             Self::NamespaceCommit => "namespace-commit",
@@ -187,22 +202,9 @@ impl ObjectClass {
     }
 
     pub(crate) fn parse(value: &str) -> Option<Self> {
-        [
-            Self::NamespaceCommit,
-            Self::NodeSegment,
-            Self::DirectorySegment,
-            Self::FileVersionSegment,
-            Self::ChangeSegment,
-            Self::OperationResultSegment,
-            Self::FileExtentSegment,
-            Self::FileShard,
-            Self::ProjectionManifest,
-            Self::ProjectionSegment,
-            Self::ExtensionManifest,
-            Self::ExtensionData,
-        ]
-        .into_iter()
-        .find(|class| class.key_segment() == value)
+        Self::ALL
+            .into_iter()
+            .find(|class| class.key_segment() == value)
     }
 
     pub(crate) const fn from_code(value: u8) -> Option<Self> {

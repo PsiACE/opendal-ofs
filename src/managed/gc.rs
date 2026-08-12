@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -93,25 +93,105 @@ impl ManagedVolume {
         current_epoch: GcEpoch,
         inventory: &mut PartitionedInventory,
     ) -> Result<(), Error> {
+        for epoch in self.old_gc_epochs(current_epoch).await? {
+            for class in ObjectClass::ALL {
+                let class_prefix =
+                    format!("{OBJECT_PREFIX}{}/{}/", epoch.value(), class.key_segment());
+                for prefix in self.object_id_prefixes(&class_prefix).await? {
+                    self.inventory_partition(epoch, class, prefix, inventory)
+                        .await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn old_gc_epochs(&self, current: GcEpoch) -> Result<Vec<GcEpoch>, Error> {
+        let mut epochs = BTreeSet::new();
         let mut lister = self
             .operator()
-            .lister_with(OBJECT_PREFIX)
-            .recursive(true)
+            .lister(OBJECT_PREFIX)
             .await
-            .map_err(|error| Error::from_storage("list Managed objects", error))?;
+            .map_err(|error| Error::from_storage("list Managed GC epochs", error))?;
         while let Some(entry) = lister
             .try_next()
             .await
-            .map_err(|error| Error::from_storage("list Managed objects", error))?
+            .map_err(|error| Error::from_storage("list Managed GC epochs", error))?
+        {
+            let Some(segment) = child_segment(OBJECT_PREFIX, entry.path()) else {
+                continue;
+            };
+            let Ok(value) = segment.parse::<u64>() else {
+                continue;
+            };
+            if value < current.value() {
+                epochs.insert(GcEpoch::from_value(value));
+            }
+        }
+        Ok(epochs.into_iter().collect())
+    }
+
+    async fn object_id_prefixes(&self, class_prefix: &str) -> Result<Vec<u8>, Error> {
+        let mut prefixes = BTreeSet::new();
+        let mut lister = self
+            .operator()
+            .lister(class_prefix)
+            .await
+            .map_err(|error| Error::from_storage("list Managed object prefixes", error))?;
+        while let Some(entry) = lister
+            .try_next()
+            .await
+            .map_err(|error| Error::from_storage("list Managed object prefixes", error))?
+        {
+            let Some(segment) = child_segment(class_prefix, entry.path()) else {
+                continue;
+            };
+            if segment.len() == 2
+                && let Ok(prefix) = u8::from_str_radix(segment, 16)
+            {
+                prefixes.insert(prefix);
+            }
+        }
+        Ok(prefixes.into_iter().collect())
+    }
+
+    async fn inventory_partition(
+        &self,
+        epoch: GcEpoch,
+        class: ObjectClass,
+        prefix: u8,
+        inventory: &mut PartitionedInventory,
+    ) -> Result<(), Error> {
+        let path = format!(
+            "{OBJECT_PREFIX}{}/{}/{prefix:02x}/",
+            epoch.value(),
+            class.key_segment()
+        );
+        let mut lister = self
+            .operator()
+            .lister_with(&path)
+            .recursive(true)
+            .await
+            .map_err(|error| Error::from_storage("list Managed object partition", error))?;
+        while let Some(entry) = lister
+            .try_next()
+            .await
+            .map_err(|error| Error::from_storage("list Managed object partition", error))?
         {
             if !entry.metadata().is_file() {
                 continue;
             }
-            let Some(identity) = ObjectIdentity::parse(entry.path()) else {
-                continue;
-            };
-            if identity.gc_epoch.value() >= current_epoch.value() {
-                continue;
+            let identity = ObjectIdentity::parse(entry.path()).ok_or_else(|| {
+                Error::corrupt("collect Managed objects", "object key is invalid")
+            })?;
+            if identity.gc_epoch != epoch
+                || identity.class != class
+                || identity.id.as_bytes()[0] != prefix
+            {
+                return Err(Error::corrupt(
+                    "collect Managed objects",
+                    "listed object is outside its GC partition",
+                ));
             }
             inventory.candidate(identity, entry.metadata().content_length())?;
         }
@@ -188,6 +268,12 @@ impl ManagedVolume {
             "namespace kept changing while publishing the reclamation watermark",
         ))
     }
+}
+
+fn child_segment<'a>(parent: &str, path: &'a str) -> Option<&'a str> {
+    let relative = path.strip_prefix(parent)?;
+    let segment = relative.split('/').next()?;
+    (!segment.is_empty()).then_some(segment)
 }
 
 struct PartitionedInventory {

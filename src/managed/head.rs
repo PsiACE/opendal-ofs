@@ -54,8 +54,7 @@ pub struct ManagedObservation {
     gc_epoch: GcEpoch,
     operations: BTreeMap<OperationId, OperationRecord>,
     commit: NamespaceCommit,
-    node_values: BTreeMap<NodeId, NodeValue>,
-    directory_entries: BTreeMap<DirectoryKey, DirectoryEntry>,
+    node_states: BTreeMap<NodeId, NodeState>,
 }
 
 #[derive(Default)]
@@ -438,6 +437,21 @@ impl NodeValue {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct NodeState {
+    generation: u64,
+    directory_generation: Option<u64>,
+}
+
+impl From<&NodeValue> for NodeState {
+    fn from(value: &NodeValue) -> Self {
+        Self {
+            generation: value.generation(),
+            directory_generation: value.directory_generation(),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct NodeMutation {
     node_id: NodeId,
@@ -665,10 +679,7 @@ struct StoredNamespace {
     snapshot: VolumeSnapshot,
     operations: BTreeMap<OperationId, OperationRecord>,
     commit: NamespaceCommit,
-    node_values: BTreeMap<NodeId, NodeValue>,
-    directory_entries: BTreeMap<DirectoryKey, DirectoryEntry>,
-    file_versions: BTreeMap<FileVersionId, FileVersionRecord>,
-    file_extents: BTreeMap<FileVersionId, Vec<FileExtent>>,
+    node_states: BTreeMap<NodeId, NodeState>,
 }
 
 impl ManagedVolume {
@@ -738,8 +749,7 @@ impl ManagedVolume {
             gc_epoch: head.gc_epoch,
             operations: stored.operations,
             commit: stored.commit,
-            node_values: stored.node_values,
-            directory_entries: stored.directory_entries,
+            node_states: stored.node_states,
         })
     }
 
@@ -926,11 +936,16 @@ impl ManagedVolume {
                 "namespace contains an unsupported semantic extension",
             ));
         }
-        let stored = self.read_namespace_streams(commit).await?;
-        for extents in stored.file_extents.values() {
-            for extent in extents {
-                visit(extent.shard.object)?;
-            }
+        for reference in &commit.file_extents {
+            require_stream(
+                *reference,
+                StreamKind::FILE_EXTENT_RECORDS,
+                ObjectClass::FileExtentSegment,
+            )?;
+            stream::visit_records(&self.operator, *reference, |record: FileExtentRecord| {
+                visit(record.shard.object)
+            })
+            .await?;
         }
         Ok(())
     }
@@ -940,55 +955,36 @@ impl ManagedVolume {
         reference: NamespaceRevision,
         gc_epoch: GcEpoch,
     ) -> Result<NamespaceRevision, Error> {
-        let stored = self.read_namespace(reference).await?;
-        let change_cursor = stored.commit.change_cursor;
-        let nodes = stored
-            .node_values
+        let source = self.read_commit(reference).await?;
+        let change_cursor = source.change_cursor;
+        let node_values = self.read_node_values(&source, change_cursor).await?;
+        let live_versions = node_values
+            .values()
+            .filter_map(|value| match value {
+                NodeValue::RegularFile { file_version, .. } => Some(*file_version),
+                NodeValue::Directory { .. } => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let nodes = node_values
             .into_iter()
             .map(|(node_id, value)| NodeMutation {
                 node_id,
                 change_cursor,
                 value: Some(value),
-            })
-            .collect::<Vec<_>>();
-        let directory_entries = stored
-            .directory_entries
+            });
+        let directory_entries = self
+            .read_directory_entries(&source, change_cursor)
+            .await?
             .into_iter()
             .map(|(key, value)| DirectoryMutation {
                 parent_node_id: key.parent_node_id,
                 name: key.name,
                 change_cursor,
                 value: Some(value),
-            })
-            .collect::<Vec<_>>();
-        let live_versions = stored
-            .snapshot
-            .nodes
-            .values()
-            .filter_map(|node| node.file_version)
-            .collect::<BTreeSet<_>>();
-        let file_versions = stored
-            .file_versions
-            .into_iter()
-            .filter_map(|(version, record)| live_versions.contains(&version).then_some(record))
-            .collect::<Vec<_>>();
-        let file_extents = stored
-            .file_extents
-            .into_iter()
-            .filter(|(version, _)| live_versions.contains(version))
-            .flat_map(|(version, extents)| {
-                extents.into_iter().map(move |extent| FileExtentRecord {
-                    file_version: version,
-                    logical_range: extent.logical_range,
-                    shard: extent.shard,
-                    object_range: extent.object_range,
-                })
-            })
-            .collect::<Vec<_>>();
-        let operation_results = stored.operations.into_values().collect::<Vec<_>>();
+            });
 
         let mut commit = NamespaceCommit {
-            volume_id: stored.commit.volume_id,
+            volume_id: source.volume_id,
             change_cursor,
             nodes: Vec::new(),
             directory_entries: Vec::new(),
@@ -996,7 +992,7 @@ impl ManagedVolume {
             file_extents: Vec::new(),
             changes: Vec::new(),
             operation_results: Vec::new(),
-            projections: stored.commit.projections,
+            projections: source.projections.clone(),
             extensions: Vec::new(),
         };
         append_stream(
@@ -1017,34 +1013,87 @@ impl ManagedVolume {
             directory_entries,
         )
         .await?;
-        append_stream(
+        self.copy_live_file_streams(&source, &live_versions, gc_epoch, &mut commit)
+            .await?;
+        self.copy_operation_streams(&source, gc_epoch, &mut commit)
+            .await?;
+        self.write_commit(gc_epoch, &commit).await
+    }
+
+    async fn copy_live_file_streams(
+        &self,
+        source: &NamespaceCommit,
+        live_versions: &BTreeSet<FileVersionId>,
+        gc_epoch: GcEpoch,
+        target: &mut NamespaceCommit,
+    ) -> Result<(), Error> {
+        for reference in &source.file_versions {
+            require_stream(
+                *reference,
+                StreamKind::FILE_VERSION_RECORDS,
+                ObjectClass::FileVersionSegment,
+            )?;
+        }
+        if let Some(reference) = stream::rewrite_records::<FileVersionRecord>(
             &self.operator,
+            &source.file_versions,
             gc_epoch,
-            &mut commit.file_versions,
             ObjectClass::FileVersionSegment,
             StreamKind::FILE_VERSION_RECORDS,
-            file_versions,
+            |record| live_versions.contains(&record.file_version),
         )
-        .await?;
-        append_stream(
+        .await?
+        {
+            target.file_versions.push(reference);
+        }
+        for reference in &source.file_extents {
+            require_stream(
+                *reference,
+                StreamKind::FILE_EXTENT_RECORDS,
+                ObjectClass::FileExtentSegment,
+            )?;
+        }
+        if let Some(reference) = stream::rewrite_records::<FileExtentRecord>(
             &self.operator,
+            &source.file_extents,
             gc_epoch,
-            &mut commit.file_extents,
             ObjectClass::FileExtentSegment,
             StreamKind::FILE_EXTENT_RECORDS,
-            file_extents,
+            |record| live_versions.contains(&record.file_version),
         )
-        .await?;
-        append_stream(
+        .await?
+        {
+            target.file_extents.push(reference);
+        }
+        Ok(())
+    }
+
+    async fn copy_operation_streams(
+        &self,
+        source: &NamespaceCommit,
+        gc_epoch: GcEpoch,
+        target: &mut NamespaceCommit,
+    ) -> Result<(), Error> {
+        for reference in &source.operation_results {
+            require_stream(
+                *reference,
+                StreamKind::OPERATION_RESULTS,
+                ObjectClass::OperationResultSegment,
+            )?;
+        }
+        if let Some(reference) = stream::rewrite_records::<OperationRecord>(
             &self.operator,
+            &source.operation_results,
             gc_epoch,
-            &mut commit.operation_results,
             ObjectClass::OperationResultSegment,
             StreamKind::OPERATION_RESULTS,
-            operation_results,
+            |_| true,
         )
-        .await?;
-        self.write_commit(gc_epoch, &commit).await
+        .await?
+        {
+            target.operation_results.push(reference);
+        }
+        Ok(())
     }
 
     async fn write_namespace(
@@ -1057,9 +1106,10 @@ impl ManagedVolume {
         let operation = cursor
             .operation()
             .expect("validated target has an operation identity");
+        let observed_entries = flatten_directories(&observed.snapshot);
         let target_entries = flatten_directories(target);
         let mut node_mutations = Vec::new();
-        let mut node_values = observed.node_values.clone();
+        let mut node_states = observed.node_states.clone();
         let node_ids = observed
             .snapshot
             .nodes
@@ -1076,17 +1126,17 @@ impl ManagedVolume {
             let value = match target_record {
                 Some(record) => {
                     let generation = observed
-                        .node_values
+                        .node_states
                         .get(&node_id)
-                        .map_or(Ok(1), |value| next_generation(value.generation()))?;
+                        .map_or(Ok(1), |state| next_generation(state.generation))?;
                     let value = match record.kind {
                         NodeKind::Directory => {
                             let previous_entries = observed.snapshot.directories.get(&node_id);
                             let target_entries = target.directories.get(&node_id);
                             let directory_generation = observed
-                                .node_values
+                                .node_states
                                 .get(&node_id)
-                                .and_then(NodeValue::directory_generation)
+                                .and_then(|state| state.directory_generation)
                                 .map_or(Ok(1), |value| {
                                     if previous_entries == target_entries {
                                         Ok(value)
@@ -1111,11 +1161,11 @@ impl ManagedVolume {
                             })?,
                         },
                     };
-                    node_values.insert(node_id, value.clone());
+                    node_states.insert(node_id, NodeState::from(&value));
                     Some(value)
                 }
                 None => {
-                    node_values.remove(&node_id);
+                    node_states.remove(&node_id);
                     None
                 }
             };
@@ -1127,14 +1177,13 @@ impl ManagedVolume {
         }
 
         let mut directory_mutations = Vec::new();
-        let entry_keys = observed
-            .directory_entries
+        let entry_keys = observed_entries
             .keys()
             .chain(target_entries.keys())
             .cloned()
             .collect::<BTreeSet<_>>();
         for key in entry_keys {
-            let previous = observed.directory_entries.get(&key);
+            let previous = observed_entries.get(&key);
             let target = target_entries.get(&key);
             if previous == target {
                 continue;
@@ -1156,20 +1205,20 @@ impl ManagedVolume {
                 },
                 None => ChangeEvent::NodeRemoved {
                     node_id: mutation.node_id,
-                    previous_generation: observed.node_values[&mutation.node_id].generation(),
+                    previous_generation: observed.node_states[&mutation.node_id].generation,
                 },
             };
             changes.push(event);
         }
         for mutation in &directory_mutations {
-            let directory_generation = node_values
+            let directory_generation = node_states
                 .get(&mutation.parent_node_id)
-                .and_then(NodeValue::directory_generation)
+                .and_then(|state| state.directory_generation)
                 .or_else(|| {
                     observed
-                        .node_values
+                        .node_states
                         .get(&mutation.parent_node_id)
-                        .and_then(NodeValue::directory_generation)
+                        .and_then(|state| state.directory_generation)
                 })
                 .ok_or_else(|| {
                     Error::invalid(
@@ -1186,7 +1235,7 @@ impl ManagedVolume {
                     directory_generation,
                 },
                 None => {
-                    let previous = observed.directory_entries[&DirectoryKey {
+                    let previous = observed_entries[&DirectoryKey {
                         parent_node_id: mutation.parent_node_id,
                         name: mutation.name.clone(),
                     }];
@@ -1297,62 +1346,6 @@ impl ManagedVolume {
         commit: NamespaceCommit,
         view_cursor: ChangeCursor,
     ) -> Result<StoredNamespace, Error> {
-        let mut node_values = BTreeMap::new();
-        for reference in &commit.nodes {
-            require_stream(
-                *reference,
-                StreamKind::NODE_MUTATIONS,
-                ObjectClass::NodeSegment,
-            )?;
-            stream::visit_records(&self.operator, *reference, |mutation: NodeMutation| {
-                if mutation.change_cursor.sequence() > commit.change_cursor.sequence() {
-                    return Err(Error::corrupt(
-                        "read Managed namespace",
-                        "node mutation is newer than its commit",
-                    ));
-                }
-                if mutation.change_cursor.sequence() > view_cursor.sequence() {
-                    return Ok(());
-                }
-                match mutation.value {
-                    Some(value) => {
-                        node_values.insert(mutation.node_id, value);
-                    }
-                    None => {
-                        node_values.remove(&mutation.node_id);
-                    }
-                }
-                Ok(())
-            })
-            .await?;
-        }
-        let mut directory_entries = BTreeMap::new();
-        for reference in &commit.directory_entries {
-            require_stream(
-                *reference,
-                StreamKind::DIRECTORY_MUTATIONS,
-                ObjectClass::DirectorySegment,
-            )?;
-            stream::visit_records(&self.operator, *reference, |mutation: DirectoryMutation| {
-                if mutation.change_cursor.sequence() > view_cursor.sequence() {
-                    return Ok(());
-                }
-                let key = DirectoryKey {
-                    parent_node_id: mutation.parent_node_id,
-                    name: mutation.name,
-                };
-                match mutation.value {
-                    Some(value) => {
-                        directory_entries.insert(key, value);
-                    }
-                    None => {
-                        directory_entries.remove(&key);
-                    }
-                }
-                Ok(())
-            })
-            .await?;
-        }
         let mut file_versions = BTreeMap::new();
         for reference in &commit.file_versions {
             require_stream(
@@ -1365,6 +1358,34 @@ impl ManagedVolume {
                 Ok(())
             })
             .await?;
+        }
+        let node_values = self.read_node_values(&commit, view_cursor).await?;
+        let mut node_states = BTreeMap::new();
+        let mut nodes = BTreeMap::new();
+        let mut directories = BTreeMap::new();
+        for (id, value) in node_values {
+            node_states.insert(id, NodeState::from(&value));
+            if matches!(value, NodeValue::Directory { .. }) {
+                directories.insert(
+                    id,
+                    DirectoryRecord {
+                        entries: BTreeMap::new(),
+                    },
+                );
+            }
+            nodes.insert(id, value.record(&file_versions));
+        }
+        for (key, entry) in self.read_directory_entries(&commit, view_cursor).await? {
+            directories
+                .get_mut(&key.parent_node_id)
+                .ok_or_else(|| {
+                    Error::corrupt(
+                        "read Managed namespace",
+                        "directory entry parent is missing",
+                    )
+                })?
+                .entries
+                .insert(key.name, entry);
         }
         let mut file_extents = BTreeMap::<FileVersionId, Vec<FileExtent>>::new();
         for reference in &commit.file_extents {
@@ -1409,34 +1430,6 @@ impl ManagedVolume {
             .await?;
         }
 
-        let nodes = node_values
-            .iter()
-            .map(|(id, value)| (*id, value.record(&file_versions)))
-            .collect::<BTreeMap<_, _>>();
-        let mut directories = node_values
-            .iter()
-            .filter(|(_, value)| matches!(value, NodeValue::Directory { .. }))
-            .map(|(id, _)| {
-                (
-                    *id,
-                    DirectoryRecord {
-                        entries: BTreeMap::new(),
-                    },
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        for (key, entry) in &directory_entries {
-            directories
-                .get_mut(&key.parent_node_id)
-                .ok_or_else(|| {
-                    Error::corrupt(
-                        "read Managed namespace",
-                        "directory entry parent is missing",
-                    )
-                })?
-                .entries
-                .insert(key.name.clone(), *entry);
-        }
         let snapshot = VolumeSnapshot {
             volume_id: commit.volume_id,
             cursor: view_cursor,
@@ -1448,28 +1441,93 @@ impl ManagedVolume {
         self.file_versions
             .write()
             .map_err(|_| Error::unavailable("read Managed namespace", "file cache failed"))?
-            .extend(
-                file_versions
-                    .iter()
-                    .map(|(version, record)| (*version, *record)),
-            );
+            .append(&mut file_versions);
         self.file_extents
             .write()
             .map_err(|_| Error::unavailable("read Managed namespace", "file cache failed"))?
-            .extend(
-                file_extents
-                    .iter()
-                    .map(|(version, extents)| (*version, extents.clone())),
-            );
+            .append(&mut file_extents);
         Ok(StoredNamespace {
             snapshot,
             operations,
             commit,
-            node_values,
-            directory_entries,
-            file_versions,
-            file_extents,
+            node_states,
         })
+    }
+
+    async fn read_node_values(
+        &self,
+        commit: &NamespaceCommit,
+        view_cursor: ChangeCursor,
+    ) -> Result<BTreeMap<NodeId, NodeValue>, Error> {
+        let mut values = BTreeMap::new();
+        for reference in &commit.nodes {
+            require_stream(
+                *reference,
+                StreamKind::NODE_MUTATIONS,
+                ObjectClass::NodeSegment,
+            )?;
+            stream::visit_records(&self.operator, *reference, |mutation: NodeMutation| {
+                if mutation.change_cursor.sequence() > commit.change_cursor.sequence() {
+                    return Err(Error::corrupt(
+                        "read Managed namespace",
+                        "node mutation is newer than its commit",
+                    ));
+                }
+                if mutation.change_cursor.sequence() <= view_cursor.sequence() {
+                    match mutation.value {
+                        Some(value) => {
+                            values.insert(mutation.node_id, value);
+                        }
+                        None => {
+                            values.remove(&mutation.node_id);
+                        }
+                    }
+                }
+                Ok(())
+            })
+            .await?;
+        }
+        Ok(values)
+    }
+
+    async fn read_directory_entries(
+        &self,
+        commit: &NamespaceCommit,
+        view_cursor: ChangeCursor,
+    ) -> Result<BTreeMap<DirectoryKey, DirectoryEntry>, Error> {
+        let mut entries = BTreeMap::new();
+        for reference in &commit.directory_entries {
+            require_stream(
+                *reference,
+                StreamKind::DIRECTORY_MUTATIONS,
+                ObjectClass::DirectorySegment,
+            )?;
+            stream::visit_records(&self.operator, *reference, |mutation: DirectoryMutation| {
+                if mutation.change_cursor.sequence() > commit.change_cursor.sequence() {
+                    return Err(Error::corrupt(
+                        "read Managed namespace",
+                        "directory mutation is newer than its commit",
+                    ));
+                }
+                if mutation.change_cursor.sequence() <= view_cursor.sequence() {
+                    let key = DirectoryKey {
+                        parent_node_id: mutation.parent_node_id,
+                        name: mutation.name,
+                    };
+                    match mutation.value {
+                        Some(value) => {
+                            entries.insert(key, value);
+                        }
+                        None => {
+                            entries.remove(&key);
+                        }
+                    }
+                }
+                Ok(())
+            })
+            .await?;
+        }
+        Ok(entries)
     }
 
     pub(super) fn file_version_record(
@@ -1561,8 +1619,8 @@ async fn append_stream<T: Serialize>(
     kind: StreamKind,
     records: impl IntoIterator<Item = T>,
 ) -> Result<(), Error> {
-    let records = records.into_iter().collect::<Vec<_>>();
-    if records.is_empty() {
+    let mut records = records.into_iter().peekable();
+    if records.peek().is_none() {
         return Ok(());
     }
     streams.push(stream::write_records(operator, gc_epoch, class, kind, records).await?);
