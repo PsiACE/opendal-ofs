@@ -194,7 +194,7 @@ impl ManagedVolume {
     }
 
     /// Read and verify one immutable file version into a destination.
-    pub(crate) async fn read_data(
+    pub async fn read_data(
         &self,
         version: FileVersionId,
         destination: &mut (impl AsyncWrite + Unpin),
@@ -205,7 +205,7 @@ impl ManagedVolume {
     }
 
     /// Read and independently verify a selected logical byte range.
-    pub(crate) async fn read_data_range(
+    pub async fn read_data_range(
         &self,
         version: FileVersionId,
         range: Range<u64>,
