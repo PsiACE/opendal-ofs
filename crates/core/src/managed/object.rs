@@ -27,18 +27,18 @@ use crate::filesystem::{Checksum, Digest};
 pub(super) const OBJECT_PREFIX: &str = "managed/1/objects/";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct ObjectId([u8; 16]);
+pub struct ObjectId([u8; 16]);
 
 impl ObjectId {
-    pub(crate) fn generate() -> Self {
+    pub fn generate() -> Self {
         Self(*uuid::Uuid::new_v4().as_bytes())
     }
 
-    pub(crate) const fn as_bytes(&self) -> &[u8; 16] {
+    pub const fn as_bytes(&self) -> &[u8; 16] {
         &self.0
     }
 
-    pub(crate) const fn from_bytes(bytes: [u8; 16]) -> Self {
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
         Self(bytes)
     }
 }
@@ -72,16 +72,16 @@ impl fmt::Display for ObjectId {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
-pub(crate) struct GcEpoch(u64);
+pub struct GcEpoch(u64);
 
 impl GcEpoch {
-    pub(crate) const ZERO: Self = Self(0);
+    pub const ZERO: Self = Self(0);
 
-    pub(crate) const fn value(self) -> u64 {
+    pub const fn value(self) -> u64 {
         self.0
     }
 
-    pub(crate) const fn from_value(value: u64) -> Self {
+    pub const fn from_value(value: u64) -> Self {
         Self(value)
     }
 
@@ -94,12 +94,13 @@ impl GcEpoch {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) enum ObjectClass {
+pub enum ObjectClass {
     NamespaceCommit,
     NamespaceSegment,
     OperationReceiptSegment,
     FileData,
     FilePack,
+    Extension,
 }
 
 impl Serialize for ObjectClass {
@@ -116,6 +117,7 @@ impl<'de> Deserialize<'de> for ObjectClass {
             3 => Ok(Self::OperationReceiptSegment),
             4 => Ok(Self::FileData),
             5 => Ok(Self::FilePack),
+            6 => Ok(Self::Extension),
             value => Err(serde::de::Error::custom(format_args!(
                 "unknown object class {value}"
             ))),
@@ -124,12 +126,13 @@ impl<'de> Deserialize<'de> for ObjectClass {
 }
 
 impl ObjectClass {
-    pub(crate) const ALL: [Self; 5] = [
+    pub(crate) const ALL: [Self; 6] = [
         Self::NamespaceCommit,
         Self::NamespaceSegment,
         Self::OperationReceiptSegment,
         Self::FileData,
         Self::FilePack,
+        Self::Extension,
     ];
 
     const fn code(self) -> u8 {
@@ -139,6 +142,7 @@ impl ObjectClass {
             Self::OperationReceiptSegment => 3,
             Self::FileData => 4,
             Self::FilePack => 5,
+            Self::Extension => 6,
         }
     }
 
@@ -149,6 +153,7 @@ impl ObjectClass {
             Self::OperationReceiptSegment => "03-operation-receipt-segment",
             Self::FileData => "04-file-data",
             Self::FilePack => "05-file-pack",
+            Self::Extension => "06-extension",
         }
     }
 
@@ -160,10 +165,10 @@ impl ObjectClass {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) struct ObjectLocator {
-    pub(crate) gc_epoch: GcEpoch,
-    pub(crate) class: ObjectClass,
-    pub(crate) id: ObjectId,
+pub struct ObjectLocator {
+    pub gc_epoch: GcEpoch,
+    pub class: ObjectClass,
+    pub id: ObjectId,
 }
 
 super::wire::tuple_wire!(ObjectLocator {
@@ -173,7 +178,7 @@ super::wire::tuple_wire!(ObjectLocator {
 });
 
 impl ObjectLocator {
-    pub(crate) fn generate(gc_epoch: GcEpoch, class: ObjectClass) -> Self {
+    pub fn generate(gc_epoch: GcEpoch, class: ObjectClass) -> Self {
         Self {
             gc_epoch,
             class,
@@ -181,7 +186,7 @@ impl ObjectLocator {
         }
     }
 
-    pub(crate) fn key(self) -> String {
+    pub fn key(self) -> String {
         let prefix = self.id.as_bytes()[0];
         format!(
             "{OBJECT_PREFIX}{:020}/{}/{prefix:02x}/{}",
@@ -218,10 +223,10 @@ impl ObjectLocator {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ObjectRef {
-    pub(crate) locator: ObjectLocator,
-    pub(crate) encoded_length: u64,
-    pub(crate) digest: Digest,
+pub struct ObjectRef {
+    pub locator: ObjectLocator,
+    pub encoded_length: u64,
+    pub digest: Digest,
 }
 
 super::wire::tuple_wire!(ObjectRef {
@@ -231,7 +236,7 @@ super::wire::tuple_wire!(ObjectRef {
 });
 
 impl ObjectRef {
-    pub(crate) fn key(self) -> String {
+    pub fn key(self) -> String {
         self.locator.key()
     }
 }

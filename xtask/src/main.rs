@@ -182,6 +182,7 @@ struct CommandManagedSyncBehavior {
             "admission",
             "gc",
             "growing",
+            "extensions",
             "install-recovery",
             "offline-gc",
             "reconcile",

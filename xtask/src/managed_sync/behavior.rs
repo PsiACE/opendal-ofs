@@ -36,6 +36,7 @@ pub(crate) fn run(keep: bool, case: Option<&str>) {
         Some("admission") => lifecycle::admission(&fixture, ofs),
         Some("gc") => recovery::gc(&fixture, ofs),
         Some("growing") => lifecycle::growing(&fixture, ofs),
+        Some("extensions") => lifecycle::extensions(&fixture, ofs),
         Some("install-recovery") => recovery::install_recovery(&fixture, ofs),
         Some("offline-gc") => recovery::offline_gc(&fixture, ofs),
         Some("reconcile") => reconciliation::reconcile(&fixture, ofs),
@@ -46,6 +47,7 @@ pub(crate) fn run(keep: bool, case: Option<&str>) {
         None => {
             lifecycle::admission(&fixture, ofs);
             lifecycle::smoke(&fixture, ofs);
+            lifecycle::extensions(&fixture, ofs);
             reconciliation::reconcile(&fixture, ofs);
             reconciliation::rename(&fixture, ofs);
             recovery::offline_gc(&fixture, ofs);

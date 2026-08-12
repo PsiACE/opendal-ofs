@@ -76,6 +76,57 @@ pub(super) fn growing(fixture: &Fixture, ofs: Ofs) {
     );
 }
 
+pub(super) fn extensions(fixture: &Fixture, ofs: Ofs) {
+    for (name, zstd) in [("fastcdc", false), ("fastcdc-zstd", true)] {
+        let root = CaseRoot::new();
+        let replica_a = root.path.join("replica-a");
+        let replica_b = root.path.join("replica-b");
+        let state_a = root.path.join("state-a");
+        let state_b = root.path.join("state-b");
+        fs::create_dir_all(&replica_a).expect("create extension replica A");
+        fs::create_dir_all(&replica_b).expect("create extension replica B");
+        let storage = fixture.storage_url(&format!("extensions/{name}"));
+
+        require_success(
+            ofs.volume_create_extensions(&storage, zstd),
+            "create extension volume",
+        );
+        let mut contents = deterministic_bytes(3 * 1024 * 1024, 41);
+        fs::write(replica_a.join("stream.bin"), &contents).expect("write extension source file");
+        require_success(
+            ofs.sync(&replica_a, &state_a, &storage),
+            "publish extension file",
+        );
+        require_success(
+            ofs.sync(&replica_b, &state_b, &storage),
+            "cold-install extension file",
+        );
+        assert_eq!(
+            tree_fingerprint(&replica_a),
+            tree_fingerprint(&replica_b),
+            "an extension file converges across replicas"
+        );
+
+        contents[1024 * 1024..1024 * 1024 + 4096].fill(217);
+        fs::write(replica_b.join("stream.bin"), &contents)
+            .expect("update extension file in replica B");
+        require_success(
+            ofs.sync(&replica_b, &state_b, &storage),
+            "publish extension update",
+        );
+        require_success(
+            ofs.sync(&replica_a, &state_a, &storage),
+            "install extension update",
+        );
+        require_success(ofs.gc(&storage), "collect extension volume");
+        assert_eq!(
+            tree_fingerprint(&replica_a),
+            tree_fingerprint(&replica_b),
+            "an updated extension file remains readable after collection"
+        );
+    }
+}
+
 pub(super) fn admission(fixture: &Fixture, ofs: Ofs) {
     let root = CaseRoot::new();
     let replica_a = root.path.join("replica-a");

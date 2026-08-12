@@ -18,6 +18,7 @@
 //! Managed namespace authority and its current visible position.
 
 use opendal::Operator;
+use std::sync::Arc;
 
 use crate::Error;
 use crate::filesystem::{ChangeCursor, VolumeId};
@@ -25,6 +26,7 @@ use crate::namespace::Namespace;
 use crate::workset::WorksetOptions;
 
 use super::data::FileDataRef;
+use super::extension::{AccessContext, FileAccessDyn};
 use super::format::ManagedFormat;
 use super::layout::NamespaceCommit;
 use super::namespace;
@@ -42,6 +44,8 @@ pub struct ManagedVolume {
     pub(super) operator: Operator,
     pub(super) stream_concurrency: usize,
     pub(super) worksets: WorksetOptions,
+    pub(super) file_access: Option<Arc<dyn FileAccessDyn>>,
+    pub(super) access_context: AccessContext,
 }
 
 pub(crate) struct ManagedObservation {
@@ -106,17 +110,21 @@ impl NamespaceRevision {
 }
 
 impl ManagedVolume {
-    pub(super) const fn new(
+    pub(super) fn new(
         format: ManagedFormat,
         operator: Operator,
         stream_concurrency: usize,
         worksets: WorksetOptions,
+        file_access: Option<Arc<dyn FileAccessDyn>>,
     ) -> Self {
+        let access_context = AccessContext::new(operator.clone());
         Self {
             format,
             operator,
             stream_concurrency,
             worksets,
+            file_access,
+            access_context,
         }
     }
 
@@ -126,6 +134,15 @@ impl ManagedVolume {
 
     pub(crate) const fn pack_target_bytes(&self) -> Option<u64> {
         self.format.file_placement().pack_target_bytes()
+    }
+
+    pub(super) fn file_access(&self) -> Result<&dyn FileAccessDyn, Error> {
+        self.file_access.as_deref().ok_or_else(|| {
+            Error::unsupported(
+                "use Managed file extension",
+                "the volume file extension access is unavailable",
+            )
+        })
     }
 
     pub(super) async fn initialize(&self) -> Result<(), Error> {

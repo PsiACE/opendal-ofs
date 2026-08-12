@@ -16,20 +16,21 @@
 # under the License.
 
 [package]
-description = "Managed filesystem extensions"
+description = "Streaming Zstandard extent extension for Apache OpenDAL File System"
 edition.workspace = true
 license.workspace = true
-name = "ofs-extras"
+name = "ofs-ext-zstd"
 publish = false
 repository.workspace = true
 rust-version.workspace = true
 version = "0.0.24"
 
 [dependencies]
+async-compression = { version = "0.4", features = ["tokio", "zstd"] }
+blake3.workspace = true
 ciborium = "0.2"
-ofs-core = { path = "../core" }
-ofs-ext-fastcdc = { path = "../extensions/fastcdc" }
-ofs-ext-zstd = { path = "../extensions/zstd" }
+ofs-core = { path = "../../core" }
+tokio = { version = "1", features = ["io-util"] }
 
 [lints]
 workspace = true

@@ -28,14 +28,18 @@ use super::{
     validate_stream_tail,
 };
 
-pub(crate) async fn write_byte_stream(
+pub(crate) async fn write_byte_stream<R>(
     operator: &Operator,
     gc_epoch: GcEpoch,
-    source: &mut (impl AsyncRead + Unpin),
+    class: ObjectClass,
+    source: &mut R,
     expected_length: u64,
     expected_digest: Digest,
-) -> Result<StreamRef, Error> {
-    let mut writer = ImmutableWriter::open(operator, gc_epoch, ObjectClass::FileData).await?;
+) -> Result<StreamRef, Error>
+where
+    R: AsyncRead + Unpin + ?Sized,
+{
+    let mut writer = ImmutableWriter::open(operator, gc_epoch, class).await?;
     let (payload_length, payload_digest) = writer.write_source(source).await?;
     if payload_length != expected_length || payload_digest != expected_digest {
         writer.abort().await?;
@@ -53,12 +57,35 @@ pub(crate) async fn write_byte_stream(
     .await
 }
 
-pub(crate) async fn copy_byte_stream(
+pub(crate) async fn write_unchecked_byte_stream<R>(
+    operator: &Operator,
+    gc_epoch: GcEpoch,
+    class: ObjectClass,
+    source: &mut R,
+) -> Result<StreamRef, Error>
+where
+    R: AsyncRead + Unpin + ?Sized,
+{
+    let mut writer = ImmutableWriter::open(operator, gc_epoch, class).await?;
+    let (payload_length, payload_digest) = writer.write_source(source).await?;
+    finish_stream(
+        writer,
+        StreamKind::FILE_BYTES,
+        payload_length,
+        payload_digest,
+    )
+    .await
+}
+
+pub(crate) async fn copy_byte_stream<W>(
     operator: &Operator,
     reference: StreamRef,
     range: std::ops::Range<u64>,
-    destination: &mut (impl AsyncWrite + Unpin),
-) -> Result<(), Error> {
+    destination: &mut W,
+) -> Result<(), Error>
+where
+    W: AsyncWrite + Unpin + ?Sized,
+{
     if range.start > range.end || range.end > reference.payload_length {
         return Err(Error::invalid(
             "read Managed byte range",
@@ -103,11 +130,14 @@ pub(crate) async fn copy_byte_stream(
     Ok(())
 }
 
-async fn copy_complete_byte_stream(
+async fn copy_complete_byte_stream<W>(
     operator: &Operator,
     reference: StreamRef,
-    destination: &mut (impl AsyncWrite + Unpin),
-) -> Result<(), Error> {
+    destination: &mut W,
+) -> Result<(), Error>
+where
+    W: AsyncWrite + Unpin + ?Sized,
+{
     validate_stream_layout(reference)?;
     let mut stream = operator
         .reader_with(&reference.object.key())

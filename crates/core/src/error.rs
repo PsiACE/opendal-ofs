@@ -42,11 +42,7 @@ pub struct Error {
 }
 
 impl Error {
-    pub(crate) fn new(
-        kind: ErrorKind,
-        operation: &'static str,
-        message: impl Into<String>,
-    ) -> Self {
+    pub fn new(kind: ErrorKind, operation: &'static str, message: impl Into<String>) -> Self {
         Self {
             kind,
             operation,
@@ -60,8 +56,14 @@ impl Error {
         self.kind
     }
 
-    pub(crate) fn with_context(mut self, key: &'static str, value: impl ToString) -> Self {
+    pub fn with_context(mut self, key: &'static str, value: impl ToString) -> Self {
         self.context.push((key, value.to_string()));
+        self
+    }
+
+    /// Attach the original implementation failure without changing its stable kind.
+    pub fn with_source(mut self, source: impl std::error::Error + Send + Sync + 'static) -> Self {
+        self.source = Some(Box::new(source));
         self
     }
 

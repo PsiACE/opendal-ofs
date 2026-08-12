@@ -28,8 +28,9 @@ use crate::filesystem::Digest;
 use super::object::{ObjectRef, checksum};
 use super::storage::ImmutableWriter;
 
-pub(crate) use bytes::{copy_byte_stream, write_byte_stream};
-pub(crate) use record::{RecordStreamReader, RecordStreamWriter, write_records};
+pub(crate) use bytes::{copy_byte_stream, write_byte_stream, write_unchecked_byte_stream};
+pub(crate) use record::write_records;
+pub use record::{RecordStreamReader, RecordStreamWriter};
 
 const TRAILER_MAGIC: [u8; 8] = *b"OFSSTR01";
 const FOOTER_BYTES: usize = 8 + 32;
@@ -38,7 +39,7 @@ pub(super) const STREAM_TAIL_BYTES: usize = FOOTER_BYTES + TRAILER_BYTES;
 
 #[derive(Clone, Copy, Debug, serde::Deserialize, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
-pub(crate) struct StreamKind(u16);
+pub struct StreamKind(u16);
 
 impl StreamKind {
     pub(crate) const NAMESPACE_SNAPSHOT: Self = Self(1);
@@ -47,17 +48,25 @@ impl StreamKind {
     pub(crate) const NAMESPACE_CHANGES: Self = Self(4);
     pub(crate) const FILE_PACK: Self = Self(5);
 
-    pub(crate) const fn value(self) -> u16 {
+    pub const fn extension(value: u16) -> Option<Self> {
+        if value >= 1024 {
+            Some(Self(value))
+        } else {
+            None
+        }
+    }
+
+    pub const fn value(self) -> u16 {
         self.0
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct StreamRef {
-    pub(crate) kind: StreamKind,
-    pub(crate) object: ObjectRef,
-    pub(crate) payload_length: u64,
-    pub(crate) payload_digest: Digest,
+pub struct StreamRef {
+    pub kind: StreamKind,
+    pub object: ObjectRef,
+    pub payload_length: u64,
+    pub payload_digest: Digest,
 }
 super::wire::tuple_wire!(StreamRef {
     kind: StreamKind,
@@ -67,11 +76,7 @@ super::wire::tuple_wire!(StreamRef {
 });
 
 impl StreamRef {
-    pub(crate) fn require(
-        self,
-        kind: StreamKind,
-        class: super::object::ObjectClass,
-    ) -> Result<(), Error> {
+    pub fn require(self, kind: StreamKind, class: super::object::ObjectClass) -> Result<(), Error> {
         if self.kind != kind || self.object.locator.class != class {
             return Err(Error::corrupt(
                 "read Managed stream",

@@ -22,6 +22,7 @@ use serde::ser::SerializeTuple as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 
+use super::extension::ExtensionFileRef;
 use super::object::{GcEpoch, ObjectClass, ObjectId, ObjectLocator, ObjectRef};
 use super::pack::EntryRef as PackEntryRef;
 use super::stream::{STREAM_TAIL_BYTES, StreamKind, StreamRef};
@@ -51,10 +52,12 @@ super::wire::tuple_wire!(WholeFileRef {
 pub(crate) enum FileDataRef {
     Whole(WholeFileRef),
     Pack(PackEntryRef),
+    Extension(ExtensionFileRef),
 }
 
 const WHOLE_FILE: u8 = 1;
 const PACK_ENTRY: u8 = 2;
+const EXTENSION_FILE: u8 = 3;
 
 impl FileDataRef {
     pub(super) fn from_stream(
@@ -118,6 +121,7 @@ impl FileDataRef {
                 id: reference.object_id,
             },
             Self::Pack(reference) => reference.locator(),
+            Self::Extension(reference) => reference.root.object.locator,
         }
     }
 
@@ -125,6 +129,14 @@ impl FileDataRef {
         match self {
             Self::Whole(_) => None,
             Self::Pack(reference) => Some(reference.offset()),
+            Self::Extension(_) => None,
+        }
+    }
+
+    pub(crate) const fn extension(self) -> Option<ExtensionFileRef> {
+        match self {
+            Self::Extension(reference) => Some(reference),
+            Self::Whole(_) | Self::Pack(_) => None,
         }
     }
 
@@ -136,6 +148,15 @@ impl FileDataRef {
                 .checked_add(fingerprint.logical_length())
                 .map(drop)
                 .ok_or_else(|| Error::corrupt("read Managed file", "pack range overflows")),
+            Self::Extension(reference) => {
+                if reference.root.object.locator.class != ObjectClass::Extension {
+                    return Err(Error::corrupt(
+                        "read Managed file",
+                        "extension root uses the wrong object class",
+                    ));
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -153,6 +174,10 @@ impl Serialize for FileDataRef {
             }
             Self::Pack(reference) => {
                 tuple.serialize_element(&PACK_ENTRY)?;
+                tuple.serialize_element(reference)?;
+            }
+            Self::Extension(reference) => {
+                tuple.serialize_element(&EXTENSION_FILE)?;
                 tuple.serialize_element(reference)?;
             }
         }
@@ -192,6 +217,11 @@ impl<'de> Deserialize<'de> for FileDataRef {
                             .next_element()?
                             .ok_or_else(|| A::Error::custom("pack-entry reference is missing"))?,
                     ),
+                    EXTENSION_FILE => {
+                        Self::Value::Extension(sequence.next_element()?.ok_or_else(|| {
+                            A::Error::custom("extension-file reference is missing")
+                        })?)
+                    }
                     _ => return Err(A::Error::custom("unknown file-data reference kind")),
                 };
                 if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {

@@ -150,10 +150,10 @@ impl ImmutableWriter {
     }
 
     /// Append one source stream and return its length and digest.
-    pub(crate) async fn write_source(
-        &mut self,
-        source: &mut (impl AsyncRead + Unpin),
-    ) -> Result<(u64, Digest), Error> {
+    pub(crate) async fn write_source<R>(&mut self, source: &mut R) -> Result<(u64, Digest), Error>
+    where
+        R: AsyncRead + Unpin + ?Sized,
+    {
         let mut length = 0_u64;
         let mut hasher = Hasher::new();
         loop {

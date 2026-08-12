@@ -166,6 +166,14 @@ pub(crate) struct VolumeCreateArgs {
     #[arg(long, value_name = "MIB")]
     pub(crate) pack_target_mib: Option<NonZeroU64>,
 
+    /// Enable a Managed extension; repeat to compose FastCDC with Zstandard.
+    #[arg(long = "ext", value_enum, value_name = "EXTENSION")]
+    pub(crate) extensions: Vec<ManagedExtension>,
+
+    /// Zstandard compression level used by the zstd extension.
+    #[arg(long, default_value = "3", value_name = "LEVEL")]
+    pub(crate) zstd_level: i32,
+
     #[command(flatten)]
     pub(crate) resources: ManagedResourceArgs,
 }
@@ -173,4 +181,11 @@ pub(crate) struct VolumeCreateArgs {
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub(crate) enum VolumeModel {
     Managed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum ManagedExtension {
+    #[value(name = "fastcdc")]
+    FastCdc,
+    Zstd,
 }

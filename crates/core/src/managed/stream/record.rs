@@ -52,7 +52,7 @@ pub(crate) async fn write_records<T: Serialize>(
     writer.close().await
 }
 
-pub(crate) struct RecordStreamReader<T> {
+pub struct RecordStreamReader<T> {
     reference: StreamRef,
     reader: opendal::FuturesAsyncReader,
     object_hasher: blake3::Hasher,
@@ -62,7 +62,7 @@ pub(crate) struct RecordStreamReader<T> {
 }
 
 impl<T: DeserializeOwned> RecordStreamReader<T> {
-    pub(crate) async fn open(operator: &Operator, reference: StreamRef) -> Result<Self, Error> {
+    pub async fn open(operator: &Operator, reference: StreamRef) -> Result<Self, Error> {
         validate_stream_layout(reference)?;
         Ok(Self {
             reference,
@@ -74,7 +74,7 @@ impl<T: DeserializeOwned> RecordStreamReader<T> {
         })
     }
 
-    pub(crate) async fn next(&mut self) -> Result<Option<T>, Error> {
+    pub async fn next(&mut self) -> Result<Option<T>, Error> {
         loop {
             if let Some(record) = self.records.next() {
                 return Ok(Some(record));
@@ -118,7 +118,7 @@ impl<T: DeserializeOwned> RecordStreamReader<T> {
     }
 }
 
-pub(crate) struct RecordStreamWriter {
+pub struct RecordStreamWriter {
     writer: ImmutableWriter,
     kind: StreamKind,
     payload_length: u64,
@@ -128,7 +128,7 @@ pub(crate) struct RecordStreamWriter {
 }
 
 impl RecordStreamWriter {
-    pub(crate) async fn open(
+    pub async fn open(
         operator: &Operator,
         gc_epoch: GcEpoch,
         class: ObjectClass,
@@ -144,7 +144,7 @@ impl RecordStreamWriter {
         })
     }
 
-    pub(crate) async fn write(&mut self, record: &impl Serialize) -> Result<(), Error> {
+    pub async fn write(&mut self, record: &impl Serialize) -> Result<(), Error> {
         self.record.clear();
         ciborium::into_writer(record, &mut self.record)
             .map_err(|_| Error::invalid("write Managed stream", "record cannot be encoded"))?;
@@ -190,7 +190,7 @@ impl RecordStreamWriter {
         Ok(())
     }
 
-    pub(crate) async fn close(mut self) -> Result<StreamRef, Error> {
+    pub async fn close(mut self) -> Result<StreamRef, Error> {
         self.flush_frame().await?;
         let payload_digest = self.writer.digest();
         finish_stream(self.writer, self.kind, self.payload_length, payload_digest).await

@@ -15,4 +15,93 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Optional Managed extension layers.
+//! Optional Managed extensions.
+
+use ofs_core::filesystem::VolumeId;
+use ofs_core::managed::extension::{
+    ExtensionId, ExtentExtension as _, FileAccessInfo, FileExtension as _, IdentityExtentAccess,
+};
+use ofs_core::managed::{ManagedMetadata, ManagedVolume};
+use ofs_core::{Error, ErrorKind};
+use ofs_ext_fastcdc::{FASTCDC_EXTENSION_ID, FastCdcExtension};
+use ofs_ext_zstd::{ZSTD_EXTENSION_ID, ZstdExtension};
+
+/// Supported file-extension composition selected when a volume is created.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FileExtensions {
+    /// FastCDC layout over identity extents.
+    FastCdc,
+    /// FastCDC layout over independently compressed Zstandard extents.
+    FastCdcZstd { level: i32 },
+}
+
+impl FileExtensions {
+    /// Configure a metadata handle with this statically composed access.
+    pub fn configure(self, metadata: ManagedMetadata) -> ManagedMetadata {
+        match self {
+            Self::FastCdc => {
+                metadata.with_file_extension(FastCdcExtension::new().extend(IdentityExtentAccess))
+            }
+            Self::FastCdcZstd { level } => metadata.with_file_extension(
+                FastCdcExtension::new()
+                    .extend(ZstdExtension::new(level).extend(IdentityExtentAccess)),
+            ),
+        }
+    }
+}
+
+/// Configure the extension access described by an existing volume.
+pub async fn configure_existing(metadata: ManagedMetadata) -> Result<ManagedMetadata, Error> {
+    let Some(info) = metadata.file_extension().await? else {
+        return Ok(metadata);
+    };
+    let extensions = detect(&info)?.ok_or_else(|| {
+        Error::new(
+            ErrorKind::Unsupported,
+            "open Managed volume",
+            "the volume uses an unavailable file extension composition",
+        )
+    })?;
+    Ok(extensions.configure(metadata))
+}
+
+/// Configure and open an existing volume.
+pub async fn open(
+    metadata: ManagedMetadata,
+    expected: Option<VolumeId>,
+) -> Result<ManagedVolume, Error> {
+    configure_existing(metadata).await?.open(expected).await
+}
+
+fn detect(info: &FileAccessInfo) -> Result<Option<FileExtensions>, Error> {
+    if info.layout.id != FASTCDC_EXTENSION_ID {
+        return Ok(None);
+    }
+    let identities = info
+        .extents
+        .iter()
+        .map(|extension| extension.id)
+        .collect::<Vec<ExtensionId>>();
+    if identities == [ExtensionId::IDENTITY] {
+        return Ok(Some(FileExtensions::FastCdc));
+    }
+    if identities == [ZSTD_EXTENSION_ID, ExtensionId::IDENTITY] {
+        let mut input = info.extents[0].configuration.as_slice();
+        let level = ciborium::from_reader(&mut input).map_err(|_| {
+            Error::new(
+                ErrorKind::Corrupt,
+                "open Managed volume",
+                "Zstandard extension configuration is invalid",
+            )
+        })?;
+        if !input.is_empty() {
+            return Err(Error::new(
+                ErrorKind::Corrupt,
+                "open Managed volume",
+                "Zstandard extension configuration has trailing bytes",
+            ));
+        }
+        return Ok(Some(FileExtensions::FastCdcZstd { level }));
+    }
+    Ok(None)
+}

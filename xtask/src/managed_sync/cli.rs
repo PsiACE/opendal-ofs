@@ -68,6 +68,17 @@ impl Ofs {
         command
     }
 
+    pub(super) fn volume_create_extensions(self, storage: &str, zstd: bool) -> Command {
+        let mut command = self.command();
+        command.args([
+            "volume", "create", storage, "--model", "managed", "--ext", "fastcdc",
+        ]);
+        if zstd {
+            command.args(["--ext", "zstd"]);
+        }
+        command
+    }
+
     pub(super) fn sync(self, replica: &Path, state: &Path, storage: &str) -> Command {
         let mut command = self.command();
         command

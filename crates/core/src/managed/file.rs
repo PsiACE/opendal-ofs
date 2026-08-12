@@ -34,13 +34,24 @@ impl ManagedVolume {
     /// Publish one file as an immutable byte stream.
     pub(crate) async fn publish_data(
         &self,
-        source: &mut (impl AsyncRead + Unpin),
+        source: &mut (impl AsyncRead + Send + Unpin),
         fingerprint: FileFingerprint,
         gc_epoch: GcEpoch,
     ) -> Result<FileDataRef, Error> {
+        if matches!(
+            self.format.file_placement(),
+            super::format::FilePlacement::Extension(_)
+        ) {
+            return self
+                .file_access()?
+                .write_dyn(&self.access_context, source, fingerprint, gc_epoch)
+                .await
+                .map(FileDataRef::Extension);
+        }
         let stream = stream::write_byte_stream(
             self.operator(),
             gc_epoch,
+            super::object::ObjectClass::FileData,
             source,
             fingerprint.logical_length(),
             fingerprint.digest(),
@@ -54,7 +65,7 @@ impl ManagedVolume {
         &self,
         content: (FileFingerprint, FileDataRef),
         range: impl RangeBounds<u64>,
-        destination: &mut (impl AsyncWrite + Unpin),
+        destination: &mut (impl AsyncWrite + Send + Unpin),
     ) -> Result<(), Error> {
         let (fingerprint, content) = content;
         let file_size = fingerprint.logical_length();
@@ -77,6 +88,18 @@ impl ManagedVolume {
                 "read Managed file range",
                 "logical byte range is invalid",
             ));
+        }
+        if let FileDataRef::Extension(reference) = content {
+            return self
+                .file_access()?
+                .read_dyn(
+                    &self.access_context,
+                    reference,
+                    fingerprint,
+                    start..end,
+                    destination,
+                )
+                .await;
         }
         if let Some(offset) = content.pack_offset() {
             if start == end {

@@ -23,6 +23,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use std::num::NonZeroU64;
 
+use super::extension::FileAccessInfo;
 use super::record::Record;
 
 pub(crate) const FORMAT_KEY: &str = "managed/1/format";
@@ -32,7 +33,7 @@ const FORMAT_RECORD: Record = Record::new(*b"OFSFMT01", MAX_FORMAT_BODY_BYTES);
 pub(crate) const MAX_FORMAT_BYTES: usize = FORMAT_RECORD.maximum_encoded_bytes();
 
 /// The sole Managed storage format understood by this build.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ManagedFormat {
     volume_id: VolumeId,
     root_node_id: NodeId,
@@ -52,23 +53,23 @@ impl ManagedFormat {
         }
     }
 
-    pub(crate) const fn volume_id(self) -> VolumeId {
+    pub(crate) const fn volume_id(&self) -> VolumeId {
         self.volume_id
     }
 
-    pub(crate) const fn root_node_id(self) -> NodeId {
+    pub(crate) const fn root_node_id(&self) -> NodeId {
         self.root_node_id
     }
 
-    pub(crate) const fn file_placement(self) -> FilePlacement {
-        self.file_placement
+    pub(crate) const fn file_placement(&self) -> &FilePlacement {
+        &self.file_placement
     }
 
-    pub(crate) fn encode(self) -> Result<Vec<u8>, Error> {
+    pub(crate) fn encode(&self) -> Result<Vec<u8>, Error> {
         FORMAT_RECORD.encode(&VolumeFormat {
             volume_id: self.volume_id,
             root_node_id: self.root_node_id,
-            file_placement: self.file_placement,
+            file_placement: self.file_placement.clone(),
         })
     }
 
@@ -83,10 +84,11 @@ impl ManagedFormat {
 }
 
 /// File-data placement fixed for the lifetime of one volume.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum FilePlacement {
     Whole,
     Pack { target_bytes: NonZeroU64 },
+    Extension(FileAccessInfo),
 }
 
 impl Serialize for FilePlacement {
@@ -96,13 +98,17 @@ impl Serialize for FilePlacement {
     {
         let mut tuple = serializer.serialize_tuple(match self {
             Self::Whole => 1,
-            Self::Pack { .. } => 2,
+            Self::Pack { .. } | Self::Extension(_) => 2,
         })?;
         match self {
             Self::Whole => tuple.serialize_element(&1_u8)?,
             Self::Pack { target_bytes } => {
                 tuple.serialize_element(&2_u8)?;
                 tuple.serialize_element(target_bytes)?;
+            }
+            Self::Extension(info) => {
+                tuple.serialize_element(&3_u8)?;
+                tuple.serialize_element(info)?;
             }
         }
         tuple.end()
@@ -137,6 +143,9 @@ impl<'de> Deserialize<'de> for FilePlacement {
                             .next_element()?
                             .ok_or_else(|| A::Error::custom("Pack target bytes are missing"))?,
                     },
+                    3 => FilePlacement::Extension(sequence.next_element()?.ok_or_else(|| {
+                        A::Error::custom("extension access description is missing")
+                    })?),
                     _ => return Err(A::Error::custom("unknown file placement kind")),
                 };
                 if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
@@ -151,10 +160,11 @@ impl<'de> Deserialize<'de> for FilePlacement {
 }
 
 impl FilePlacement {
-    pub(crate) const fn pack_target_bytes(self) -> Option<u64> {
+    pub(crate) const fn pack_target_bytes(&self) -> Option<u64> {
         match self {
             Self::Whole => None,
             Self::Pack { target_bytes } => Some(target_bytes.get()),
+            Self::Extension(_) => None,
         }
     }
 }

@@ -18,6 +18,7 @@
 //! Managed volume authority and durable storage format.
 
 mod data;
+pub mod extension;
 mod file;
 mod format;
 mod gc;
@@ -37,7 +38,7 @@ pub(crate) use format::ManagedFormat;
 pub use gc::GcOutcome;
 pub(crate) use head::ManagedObservation;
 pub use head::{ManagedVolume, NamespaceRevision};
-pub(crate) use object::{GcEpoch, ObjectLocator};
+pub use object::{GcEpoch, ObjectClass, ObjectId, ObjectLocator, ObjectRef};
 pub(crate) use pack::{
     ENTRY_BYTES as PACK_ENTRY_BYTES, RangeReader as PackRangeReader,
     TRAILER_BYTES as PACK_TRAILER_BYTES, Writer as PackWriter,
@@ -45,12 +46,14 @@ pub(crate) use pack::{
 
 use std::num::NonZeroU64;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 use opendal::Operator;
 
 use crate::filesystem::{NodeId, VolumeId};
 use crate::workset::WorksetOptions;
 use crate::{Error, ErrorKind};
+use extension::{FileAccess, FileAccessDyn, FileAccessInfo};
 use format::{FORMAT_KEY, MAX_FORMAT_BYTES};
 
 /// Object Metadata authority for one Managed volume.
@@ -59,6 +62,7 @@ pub struct ManagedMetadata {
     operator: Operator,
     stream_concurrency: usize,
     worksets: WorksetOptions,
+    file_access: Option<Arc<dyn FileAccessDyn>>,
 }
 
 impl ManagedMetadata {
@@ -83,6 +87,22 @@ impl ManagedMetadata {
             operator,
             stream_concurrency: stream_concurrency.get(),
             worksets: WorksetOptions::new(work_memory_mib, stream_concurrency)?,
+            file_access: None,
+        })
+    }
+
+    /// Configure one statically composed file extension access.
+    pub fn with_file_extension(mut self, access: impl FileAccess) -> Self {
+        self.file_access = Some(extension::type_erase(access));
+        self
+    }
+
+    /// Read the file extension description recorded by an existing volume.
+    pub async fn file_extension(&self) -> Result<Option<FileAccessInfo>, Error> {
+        let format = self.read_format().await?;
+        Ok(match format.file_placement() {
+            format::FilePlacement::Extension(info) => Some(info.clone()),
+            format::FilePlacement::Whole | format::FilePlacement::Pack { .. } => None,
         })
     }
 
@@ -108,7 +128,7 @@ impl ManagedMetadata {
             desired
         } else {
             let existing = self.read_format().await?;
-            if existing.file_placement() != file_placement {
+            if existing.file_placement() != desired.file_placement() {
                 return Err(Error::conflict(
                     "create Managed volume",
                     "volume already uses a different file placement",
@@ -121,6 +141,50 @@ impl ManagedMetadata {
             self.operator.clone(),
             self.stream_concurrency,
             self.worksets,
+            self.file_access.clone(),
+        );
+        volume.initialize().await?;
+        Ok(volume)
+    }
+
+    /// Create a volume using the configured file extension access.
+    pub async fn initialize_extension(&self) -> Result<ManagedVolume, Error> {
+        let access = self.file_access.as_ref().ok_or_else(|| {
+            Error::invalid(
+                "create Managed volume",
+                "a file extension access was not configured",
+            )
+        })?;
+        let desired = ManagedFormat::new(
+            VolumeId::generate(),
+            NodeId::generate(),
+            format::FilePlacement::Extension(access.info_dyn()),
+        );
+        let format = if storage::write_control(
+            &self.operator,
+            FORMAT_KEY,
+            desired.encode()?,
+            storage::ControlCondition::Missing,
+        )
+        .await?
+        {
+            desired
+        } else {
+            let existing = self.read_format().await?;
+            if existing.file_placement() != desired.file_placement() {
+                return Err(Error::conflict(
+                    "create Managed volume",
+                    "volume already uses a different file extension access",
+                ));
+            }
+            existing
+        };
+        let volume = ManagedVolume::new(
+            format,
+            self.operator.clone(),
+            self.stream_concurrency,
+            self.worksets,
+            self.file_access.clone(),
         );
         volume.initialize().await?;
         Ok(volume)
@@ -148,11 +212,29 @@ impl ManagedMetadata {
                 "replica state belongs to a different volume",
             ));
         }
+        match (format.file_placement(), self.file_access.as_ref()) {
+            (format::FilePlacement::Extension(expected), Some(access))
+                if access.info_dyn() == *expected => {}
+            (format::FilePlacement::Extension(_), _) => {
+                return Err(Error::unsupported(
+                    "open Managed volume",
+                    "the volume file extension access is not configured",
+                ));
+            }
+            (format::FilePlacement::Whole | format::FilePlacement::Pack { .. }, None) => {}
+            (format::FilePlacement::Whole | format::FilePlacement::Pack { .. }, Some(_)) => {
+                return Err(Error::invalid(
+                    "open Managed volume",
+                    "a file extension access was configured for a core file layout",
+                ));
+            }
+        }
         Ok(ManagedVolume::new(
             format,
             self.operator.clone(),
             self.stream_concurrency,
             self.worksets,
+            self.file_access.clone(),
         ))
     }
 }

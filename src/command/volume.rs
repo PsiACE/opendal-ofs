@@ -17,6 +17,7 @@
 
 use anyhow::Result;
 use ofs::managed::ManagedMetadata;
+use ofs_extras::FileExtensions;
 
 use crate::cli::{VolumeArgs, VolumeCommand, VolumeCreateArgs};
 
@@ -35,6 +36,24 @@ async fn create(args: VolumeCreateArgs) -> Result<()> {
         args.resources.transfer_concurrency,
         args.resources.work_memory_mib,
     )?;
+    let file_extensions = match args.extensions.as_slice() {
+        [] => None,
+        [crate::cli::ManagedExtension::FastCdc] => Some(FileExtensions::FastCdc),
+        [
+            crate::cli::ManagedExtension::FastCdc,
+            crate::cli::ManagedExtension::Zstd,
+        ]
+        | [
+            crate::cli::ManagedExtension::Zstd,
+            crate::cli::ManagedExtension::FastCdc,
+        ] => Some(FileExtensions::FastCdcZstd {
+            level: args.zstd_level,
+        }),
+        _ => anyhow::bail!("--ext accepts fast-cdc once, optionally composed with zstd once"),
+    };
+    if file_extensions.is_some() && args.pack_target_mib.is_some() {
+        anyhow::bail!("--pack-target-mib cannot be combined with --ext");
+    }
     let pack_target_bytes = args
         .pack_target_mib
         .map(|target| {
@@ -45,7 +64,15 @@ async fn create(args: VolumeCreateArgs) -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("--pack-target-mib overflows"))
         })
         .transpose()?;
-    let volume = metadata.initialize(pack_target_bytes).await?;
+    let volume = match file_extensions {
+        Some(extensions) => {
+            extensions
+                .configure(metadata)
+                .initialize_extension()
+                .await?
+        }
+        None => metadata.initialize(pack_target_bytes).await?,
+    };
     println!("created managed volume {}", volume.id());
     Ok(())
 }

@@ -28,7 +28,7 @@ pub(super) async fn run(args: GcArgs) -> Result<()> {
         args.resources.transfer_concurrency,
         args.resources.work_memory_mib,
     )?;
-    let volume = metadata.open(None).await?;
+    let volume = ofs_extras::open(metadata, None).await?;
     let outcome = volume.collect_unreachable().await?;
     println!(
         "collected managed volume {}: scanned {}, deleted {} object(s), {} byte(s)",

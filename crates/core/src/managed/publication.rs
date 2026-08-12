@@ -17,6 +17,7 @@
 
 //! Immutable namespace commits, operation receipts, and atomic publication.
 
+use crate::filesystem::NamespaceValue;
 use crate::filesystem::{ChangeCursor, OperationId};
 use crate::namespace::Namespace;
 use crate::{Error, ErrorKind};
@@ -212,12 +213,28 @@ impl ManagedVolume {
         &self,
         reference: NamespaceRevision,
         gc_epoch: GcEpoch,
-        mut visit: impl FnMut(ObjectLocator) -> Result<(), Error>,
+        mut visit: impl FnMut(ObjectLocator) -> Result<(), Error> + Send,
     ) -> Result<NamespaceRevision, Error> {
         let source = read_commit(self, reference).await?;
         let current = namespace::read(self, &source, source.change_cursor).await?;
+        let mut records = current.reader()?;
+        while let Some(record) = records.next()? {
+            let Some(node) = record.value else {
+                continue;
+            };
+            let NamespaceValue::RegularFile { content, .. } = node.value else {
+                continue;
+            };
+            if let Some(reference) = content.extension() {
+                self.file_access()?
+                    .visit_reachable_dyn(&self.access_context, reference, &mut visit)
+                    .await?;
+            } else {
+                visit(content.object_locator())?;
+            }
+        }
         let namespace_stream =
-            namespace::write_snapshot(self, &current, gc_epoch, &mut visit).await?;
+            namespace::write_snapshot(self, &current, gc_epoch, |_| Ok(())).await?;
         visit(namespace_stream.object.locator)?;
         for receipt in &source.operation_receipts {
             visit(receipt.stream.object.locator)?;
