@@ -28,6 +28,7 @@ use crate::namespace::Namespace;
 use crate::workset::{self, Spool, Workspace};
 
 use super::local_fs::{self, DirectoryDurability, StoredPath};
+use super::pack::{self, Installation as PackInstallation};
 use super::transfer::materialize_file;
 
 pub(crate) async fn install<C: DeserializeOwned>(
@@ -75,6 +76,7 @@ async fn apply<C: DeserializeOwned>(
     }
 
     let mut file_installations = FuturesUnordered::new();
+    let mut packed = workspace.writer("packed-file-installations")?;
     let mut current_reader = current.map(Namespace::reader).transpose()?;
     let mut current_record = current_reader
         .as_mut()
@@ -137,14 +139,25 @@ async fn apply<C: DeserializeOwned>(
             continue;
         }
         let executable = node.attributes.executable;
-        file_installations.push(install_file(
-            volume,
-            destination,
-            fingerprint,
-            content,
-            executable,
-            authoritative,
-        ));
+        if let Some(offset) = content.pack_offset() {
+            packed.write(&PackInstallation::create(
+                content.object_locator(),
+                offset,
+                &destination,
+                fingerprint,
+                executable,
+                authoritative,
+            )?)?;
+        } else {
+            file_installations.push(install_file(
+                volume,
+                destination,
+                fingerprint,
+                content,
+                executable,
+                authoritative,
+            ));
+        }
         if file_installations.len() >= transfer_concurrency
             && let Some(destination) = file_installations
                 .next()
@@ -159,6 +172,15 @@ async fn apply<C: DeserializeOwned>(
             durability.changed_parent(&destination)?;
         }
     }
+
+    pack::install(
+        volume,
+        &workspace,
+        &packed.finish()?,
+        transfer_concurrency,
+        &mut durability,
+    )
+    .await?;
     durability.sync(&workspace)?;
     Ok(())
 }
@@ -178,10 +200,7 @@ async fn install_file(
         local_fs::remove_replaced_directory(&destination)?;
         crate::fault::check("during-install")?;
     }
-    materialize_file(volume, (fingerprint, content), &destination).await?;
-    if executable {
-        local_fs::make_executable(&destination)?;
-    }
+    materialize_file(volume, (fingerprint, content), &destination, executable).await?;
     crate::fault::check("during-install")?;
     Ok(Some(destination))
 }

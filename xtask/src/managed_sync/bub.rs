@@ -358,7 +358,16 @@ fn container_volume_create(fixture: &Fixture, service: &str, storage: &str) {
     container_success(
         fixture,
         service,
-        &["ofs", "volume", "create", storage, "--model", "managed"],
+        &[
+            "ofs",
+            "volume",
+            "create",
+            storage,
+            "--model",
+            "managed",
+            "--pack-target-mib",
+            "8",
+        ],
         "create Managed volume",
     );
 }

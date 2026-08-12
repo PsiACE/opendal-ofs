@@ -35,7 +35,17 @@ async fn create(args: VolumeCreateArgs) -> Result<()> {
         args.resources.transfer_concurrency,
         args.resources.work_memory_mib,
     )?;
-    let volume = metadata.initialize().await?;
+    let pack_target_bytes = args
+        .pack_target_mib
+        .map(|target| {
+            target
+                .get()
+                .checked_mul(1024 * 1024)
+                .and_then(std::num::NonZeroU64::new)
+                .ok_or_else(|| anyhow::anyhow!("--pack-target-mib overflows"))
+        })
+        .transpose()?;
+    let volume = metadata.initialize(pack_target_bytes).await?;
     println!("created managed volume {}", volume.id());
     Ok(())
 }

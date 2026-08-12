@@ -227,11 +227,18 @@ impl Fixture {
             ])
             .output()
             .expect("inspect Managed storage usage");
-        assert!(
-            output.status.success(),
-            "inspect Managed storage usage failed: {}",
-            output_text(&output.stderr)
-        );
+        if !output.status.success() {
+            let missing = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+                .ok()
+                .and_then(|document| document["error"]["message"].as_str().map(str::to_owned))
+                .is_some_and(|message| message.contains("is not a folder"));
+            assert!(
+                missing,
+                "inspect Managed storage usage failed: {}",
+                output_text(&output.stderr)
+            );
+            return (0, 0);
+        }
         let document: serde_json::Value =
             serde_json::from_slice(&output.stdout).expect("Managed storage usage is valid JSON");
         let field = |name| {

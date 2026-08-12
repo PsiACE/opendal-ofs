@@ -72,37 +72,85 @@ pub(super) async fn materialize_file(
     volume: &ManagedVolume,
     content: (FileFingerprint, FileDataRef),
     destination: &Path,
+    executable: bool,
 ) -> Result<(), Error> {
-    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
-    tokio::fs::create_dir_all(parent)
+    let mut staging = StagedFile::create(destination).await?;
+    let result = volume
+        .read_data(content, .., staging.writer())
         .await
-        .map_err(|error| Error::from_io("create replica directory", Some(parent), error))?;
-    let name = destination
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("file");
-    let temporary = destination.with_file_name(format!(".{name}.{}.tmp", OperationId::generate()));
-    let result = async {
-        let mut file = File::create(&temporary).await.map_err(|error| {
-            Error::from_io("create replica staging file", Some(&temporary), error)
-        })?;
-        volume
-            .read_data(content, .., &mut file)
-            .await
-            .map_err(|error| error.with_context("path", temporary.display()))?;
-        file.sync_all().await.map_err(|error| {
-            Error::from_io("persist replica staging file", Some(&temporary), error)
-        })?;
-        drop(file);
-        tokio::fs::rename(&temporary, destination)
-            .await
-            .map_err(|error| Error::from_io("install replica file", Some(destination), error))?;
-        Ok(())
-    }
-    .await;
+        .map_err(|error| error.with_context("path", staging.path().display()));
     if let Err(error) = result {
-        let _ = tokio::fs::remove_file(&temporary).await;
+        staging.abort().await;
         return Err(error);
     }
-    Ok(())
+    staging.commit(executable).await
+}
+
+/// One durable local-file installation shared by every data placement.
+pub(super) struct StagedFile {
+    destination: std::path::PathBuf,
+    temporary: std::path::PathBuf,
+    file: Option<File>,
+}
+
+impl StagedFile {
+    pub(super) async fn create(destination: &Path) -> Result<Self, Error> {
+        let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|error| Error::from_io("create replica directory", Some(parent), error))?;
+        let name = destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("file");
+        let temporary =
+            destination.with_file_name(format!(".{name}.{}.tmp", OperationId::generate()));
+        let file = File::create(&temporary).await.map_err(|error| {
+            Error::from_io("create replica staging file", Some(&temporary), error)
+        })?;
+        Ok(Self {
+            destination: destination.to_owned(),
+            temporary,
+            file: Some(file),
+        })
+    }
+
+    pub(super) fn writer(&mut self) -> &mut File {
+        self.file.as_mut().expect("staging file is open")
+    }
+
+    pub(super) fn path(&self) -> &Path {
+        &self.temporary
+    }
+
+    pub(super) async fn commit(mut self, executable: bool) -> Result<(), Error> {
+        let file = self.file.take().expect("staging file is open");
+        if let Err(error) = file.sync_all().await {
+            drop(file);
+            let _ = tokio::fs::remove_file(&self.temporary).await;
+            return Err(Error::from_io(
+                "persist replica staging file",
+                Some(&self.temporary),
+                error,
+            ));
+        }
+        drop(file);
+        if let Err(error) = tokio::fs::rename(&self.temporary, &self.destination).await {
+            let _ = tokio::fs::remove_file(&self.temporary).await;
+            return Err(Error::from_io(
+                "install replica file",
+                Some(&self.destination),
+                error,
+            ));
+        }
+        if executable {
+            super::local_fs::make_executable(&self.destination)?;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn abort(mut self) {
+        drop(self.file.take());
+        let _ = tokio::fs::remove_file(&self.temporary).await;
+    }
 }

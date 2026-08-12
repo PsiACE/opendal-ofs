@@ -19,11 +19,14 @@
 
 use blake3::Hasher;
 use opendal::{Buffer, ErrorKind as StorageErrorKind, Operator, Writer};
+use tokio::io::{AsyncRead, AsyncReadExt as _};
 
 use crate::Error;
 use crate::filesystem::Digest;
 
 use super::object::{GcEpoch, ObjectClass, ObjectLocator, ObjectRef};
+
+const SOURCE_BUFFER_BYTES: usize = 256 * 1024;
 
 pub(crate) struct ControlObject {
     pub(crate) bytes: Vec<u8>,
@@ -144,6 +147,36 @@ impl ImmutableWriter {
             return Err(error);
         }
         Ok(())
+    }
+
+    /// Append one source stream and return its length and digest.
+    pub(crate) async fn write_source(
+        &mut self,
+        source: &mut (impl AsyncRead + Unpin),
+    ) -> Result<(u64, Digest), Error> {
+        let mut length = 0_u64;
+        let mut hasher = Hasher::new();
+        loop {
+            let mut bytes = vec![0; SOURCE_BUFFER_BYTES];
+            let read = match source.read(&mut bytes).await {
+                Ok(read) => read,
+                Err(error) => {
+                    let error = Error::io("read Managed object source", error);
+                    let _ = self.abort().await;
+                    return Err(error);
+                }
+            };
+            if read == 0 {
+                break;
+            }
+            bytes.truncate(read);
+            length = length
+                .checked_add(read as u64)
+                .ok_or_else(|| Error::invalid("write Managed object", "source length overflows"))?;
+            hasher.update(&bytes);
+            self.write(bytes).await?;
+        }
+        Ok((length, Digest::from_bytes(hasher.finalize().into())))
     }
 
     pub(crate) fn digest(&self) -> Digest {

@@ -25,6 +25,7 @@ use crate::Error;
 use crate::filesystem::FileFingerprint;
 
 use super::ManagedVolume;
+use super::PackRangeReader;
 use super::data::FileDataRef;
 use super::object::GcEpoch;
 use super::stream;
@@ -77,12 +78,35 @@ impl ManagedVolume {
                 "logical byte range is invalid",
             ));
         }
-        stream::copy_byte_stream(
-            self.operator(),
-            content.stream_ref(fingerprint)?,
-            start..end,
-            destination,
-        )
-        .await
+        if let Some(offset) = content.pack_offset() {
+            if start == end {
+                return Ok(());
+            }
+            let physical_start = offset
+                .checked_add(start)
+                .ok_or_else(|| Error::corrupt("read Managed file", "pack range start overflows"))?;
+            let physical_end = offset
+                .checked_add(end)
+                .ok_or_else(|| Error::corrupt("read Managed file", "pack range end overflows"))?;
+            let mut reader = PackRangeReader::open(
+                self.operator(),
+                content.object_locator(),
+                physical_start..physical_end,
+            )
+            .await?;
+            if start == 0 && end == file_size {
+                reader.copy_file(fingerprint, destination).await
+            } else {
+                reader.copy_bytes(end - start, destination).await
+            }
+        } else {
+            stream::copy_byte_stream(
+                self.operator(),
+                content.stream_ref(fingerprint)?,
+                start..end,
+                destination,
+            )
+            .await
+        }
     }
 }

@@ -17,17 +17,19 @@
 
 //! Durable file publication followed by atomic namespace publication.
 
-use std::path::Path;
-
-use futures::TryStreamExt as _;
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
 
 use crate::Error;
 use crate::filesystem::{NamespaceValue, OperationId};
-use crate::managed::{FileDataRef, ManagedObservation, NamespaceRevision};
+use crate::managed::{FileDataRef, ManagedObservation, ManagedVolume, NamespaceRevision};
 use crate::namespace::Namespace;
-use crate::workset::{self, Workspace};
+use crate::workset::{self, Spool, SpoolWriter, Workspace};
+use futures::stream::{FuturesUnordered, StreamExt as _};
 
 use super::SyncEngine;
+use super::pack::{self, PendingFile, PublicationPlan};
 use super::state::ReplicaState;
 use super::transfer::publish_file;
 
@@ -67,43 +69,78 @@ impl SyncEngine {
     ) -> Result<Namespace<FileDataRef>, Error> {
         let workspace = Workspace::create(self.volume.workset_options())?;
         let mut completed = workspace.writer("completed-file-publications")?;
-        let publications = target
-            .entries
-            .stream()?
-            .try_filter_map(|record| async move {
-                let Some(node) = record.value.as_ref() else {
-                    return Err(Error::corrupt(
-                        "publish Managed files",
-                        "current namespace contains a tombstone",
-                    ));
+        let mut publications = FuturesUnordered::<PublicationFuture>::new();
+        let mut pack = None;
+        let pack_target = self.volume.pack_target_bytes();
+        let mut target_reader = target.reader()?;
+        while let Some(record) = target_reader.next()? {
+            let Some(node) = record.value.as_ref() else {
+                return Err(Error::corrupt(
+                    "publish Managed files",
+                    "current namespace contains a tombstone",
+                ));
+            };
+            let NamespaceValue::RegularFile {
+                fingerprint,
+                content: None,
+                ..
+            } = &node.value
+            else {
+                continue;
+            };
+            let pending = PendingFile {
+                path: record.path,
+                fingerprint: *fingerprint,
+            };
+            if pack_target.is_some_and(|target| PublicationPlan::accepts(target, *fingerprint)) {
+                let target = pack_target.expect("Pack placement has a target");
+                if pack
+                    .as_ref()
+                    .is_some_and(|plan: &PublicationPlan| plan.would_overflow(target, *fingerprint))
+                {
+                    schedule_pack(
+                        &mut publications,
+                        pack.take().expect("non-empty Pack plan"),
+                        self.volume.clone(),
+                        workspace.clone(),
+                        root.to_owned(),
+                        observed.gc_epoch(),
+                    )?;
+                }
+                let plan = match pack.as_mut() {
+                    Some(plan) => plan,
+                    None => pack.insert(PublicationPlan::create(&workspace)?),
                 };
-                let publication = match &node.value {
-                    NamespaceValue::RegularFile {
-                        fingerprint,
-                        content: None,
-                        ..
-                    } => Some((record.path, *fingerprint)),
-                    NamespaceValue::Directory { .. }
-                    | NamespaceValue::RegularFile {
-                        content: Some(_), ..
-                    } => None,
-                };
-                Ok(publication)
-            })
-            .map_ok(|(path, fingerprint)| async move {
-                let content = publish_file(
-                    &self.volume,
-                    &root.join(&path),
-                    fingerprint,
+                plan.push(pending)?;
+            } else {
+                schedule_file(
+                    &mut publications,
+                    self.volume.clone(),
+                    root.to_owned(),
+                    pending,
                     observed.gc_epoch(),
-                )
-                .await?;
-                Ok::<_, Error>((path, content))
-            })
-            .try_buffer_unordered(self.transfer_concurrency);
-        futures::pin_mut!(publications);
-        while let Some(publication) = publications.try_next().await? {
-            completed.write(&publication)?;
+                );
+            }
+            if publications.len() >= self.transfer_concurrency {
+                let publication = publications
+                    .next()
+                    .await
+                    .expect("a file publication remains")?;
+                record_publication(&mut completed, publication)?;
+            }
+        }
+        if let Some(pack) = pack {
+            schedule_pack(
+                &mut publications,
+                pack,
+                self.volume.clone(),
+                workspace.clone(),
+                root.to_owned(),
+                observed.gc_epoch(),
+            )?;
+        }
+        while let Some(publication) = publications.next().await {
+            record_publication(&mut completed, publication?)?;
         }
 
         let completed = workset::sort(
@@ -155,5 +192,59 @@ impl SyncEngine {
             root: target.root,
             entries: output.finish()?,
         })
+    }
+}
+
+enum PublishedFiles {
+    One(String, FileDataRef),
+    Pack(Spool<(String, FileDataRef)>),
+}
+
+type PublicationFuture = Pin<Box<dyn Future<Output = Result<PublishedFiles, Error>> + Send>>;
+
+fn schedule_file(
+    publications: &mut FuturesUnordered<PublicationFuture>,
+    volume: ManagedVolume,
+    root: PathBuf,
+    file: PendingFile,
+    gc_epoch: crate::managed::GcEpoch,
+) {
+    publications.push(Box::pin(async move {
+        let content =
+            publish_file(&volume, &root.join(&file.path), file.fingerprint, gc_epoch).await?;
+        Ok(PublishedFiles::One(file.path, content))
+    }));
+}
+
+fn schedule_pack(
+    publications: &mut FuturesUnordered<PublicationFuture>,
+    plan: PublicationPlan,
+    volume: ManagedVolume,
+    workspace: Workspace,
+    root: PathBuf,
+    gc_epoch: crate::managed::GcEpoch,
+) -> Result<(), Error> {
+    let files = plan.finish()?;
+    publications.push(Box::pin(async move {
+        pack::publish(&volume, &workspace, &root, &files, gc_epoch)
+            .await
+            .map(PublishedFiles::Pack)
+    }));
+    Ok(())
+}
+
+fn record_publication(
+    completed: &mut SpoolWriter<(String, FileDataRef)>,
+    publication: PublishedFiles,
+) -> Result<(), Error> {
+    match publication {
+        PublishedFiles::One(path, content) => completed.write(&(path, content)),
+        PublishedFiles::Pack(files) => {
+            let mut files = files.reader()?;
+            while let Some(file) = files.next()? {
+                completed.write(&file)?;
+            }
+            Ok(())
+        }
     }
 }

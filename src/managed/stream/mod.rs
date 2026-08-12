@@ -45,6 +45,7 @@ impl StreamKind {
     pub(crate) const OPERATION_RECEIPTS: Self = Self(2);
     pub(crate) const FILE_BYTES: Self = Self(3);
     pub(crate) const NAMESPACE_CHANGES: Self = Self(4);
+    pub(crate) const FILE_PACK: Self = Self(5);
 
     pub(crate) const fn value(self) -> u16 {
         self.0

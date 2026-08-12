@@ -22,7 +22,7 @@ use crate::workset::{self, Spool, Workspace};
 use crate::{Error, ErrorKind};
 
 use super::ManagedVolume;
-use super::object::{GcEpoch, OBJECT_PREFIX, ObjectLocator, ObjectRef};
+use super::object::{GcEpoch, OBJECT_PREFIX, ObjectLocator};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct GcOutcome {
@@ -60,7 +60,7 @@ impl ManagedVolume {
         let mut records = workspace.writer("gc-reachable")?;
         let collection_commit = self
             .compact_for_collection(previous_commit, collection_epoch, |reference| {
-                records.write(&ObjectRecord::from_ref(reference))
+                records.write(&reference)
             })
             .await?;
         rotated.current_commit = collection_commit;
@@ -72,7 +72,7 @@ impl ManagedVolume {
             ));
         }
 
-        let marks = workset::sort(&workspace, &records.finish()?, |record| record.identity)?;
+        let marks = workset::sort(&workspace, &records.finish()?, |identity| *identity)?;
         let candidates = self.inventory_workset(&workspace, collection_epoch).await?;
         let outcome = self.sweep_worksets(&marks, &candidates).await?;
         self.advance_reclamation_watermark(collection_commit.cursor())
@@ -116,7 +116,7 @@ impl ManagedVolume {
 
     async fn sweep_worksets(
         &self,
-        marks: &Spool<ObjectRecord>,
+        marks: &Spool<ObjectLocator>,
         candidates: &Spool<ObjectRecord>,
     ) -> Result<GcOutcome, Error> {
         let mut marks = marks.reader()?;
@@ -133,21 +133,12 @@ impl ManagedVolume {
             outcome.scanned = outcome.scanned.checked_add(1).ok_or_else(|| {
                 Error::corrupt("collect Managed objects", "scanned object count overflows")
             })?;
-            while mark
-                .as_ref()
-                .is_some_and(|mark| mark.identity < candidate.identity)
-            {
+            while mark.as_ref().is_some_and(|mark| *mark < candidate.identity) {
                 mark = next_unique_mark(&mut marks, mark.take())?;
             }
             if let Some(reachable) = mark.as_ref()
-                && reachable.identity == candidate.identity
+                && *reachable == candidate.identity
             {
-                if reachable.length != candidate.length {
-                    return Err(Error::corrupt(
-                        "collect Managed objects",
-                        "reachable object length changed",
-                    ));
-                }
                 continue;
             }
             deleter
@@ -189,19 +180,13 @@ impl ManagedVolume {
 }
 
 fn next_unique_mark(
-    reader: &mut workset::SpoolReader<ObjectRecord>,
-    previous: Option<ObjectRecord>,
-) -> Result<Option<ObjectRecord>, Error> {
+    reader: &mut workset::SpoolReader<ObjectLocator>,
+    previous: Option<ObjectLocator>,
+) -> Result<Option<ObjectLocator>, Error> {
     let mut next = reader.next()?;
     while let (Some(previous), Some(current)) = (previous, next) {
-        if previous.identity != current.identity {
+        if previous != current {
             return Ok(Some(current));
-        }
-        if previous.length != current.length {
-            return Err(Error::corrupt(
-                "collect Managed objects",
-                "one reachable object has conflicting lengths",
-            ));
         }
         next = reader.next()?;
     }
@@ -212,13 +197,4 @@ fn next_unique_mark(
 struct ObjectRecord {
     identity: ObjectLocator,
     length: u64,
-}
-
-impl ObjectRecord {
-    const fn from_ref(reference: ObjectRef) -> Self {
-        Self {
-            identity: reference.locator,
-            length: reference.encoded_length,
-        }
-    }
 }

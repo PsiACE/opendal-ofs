@@ -28,7 +28,7 @@ use super::layout::{
     OperationReceiptSegment, should_merge,
 };
 use super::namespace;
-use super::object::{GcEpoch, ObjectClass, ObjectRef};
+use super::object::{GcEpoch, ObjectClass, ObjectLocator};
 use super::record::Record;
 use super::storage;
 use super::stream::{self, RecordStreamReader, RecordStreamWriter, StreamKind};
@@ -212,15 +212,15 @@ impl ManagedVolume {
         &self,
         reference: NamespaceRevision,
         gc_epoch: GcEpoch,
-        mut visit: impl FnMut(ObjectRef) -> Result<(), Error>,
+        mut visit: impl FnMut(ObjectLocator) -> Result<(), Error>,
     ) -> Result<NamespaceRevision, Error> {
         let source = read_commit(self, reference).await?;
         let current = namespace::read(self, &source, source.change_cursor).await?;
         let namespace_stream =
             namespace::write_snapshot(self, &current, gc_epoch, &mut visit).await?;
-        visit(namespace_stream.object)?;
+        visit(namespace_stream.object.locator)?;
         for receipt in &source.operation_receipts {
-            visit(receipt.stream.object)?;
+            visit(receipt.stream.object.locator)?;
         }
         let commit = NamespaceCommit {
             volume_id: source.volume_id,
@@ -233,7 +233,7 @@ impl ManagedVolume {
             operation_receipts: source.operation_receipts,
         };
         let revision = write_commit(self, gc_epoch, &commit).await?;
-        visit(revision.object)?;
+        visit(revision.object.locator)?;
         Ok(revision)
     }
 }

@@ -56,7 +56,15 @@ impl Ofs {
 
     pub(super) fn volume_create(self, storage: &str) -> Command {
         let mut command = self.command();
-        command.args(["volume", "create", storage, "--model", "managed"]);
+        command.args([
+            "volume",
+            "create",
+            storage,
+            "--model",
+            "managed",
+            "--pack-target-mib",
+            "8",
+        ]);
         command
     }
 

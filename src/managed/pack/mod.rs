@@ -15,25 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod engine;
-mod install;
-mod local_fs;
-mod local_scan;
-mod pack;
-mod publication;
-mod reconcile;
-mod recovery;
-mod rename;
-mod scan;
-mod state;
-mod state_file;
-mod transfer;
+//! Complete-file Pack placement.
 
-pub use engine::{SyncEngine, SyncOutcome};
-pub(crate) use state::ConflictRecord;
-pub use state::ReplicaState;
+mod layout;
+mod reader;
+mod writer;
 
-/// Load and validate the lightweight state of one local replica.
-pub fn load_replica_state(path: &std::path::Path) -> Result<Option<ReplicaState>, crate::Error> {
-    state_file::load(path)
-}
+pub(crate) use layout::{ENTRY_BYTES, EntryRef, TRAILER_BYTES};
+pub(crate) use reader::RangeReader;
+pub(crate) use writer::Writer;

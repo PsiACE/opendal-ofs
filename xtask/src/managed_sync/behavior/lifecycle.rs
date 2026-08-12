@@ -252,6 +252,14 @@ pub(super) fn smoke(fixture: &Fixture, ofs: Ofs) {
         output_text(&published.stdout).contains("(published)"),
         "a changed tree reports remote publication"
     );
+    let object_root = "local/managed-sync/smoke/managed/1/objects/00000000000000000000";
+    let (packs, _) = fixture.storage_usage(&format!("{object_root}/05-file-pack"));
+    let (loose_files, _) = fixture.storage_usage(&format!("{object_root}/04-file-data"));
+    assert_eq!(packs, 1, "small files are published as one immutable Pack");
+    assert_eq!(
+        loose_files, 0,
+        "packed files do not retain duplicate loose objects"
+    );
     require_success(
         ofs.sync(&replica_b, &state_b, &storage),
         "cold restore smoke tree",

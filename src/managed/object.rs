@@ -99,6 +99,7 @@ pub(crate) enum ObjectClass {
     NamespaceSegment,
     OperationReceiptSegment,
     FileData,
+    FilePack,
 }
 
 impl Serialize for ObjectClass {
@@ -114,6 +115,7 @@ impl<'de> Deserialize<'de> for ObjectClass {
             2 => Ok(Self::NamespaceSegment),
             3 => Ok(Self::OperationReceiptSegment),
             4 => Ok(Self::FileData),
+            5 => Ok(Self::FilePack),
             value => Err(serde::de::Error::custom(format_args!(
                 "unknown object class {value}"
             ))),
@@ -122,11 +124,12 @@ impl<'de> Deserialize<'de> for ObjectClass {
 }
 
 impl ObjectClass {
-    pub(crate) const ALL: [Self; 4] = [
+    pub(crate) const ALL: [Self; 5] = [
         Self::NamespaceCommit,
         Self::NamespaceSegment,
         Self::OperationReceiptSegment,
         Self::FileData,
+        Self::FilePack,
     ];
 
     const fn code(self) -> u8 {
@@ -135,6 +138,7 @@ impl ObjectClass {
             Self::NamespaceSegment => 2,
             Self::OperationReceiptSegment => 3,
             Self::FileData => 4,
+            Self::FilePack => 5,
         }
     }
 
@@ -144,6 +148,7 @@ impl ObjectClass {
             Self::NamespaceSegment => "02-namespace-segment",
             Self::OperationReceiptSegment => "03-operation-receipt-segment",
             Self::FileData => "04-file-data",
+            Self::FilePack => "05-file-pack",
         }
     }
 

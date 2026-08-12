@@ -124,6 +124,10 @@ impl ManagedVolume {
         self.format.volume_id()
     }
 
+    pub(crate) const fn pack_target_bytes(&self) -> Option<u64> {
+        self.format.file_placement().pack_target_bytes()
+    }
+
     pub(super) async fn initialize(&self) -> Result<(), Error> {
         if storage::read_control(
             &self.operator,

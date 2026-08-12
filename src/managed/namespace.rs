@@ -34,7 +34,7 @@ use crate::workset::{MergeRuns, Spool, Workspace};
 use super::data::FileDataRef;
 use super::head::{ManagedVolume, NamespaceRevision};
 use super::layout::{NamespaceChangeSegment, NamespaceCommit};
-use super::object::{GcEpoch, ObjectClass, ObjectRef};
+use super::object::{GcEpoch, ObjectClass, ObjectLocator};
 use super::publication;
 use super::stream::{self, RecordStreamReader, RecordStreamWriter, StreamKind, StreamRef};
 
@@ -92,7 +92,7 @@ pub(super) async fn write_snapshot(
     volume: &ManagedVolume,
     namespace: &Namespace<FileDataRef>,
     gc_epoch: GcEpoch,
-    mut visit_file: impl FnMut(ObjectRef) -> Result<(), Error>,
+    mut visit_file: impl FnMut(ObjectLocator) -> Result<(), Error>,
 ) -> Result<StreamRef, Error> {
     let mut source = namespace.reader()?;
     let mut writer = RecordStreamWriter::open(
@@ -104,16 +104,11 @@ pub(super) async fn write_snapshot(
     .await?;
     while let Some(record) = source.next()? {
         if let Some(NamespaceNode {
-            value:
-                NamespaceValue::RegularFile {
-                    fingerprint,
-                    content,
-                    ..
-                },
+            value: NamespaceValue::RegularFile { content, .. },
             ..
         }) = record.value.as_ref()
         {
-            visit_file(content.stream_ref(*fingerprint)?.object)?;
+            visit_file(content.object_locator())?;
         }
         writer.write(&record).await?;
     }
@@ -564,7 +559,7 @@ fn validate_content(node: &NamespaceNode<FileDataRef>) -> Result<(), Error> {
         content,
         ..
     } = node.value
-        && content.stream_ref(fingerprint).is_err()
+        && content.validate(fingerprint).is_err()
     {
         return Err(Error::corrupt(
             "read Managed namespace",

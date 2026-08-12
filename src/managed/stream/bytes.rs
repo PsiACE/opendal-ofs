@@ -16,7 +16,7 @@
 // under the License.
 
 use opendal::Operator;
-use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
 
 use crate::Error;
 use crate::filesystem::Digest;
@@ -28,8 +28,6 @@ use super::{
     validate_stream_tail,
 };
 
-const SOURCE_BUFFER_BYTES: usize = 256 * 1024;
-
 pub(crate) async fn write_byte_stream(
     operator: &Operator,
     gc_epoch: GcEpoch,
@@ -38,27 +36,7 @@ pub(crate) async fn write_byte_stream(
     expected_digest: Digest,
 ) -> Result<StreamRef, Error> {
     let mut writer = ImmutableWriter::open(operator, gc_epoch, ObjectClass::FileData).await?;
-    let mut payload_length = 0_u64;
-    loop {
-        let mut bytes = vec![0; SOURCE_BUFFER_BYTES];
-        let read = match source.read(&mut bytes).await {
-            Ok(read) => read,
-            Err(error) => {
-                let error = Error::io("read Managed byte stream source", error);
-                let _ = writer.abort().await;
-                return Err(error);
-            }
-        };
-        if read == 0 {
-            break;
-        }
-        bytes.truncate(read);
-        payload_length = payload_length
-            .checked_add(read as u64)
-            .ok_or_else(|| Error::invalid("write Managed byte stream", "length overflows"))?;
-        writer.write(bytes).await?;
-    }
-    let payload_digest = writer.digest();
+    let (payload_length, payload_digest) = writer.write_source(source).await?;
     if payload_length != expected_length || payload_digest != expected_digest {
         writer.abort().await?;
         return Err(Error::conflict(

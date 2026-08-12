@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -161,6 +161,10 @@ pub(crate) struct VolumeCreateArgs {
     /// Namespace authority model.
     #[arg(long, value_enum, value_name = "MODEL")]
     pub(crate) model: VolumeModel,
+
+    /// Target encoded size of immutable small-file packs, in MiB.
+    #[arg(long, value_name = "MIB")]
+    pub(crate) pack_target_mib: Option<NonZeroU64>,
 
     #[command(flatten)]
     pub(crate) resources: ManagedResourceArgs,

@@ -363,9 +363,12 @@ fn report_inventory(fixture: &Fixture, profile: Profile) {
         "02-namespace-segment",
         "03-operation-receipt-segment",
         "04-file-data",
+        "05-file-pack",
     ];
     let mut metadata_objects = 0_u64;
     let mut metadata_bytes = 0_u64;
+    let mut payload_objects = 0_u64;
+    let mut payload_bytes = 0_u64;
     for class in CLASSES {
         let target = format!(
             "local/managed-sync/scale/{}/managed/1/objects/00000000000000000000/{class}",
@@ -375,15 +378,17 @@ fn report_inventory(fixture: &Fixture, profile: Profile) {
         println!(
             "scale inventory: phase=initial class={class} objects={objects} encoded_bytes={bytes}"
         );
-        if *class == "04-file-data" {
-            println!(
-                "scale inventory: phase=initial payload_objects={objects} payload_encoded_bytes={bytes}"
-            );
+        if matches!(*class, "04-file-data" | "05-file-pack") {
+            payload_objects += objects;
+            payload_bytes += bytes;
         } else {
             metadata_objects += objects;
             metadata_bytes += bytes;
         }
     }
+    println!(
+        "scale inventory: phase=initial payload_objects={payload_objects} payload_encoded_bytes={payload_bytes}"
+    );
     println!(
         "scale inventory: phase=initial metadata_objects={metadata_objects} metadata_encoded_bytes={metadata_bytes}"
     );

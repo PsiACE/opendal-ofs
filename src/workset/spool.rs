@@ -58,21 +58,6 @@ impl<T: DeserializeOwned> Spool<T> {
     pub(crate) fn reader(&self) -> Result<SpoolReader<T>, Error> {
         SpoolReader::open(self.file.clone())
     }
-
-    pub(crate) fn stream(
-        &self,
-    ) -> Result<impl futures::Stream<Item = Result<T, Error>> + use<T>, Error> {
-        let reader = self.reader()?;
-        Ok(futures::stream::try_unfold(
-            reader,
-            |mut reader| async move {
-                match reader.next()? {
-                    Some(record) => Ok(Some((record, reader))),
-                    None => Ok(None),
-                }
-            },
-        ))
-    }
 }
 
 pub(crate) struct SpoolWriter<T> {

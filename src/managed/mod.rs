@@ -25,6 +25,7 @@ mod head;
 mod layout;
 mod namespace;
 mod object;
+mod pack;
 mod publication;
 mod record;
 mod storage;
@@ -36,8 +37,13 @@ pub(crate) use format::ManagedFormat;
 pub use gc::GcOutcome;
 pub(crate) use head::ManagedObservation;
 pub use head::{ManagedVolume, NamespaceRevision};
-pub(crate) use object::GcEpoch;
+pub(crate) use object::{GcEpoch, ObjectLocator};
+pub(crate) use pack::{
+    ENTRY_BYTES as PACK_ENTRY_BYTES, RangeReader as PackRangeReader,
+    TRAILER_BYTES as PACK_TRAILER_BYTES, Writer as PackWriter,
+};
 
+use std::num::NonZeroU64;
 use std::num::NonZeroUsize;
 
 use opendal::Operator;
@@ -81,8 +87,15 @@ impl ManagedMetadata {
     }
 
     /// Create the Managed superblock once, or return the existing format.
-    pub async fn initialize(&self) -> Result<ManagedVolume, Error> {
-        let desired = ManagedFormat::new(VolumeId::generate(), NodeId::generate());
+    pub async fn initialize(
+        &self,
+        pack_target_bytes: Option<NonZeroU64>,
+    ) -> Result<ManagedVolume, Error> {
+        let file_placement = match pack_target_bytes {
+            Some(target_bytes) => format::FilePlacement::Pack { target_bytes },
+            None => format::FilePlacement::Whole,
+        };
+        let desired = ManagedFormat::new(VolumeId::generate(), NodeId::generate(), file_placement);
         let encoded = desired.encode()?;
         let format = if storage::write_control(
             &self.operator,
@@ -94,7 +107,14 @@ impl ManagedMetadata {
         {
             desired
         } else {
-            self.read_format().await?
+            let existing = self.read_format().await?;
+            if existing.file_placement() != file_placement {
+                return Err(Error::conflict(
+                    "create Managed volume",
+                    "volume already uses a different file placement",
+                ));
+            }
+            existing
         };
         let volume = ManagedVolume::new(
             format,
