@@ -116,8 +116,11 @@ async fn apply(
         let version = node
             .file_version
             .ok_or_else(|| Error::corrupt("install replica", "remote file has no file version"))?;
+        let fingerprint = node.file_fingerprint.ok_or_else(|| {
+            Error::corrupt("install replica", "remote file has no content fingerprint")
+        })?;
         let unchanged = if authoritative {
-            local_file_matches(&destination, version, node.attributes.executable).await?
+            local_file_matches(&destination, fingerprint, node.attributes.executable).await?
         } else {
             current_paths.as_ref().is_some_and(|paths| {
                 paths.get(path).is_some_and(|current_id| {
@@ -163,7 +166,7 @@ async fn apply(
 
 async fn local_file_matches(
     path: &Path,
-    expected: crate::filesystem::FileVersionId,
+    expected: crate::filesystem::FileFingerprint,
     executable: bool,
 ) -> Result<bool, Error> {
     let metadata = match std::fs::symlink_metadata(path) {

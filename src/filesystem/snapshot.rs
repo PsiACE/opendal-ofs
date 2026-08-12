@@ -24,7 +24,8 @@ use unicode_normalization::UnicodeNormalization as _;
 use crate::Error;
 
 use super::{
-    ChangeCursor, DirectoryEntry, FileVersionId, NodeAttributes, NodeId, NodeKind, VolumeId,
+    ChangeCursor, DirectoryEntry, FileFingerprint, FileVersionId, NodeAttributes, NodeId, NodeKind,
+    VolumeId,
 };
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -33,6 +34,7 @@ pub struct NodeRecord {
     pub kind: NodeKind,
     pub attributes: NodeAttributes,
     pub file_version: Option<FileVersionId>,
+    pub file_fingerprint: Option<FileFingerprint>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -90,9 +92,13 @@ impl VolumeSnapshot {
         for (id, node) in &self.nodes {
             match node.kind {
                 NodeKind::Directory
-                    if node.file_version.is_none() && self.directories.contains_key(id) => {}
+                    if node.file_version.is_none()
+                        && node.file_fingerprint.is_none()
+                        && self.directories.contains_key(id) => {}
                 NodeKind::RegularFile
-                    if node.file_version.is_some() && !self.directories.contains_key(id) => {}
+                    if node.file_version.is_some()
+                        && node.file_fingerprint.is_some()
+                        && !self.directories.contains_key(id) => {}
                 _ => {
                     return Err(Error::invalid(
                         "validate filesystem snapshot",

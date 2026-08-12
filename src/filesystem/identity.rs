@@ -55,6 +55,11 @@ fixed_identity!(
     32
 );
 fixed_identity!(
+    /// Stable identity of one immutable logical file version.
+    FileVersionId,
+    16
+);
+fixed_identity!(
     /// Integrity value used to verify one independently readable record.
     Checksum,
     32
@@ -77,17 +82,18 @@ macro_rules! generated_identity {
     };
 }
 
-generated_identity!(VolumeId, NodeId, OperationId);
+generated_identity!(VolumeId, NodeId, FileVersionId, OperationId);
 
-/// Identity of one immutable logical file version.
+/// Content fingerprint used by Sync to compare a materialized file with a
+/// logical file version. It is not the file version identity or its layout.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct FileVersionId {
+pub struct FileFingerprint {
     digest: Digest,
     logical_length: u64,
 }
 
-impl FileVersionId {
+impl FileFingerprint {
     pub const fn new(digest: Digest, logical_length: u64) -> Self {
         Self {
             digest,
@@ -119,7 +125,7 @@ macro_rules! display_identity {
     };
 }
 
-display_identity!(VolumeId, OperationId);
+display_identity!(VolumeId, FileVersionId, OperationId);
 
 /// A position in a Managed volume's ordered change stream.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]

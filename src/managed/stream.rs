@@ -38,6 +38,9 @@ const TRAILER_BYTES: usize = 8 + 2 + 2 + 8 + 8 + 32 + 32;
 const MAXIMUM_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const MAXIMUM_FOOTER_BYTES: usize = 16 * 1024 * 1024;
 const WRITER_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+const DATA_BLOCK_BYTES: u64 = 4 * 1024 * 1024;
+const RANGE_FETCH_BLOCKS: usize = 16;
+const BLOCK_CHECKSUM_INDEX: &str = "block-checksum-index";
 
 #[derive(Clone, Copy, Debug, serde::Deserialize, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
@@ -87,6 +90,17 @@ struct EmbeddedProjectionRef {
     schema_version: u16,
     source: PayloadDigest,
     object_range: ChecksummedRange,
+}
+
+#[derive(serde::Deserialize, Serialize)]
+struct DataBlockIndex {
+    blocks: Vec<ChecksummedRange>,
+}
+
+struct EmbeddedProjection {
+    kind: &'static str,
+    schema_version: u16,
+    bytes: Vec<u8>,
 }
 
 pub(crate) async fn write_records<T: Serialize>(
@@ -168,6 +182,10 @@ pub(crate) async fn write_bytes(
     let mut writer = ImmutableWriter::open(operator, gc_epoch, class, WRITER_CHUNK_BYTES).await?;
     let mut hasher = blake3::Hasher::new();
     let mut payload_length = 0_u64;
+    let mut block_hasher = blake3::Hasher::new();
+    let mut block_offset = 0_u64;
+    let mut block_length = 0_u64;
+    let mut blocks = Vec::new();
     let mut buffer = vec![0; 256 * 1024];
     loop {
         let read = source
@@ -180,17 +198,49 @@ pub(crate) async fn write_bytes(
         let bytes = &buffer[..read];
         writer.write(bytes).await?;
         hasher.update(bytes);
+        let mut observed = bytes;
+        while !observed.is_empty() {
+            let remaining = (DATA_BLOCK_BYTES - block_length) as usize;
+            let length = remaining.min(observed.len());
+            block_hasher.update(&observed[..length]);
+            block_length += length as u64;
+            observed = &observed[length..];
+            if block_length == DATA_BLOCK_BYTES {
+                blocks.push(ChecksummedRange {
+                    offset: block_offset,
+                    length: block_length,
+                    checksum: RangeChecksum::from_bytes(block_hasher.finalize().into()),
+                });
+                block_offset += block_length;
+                block_length = 0;
+                block_hasher = blake3::Hasher::new();
+            }
+        }
         payload_length = payload_length
             .checked_add(read as u64)
             .ok_or_else(|| Error::invalid("write Managed stream", "payload length overflows"))?;
     }
+    if block_length != 0 {
+        blocks.push(ChecksummedRange {
+            offset: block_offset,
+            length: block_length,
+            checksum: RangeChecksum::from_bytes(block_hasher.finalize().into()),
+        });
+    }
+    let mut block_index = Vec::new();
+    ciborium::into_writer(&DataBlockIndex { blocks }, &mut block_index)
+        .map_err(|_| Error::invalid("write Managed stream", "block index cannot be encoded"))?;
     finish_stream(
         writer,
         kind,
         schema_version,
         payload_length,
         PayloadDigest::from_bytes(hasher.finalize().into()),
-        Vec::new(),
+        vec![EmbeddedProjection {
+            kind: BLOCK_CHECKSUM_INDEX,
+            schema_version: 1,
+            bytes: block_index,
+        }],
     )
     .await
 }
@@ -231,6 +281,163 @@ pub(crate) async fn copy_bytes(
     {
         return Err(Error::corrupt(
             "read Managed byte stream",
+            "payload does not match its reference",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) async fn copy_byte_range(
+    operator: &Operator,
+    reference: StreamRef,
+    range: std::ops::Range<u64>,
+    destination: &mut (impl AsyncWrite + Unpin),
+) -> Result<(), Error> {
+    if range.start > range.end || range.end > reference.payload_length {
+        return Err(Error::invalid(
+            "read Managed byte range",
+            "logical byte range is invalid",
+        ));
+    }
+    if range.is_empty() {
+        return Ok(());
+    }
+    let footer = read_footer(operator, reference).await?;
+    let Some(projection) = footer.projections.iter().find(|projection| {
+        projection.kind == BLOCK_CHECKSUM_INDEX
+            && projection.schema_version == 1
+            && projection.source == reference.payload_digest
+    }) else {
+        return copy_byte_range_by_scanning(operator, reference, range, destination).await;
+    };
+    let projection_end = projection
+        .object_range
+        .offset
+        .checked_add(projection.object_range.length);
+    if projection.object_range.offset < reference.payload_length
+        || projection_end.is_none_or(|end| end > reference.footer.offset)
+    {
+        return copy_byte_range_by_scanning(operator, reference, range, destination).await;
+    }
+    let bytes = match read_range(
+        operator,
+        reference.object,
+        projection.object_range.offset
+            ..projection.object_range.offset + projection.object_range.length,
+    )
+    .await
+    {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return copy_byte_range_by_scanning(operator, reference, range, destination).await;
+        }
+    };
+    if checksum(&bytes) != projection.object_range.checksum {
+        return copy_byte_range_by_scanning(operator, reference, range, destination).await;
+    }
+    let Ok(index) = ciborium::from_reader::<DataBlockIndex, _>(Cursor::new(bytes)) else {
+        return copy_byte_range_by_scanning(operator, reference, range, destination).await;
+    };
+    if !valid_block_index(reference.payload_length, &index.blocks) {
+        return copy_byte_range_by_scanning(operator, reference, range, destination).await;
+    }
+    let selected = index
+        .blocks
+        .into_iter()
+        .filter(|block| {
+            block.offset < range.end && block.offset.saturating_add(block.length) > range.start
+        })
+        .collect::<Vec<_>>();
+    let reader = operator
+        .reader_with(&reference.object.key())
+        .content_length_hint(reference.object.encoded_length)
+        .concurrent(4)
+        .gap(0)
+        .await
+        .map_err(|error| Error::from_storage("read Managed byte range", error))?;
+    for batch in selected.chunks(RANGE_FETCH_BLOCKS) {
+        let ranges = batch
+            .iter()
+            .map(|block| block.offset..block.offset + block.length)
+            .collect();
+        let buffers = reader
+            .fetch(ranges)
+            .await
+            .map_err(|error| Error::from_storage("read Managed byte range", error))?;
+        for (block, buffer) in batch.iter().zip(buffers) {
+            let bytes = buffer.to_vec();
+            if bytes.len() as u64 != block.length || checksum(&bytes) != block.checksum {
+                return Err(Error::corrupt(
+                    "read Managed byte range",
+                    "file data block is invalid",
+                ));
+            }
+            let start = range.start.saturating_sub(block.offset) as usize;
+            let end = (range.end.min(block.offset + block.length) - block.offset) as usize;
+            destination
+                .write_all(&bytes[start..end])
+                .await
+                .map_err(|error| Error::io("write Managed byte range", error))?;
+        }
+    }
+    Ok(())
+}
+
+fn valid_block_index(payload_length: u64, blocks: &[ChecksummedRange]) -> bool {
+    let mut covered = 0_u64;
+    for block in blocks {
+        let Some(end) = block.offset.checked_add(block.length) else {
+            return false;
+        };
+        if block.offset != covered || block.length == 0 || end > payload_length {
+            return false;
+        }
+        covered = end;
+    }
+    covered == payload_length
+}
+
+async fn copy_byte_range_by_scanning(
+    operator: &Operator,
+    reference: StreamRef,
+    range: std::ops::Range<u64>,
+    destination: &mut (impl AsyncWrite + Unpin),
+) -> Result<(), Error> {
+    let key = reference.object.key();
+    let mut stream = operator
+        .reader(&key)
+        .await
+        .map_err(|error| Error::from_storage("read Managed byte range", error))?
+        .into_stream(0..reference.payload_length)
+        .await
+        .map_err(|error| Error::from_storage("read Managed byte range", error))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut offset = 0_u64;
+    use futures::StreamExt as _;
+    while let Some(buffer) = stream.next().await {
+        let buffer =
+            buffer.map_err(|error| Error::from_storage("read Managed byte range", error))?;
+        for chunk in buffer {
+            let end = offset
+                .checked_add(chunk.len() as u64)
+                .ok_or_else(|| Error::corrupt("read Managed byte range", "length overflows"))?;
+            hasher.update(&chunk);
+            if offset < range.end && end > range.start {
+                let start = range.start.saturating_sub(offset) as usize;
+                let selected_end = (range.end.min(end) - offset) as usize;
+                destination
+                    .write_all(&chunk[start..selected_end])
+                    .await
+                    .map_err(|error| Error::io("write Managed byte range", error))?;
+            }
+            offset = end;
+        }
+    }
+    if offset != reference.payload_length
+        || PayloadDigest::from_bytes(hasher.finalize().into()) != reference.payload_digest
+    {
+        return Err(Error::corrupt(
+            "read Managed byte range",
             "payload does not match its reference",
         ));
     }
@@ -374,14 +581,34 @@ async fn finish_stream(
     schema_version: u16,
     payload_length: u64,
     digest: PayloadDigest,
-    projections: Vec<EmbeddedProjectionRef>,
+    projections: Vec<EmbeddedProjection>,
 ) -> Result<StreamRef, Error> {
+    let mut projection_refs = Vec::with_capacity(projections.len());
+    let mut footer_offset = payload_length;
+    for projection in projections {
+        let length = projection.bytes.len() as u64;
+        let object_range = ChecksummedRange {
+            offset: footer_offset,
+            length,
+            checksum: checksum(&projection.bytes),
+        };
+        writer.write(&projection.bytes).await?;
+        footer_offset = footer_offset
+            .checked_add(length)
+            .ok_or_else(|| Error::invalid("write Managed stream", "stream length overflows"))?;
+        projection_refs.push(EmbeddedProjectionRef {
+            kind: projection.kind.to_owned(),
+            schema_version: projection.schema_version,
+            source: digest,
+            object_range,
+        });
+    }
     let mut footer = Vec::new();
     ciborium::into_writer(
         &StreamFooter {
             payload_length,
             payload_digest: digest,
-            projections,
+            projections: projection_refs,
         },
         &mut footer,
     )
@@ -400,7 +627,7 @@ async fn finish_stream(
     trailer.extend_from_slice(&TRAILER_MAGIC);
     trailer.extend_from_slice(&schema_version.to_le_bytes());
     trailer.extend_from_slice(&kind.value().to_le_bytes());
-    trailer.extend_from_slice(&payload_length.to_le_bytes());
+    trailer.extend_from_slice(&footer_offset.to_le_bytes());
     trailer.extend_from_slice(&footer_length.to_le_bytes());
     trailer.extend_from_slice(footer_checksum.as_bytes());
     trailer.extend_from_slice(checksum(&trailer).as_bytes());
@@ -413,7 +640,7 @@ async fn finish_stream(
         payload_length,
         payload_digest: digest,
         footer: ChecksummedRange {
-            offset: payload_length,
+            offset: footer_offset,
             length: footer_length,
             checksum: footer_checksum,
         },

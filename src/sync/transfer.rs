@@ -23,13 +23,13 @@ use tokio::io::AsyncReadExt as _;
 
 use crate::Error;
 use crate::filesystem::ChangeCursor;
-use crate::filesystem::{Digest, FileVersionId, OperationId};
+use crate::filesystem::{Digest, FileFingerprint, FileVersionId, OperationId};
 use crate::managed::ManagedVolume;
 use crate::managed::{GcEpoch, ObjectRef};
 
 const IO_BUFFER_BYTES: usize = 256 * 1024;
 
-pub(super) async fn inspect_file(path: &Path) -> Result<FileVersionId, Error> {
+pub(super) async fn inspect_file(path: &Path) -> Result<FileFingerprint, Error> {
     let mut file = File::open(path)
         .await
         .map_err(|error| Error::from_io("inspect local file", Some(path), error))?;
@@ -49,7 +49,7 @@ pub(super) async fn inspect_file(path: &Path) -> Result<FileVersionId, Error> {
             .checked_add(read as u64)
             .ok_or_else(|| Error::invalid("inspect local file", "file length overflows"))?;
     }
-    Ok(FileVersionId::new(
+    Ok(FileFingerprint::new(
         Digest::from_bytes(hasher.finalize().into()),
         length,
     ))
@@ -59,6 +59,8 @@ pub(super) async fn publish_file(
     volume: &ManagedVolume,
     path: &Path,
     version: FileVersionId,
+    fingerprint: FileFingerprint,
+    base_version: Option<FileVersionId>,
     gc_epoch: GcEpoch,
     change_cursor: ChangeCursor,
 ) -> Result<ObjectRef, Error> {
@@ -66,7 +68,14 @@ pub(super) async fn publish_file(
         .await
         .map_err(|error| Error::from_io("publish local file", Some(path), error))?;
     volume
-        .publish_data(&mut file, version, gc_epoch, change_cursor)
+        .publish_data(
+            &mut file,
+            version,
+            fingerprint,
+            base_version,
+            gc_epoch,
+            change_cursor,
+        )
         .await
         .map_err(|error| error.with_context("path", path.display()))
 }

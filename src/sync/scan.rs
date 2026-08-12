@@ -24,8 +24,8 @@ use futures::StreamExt as _;
 use super::transfer::inspect_file;
 use crate::Error;
 use crate::filesystem::{
-    ChangeCursor, DirectoryEntry, DirectoryRecord, FileVersionId, NodeAttributes, NodeId, NodeKind,
-    NodeRecord, OperationId, VolumeSnapshot,
+    ChangeCursor, DirectoryEntry, DirectoryRecord, FileFingerprint, FileVersionId, NodeAttributes,
+    NodeId, NodeKind, NodeRecord, OperationId, VolumeSnapshot,
 };
 
 pub(crate) enum ScannedTree {
@@ -50,7 +50,7 @@ pub(crate) async fn scan(root: &Path, base: &VolumeSnapshot) -> Result<ScannedTr
     )
     .map(|(path, _)| async move { Ok::<_, Error>((path, inspect_file(&root.join(path)).await?)) })
     .buffer_unordered(32);
-    let mut file_by_path = BTreeMap::<String, FileVersionId>::new();
+    let mut file_by_path = BTreeMap::<String, FileFingerprint>::new();
     while let Some(result) = inspected.next().await {
         let (path, version) = result?;
         file_by_path.insert(path.clone(), version);
@@ -127,16 +127,26 @@ pub(crate) async fn scan(root: &Path, base: &VolumeSnapshot) -> Result<ScannedTr
 
     let mut nodes = BTreeMap::new();
     for (path, node) in &ids {
-        let (kind, attributes, file_version) = if path.is_empty() {
-            (NodeKind::Directory, NodeAttributes::default(), None)
+        let (kind, attributes, file_version, file_fingerprint) = if path.is_empty() {
+            (NodeKind::Directory, NodeAttributes::default(), None, None)
         } else {
             let local = local[path];
+            let fingerprint = file_by_path.get(path).copied();
+            let version = fingerprint.map(|fingerprint| {
+                base_paths
+                    .get(path)
+                    .and_then(|node| base.nodes.get(node))
+                    .filter(|node| node.file_fingerprint == Some(fingerprint))
+                    .and_then(|node| node.file_version)
+                    .unwrap_or_else(FileVersionId::generate)
+            });
             (
                 local.kind,
                 NodeAttributes {
                     executable: local.executable,
                 },
-                file_by_path.get(path).copied(),
+                version,
+                fingerprint,
             )
         };
         nodes.insert(
@@ -145,6 +155,7 @@ pub(crate) async fn scan(root: &Path, base: &VolumeSnapshot) -> Result<ScannedTr
                 kind,
                 attributes,
                 file_version,
+                file_fingerprint,
             },
         );
     }
@@ -164,7 +175,7 @@ pub(crate) async fn scan(root: &Path, base: &VolumeSnapshot) -> Result<ScannedTr
 
 fn same_local_namespace(
     local: &BTreeMap<String, LocalEntry>,
-    files: &BTreeMap<String, FileVersionId>,
+    files: &BTreeMap<String, FileFingerprint>,
     base: &VolumeSnapshot,
     base_paths: &BTreeMap<String, NodeId>,
 ) -> bool {
@@ -182,13 +193,13 @@ fn same_local_namespace(
                 == NodeAttributes {
                     executable: entry.executable,
                 }
-            && node.file_version == files.get(path).copied()
+            && node.file_fingerprint == files.get(path).copied()
     })
 }
 
 fn reuse_unique_identities(
     local: &BTreeMap<String, LocalEntry>,
-    file_by_path: &BTreeMap<String, FileVersionId>,
+    file_by_path: &BTreeMap<String, FileFingerprint>,
     base: &VolumeSnapshot,
     base_paths: &BTreeMap<String, NodeId>,
     ids: &mut BTreeMap<String, NodeId>,
@@ -230,7 +241,7 @@ fn reuse_unique_identities(
 
 fn local_signatures(
     local: &BTreeMap<String, LocalEntry>,
-    files: &BTreeMap<String, FileVersionId>,
+    files: &BTreeMap<String, FileFingerprint>,
 ) -> BTreeMap<String, crate::filesystem::Digest> {
     let children = child_paths(local.keys());
     let mut signatures = BTreeMap::new();
@@ -273,7 +284,7 @@ fn snapshot_signatures(
             entry_signature(
                 node.kind,
                 node.attributes.executable,
-                node.file_version,
+                node.file_fingerprint,
                 &child_signatures,
             ),
         );
@@ -301,7 +312,7 @@ fn child_paths<'a>(
 fn entry_signature(
     kind: NodeKind,
     executable: bool,
-    file: Option<FileVersionId>,
+    file: Option<FileFingerprint>,
     children: &[(&str, crate::filesystem::Digest)],
 ) -> crate::filesystem::Digest {
     let mut hasher = blake3::Hasher::new();

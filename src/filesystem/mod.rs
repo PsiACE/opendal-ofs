@@ -21,6 +21,8 @@ mod identity;
 mod namespace;
 mod snapshot;
 
-pub use identity::{ChangeCursor, Checksum, Digest, FileVersionId, NodeId, OperationId, VolumeId};
+pub use identity::{
+    ChangeCursor, Checksum, Digest, FileFingerprint, FileVersionId, NodeId, OperationId, VolumeId,
+};
 pub use namespace::{DirectoryEntry, NodeAttributes, NodeKind};
 pub use snapshot::{DirectoryRecord, NodeRecord, VolumeSnapshot};

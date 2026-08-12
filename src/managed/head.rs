@@ -22,8 +22,8 @@ use opendal::Operator;
 use serde::{Deserialize, Serialize};
 
 use crate::filesystem::{
-    ChangeCursor, DirectoryEntry, DirectoryRecord, FileVersionId, NodeAttributes, NodeId, NodeKind,
-    NodeRecord, OperationId, VolumeId, VolumeSnapshot,
+    ChangeCursor, DirectoryEntry, DirectoryRecord, FileFingerprint, FileVersionId, NodeAttributes,
+    NodeId, NodeKind, NodeRecord, OperationId, VolumeId, VolumeSnapshot,
 };
 use crate::{Error, ErrorKind};
 
@@ -176,12 +176,13 @@ impl NodeValue {
         }
     }
 
-    fn record(&self) -> NodeRecord {
+    fn record(&self, file_versions: &BTreeMap<FileVersionId, FileVersionRecord>) -> NodeRecord {
         match self {
             Self::Directory { attributes, .. } => NodeRecord {
                 kind: NodeKind::Directory,
                 attributes: *attributes,
                 file_version: None,
+                file_fingerprint: None,
             },
             Self::RegularFile {
                 attributes,
@@ -191,6 +192,9 @@ impl NodeValue {
                 kind: NodeKind::RegularFile,
                 attributes: *attributes,
                 file_version: Some(*file_version),
+                file_fingerprint: file_versions
+                    .get(file_version)
+                    .map(|record| record.content_fingerprint),
             },
         }
     }
@@ -215,6 +219,7 @@ struct DirectoryMutation {
 pub(super) struct FileVersionRecord {
     pub(super) file_version: FileVersionId,
     pub(super) file_size: u64,
+    pub(super) content_fingerprint: FileFingerprint,
     pub(super) manifest: ObjectRef,
 }
 
@@ -591,9 +596,16 @@ impl ManagedVolume {
                     "new file version has no durable manifest",
                 )
             })?;
+            let fingerprint = node.file_fingerprint.ok_or_else(|| {
+                Error::invalid(
+                    "publish Managed namespace",
+                    "new file version has no content fingerprint",
+                )
+            })?;
             file_version_records.push(FileVersionRecord {
                 file_version: version,
-                file_size: version.logical_length(),
+                file_size: fingerprint.logical_length(),
+                content_fingerprint: fingerprint,
                 manifest,
             });
         }
@@ -832,7 +844,7 @@ impl ManagedVolume {
 
         let nodes = node_values
             .iter()
-            .map(|(id, value)| (*id, value.record()))
+            .map(|(id, value)| (*id, value.record(&file_versions)))
             .collect::<BTreeMap<_, _>>();
         let mut directories = node_values
             .iter()

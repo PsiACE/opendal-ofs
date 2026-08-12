@@ -286,7 +286,7 @@ fn conflict(
 
 fn digest(snapshot: &VolumeSnapshot, node: Option<NodeId>) -> Option<crate::filesystem::Digest> {
     let node = &snapshot.nodes[&node?];
-    Some(node.file_version?.digest())
+    Some(node.file_fingerprint?.digest())
 }
 
 fn build_target(

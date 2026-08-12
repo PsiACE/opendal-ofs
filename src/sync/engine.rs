@@ -497,35 +497,50 @@ impl SyncEngine {
             let version = node.file_version.ok_or_else(|| {
                 Error::corrupt("publish Managed files", "pending file has no file version")
             })?;
+            let fingerprint = node.file_fingerprint.ok_or_else(|| {
+                Error::corrupt(
+                    "publish Managed files",
+                    "pending file has no content fingerprint",
+                )
+            })?;
             if common_versions.contains(&version) {
                 continue;
             }
+            let base_version = observed
+                .snapshot
+                .nodes
+                .get(&node_id)
+                .and_then(|node| node.file_version);
             let publish = new_versions.insert(version);
-            files.push((path, version, publish));
+            files.push((path, version, fingerprint, base_version, publish));
         }
 
         let manifests = futures::stream::iter(files)
-            .map(|(path, version, publish)| async move {
-                let path = root.join(path);
-                if publish {
-                    let manifest = publish_file(
-                        &self.volume,
-                        &path,
-                        version,
-                        observed.gc_epoch(),
-                        target.cursor,
-                    )
-                    .await?;
-                    Ok(Some((version, manifest)))
-                } else if inspect_file(&path).await? != version {
-                    Err(Error::conflict(
-                        "publish Managed files",
-                        "local file changed while being published",
-                    ))
-                } else {
-                    Ok(None)
-                }
-            })
+            .map(
+                |(path, version, fingerprint, base_version, publish)| async move {
+                    let path = root.join(path);
+                    if publish {
+                        let manifest = publish_file(
+                            &self.volume,
+                            &path,
+                            version,
+                            fingerprint,
+                            base_version,
+                            observed.gc_epoch(),
+                            target.cursor,
+                        )
+                        .await?;
+                        Ok(Some((version, manifest)))
+                    } else if inspect_file(&path).await? != fingerprint {
+                        Err(Error::conflict(
+                            "publish Managed files",
+                            "local file changed while being published",
+                        ))
+                    } else {
+                        Ok(None)
+                    }
+                },
+            )
             .buffer_unordered(self.transfer_concurrency)
             .try_collect::<Vec<_>>()
             .await?;
