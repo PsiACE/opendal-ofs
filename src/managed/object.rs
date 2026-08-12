@@ -28,8 +28,7 @@ use crate::Error;
 
 const OBJECT_PREFIX: &str = "managed/1/objects/";
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(transparent)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct ObjectId([u8; 16]);
 
 impl ObjectId {
@@ -46,6 +45,24 @@ impl ObjectId {
     }
 }
 
+impl Serialize for ObjectId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_bytes(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for ObjectId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserialize_fixed_bytes(deserializer).map(Self)
+    }
+}
+
 impl fmt::Display for ObjectId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         for byte in self.0 {
@@ -57,10 +74,7 @@ impl fmt::Display for ObjectId {
 
 macro_rules! integrity_value {
     ($name:ident) => {
-        #[derive(
-            Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
-        )]
-        #[serde(transparent)]
+        #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
         pub(crate) struct $name([u8; 32]);
 
         impl $name {
@@ -70,6 +84,24 @@ macro_rules! integrity_value {
 
             pub(crate) const fn as_bytes(&self) -> &[u8; 32] {
                 &self.0
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                serializer.serialize_bytes(&self.0)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                deserialize_fixed_bytes(deserializer).map(Self)
             }
         }
     };
@@ -197,7 +229,7 @@ impl ObjectClass {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ObjectRef {
     pub(crate) gc_epoch: GcEpoch,
     pub(crate) class: ObjectClass,
@@ -205,6 +237,14 @@ pub(crate) struct ObjectRef {
     pub(crate) encoded_length: u64,
     pub(crate) digest: ObjectDigest,
 }
+
+super::wire::tuple_wire!(ObjectRef {
+    gc_epoch: GcEpoch,
+    class: ObjectClass,
+    id: ObjectId,
+    encoded_length: u64,
+    digest: ObjectDigest,
+});
 
 impl ObjectRef {
     pub(crate) fn key(self) -> String {
@@ -485,4 +525,37 @@ fn object_key(gc_epoch: GcEpoch, class: ObjectClass, id: ObjectId) -> String {
         gc_epoch.value(),
         class.key_segment(),
     )
+}
+
+fn deserialize_fixed_bytes<'de, D, const N: usize>(deserializer: D) -> Result<[u8; N], D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct FixedBytesVisitor<const N: usize>;
+
+    impl<const N: usize> serde::de::Visitor<'_> for FixedBytesVisitor<N> {
+        type Value = [u8; N];
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "a {N}-byte value")
+        }
+
+        fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            value
+                .try_into()
+                .map_err(|_| E::invalid_length(value.len(), &self))
+        }
+
+        fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            self.visit_bytes(&value)
+        }
+    }
+
+    deserializer.deserialize_bytes(FixedBytesVisitor::<N>)
 }

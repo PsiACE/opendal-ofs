@@ -19,23 +19,83 @@ use serde::{Deserialize, Serialize};
 
 use super::NodeId;
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NodeKind {
     Directory,
     RegularFile,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+impl Serialize for NodeKind {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_u8(match self {
+            Self::Directory => 0,
+            Self::RegularFile => 1,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for NodeKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        match u8::deserialize(deserializer)? {
+            0 => Ok(Self::Directory),
+            1 => Ok(Self::RegularFile),
+            _ => Err(serde::de::Error::custom("unknown node kind")),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NodeAttributes {
     pub executable: bool,
 }
 
+impl Serialize for NodeAttributes {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        (self.executable,).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for NodeAttributes {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let (executable,) = Deserialize::deserialize(deserializer)?;
+        Ok(Self { executable })
+    }
+}
+
 /// One named edge from a directory to a filesystem node.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DirectoryEntry {
     pub node: NodeId,
     pub kind: NodeKind,
+}
+
+impl Serialize for DirectoryEntry {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        (self.node, self.kind).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for DirectoryEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let (node, kind) = Deserialize::deserialize(deserializer)?;
+        Ok(Self { node, kind })
+    }
 }

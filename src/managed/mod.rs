@@ -24,6 +24,7 @@ mod head;
 mod object;
 mod record;
 mod stream;
+mod wire;
 
 pub use format::ManagedFormat;
 pub use gc::GcOutcome;

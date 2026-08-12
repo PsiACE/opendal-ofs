@@ -60,14 +60,19 @@ impl StreamKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, serde::Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ChecksummedRange {
     pub(crate) offset: u64,
     pub(crate) length: u64,
     pub(crate) checksum: RangeChecksum,
 }
+super::wire::tuple_wire!(ChecksummedRange {
+    offset: u64,
+    length: u64,
+    checksum: RangeChecksum,
+});
 
-#[derive(Clone, Copy, Debug, serde::Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct StreamRef {
     pub(crate) kind: StreamKind,
     pub(crate) schema_version: u16,
@@ -76,26 +81,48 @@ pub(crate) struct StreamRef {
     pub(crate) payload_digest: PayloadDigest,
     pub(crate) footer: ChecksummedRange,
 }
+super::wire::tuple_wire!(StreamRef {
+    kind: StreamKind,
+    schema_version: u16,
+    object: ObjectRef,
+    payload_length: u64,
+    payload_digest: PayloadDigest,
+    footer: ChecksummedRange,
+});
 
-#[derive(serde::Deserialize, Serialize)]
+#[derive(Debug)]
 struct StreamFooter {
     payload_length: u64,
     payload_digest: PayloadDigest,
     projections: Vec<EmbeddedProjectionRef>,
 }
+super::wire::tuple_wire!(StreamFooter {
+    payload_length: u64,
+    payload_digest: PayloadDigest,
+    projections: Vec<EmbeddedProjectionRef>,
+});
 
-#[derive(serde::Deserialize, Serialize)]
+#[derive(Debug)]
 struct EmbeddedProjectionRef {
     kind: String,
     schema_version: u16,
     source: PayloadDigest,
     object_range: ChecksummedRange,
 }
+super::wire::tuple_wire!(EmbeddedProjectionRef {
+    kind: String,
+    schema_version: u16,
+    source: PayloadDigest,
+    object_range: ChecksummedRange,
+});
 
-#[derive(serde::Deserialize, Serialize)]
+#[derive(Debug)]
 struct DataBlockIndex {
     blocks: Vec<ChecksummedRange>,
 }
+super::wire::tuple_wire!(DataBlockIndex {
+    blocks: Vec<ChecksummedRange>,
+});
 
 struct EmbeddedProjection {
     kind: &'static str,

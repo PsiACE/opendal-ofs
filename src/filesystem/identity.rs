@@ -23,8 +23,7 @@ use serde::{Deserialize, Serialize};
 macro_rules! fixed_identity {
     ($(#[$meta:meta])* $name:ident, $length:literal) => {
         $(#[$meta])*
-        #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-        #[serde(transparent)]
+        #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
         pub struct $name([u8; $length]);
 
         impl $name {
@@ -34,6 +33,50 @@ macro_rules! fixed_identity {
 
             pub const fn as_bytes(&self) -> &[u8; $length] {
                 &self.0
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                serializer.serialize_bytes(&self.0)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct IdentityVisitor;
+
+                impl serde::de::Visitor<'_> for IdentityVisitor {
+                    type Value = [u8; $length];
+
+                    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                        write!(formatter, "a {}-byte identity", $length)
+                    }
+
+                    fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        value.try_into().map_err(|_| {
+                            E::invalid_length(value.len(), &self)
+                        })
+                    }
+
+                    fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Self::Value, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        self.visit_bytes(&value)
+                    }
+                }
+
+                deserializer.deserialize_bytes(IdentityVisitor).map(Self)
             }
         }
     };
@@ -86,11 +129,32 @@ generated_identity!(VolumeId, NodeId, FileVersionId, OperationId);
 
 /// Content fingerprint used by Sync to compare a materialized file with a
 /// logical file version. It is not the file version identity or its layout.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct FileFingerprint {
     digest: Digest,
     logical_length: u64,
+}
+
+impl Serialize for FileFingerprint {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        (self.digest, self.logical_length).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for FileFingerprint {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let (digest, logical_length) = Deserialize::deserialize(deserializer)?;
+        Ok(Self {
+            digest,
+            logical_length,
+        })
+    }
 }
 
 impl FileFingerprint {

@@ -74,13 +74,17 @@ impl ManagedFormat {
     }
 }
 
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug)]
 struct VolumeFormat {
     volume_id: VolumeId,
     root_node_id: NodeId,
     naming_policy: NamingPolicy,
 }
+super::wire::tuple_wire!(VolumeFormat {
+    volume_id: VolumeId,
+    root_node_id: NodeId,
+    naming_policy: NamingPolicy,
+});
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]

@@ -79,18 +79,27 @@ impl ManagedObservation {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct Head {
     pub(super) current_commit: NamespaceRevision,
     pub(super) gc_epoch: GcEpoch,
     pub(super) minimum_retained_cursor: ChangeCursor,
 }
+super::wire::tuple_wire!(Head {
+    current_commit: NamespaceRevision,
+    gc_epoch: GcEpoch,
+    minimum_retained_cursor: ChangeCursor,
+});
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NamespaceRevision {
     object: ObjectRef,
     cursor: ChangeCursor,
 }
+super::wire::tuple_wire!(NamespaceRevision {
+    object: ObjectRef,
+    cursor: ChangeCursor,
+});
 
 impl NamespaceRevision {
     pub const fn cursor(self) -> ChangeCursor {
@@ -98,7 +107,7 @@ impl NamespaceRevision {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug)]
 struct NamespaceCommit {
     volume_id: VolumeId,
     change_cursor: ChangeCursor,
@@ -110,6 +119,17 @@ struct NamespaceCommit {
     projections: Vec<ObjectRef>,
     extensions: Vec<ObjectRef>,
 }
+super::wire::tuple_wire!(NamespaceCommit {
+    volume_id: VolumeId,
+    change_cursor: ChangeCursor,
+    nodes: Vec<StreamRef>,
+    directory_entries: Vec<StreamRef>,
+    file_versions: Vec<StreamRef>,
+    changes: Vec<StreamRef>,
+    operation_results: Vec<StreamRef>,
+    projections: Vec<ObjectRef>,
+    extensions: Vec<ObjectRef>,
+});
 
 impl NamespaceCommit {
     fn genesis(volume_id: VolumeId, nodes: StreamRef) -> Self {
@@ -137,13 +157,13 @@ impl NamespaceCommit {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct DirectoryKey {
     parent_node_id: NodeId,
     name: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum NodeValue {
     Directory {
         generation: u64,
@@ -155,6 +175,84 @@ enum NodeValue {
         attributes: NodeAttributes,
         file_version: FileVersionId,
     },
+}
+
+impl Serialize for NodeValue {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeTuple as _;
+        match self {
+            Self::Directory {
+                generation,
+                attributes,
+                directory_generation,
+            } => {
+                let mut tuple = serializer.serialize_tuple(4)?;
+                tuple.serialize_element(&0_u8)?;
+                tuple.serialize_element(generation)?;
+                tuple.serialize_element(&attributes.executable)?;
+                tuple.serialize_element(directory_generation)?;
+                tuple.end()
+            }
+            Self::RegularFile {
+                generation,
+                attributes,
+                file_version,
+            } => {
+                let mut tuple = serializer.serialize_tuple(4)?;
+                tuple.serialize_element(&1_u8)?;
+                tuple.serialize_element(generation)?;
+                tuple.serialize_element(&attributes.executable)?;
+                tuple.serialize_element(file_version)?;
+                tuple.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for NodeValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct NodeValueVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for NodeValueVisitor {
+            type Value = NodeValue;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a Managed node value array")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let tag = next_element(&mut sequence, "node value tag")?;
+                let generation = next_element(&mut sequence, "node generation")?;
+                let executable = next_element(&mut sequence, "node executable attribute")?;
+                let value = match tag {
+                    0_u8 => Self::Value::Directory {
+                        generation,
+                        attributes: NodeAttributes { executable },
+                        directory_generation: next_element(&mut sequence, "directory generation")?,
+                    },
+                    1_u8 => Self::Value::RegularFile {
+                        generation,
+                        attributes: NodeAttributes { executable },
+                        file_version: next_element(&mut sequence, "file version")?,
+                    },
+                    _ => return Err(serde::de::Error::custom("unknown node value tag")),
+                };
+                require_sequence_end(&mut sequence)?;
+                Ok(value)
+            }
+        }
+
+        deserializer.deserialize_seq(NodeValueVisitor)
+    }
 }
 
 impl NodeValue {
@@ -200,38 +298,61 @@ impl NodeValue {
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Debug)]
 struct NodeMutation {
     node_id: NodeId,
     change_cursor: ChangeCursor,
     value: Option<NodeValue>,
 }
+super::wire::tuple_wire!(NodeMutation {
+    node_id: NodeId,
+    change_cursor: ChangeCursor,
+    value: Option<NodeValue>,
+});
 
-#[derive(Deserialize, Serialize)]
+#[derive(Debug)]
 struct DirectoryMutation {
     parent_node_id: NodeId,
     name: String,
     change_cursor: ChangeCursor,
     value: Option<DirectoryEntry>,
 }
+super::wire::tuple_wire!(DirectoryMutation {
+    parent_node_id: NodeId,
+    name: String,
+    change_cursor: ChangeCursor,
+    value: Option<DirectoryEntry>,
+});
 
-#[derive(Clone, Copy, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug)]
 pub(super) struct FileVersionRecord {
     pub(super) file_version: FileVersionId,
     pub(super) file_size: u64,
     pub(super) content_fingerprint: FileFingerprint,
     pub(super) manifest: ObjectRef,
 }
+super::wire::tuple_wire!(FileVersionRecord {
+    file_version: FileVersionId,
+    file_size: u64,
+    content_fingerprint: FileFingerprint,
+    manifest: ObjectRef,
+});
 
-#[derive(Deserialize, Serialize)]
+#[derive(Debug)]
 struct ChangeRecord {
     change_cursor: ChangeCursor,
     ordinal: u32,
     operation_id: OperationId,
     event: ChangeEvent,
 }
+super::wire::tuple_wire!(ChangeRecord {
+    change_cursor: ChangeCursor,
+    ordinal: u32,
+    operation_id: OperationId,
+    event: ChangeEvent,
+});
 
-#[derive(Deserialize, Serialize)]
+#[derive(Debug)]
 enum ChangeEvent {
     NodeChanged {
         node_id: NodeId,
@@ -256,11 +377,151 @@ enum ChangeEvent {
     },
 }
 
-#[derive(Clone, Copy, Deserialize, Serialize)]
+impl Serialize for ChangeEvent {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeTuple as _;
+        match self {
+            Self::NodeChanged {
+                node_id,
+                generation,
+            } => {
+                let mut tuple = serializer.serialize_tuple(3)?;
+                tuple.serialize_element(&0_u8)?;
+                tuple.serialize_element(node_id)?;
+                tuple.serialize_element(generation)?;
+                tuple.end()
+            }
+            Self::NodeRemoved {
+                node_id,
+                previous_generation,
+            } => {
+                let mut tuple = serializer.serialize_tuple(3)?;
+                tuple.serialize_element(&1_u8)?;
+                tuple.serialize_element(node_id)?;
+                tuple.serialize_element(previous_generation)?;
+                tuple.end()
+            }
+            Self::EntryLinked {
+                parent_node_id,
+                name,
+                node_id,
+                kind,
+                directory_generation,
+            } => {
+                let mut tuple = serializer.serialize_tuple(6)?;
+                tuple.serialize_element(&2_u8)?;
+                tuple.serialize_element(parent_node_id)?;
+                tuple.serialize_element(name)?;
+                tuple.serialize_element(node_id)?;
+                tuple.serialize_element(kind)?;
+                tuple.serialize_element(directory_generation)?;
+                tuple.end()
+            }
+            Self::EntryUnlinked {
+                parent_node_id,
+                name,
+                node_id,
+                directory_generation,
+            } => {
+                let mut tuple = serializer.serialize_tuple(5)?;
+                tuple.serialize_element(&3_u8)?;
+                tuple.serialize_element(parent_node_id)?;
+                tuple.serialize_element(name)?;
+                tuple.serialize_element(node_id)?;
+                tuple.serialize_element(directory_generation)?;
+                tuple.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ChangeEvent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ChangeEventVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ChangeEventVisitor {
+            type Value = ChangeEvent;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a Managed change event array")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let tag = next_element(&mut sequence, "change event tag")?;
+                let value = match tag {
+                    0_u8 => Self::Value::NodeChanged {
+                        node_id: next_element(&mut sequence, "node identity")?,
+                        generation: next_element(&mut sequence, "node generation")?,
+                    },
+                    1_u8 => Self::Value::NodeRemoved {
+                        node_id: next_element(&mut sequence, "node identity")?,
+                        previous_generation: next_element(
+                            &mut sequence,
+                            "previous node generation",
+                        )?,
+                    },
+                    2_u8 => Self::Value::EntryLinked {
+                        parent_node_id: next_element(&mut sequence, "parent node identity")?,
+                        name: next_element(&mut sequence, "entry name")?,
+                        node_id: next_element(&mut sequence, "node identity")?,
+                        kind: next_element(&mut sequence, "node kind")?,
+                        directory_generation: next_element(&mut sequence, "directory generation")?,
+                    },
+                    3_u8 => Self::Value::EntryUnlinked {
+                        parent_node_id: next_element(&mut sequence, "parent node identity")?,
+                        name: next_element(&mut sequence, "entry name")?,
+                        node_id: next_element(&mut sequence, "node identity")?,
+                        directory_generation: next_element(&mut sequence, "directory generation")?,
+                    },
+                    _ => return Err(serde::de::Error::custom("unknown change event tag")),
+                };
+                require_sequence_end(&mut sequence)?;
+                Ok(value)
+            }
+        }
+
+        deserializer.deserialize_seq(ChangeEventVisitor)
+    }
+}
+
+fn next_element<'de, A, T>(sequence: &mut A, name: &'static str) -> Result<T, A::Error>
+where
+    A: serde::de::SeqAccess<'de>,
+    T: Deserialize<'de>,
+{
+    sequence
+        .next_element()?
+        .ok_or_else(|| serde::de::Error::custom(format!("missing {name}")))
+}
+
+fn require_sequence_end<'de, A>(sequence: &mut A) -> Result<(), A::Error>
+where
+    A: serde::de::SeqAccess<'de>,
+{
+    if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
+        return Err(serde::de::Error::custom("record array has trailing fields"));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
 struct OperationRecord {
     operation_id: OperationId,
     change_cursor: ChangeCursor,
 }
+super::wire::tuple_wire!(OperationRecord {
+    operation_id: OperationId,
+    change_cursor: ChangeCursor,
+});
 
 struct StoredNamespace {
     snapshot: VolumeSnapshot,
