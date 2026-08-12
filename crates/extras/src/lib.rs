@@ -19,7 +19,8 @@
 
 use ofs_core::filesystem::VolumeId;
 use ofs_core::managed::extension::{
-    ExtensionId, ExtentExtension as _, FileAccessInfo, FileExtension as _, IdentityExtentAccess,
+    ExtensionId, ExtentExtension as _, FileAccessInfo, FileLayoutExtension as _,
+    IdentityExtentAccess,
 };
 use ofs_core::managed::{ManagedMetadata, ManagedVolume};
 use ofs_core::{Error, ErrorKind};

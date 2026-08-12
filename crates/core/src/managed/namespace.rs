@@ -67,7 +67,8 @@ impl ManagedVolume {
         &self,
         revision: NamespaceRevision,
     ) -> Result<Namespace<FileDataRef>, Error> {
-        let (head, _) = self.read_head().await?;
+        let authority = self.read_authority().await?;
+        let head = authority.head();
         if revision.change_cursor.sequence() < head.minimum_retained_cursor.sequence()
             || revision.change_cursor.sequence() > head.current_commit.change_cursor.sequence()
         {

@@ -22,6 +22,7 @@ use crate::workset::{self, Spool, Workspace};
 use crate::{Error, ErrorKind};
 
 use super::ManagedVolume;
+use super::authority::{AuthorityHead, AuthorityRoot, AuthorityRoots};
 use super::object::{GcEpoch, OBJECT_PREFIX, ObjectLocator};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -35,49 +36,48 @@ impl ManagedVolume {
     /// Rotate the upload epoch, compact live metadata, then merge a streamed
     /// inventory against the streamed reachability set.
     pub async fn collect_unreachable(&self) -> Result<GcOutcome, Error> {
-        let (mut head, revision) = self.read_head().await?;
-        let previous_commit = head.current_commit;
-        let collection_epoch = head.gc_epoch.next()?;
-        head.gc_epoch = collection_epoch;
-        if !self.replace_head(&revision, &head).await? {
-            return Err(Error::new(
-                ErrorKind::Conflict,
-                "collect Managed objects",
-                "namespace authority changed while rotating the GC epoch",
-            ));
-        }
+        let (fence, mut roots) = self
+            .authority_access
+            .begin_collection_dyn(&self.access_context)
+            .await?;
+        let collection_epoch = fence.epoch();
         crate::fault::check("after-gc-epoch-rotation")?;
 
-        let (mut rotated, revision) = self.read_head().await?;
-        if rotated.gc_epoch != collection_epoch || rotated.current_commit != previous_commit {
-            return Err(Error::new(
-                ErrorKind::Conflict,
-                "collect Managed objects",
-                "namespace authority changed before metadata compaction",
-            ));
-        }
         let workspace = Workspace::create(self.workset_options())?;
         let mut records = workspace.writer("gc-reachable")?;
-        let collection_commit = self
-            .compact_for_collection(previous_commit, collection_epoch, |reference| {
-                records.write(&reference)
-            })
-            .await?;
-        rotated.current_commit = collection_commit;
-        if !self.replace_head(&revision, &rotated).await? {
+        let mut compacted = workspace.writer("gc-authority-roots")?;
+        while let Some(root) = roots.next().await? {
+            let collection_commit = self
+                .compact_for_collection(root.head.current_commit(), collection_epoch, |reference| {
+                    records.write(&reference)
+                })
+                .await?;
+            compacted.write(&AuthorityRoot {
+                id: root.id,
+                name: root.name,
+                head: AuthorityHead::new(
+                    collection_commit,
+                    collection_epoch,
+                    collection_commit.cursor(),
+                ),
+            })?;
+        }
+        let mut compacted = SpoolAuthorityRoots(compacted.finish()?.reader()?);
+        if !self
+            .authority_access
+            .finish_collection_dyn(&self.access_context, fence, &mut compacted)
+            .await?
+        {
             return Err(Error::new(
                 ErrorKind::Conflict,
                 "collect Managed objects",
-                "namespace authority changed while publishing compacted metadata",
+                "namespace authority changed while publishing compacted roots",
             ));
         }
 
         let marks = workset::sort(&workspace, &records.finish()?, |identity| *identity)?;
         let candidates = self.inventory_workset(&workspace, collection_epoch).await?;
-        let outcome = self.sweep_worksets(&marks, &candidates).await?;
-        self.advance_reclamation_watermark(collection_commit.cursor())
-            .await?;
-        Ok(outcome)
+        self.sweep_worksets(&marks, &candidates).await
     }
 
     async fn inventory_workset(
@@ -161,21 +161,16 @@ impl ManagedVolume {
             .map_err(|error| Error::from_storage("finish Managed object deletion", error))?;
         Ok(outcome)
     }
+}
 
-    async fn advance_reclamation_watermark(
-        &self,
-        completed: crate::filesystem::ChangeCursor,
-    ) -> Result<(), Error> {
-        loop {
-            let (mut head, revision) = self.read_head().await?;
-            if head.minimum_retained_cursor.sequence() >= completed.sequence() {
-                return Ok(());
-            }
-            head.minimum_retained_cursor = completed;
-            if self.replace_head(&revision, &head).await? {
-                return Ok(());
-            }
-        }
+struct SpoolAuthorityRoots(workset::SpoolReader<AuthorityRoot>);
+
+impl AuthorityRoots for SpoolAuthorityRoots {
+    fn next(
+        &mut self,
+    ) -> super::authority::AuthorityFuture<'_, Result<Option<AuthorityRoot>, Error>> {
+        let root = self.0.next();
+        Box::pin(async move { root })
     }
 }
 

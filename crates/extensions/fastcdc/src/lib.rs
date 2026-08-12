@@ -23,7 +23,8 @@ use fastcdc::v2020::AsyncStreamCDC;
 use ofs_core::filesystem::{Digest, FileFingerprint};
 use ofs_core::managed::extension::{
     AccessContext, ExtensionFileRef, ExtensionFormat, ExtensionId, ExtentAccess, ExtentRef,
-    FileAccess, FileAccessInfo, FileExtension, RecordStreamReader, RecordStreamWriter, StreamKind,
+    FileAccess, FileAccessInfo, FileLayoutExtension, RecordStreamReader, RecordStreamWriter,
+    StreamKind,
 };
 use ofs_core::managed::{GcEpoch, ObjectClass, ObjectLocator};
 use ofs_core::{Error, ErrorKind};
@@ -71,7 +72,7 @@ impl FastCdcExtension {
     }
 }
 
-impl<A: ExtentAccess> FileExtension<A> for FastCdcExtension {
+impl<A: ExtentAccess> FileLayoutExtension<A> for FastCdcExtension {
     type ExtendedAccess = FastCdcAccess<A>;
 
     fn extend(&self, inner: A) -> Self::ExtendedAccess {

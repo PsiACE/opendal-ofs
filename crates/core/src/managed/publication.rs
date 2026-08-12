@@ -22,8 +22,9 @@ use crate::filesystem::{ChangeCursor, OperationId};
 use crate::namespace::Namespace;
 use crate::{Error, ErrorKind};
 
+use super::authority::AuthorityHead;
 use super::data::FileDataRef;
-use super::head::{Head, ManagedObservation, ManagedVolume, NamespaceRevision};
+use super::head::{ManagedObservation, ManagedVolume, NamespaceRevision};
 use super::layout::{
     NamespaceChangeSegment, NamespaceCommit, NamespaceSnapshot, OperationReceipt,
     OperationReceiptSegment, should_merge,
@@ -132,16 +133,12 @@ impl ManagedVolume {
                 "prepared publication ancestry is invalid",
             ));
         }
-        let head = Head {
-            current_commit: target,
-            gc_epoch: observed.gc_epoch,
-            minimum_retained_cursor: observed.reclamation_watermark,
-        };
-        if self.replace_head(&observed.head_revision, &head).await? {
+        let head = AuthorityHead::new(target, observed.gc_epoch, observed.reclamation_watermark);
+        if self.replace_head(&observed.authority, head).await? {
             return Ok(());
         }
-        let (current, _) = self.read_head().await?;
-        let commit = read_commit(self, current.current_commit).await?;
+        let current = self.read_authority().await?;
+        let commit = read_commit(self, current.head().current_commit()).await?;
         if operation_in_commit(self, operation, target.change_cursor, &commit).await? {
             Ok(())
         } else {

@@ -355,12 +355,108 @@ pub trait FileAccess: Send + Sync + fmt::Debug + Unpin + 'static {
 }
 
 /// Typed file-layout extension over an extent access.
-pub trait FileExtension<A: ExtentAccess> {
+pub trait FileLayoutExtension<A: ExtentAccess> {
     /// Resulting statically composed file access.
     type ExtendedAccess: FileAccess;
 
     /// Build the layout around the extent access.
     fn extend(&self, inner: A) -> Self::ExtendedAccess;
+}
+
+/// Cross-cutting extension over complete logical-file access.
+///
+/// Flow control and observability extensions use this boundary so publication,
+/// range reads, installation, and collection traversal share one call chain.
+pub trait FileAccessExtension<A: FileAccess> {
+    /// Resulting statically composed access.
+    type ExtendedAccess: FileAccess;
+
+    /// Wrap the complete logical-file access.
+    fn extend(&self, inner: A) -> Self::ExtendedAccess;
+}
+
+/// Default forwarding surface for cross-cutting file access extensions.
+pub trait ExtendedFileAccess: Send + Sync + fmt::Debug + Unpin + 'static {
+    /// Wrapped logical-file access.
+    type Inner: FileAccess;
+
+    /// Return the wrapped access.
+    fn inner(&self) -> &Self::Inner;
+
+    /// Forward the persisted access description by default.
+    fn info(&self) -> FileAccessInfo {
+        self.inner().info()
+    }
+
+    /// Forward publication by default.
+    fn write<'a>(
+        &'a self,
+        context: &'a AccessContext,
+        source: &'a mut (dyn AsyncRead + Send + Unpin),
+        fingerprint: FileFingerprint,
+        gc_epoch: GcEpoch,
+    ) -> impl Future<Output = Result<ExtensionFileRef, Error>> + Send + 'a {
+        self.inner().write(context, source, fingerprint, gc_epoch)
+    }
+
+    /// Forward logical range reads by default.
+    fn read<'a>(
+        &'a self,
+        context: &'a AccessContext,
+        reference: ExtensionFileRef,
+        fingerprint: FileFingerprint,
+        range: Range<u64>,
+        destination: &'a mut (dyn AsyncWrite + Send + Unpin),
+    ) -> impl Future<Output = Result<(), Error>> + Send + 'a {
+        self.inner()
+            .read(context, reference, fingerprint, range, destination)
+    }
+
+    /// Forward collection reachability traversal by default.
+    fn visit_reachable<'a>(
+        &'a self,
+        context: &'a AccessContext,
+        reference: ExtensionFileRef,
+        visit: &'a mut (dyn FnMut(ObjectLocator) -> Result<(), Error> + Send),
+    ) -> impl Future<Output = Result<(), Error>> + Send + 'a {
+        self.inner().visit_reachable(context, reference, visit)
+    }
+}
+
+impl<T: ExtendedFileAccess> FileAccess for T {
+    fn info(&self) -> FileAccessInfo {
+        ExtendedFileAccess::info(self)
+    }
+
+    fn write<'a>(
+        &'a self,
+        context: &'a AccessContext,
+        source: &'a mut (dyn AsyncRead + Send + Unpin),
+        fingerprint: FileFingerprint,
+        gc_epoch: GcEpoch,
+    ) -> impl Future<Output = Result<ExtensionFileRef, Error>> + Send + 'a {
+        ExtendedFileAccess::write(self, context, source, fingerprint, gc_epoch)
+    }
+
+    fn read<'a>(
+        &'a self,
+        context: &'a AccessContext,
+        reference: ExtensionFileRef,
+        fingerprint: FileFingerprint,
+        range: Range<u64>,
+        destination: &'a mut (dyn AsyncWrite + Send + Unpin),
+    ) -> impl Future<Output = Result<(), Error>> + Send + 'a {
+        ExtendedFileAccess::read(self, context, reference, fingerprint, range, destination)
+    }
+
+    fn visit_reachable<'a>(
+        &'a self,
+        context: &'a AccessContext,
+        reference: ExtensionFileRef,
+        visit: &'a mut (dyn FnMut(ObjectLocator) -> Result<(), Error> + Send),
+    ) -> impl Future<Output = Result<(), Error>> + Send + 'a {
+        ExtendedFileAccess::visit_reachable(self, context, reference, visit)
+    }
 }
 
 /// Object-safe file access used only by `ManagedVolume`.

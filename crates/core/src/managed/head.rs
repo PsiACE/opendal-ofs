@@ -25,6 +25,7 @@ use crate::filesystem::{ChangeCursor, VolumeId};
 use crate::namespace::Namespace;
 use crate::workset::WorksetOptions;
 
+use super::authority::{AuthorityAccessDyn, AuthorityHead, AuthorityObservation};
 use super::data::FileDataRef;
 use super::extension::{AccessContext, FileAccessDyn};
 use super::format::ManagedFormat;
@@ -32,11 +33,6 @@ use super::layout::NamespaceCommit;
 use super::namespace;
 use super::object::{GcEpoch, ObjectRef};
 use super::publication;
-use super::record::Record;
-use super::storage;
-
-const HEAD_KEY: &str = "managed/1/head";
-const HEAD_RECORD: Record = Record::new(*b"OFSHEAD1", 64 * 1024);
 
 #[derive(Clone)]
 pub struct ManagedVolume {
@@ -46,11 +42,13 @@ pub struct ManagedVolume {
     pub(super) worksets: WorksetOptions,
     pub(super) file_access: Option<Arc<dyn FileAccessDyn>>,
     pub(super) access_context: AccessContext,
+    pub(super) authority_access: Arc<dyn AuthorityAccessDyn>,
+    pub(super) authority_name: String,
 }
 
 pub(crate) struct ManagedObservation {
     pub(crate) namespace: Namespace<FileDataRef>,
-    pub(super) head_revision: String,
+    pub(super) authority: AuthorityObservation,
     namespace_revision: NamespaceRevision,
     pub(super) reclamation_watermark: ChangeCursor,
     pub(super) gc_epoch: GcEpoch,
@@ -82,18 +80,6 @@ impl ManagedObservation {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct Head {
-    pub(super) current_commit: NamespaceRevision,
-    pub(super) gc_epoch: GcEpoch,
-    pub(super) minimum_retained_cursor: ChangeCursor,
-}
-super::wire::tuple_wire!(Head {
-    current_commit: NamespaceRevision,
-    gc_epoch: GcEpoch,
-    minimum_retained_cursor: ChangeCursor,
-});
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NamespaceRevision {
     pub(super) object: ObjectRef,
     pub(super) change_cursor: ChangeCursor,
@@ -107,6 +93,11 @@ impl NamespaceRevision {
     pub const fn cursor(self) -> ChangeCursor {
         self.change_cursor
     }
+
+    /// Immutable namespace commit object.
+    pub const fn object(self) -> ObjectRef {
+        self.object
+    }
 }
 
 impl ManagedVolume {
@@ -116,6 +107,8 @@ impl ManagedVolume {
         stream_concurrency: usize,
         worksets: WorksetOptions,
         file_access: Option<Arc<dyn FileAccessDyn>>,
+        authority_access: Arc<dyn AuthorityAccessDyn>,
+        authority_name: String,
     ) -> Self {
         let access_context = AccessContext::new(operator.clone());
         Self {
@@ -125,6 +118,8 @@ impl ManagedVolume {
             worksets,
             file_access,
             access_context,
+            authority_access,
+            authority_name,
         }
     }
 
@@ -146,15 +141,14 @@ impl ManagedVolume {
     }
 
     pub(super) async fn initialize(&self) -> Result<(), Error> {
-        if storage::read_control(
-            &self.operator,
-            HEAD_KEY,
-            HEAD_RECORD.maximum_encoded_bytes(),
-        )
-        .await?
-        .is_some()
+        match self
+            .authority_access
+            .observe_dyn(&self.access_context, &self.authority_name)
+            .await
         {
-            return self.observe().await.map(drop);
+            Ok(_) => return self.observe().await.map(drop),
+            Err(error) if error.kind() == crate::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
 
         let namespace =
@@ -162,32 +156,22 @@ impl ManagedVolume {
                 .await?;
         let commit = NamespaceCommit::genesis(self.id(), namespace);
         let revision = publication::write_commit(self, GcEpoch::ZERO, &commit).await?;
-        let head = Head {
-            current_commit: revision,
-            gc_epoch: GcEpoch::ZERO,
-            minimum_retained_cursor: ChangeCursor::GENESIS,
-        };
-        if storage::write_control(
-            &self.operator,
-            HEAD_KEY,
-            HEAD_RECORD.encode(&head)?,
-            storage::ControlCondition::Missing,
-        )
-        .await?
-        {
-            Ok(())
-        } else {
-            self.observe().await.map(drop)
-        }
+        self.authority_access
+            .initialize_dyn(
+                &self.access_context,
+                AuthorityHead::new(revision, GcEpoch::ZERO, ChangeCursor::GENESIS),
+            )
+            .await
     }
 
     pub(crate) async fn observe(&self) -> Result<ManagedObservation, Error> {
-        let (head, head_revision) = self.read_head().await?;
+        let authority = self.read_authority().await?;
+        let head = authority.head();
         let commit = publication::read_commit(self, head.current_commit).await?;
         let namespace = namespace::read(self, &commit, commit.change_cursor).await?;
         Ok(ManagedObservation {
             namespace,
-            head_revision,
+            authority,
             namespace_revision: head.current_commit,
             reclamation_watermark: head.minimum_retained_cursor,
             gc_epoch: head.gc_epoch,
@@ -195,22 +179,10 @@ impl ManagedVolume {
         })
     }
 
-    pub(super) async fn read_head(&self) -> Result<(Head, String), Error> {
-        let control = storage::read_control(
-            &self.operator,
-            HEAD_KEY,
-            HEAD_RECORD.maximum_encoded_bytes(),
-        )
-        .await?
-        .ok_or_else(|| Error::corrupt("open Managed volume", "namespace head is missing"))?;
-        let head: Head = HEAD_RECORD.decode(&control.bytes)?;
-        if head.minimum_retained_cursor.sequence() > head.current_commit.change_cursor.sequence() {
-            return Err(Error::corrupt(
-                "read Managed namespace",
-                "namespace head retention is invalid",
-            ));
-        }
-        Ok((head, control.revision))
+    pub(super) async fn read_authority(&self) -> Result<AuthorityObservation, Error> {
+        self.authority_access
+            .observe_dyn(&self.access_context, &self.authority_name)
+            .await
     }
 
     pub(crate) const fn operator(&self) -> &Operator {
@@ -223,15 +195,11 @@ impl ManagedVolume {
 
     pub(super) async fn replace_head(
         &self,
-        expected_revision: &str,
-        head: &Head,
+        observed: &AuthorityObservation,
+        head: AuthorityHead,
     ) -> Result<bool, Error> {
-        storage::write_control(
-            &self.operator,
-            HEAD_KEY,
-            HEAD_RECORD.encode(head)?,
-            storage::ControlCondition::Revision(expected_revision),
-        )
-        .await
+        self.authority_access
+            .compare_exchange_dyn(&self.access_context, &self.authority_name, observed, head)
+            .await
     }
 }

@@ -17,6 +17,7 @@
 
 //! Managed volume authority and durable storage format.
 
+pub mod authority;
 mod data;
 pub mod extension;
 mod file;
@@ -33,6 +34,10 @@ mod storage;
 mod stream;
 mod wire;
 
+pub use authority::{
+    AuthorityAccess, AuthorityExtension, AuthorityFuture, AuthorityHead, AuthorityId,
+    AuthorityObservation, AuthorityRoots, CollectionFence, DefaultAuthorityAccess,
+};
 pub(crate) use data::FileDataRef;
 pub(crate) use format::ManagedFormat;
 pub use gc::GcOutcome;
@@ -53,6 +58,7 @@ use opendal::Operator;
 use crate::filesystem::{NodeId, VolumeId};
 use crate::workset::WorksetOptions;
 use crate::{Error, ErrorKind};
+use authority::{AuthorityAccessDyn, DEFAULT_AUTHORITY};
 use extension::{FileAccess, FileAccessDyn, FileAccessInfo};
 use format::{FORMAT_KEY, MAX_FORMAT_BYTES};
 
@@ -63,6 +69,8 @@ pub struct ManagedMetadata {
     stream_concurrency: usize,
     worksets: WorksetOptions,
     file_access: Option<Arc<dyn FileAccessDyn>>,
+    authority_access: Arc<dyn AuthorityAccessDyn>,
+    authority_name: String,
 }
 
 impl ManagedMetadata {
@@ -88,7 +96,20 @@ impl ManagedMetadata {
             stream_concurrency: stream_concurrency.get(),
             worksets: WorksetOptions::new(work_memory_mib, stream_concurrency)?,
             file_access: None,
+            authority_access: Arc::new(DefaultAuthorityAccess),
+            authority_name: DEFAULT_AUTHORITY.to_owned(),
         })
+    }
+
+    /// Configure one statically composed namespace authority extension.
+    pub fn with_authority_extension(
+        mut self,
+        access: impl AuthorityAccess,
+        name: impl Into<String>,
+    ) -> Self {
+        self.authority_access = Arc::new(access);
+        self.authority_name = name.into();
+        self
     }
 
     /// Configure one statically composed file extension access.
@@ -106,6 +127,11 @@ impl ManagedMetadata {
         })
     }
 
+    /// Read the namespace authority extension recorded by an existing volume.
+    pub async fn authority_extension(&self) -> Result<Option<extension::ExtensionFormat>, Error> {
+        Ok(self.read_format().await?.authority_extension().cloned())
+    }
+
     /// Create the Managed superblock once, or return the existing format.
     pub async fn initialize(
         &self,
@@ -115,7 +141,12 @@ impl ManagedMetadata {
             Some(target_bytes) => format::FilePlacement::Pack { target_bytes },
             None => format::FilePlacement::Whole,
         };
-        let desired = ManagedFormat::new(VolumeId::generate(), NodeId::generate(), file_placement);
+        let desired = ManagedFormat::new(
+            VolumeId::generate(),
+            NodeId::generate(),
+            file_placement,
+            self.authority_access.info_dyn(),
+        );
         let encoded = desired.encode()?;
         let format = if storage::write_control(
             &self.operator,
@@ -142,6 +173,8 @@ impl ManagedMetadata {
             self.stream_concurrency,
             self.worksets,
             self.file_access.clone(),
+            self.authority_access.clone(),
+            self.authority_name.clone(),
         );
         volume.initialize().await?;
         Ok(volume)
@@ -159,6 +192,7 @@ impl ManagedMetadata {
             VolumeId::generate(),
             NodeId::generate(),
             format::FilePlacement::Extension(access.info_dyn()),
+            self.authority_access.info_dyn(),
         );
         let format = if storage::write_control(
             &self.operator,
@@ -185,6 +219,8 @@ impl ManagedMetadata {
             self.stream_concurrency,
             self.worksets,
             self.file_access.clone(),
+            self.authority_access.clone(),
+            self.authority_name.clone(),
         );
         volume.initialize().await?;
         Ok(volume)
@@ -229,12 +265,20 @@ impl ManagedMetadata {
                 ));
             }
         }
+        if format.authority_extension() != self.authority_access.info_dyn().as_ref() {
+            return Err(Error::unsupported(
+                "open Managed volume",
+                "the volume namespace authority extension is not configured",
+            ));
+        }
         Ok(ManagedVolume::new(
             format,
             self.operator.clone(),
             self.stream_concurrency,
             self.worksets,
             self.file_access.clone(),
+            self.authority_access.clone(),
+            self.authority_name.clone(),
         ))
     }
 }

@@ -23,7 +23,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use std::num::NonZeroU64;
 
-use super::extension::FileAccessInfo;
+use super::extension::{ExtensionFormat, FileAccessInfo};
 use super::record::Record;
 
 pub(crate) const FORMAT_KEY: &str = "managed/1/format";
@@ -38,6 +38,7 @@ pub(crate) struct ManagedFormat {
     volume_id: VolumeId,
     root_node_id: NodeId,
     file_placement: FilePlacement,
+    authority_extension: Option<ExtensionFormat>,
 }
 
 impl ManagedFormat {
@@ -45,11 +46,13 @@ impl ManagedFormat {
         volume_id: VolumeId,
         root_node_id: NodeId,
         file_placement: FilePlacement,
+        authority_extension: Option<ExtensionFormat>,
     ) -> Self {
         Self {
             volume_id,
             root_node_id,
             file_placement,
+            authority_extension,
         }
     }
 
@@ -65,11 +68,16 @@ impl ManagedFormat {
         &self.file_placement
     }
 
+    pub(crate) const fn authority_extension(&self) -> Option<&ExtensionFormat> {
+        self.authority_extension.as_ref()
+    }
+
     pub(crate) fn encode(&self) -> Result<Vec<u8>, Error> {
         FORMAT_RECORD.encode(&VolumeFormat {
             volume_id: self.volume_id,
             root_node_id: self.root_node_id,
             file_placement: self.file_placement.clone(),
+            authority_extension: self.authority_extension.clone(),
         })
     }
 
@@ -79,6 +87,7 @@ impl ManagedFormat {
             volume_id: format.volume_id,
             root_node_id: format.root_node_id,
             file_placement: format.file_placement,
+            authority_extension: format.authority_extension,
         })
     }
 }
@@ -174,9 +183,11 @@ struct VolumeFormat {
     volume_id: VolumeId,
     root_node_id: NodeId,
     file_placement: FilePlacement,
+    authority_extension: Option<ExtensionFormat>,
 }
 super::wire::tuple_wire!(VolumeFormat {
     volume_id: VolumeId,
     root_node_id: NodeId,
     file_placement: FilePlacement,
+    authority_extension: Option<ExtensionFormat>,
 });
