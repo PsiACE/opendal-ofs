@@ -21,13 +21,14 @@ use std::path::Path;
 
 use futures::{StreamExt as _, TryStreamExt as _};
 
+use crate::Error;
 use crate::filesystem::{ChangeCursor, NodeKind, VolumeSnapshot};
 use crate::managed::{ManagedObservation, ManagedVolume, NamespaceRevision};
 
+use super::ReplicaState;
 use super::install::{install, repair};
 use super::reconcile::{changed_paths, reconcile};
 use super::scan::{ScannedTree, scan};
-use super::{ReplicaState, SyncError};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SyncOutcome {
@@ -54,29 +55,35 @@ impl SyncEngine {
         root: &Path,
         state_path: &Path,
         resolve_paths: &[String],
-    ) -> Result<SyncOutcome, SyncError> {
+    ) -> Result<SyncOutcome, Error> {
         let resolved = resolve_paths.iter().cloned().collect::<BTreeSet<_>>();
         if resolved.len() != resolve_paths.len() {
-            return Err(SyncError::new(
+            return Err(Error::invalid(
+                "synchronize replica",
                 "a conflict resolution path was provided more than once",
             ));
         }
         let root = std::fs::canonicalize(root)
-            .map_err(|error| SyncError::io("open replica directory", error))?;
+            .map_err(|error| Error::from_io("open replica directory", Some(root), error))?;
         if !root.is_dir() {
-            return Err(SyncError::new("replica path is not a directory"));
+            return Err(Error::invalid(
+                "synchronize replica",
+                "replica path is not a directory",
+            ));
         }
 
         let observed = self.volume.observe().await?;
         let stored = ReplicaState::load(state_path)?;
         if let Some(state) = &stored {
             if state.root() != root {
-                return Err(SyncError::new(
+                return Err(Error::invalid(
+                    "synchronize replica",
                     "replica state belongs to a different local directory",
                 ));
             }
             if state.volume_id() != self.volume.id() {
-                return Err(SyncError::new(
+                return Err(Error::invalid(
+                    "synchronize replica",
                     "replica state belongs to a different volume",
                 ));
             }
@@ -100,7 +107,8 @@ impl SyncEngine {
                 && !directory_is_empty(&root)? =>
             {
                 if !resolved.is_empty() {
-                    return Err(SyncError::new(
+                    return Err(Error::invalid(
+                        "synchronize replica",
                         "--resolve requires an unresolved conflict in replica state",
                     ));
                 }
@@ -110,7 +118,8 @@ impl SyncEngine {
             }
             None => {
                 if !resolved.is_empty() {
-                    return Err(SyncError::new(
+                    return Err(Error::invalid(
+                        "synchronize replica",
                         "--resolve requires an unresolved conflict in replica state",
                     ));
                 }
@@ -166,7 +175,8 @@ impl SyncEngine {
             }),
             (ScannedTree::Changed(local), false) => {
                 if !resolved.is_empty() {
-                    return Err(SyncError::new(
+                    return Err(Error::invalid(
+                        "synchronize replica",
                         "--resolve requires a current local and remote conflict",
                     ));
                 }
@@ -192,7 +202,8 @@ impl SyncEngine {
             }
             (ScannedTree::Unchanged, true) => {
                 if !resolved.is_empty() {
-                    return Err(SyncError::new(
+                    return Err(Error::invalid(
+                        "synchronize replica",
                         "--resolve requires a current local and remote conflict",
                     ));
                 }
@@ -265,7 +276,7 @@ impl SyncEngine {
         observed: ManagedObservation,
         target: NamespaceRevision,
         published: bool,
-    ) -> Result<SyncOutcome, SyncError> {
+    ) -> Result<SyncOutcome, Error> {
         if !observed.can_read_revision(target) {
             state.begin_install(observed.revision(), false);
             state.save(state_path)?;
@@ -322,7 +333,7 @@ impl SyncEngine {
         mut state: ReplicaState,
         observed: ManagedObservation,
         resolved: &BTreeSet<String>,
-    ) -> Result<SyncOutcome, SyncError> {
+    ) -> Result<SyncOutcome, Error> {
         let local = match scan(root, &observed.snapshot, &self.volume).await? {
             ScannedTree::Unchanged => {
                 state.advance(observed.revision());
@@ -386,7 +397,7 @@ impl SyncEngine {
         target_revision: NamespaceRevision,
         current: Option<&VolumeSnapshot>,
         published: bool,
-    ) -> Result<SyncOutcome, SyncError> {
+    ) -> Result<SyncOutcome, Error> {
         state.begin_install(target_revision, published);
         state.save(state_path)?;
         install(
@@ -412,7 +423,7 @@ impl SyncEngine {
         state_path: &Path,
         mut state: ReplicaState,
         observed: ManagedObservation,
-    ) -> Result<SyncOutcome, SyncError> {
+    ) -> Result<SyncOutcome, Error> {
         let (expected, target, maintenance_generation) = state
             .pending_publication()
             .expect("pending state has publication references");
@@ -437,14 +448,16 @@ impl SyncEngine {
         if !observed.accepts_prepared(maintenance_generation) {
             state.cancel_pending(observed.revision());
             state.save(state_path)?;
-            return Err(SyncError::new(
+            return Err(Error::invalid(
+                "synchronize replica",
                 "pending publication was invalidated by data collection; repeat sync to prepare it again",
             ));
         }
         if observed.revision() != expected {
             state.cancel_pending(observed.revision());
             state.save(state_path)?;
-            return Err(SyncError::new(
+            return Err(Error::invalid(
+                "synchronize replica",
                 "pending publication conflicted with a newer remote change; repeat sync to reconcile",
             ));
         }
@@ -461,7 +474,7 @@ impl SyncEngine {
         root: &Path,
         common: &VolumeSnapshot,
         target: &VolumeSnapshot,
-    ) -> Result<(), SyncError> {
+    ) -> Result<(), Error> {
         let mut new_versions = BTreeSet::new();
         let mut files = Vec::new();
         for (path, node_id) in target.paths()? {
@@ -472,7 +485,9 @@ impl SyncEngine {
             let version = node
                 .file_version
                 .and_then(|id| target.file_versions.get(&id))
-                .ok_or_else(|| SyncError::new("pending file has no file version"))?;
+                .ok_or_else(|| {
+                    Error::corrupt("publish Managed files", "pending file has no file version")
+                })?;
             if common.file_versions.get(&version.id) == Some(version) {
                 continue;
             }
@@ -481,7 +496,7 @@ impl SyncEngine {
         }
 
         futures::stream::iter(files)
-            .map(Ok::<_, SyncError>)
+            .map(Ok::<_, Error>)
             .try_for_each_concurrent(
                 self.transfer_concurrency,
                 |(path, version, publish)| async move {
@@ -489,7 +504,10 @@ impl SyncEngine {
                     if publish {
                         self.volume.publish_file(&path, version).await?;
                     } else if self.volume.inspect_file(&path).await? != *version {
-                        return Err(SyncError::new("local file changed while being published"));
+                        return Err(Error::conflict(
+                            "publish Managed files",
+                            "local file changed while being published",
+                        ));
                     }
                     Ok(())
                 },
@@ -499,9 +517,10 @@ impl SyncEngine {
 }
 
 #[cfg(debug_assertions)]
-fn test_interrupt(point: &str) -> Result<(), SyncError> {
+fn test_interrupt(point: &str) -> Result<(), Error> {
     if std::env::var("OFS_INTERNAL_TEST_INTERRUPT").as_deref() == Ok(point) {
-        return Err(SyncError::new(
+        return Err(Error::invalid(
+            "synchronize replica",
             "internal test interrupted replica synchronization",
         ));
     }
@@ -509,21 +528,22 @@ fn test_interrupt(point: &str) -> Result<(), SyncError> {
 }
 
 #[cfg(not(debug_assertions))]
-const fn test_interrupt(_point: &str) -> Result<(), SyncError> {
+const fn test_interrupt(_point: &str) -> Result<(), Error> {
     Ok(())
 }
 
-fn require_empty(root: &Path) -> Result<(), SyncError> {
+fn require_empty(root: &Path) -> Result<(), Error> {
     if !directory_is_empty(root)? {
-        return Err(SyncError::new(
+        return Err(Error::invalid(
+            "synchronize replica",
             "a replica without state must use an empty local directory",
         ));
     }
     Ok(())
 }
 
-fn directory_is_empty(root: &Path) -> Result<bool, SyncError> {
-    let mut entries =
-        std::fs::read_dir(root).map_err(|error| SyncError::io("read replica directory", error))?;
+fn directory_is_empty(root: &Path) -> Result<bool, Error> {
+    let mut entries = std::fs::read_dir(root)
+        .map_err(|error| Error::from_io("read replica directory", Some(root), error))?;
     Ok(entries.next().is_none())
 }

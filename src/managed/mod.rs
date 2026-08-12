@@ -19,7 +19,6 @@
 
 mod container;
 mod data;
-mod error;
 mod format;
 mod gc;
 mod head;
@@ -33,8 +32,8 @@ pub use head::{ManagedObservation, ManagedVolume, NamespaceRevision};
 
 use opendal::Operator;
 
-use crate::filesystem::{NodeId, VolumeError, VolumeId};
-use error::{invalid, unavailable};
+use crate::filesystem::{NodeId, VolumeId};
+use crate::{Error, ErrorKind};
 use format::{FORMAT_KEY, MAX_FORMAT_BYTES};
 
 /// Object Metadata authority for one Managed volume.
@@ -44,14 +43,15 @@ pub struct ManagedMetadata {
 }
 
 impl ManagedMetadata {
-    pub fn object(operator: Operator) -> Result<Self, VolumeError> {
+    pub fn object(operator: Operator) -> Result<Self, Error> {
         let capability = operator.info().full_capability();
         if !(capability.read
             && capability.write
             && capability.write_with_if_not_exists
             && capability.write_with_if_match)
         {
-            return Err(invalid(
+            return Err(Error::new(
+                ErrorKind::Unsupported,
                 "open Managed metadata",
                 "storage lacks conditional record operations",
             ));
@@ -60,7 +60,7 @@ impl ManagedMetadata {
     }
 
     /// Create the Managed superblock once, or return the existing format.
-    pub async fn initialize(&self) -> Result<ManagedVolume, VolumeError> {
+    pub async fn initialize(&self) -> Result<ManagedVolume, Error> {
         let desired = ManagedFormat::v1(VolumeId::generate(), NodeId::generate());
         let encoded = desired.encode()?;
         let format = if object::create(&self.operator, FORMAT_KEY, encoded).await? {
@@ -73,18 +73,24 @@ impl ManagedMetadata {
         Ok(volume)
     }
 
-    pub async fn read_format(&self) -> Result<ManagedFormat, VolumeError> {
+    pub async fn read_format(&self) -> Result<ManagedFormat, Error> {
         let bytes = object::read(&self.operator, FORMAT_KEY, MAX_FORMAT_BYTES)
             .await?
-            .ok_or_else(|| unavailable("open Managed volume", "Managed format does not exist"))?;
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::NotFound,
+                    "open Managed volume",
+                    "Managed format does not exist",
+                )
+            })?;
         ManagedFormat::decode(&bytes)
     }
 
     /// Open the authority only when it belongs to the replica's recorded volume.
-    pub async fn open(&self, expected: VolumeId) -> Result<ManagedVolume, VolumeError> {
+    pub async fn open(&self, expected: VolumeId) -> Result<ManagedVolume, Error> {
         let format = self.read_format().await?;
         if format.volume_id() != expected {
-            return Err(invalid(
+            return Err(Error::invalid(
                 "open Managed volume",
                 "replica state belongs to a different volume",
             ));
@@ -92,12 +98,12 @@ impl ManagedMetadata {
         Ok(ManagedVolume::new(format, self.operator.clone()))
     }
 
-    pub async fn open_unbound(&self) -> Result<ManagedVolume, VolumeError> {
+    pub async fn open_unbound(&self) -> Result<ManagedVolume, Error> {
         let format = self.read_format().await?;
         Ok(ManagedVolume::new(format, self.operator.clone()))
     }
 
-    pub async fn open_for_gc(&self) -> Result<ManagedVolume, VolumeError> {
+    pub async fn open_for_gc(&self) -> Result<ManagedVolume, Error> {
         let format = self.read_format().await?;
         Ok(ManagedVolume::new(format, self.operator.clone()))
     }

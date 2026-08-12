@@ -17,12 +17,10 @@
 
 //! Filesystem values shared by Managed volumes and Sync replicas.
 
-mod error;
 mod identity;
 mod namespace;
 mod snapshot;
 
-pub use error::{VolumeError, VolumeErrorKind};
 pub use identity::{
     ChangeCursor, Checksum, Digest, FileVersionId, Generation, NodeId, OperationId, VolumeId,
 };

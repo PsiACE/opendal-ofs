@@ -16,12 +16,10 @@
 // under the License.
 
 mod engine;
-mod error;
 mod install;
 mod reconcile;
 mod scan;
 mod state;
 
 pub use engine::{SyncEngine, SyncOutcome};
-pub use error::SyncError;
 pub use state::{ConflictRecord, ReplicaState};

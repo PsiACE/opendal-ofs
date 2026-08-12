@@ -19,13 +19,12 @@ use std::path::Path;
 
 use blake3::Hasher;
 use futures::StreamExt as _;
-use opendal::{Buffer, ErrorKind, Operator};
+use opendal::{Buffer, ErrorKind as StorageErrorKind, Operator};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-use crate::filesystem::{
-    Digest, FileVersion, FileVersionId, OperationId, VolumeError, VolumeErrorKind,
-};
+use crate::filesystem::{Digest, FileVersion, FileVersionId, OperationId};
+use crate::{Error, ErrorKind};
 
 use super::ManagedVolume;
 
@@ -40,12 +39,12 @@ pub(super) struct WholeObject {
 
 impl ManagedVolume {
     /// Inspect a local file without publishing data.
-    pub async fn inspect_file(&self, path: &Path) -> Result<FileVersion, VolumeError> {
+    pub async fn inspect_file(&self, path: &Path) -> Result<FileVersion, Error> {
         let mut file = File::open(path)
             .await
-            .map_err(|_| unavailable("inspect local file"))?;
+            .map_err(|error| Error::from_io("inspect local file", Some(path), error))?;
         let (logical_size, logical_digest) =
-            inspect_reader(&mut file, "inspect local file").await?;
+            inspect_reader(&mut file, path, "inspect local file").await?;
         Ok(FileVersion::new(FileVersionId::new(
             Digest::from_bytes(logical_digest),
             logical_size,
@@ -53,16 +52,12 @@ impl ManagedVolume {
     }
 
     /// Publish one immutable whole-file object before its version is committed.
-    pub async fn publish_file(
-        &self,
-        path: &Path,
-        version: &FileVersion,
-    ) -> Result<(), VolumeError> {
+    pub async fn publish_file(&self, path: &Path, version: &FileVersion) -> Result<(), Error> {
         let mut file = File::open(path)
             .await
-            .map_err(|_| unavailable("publish local file"))?;
+            .map_err(|error| Error::from_io("publish local file", Some(path), error))?;
         let Some(object) = whole_object(version)? else {
-            let (length, digest) = inspect_reader(&mut file, "publish local file").await?;
+            let (length, digest) = inspect_reader(&mut file, path, "publish local file").await?;
             return verify_local_identity(length, digest, version);
         };
 
@@ -73,7 +68,7 @@ impl ManagedVolume {
             .if_not_exists(true)
             .chunk(UPLOAD_PART_BYTES)
             .await
-            .map_err(|_| unavailable("publish local file"))?;
+            .map_err(|error| Error::from_storage("publish Managed file", error))?;
         let mut hasher = Hasher::new();
         let mut length = 0_u64;
         let mut buffer = vec![0; IO_BUFFER_BYTES];
@@ -82,7 +77,7 @@ impl ManagedVolume {
                 let read = file
                     .read(&mut buffer)
                     .await
-                    .map_err(|_| unavailable("publish local file"))?;
+                    .map_err(|error| Error::from_io("publish local file", Some(path), error))?;
                 if read == 0 {
                     break;
                 }
@@ -90,11 +85,11 @@ impl ManagedVolume {
                 hasher.update(bytes);
                 length = length
                     .checked_add(read as u64)
-                    .ok_or_else(|| invalid("publish local file", "file length overflows"))?;
+                    .ok_or_else(|| Error::invalid("publish local file", "file length overflows"))?;
                 writer
                     .write(Buffer::from(bytes.to_vec()))
                     .await
-                    .map_err(|_| unavailable("publish local file"))?;
+                    .map_err(|error| Error::from_storage("publish Managed file", error))?;
             }
             verify_local_identity(length, hasher.finalize().into(), version)
         }
@@ -104,33 +99,34 @@ impl ManagedVolume {
             return Err(error);
         }
 
-        match writer.close().await {
+        let close_error = match writer.close().await {
             Ok(_) => return Ok(()),
             Err(error)
                 if matches!(
                     error.kind(),
-                    opendal::ErrorKind::AlreadyExists | opendal::ErrorKind::ConditionNotMatch
+                    StorageErrorKind::AlreadyExists | StorageErrorKind::ConditionNotMatch
                 ) =>
             {
                 let metadata = self
                     .operator()
                     .stat(&key)
                     .await
-                    .map_err(|_| unavailable("publish local file"))?;
+                    .map_err(|error| Error::from_storage("publish Managed file", error))?;
                 if metadata.content_length() == object.length {
                     return Ok(());
                 }
-                return Err(VolumeError::new(
-                    crate::filesystem::VolumeErrorKind::Corrupt,
-                    "publish local file: immutable object has an invalid length",
+                return Err(Error::new(
+                    ErrorKind::Corrupt,
+                    "publish local file",
+                    "immutable object has an invalid length",
                 ));
             }
-            Err(_) => {}
-        }
-        if stream_object(self.operator(), object, None).await.is_ok() {
-            Ok(())
-        } else {
-            Err(unavailable("publish local file"))
+            Err(error) => error,
+        };
+        match stream_object(self.operator(), object, None).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == ErrorKind::Corrupt => Err(error),
+            Err(_) => Err(Error::from_storage("publish Managed file", close_error)),
         }
     }
 
@@ -139,11 +135,11 @@ impl ManagedVolume {
         &self,
         version: &FileVersion,
         destination: &Path,
-    ) -> Result<(), VolumeError> {
+    ) -> Result<(), Error> {
         let parent = destination.parent().unwrap_or_else(|| Path::new("."));
         tokio::fs::create_dir_all(parent)
             .await
-            .map_err(|_| unavailable("materialize Managed file"))?;
+            .map_err(|error| Error::from_io("create replica directory", Some(parent), error))?;
         let name = destination
             .file_name()
             .and_then(|name| name.to_str())
@@ -151,37 +147,37 @@ impl ManagedVolume {
         let temporary =
             destination.with_file_name(format!(".{name}.{}.tmp", OperationId::generate()));
         let result = async {
-            let mut file = File::create(&temporary)
-                .await
-                .map_err(|_| unavailable("materialize Managed file"))?;
+            let mut file = File::create(&temporary).await.map_err(|error| {
+                Error::from_io("create replica staging file", Some(&temporary), error)
+            })?;
             if let Some(object) = whole_object(version)? {
                 stream_object(self.operator(), object, Some(&mut file)).await?;
             }
-            file.sync_all()
-                .await
-                .map_err(|_| unavailable("materialize Managed file"))?;
+            file.sync_all().await.map_err(|error| {
+                Error::from_io("persist replica staging file", Some(&temporary), error)
+            })?;
             drop(file);
             tokio::fs::rename(&temporary, destination)
                 .await
-                .map_err(|_| unavailable("materialize Managed file"))?;
+                .map_err(|error| {
+                    Error::from_io("install replica file", Some(destination), error)
+                })?;
             Ok(())
         }
         .await;
-        if result.is_err() {
-            match tokio::fs::remove_file(&temporary).await {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => return Err(unavailable("clean up Managed file staging")),
-            }
+        if let Err(error) = result {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(error);
         }
-        result
+        Ok(())
     }
 }
 
 async fn inspect_reader(
     file: &mut File,
+    path: &Path,
     action: &'static str,
-) -> Result<(u64, [u8; 32]), VolumeError> {
+) -> Result<(u64, [u8; 32]), Error> {
     let mut hasher = Hasher::new();
     let mut length = 0_u64;
     let mut buffer = vec![0; IO_BUFFER_BYTES];
@@ -189,14 +185,14 @@ async fn inspect_reader(
         let read = file
             .read(&mut buffer)
             .await
-            .map_err(|_| unavailable(action))?;
+            .map_err(|error| Error::from_io(action, Some(path), error))?;
         if read == 0 {
             break;
         }
         hasher.update(&buffer[..read]);
         length = length
             .checked_add(read as u64)
-            .ok_or_else(|| invalid(action, "file length overflows"))?;
+            .ok_or_else(|| Error::invalid(action, "file length overflows"))?;
     }
     Ok((length, hasher.finalize().into()))
 }
@@ -205,43 +201,49 @@ async fn stream_object(
     operator: &Operator,
     object: WholeObject,
     mut destination: Option<&mut File>,
-) -> Result<(), VolumeError> {
+) -> Result<(), Error> {
     let key = object_key(object.digest);
     let reader = match operator.reader(&key).await {
         Ok(reader) => reader,
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            return Err(corrupt("read Managed data", "referenced object is missing"));
+        Err(error) if error.kind() == StorageErrorKind::NotFound => {
+            return Err(Error::corrupt(
+                "read Managed data",
+                "referenced object is missing",
+            ));
         }
-        Err(_) => return Err(unavailable("read Managed data")),
+        Err(error) => return Err(Error::from_storage("read Managed data", error)),
     };
     let mut stream = reader
         .into_stream(..)
         .await
-        .map_err(|_| unavailable("read Managed data"))?;
+        .map_err(|error| Error::from_storage("read Managed data", error))?;
     let mut hasher = Hasher::new();
     let mut length = 0_u64;
     while let Some(buffer) = stream.next().await {
         let buffer = match buffer {
             Ok(buffer) => buffer,
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                return Err(corrupt("read Managed data", "referenced object is missing"));
+            Err(error) if error.kind() == StorageErrorKind::NotFound => {
+                return Err(Error::corrupt(
+                    "read Managed data",
+                    "referenced object is missing",
+                ));
             }
-            Err(_) => return Err(unavailable("read Managed data")),
+            Err(error) => return Err(Error::from_storage("read Managed data", error)),
         };
         for chunk in buffer {
             hasher.update(&chunk);
             length = length
                 .checked_add(chunk.len() as u64)
-                .ok_or_else(|| corrupt("read Managed data", "object length overflows"))?;
+                .ok_or_else(|| Error::corrupt("read Managed data", "object length overflows"))?;
             if let Some(file) = destination.as_mut() {
                 file.write_all(&chunk)
                     .await
-                    .map_err(|_| unavailable("materialize Managed file"))?;
+                    .map_err(|error| Error::io("write replica staging file", error))?;
             }
         }
     }
     if length != object.length || hasher.finalize().as_bytes() != &object.digest {
-        return Err(corrupt(
+        return Err(Error::corrupt(
             "read Managed data",
             "object content does not match its identity",
         ));
@@ -253,9 +255,9 @@ fn verify_local_identity(
     length: u64,
     digest: [u8; 32],
     version: &FileVersion,
-) -> Result<(), VolumeError> {
+) -> Result<(), Error> {
     if length != version.logical_length() || digest != *version.digest().as_bytes() {
-        return Err(invalid(
+        return Err(Error::invalid(
             "publish local file",
             "file changed while being published",
         ));
@@ -263,11 +265,11 @@ fn verify_local_identity(
     Ok(())
 }
 
-pub(super) fn whole_object(version: &FileVersion) -> Result<Option<WholeObject>, VolumeError> {
+pub(super) fn whole_object(version: &FileVersion) -> Result<Option<WholeObject>, Error> {
     let digest = *version.digest().as_bytes();
     match version.logical_length() {
         0 if digest == *blake3::hash(&[]).as_bytes() => Ok(None),
-        0 => Err(corrupt(
+        0 => Err(Error::corrupt(
             "read Managed file",
             "empty file content identity is invalid",
         )),
@@ -282,19 +284,4 @@ fn object_key(digest: [u8; 32]) -> String {
 
 pub(super) fn whole_object_key(digest: [u8; 32]) -> String {
     object_key(digest)
-}
-
-fn invalid(action: &'static str, message: &'static str) -> VolumeError {
-    VolumeError::new(VolumeErrorKind::Invalid, format!("{action}: {message}"))
-}
-
-fn corrupt(action: &'static str, message: &'static str) -> VolumeError {
-    VolumeError::new(VolumeErrorKind::Corrupt, format!("{action}: {message}"))
-}
-
-fn unavailable(action: &'static str) -> VolumeError {
-    VolumeError::new(
-        VolumeErrorKind::Unavailable,
-        format!("{action}: storage operation failed"),
-    )
 }

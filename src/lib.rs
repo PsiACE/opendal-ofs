@@ -19,6 +19,10 @@
 //!
 //! Managed Sync follows the volume and access boundaries defined by RFC 016.
 
+mod error;
+
 pub mod filesystem;
 pub mod managed;
 pub mod sync;
+
+pub use error::{Error, ErrorKind, Result};

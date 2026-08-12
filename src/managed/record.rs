@@ -20,9 +20,7 @@ use std::io::Cursor;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::filesystem::VolumeError;
-
-use super::error::{corrupt, invalid};
+use crate::Error;
 
 pub(crate) struct Record {
     magic: [u8; 8],
@@ -44,12 +42,12 @@ impl Record {
             .saturating_add(32)
     }
 
-    pub(crate) fn encode<T: Serialize>(&self, value: &T) -> Result<Vec<u8>, VolumeError> {
+    pub(crate) fn encode<T: Serialize>(&self, value: &T) -> Result<Vec<u8>, Error> {
         let mut body = Vec::new();
         ciborium::into_writer(value, &mut body)
-            .map_err(|_| invalid("encode Managed record", "record cannot be encoded"))?;
+            .map_err(|_| Error::invalid("encode Managed record", "record cannot be encoded"))?;
         if body.len() > self.maximum_body_bytes {
-            return Err(invalid(
+            return Err(Error::invalid(
                 "encode Managed record",
                 "record exceeds its size limit",
             ));
@@ -61,24 +59,24 @@ impl Record {
         Ok(bytes)
     }
 
-    pub(crate) fn decode<T: DeserializeOwned>(&self, bytes: &[u8]) -> Result<T, VolumeError> {
+    pub(crate) fn decode<T: DeserializeOwned>(&self, bytes: &[u8]) -> Result<T, Error> {
         let body = bytes
             .strip_prefix(&self.magic)
             .and_then(|bytes| bytes.get(..bytes.len().checked_sub(32)?))
-            .ok_or_else(|| corrupt("decode Managed record", "record format is invalid"))?;
+            .ok_or_else(|| Error::corrupt("decode Managed record", "record format is invalid"))?;
         if body.len() > self.maximum_body_bytes
             || blake3::hash(&bytes[..bytes.len() - 32]).as_bytes() != &bytes[bytes.len() - 32..]
         {
-            return Err(corrupt(
+            return Err(Error::corrupt(
                 "decode Managed record",
                 "record checksum is invalid",
             ));
         }
         let mut input = Cursor::new(body);
         let value = ciborium::from_reader(&mut input)
-            .map_err(|_| corrupt("decode Managed record", "record body is invalid"))?;
+            .map_err(|_| Error::corrupt("decode Managed record", "record body is invalid"))?;
         if input.position() != body.len() as u64 {
-            return Err(corrupt(
+            return Err(Error::corrupt(
                 "decode Managed record",
                 "record has trailing bytes",
             ));

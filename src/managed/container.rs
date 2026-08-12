@@ -19,12 +19,12 @@
 
 use std::collections::BTreeMap;
 
-use opendal::{Buffer, ErrorKind, Operator};
+use opendal::{Buffer, ErrorKind as StorageErrorKind, Operator};
 use serde::{Deserialize, Serialize};
 
-use crate::filesystem::{Checksum, Digest, VolumeError};
+use crate::Error;
+use crate::filesystem::{Checksum, Digest};
 
-use super::error::{corrupt, invalid, unavailable};
 use super::object;
 
 const TARGET_BYTES: usize = 16 * 1024 * 1024;
@@ -81,17 +81,17 @@ impl<'a, T> ContainerWriter<'a, T> {
         section_type: u8,
         bytes: Vec<u8>,
         value: T,
-    ) -> Result<Vec<(T, SectionRef)>, VolumeError> {
+    ) -> Result<Vec<(T, SectionRef)>, Error> {
         let mut completed = Vec::new();
         if !self.pending.is_empty() && self.bytes.saturating_add(bytes.len()) > TARGET_BYTES {
             completed = self.flush().await?;
         }
         let offset = u64::try_from(self.bytes)
-            .map_err(|_| invalid("write Managed metadata", "container offset overflows"))?;
+            .map_err(|_| Error::invalid("write Managed metadata", "container offset overflows"))?;
         let length = u64::try_from(bytes.len())
-            .map_err(|_| invalid("write Managed metadata", "section length overflows"))?;
+            .map_err(|_| Error::invalid("write Managed metadata", "section length overflows"))?;
         self.bytes = self.bytes.checked_add(bytes.len()).ok_or_else(|| {
-            invalid(
+            Error::invalid(
                 "write Managed metadata",
                 "metadata container length overflows",
             )
@@ -107,11 +107,11 @@ impl<'a, T> ContainerWriter<'a, T> {
         Ok(completed)
     }
 
-    pub(crate) async fn finish(mut self) -> Result<Vec<(T, SectionRef)>, VolumeError> {
+    pub(crate) async fn finish(mut self) -> Result<Vec<(T, SectionRef)>, Error> {
         self.flush().await
     }
 
-    async fn flush(&mut self) -> Result<Vec<(T, SectionRef)>, VolumeError> {
+    async fn flush(&mut self) -> Result<Vec<(T, SectionRef)>, Error> {
         if self.pending.is_empty() {
             return Ok(Vec::new());
         }
@@ -120,7 +120,7 @@ impl<'a, T> ContainerWriter<'a, T> {
             bytes.extend_from_slice(&pending.bytes);
         }
         if bytes.len() > MAXIMUM_BYTES {
-            return Err(invalid(
+            return Err(Error::invalid(
                 "write Managed metadata",
                 "one metadata container exceeds its size bound",
             ));
@@ -130,7 +130,7 @@ impl<'a, T> ContainerWriter<'a, T> {
         match self.known.and_then(|known| known.get(&object)) {
             Some(length) if *length == object_length => {}
             Some(_) => {
-                return Err(corrupt(
+                return Err(Error::corrupt(
                     "write Managed metadata",
                     "reused container has a conflicting length",
                 ));
@@ -162,7 +162,7 @@ impl<'a, T> ContainerWriter<'a, T> {
 pub(crate) async fn read_sections(
     operator: &Operator,
     references: &[SectionRef],
-) -> Result<Vec<Vec<u8>>, VolumeError> {
+) -> Result<Vec<Vec<u8>>, Error> {
     let Some(first) = references.first() else {
         return Ok(Vec::new());
     };
@@ -171,7 +171,7 @@ pub(crate) async fn read_sections(
             reference.object != first.object || reference.object_length != first.object_length
         })
     {
-        return Err(corrupt(
+        return Err(Error::corrupt(
             "read Managed metadata",
             "container reference is invalid",
         ));
@@ -183,15 +183,17 @@ pub(crate) async fn read_sections(
                 .offset
                 .checked_add(reference.length)
                 .filter(|end| *end <= reference.object_length)
-                .ok_or_else(|| corrupt("read Managed metadata", "section range is invalid"))?;
+                .ok_or_else(|| {
+                    Error::corrupt("read Managed metadata", "section range is invalid")
+                })?;
             Ok(reference.offset..end)
         })
-        .collect::<Result<Vec<_>, VolumeError>>()?;
+        .collect::<Result<Vec<_>, Error>>()?;
     let requested_bytes = references.iter().try_fold(0_u64, |total, reference| {
         total.checked_add(reference.length)
     });
     if requested_bytes.is_none_or(|bytes| bytes > first.object_length) {
-        return Err(corrupt(
+        return Err(Error::corrupt(
             "read Managed metadata",
             "section ranges exceed their container",
         ));
@@ -202,36 +204,26 @@ pub(crate) async fn read_sections(
         .await
     {
         Ok(reader) => reader,
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            return Err(corrupt(
+        Err(error) if error.kind() == StorageErrorKind::NotFound => {
+            return Err(Error::corrupt(
                 "read Managed metadata",
                 "referenced container is missing",
             ));
         }
-        Err(_) => {
-            return Err(unavailable(
-                "read Managed metadata",
-                "object storage is unavailable",
-            ));
-        }
+        Err(error) => return Err(Error::from_storage("read Managed metadata", error)),
     };
     let buffers = match reader.fetch(ranges).await {
         Ok(buffers) => buffers,
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            return Err(corrupt(
+        Err(error) if error.kind() == StorageErrorKind::NotFound => {
+            return Err(Error::corrupt(
                 "read Managed metadata",
                 "referenced container is missing",
             ));
         }
-        Err(_) => {
-            return Err(unavailable(
-                "read Managed metadata",
-                "object storage is unavailable",
-            ));
-        }
+        Err(error) => return Err(Error::from_storage("read Managed metadata", error)),
     };
     if buffers.len() != references.len() {
-        return Err(unavailable(
+        return Err(Error::unavailable(
             "read Managed metadata",
             "object storage returned incomplete section data",
         ));
@@ -242,7 +234,7 @@ pub(crate) async fn read_sections(
         if bytes.len() as u64 != reference.length
             || blake3::hash(&bytes).as_bytes() != reference.checksum.as_bytes()
         {
-            return Err(corrupt(
+            return Err(Error::corrupt(
                 "read Managed metadata",
                 "section does not match its reference",
             ));

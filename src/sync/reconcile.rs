@@ -18,12 +18,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;
 
+use crate::Error;
 use crate::filesystem::{
     ChangeCursor, DirectoryEntry, DirectoryRecord, Generation, NodeId, NodeKind, OperationId,
     VolumeSnapshot,
 };
 
-use super::{ConflictRecord, SyncError};
+use super::ConflictRecord;
 
 pub(crate) struct ReconcilePlan {
     pub(crate) target: VolumeSnapshot,
@@ -34,7 +35,7 @@ pub(crate) struct ReconcilePlan {
 pub(crate) fn changed_paths(
     base: &VolumeSnapshot,
     side: &VolumeSnapshot,
-) -> Result<BTreeSet<String>, SyncError> {
+) -> Result<BTreeSet<String>, Error> {
     let base_paths = base.paths()?;
     let side_paths = side.paths()?;
     Ok(base_paths
@@ -63,7 +64,7 @@ pub(crate) fn reconcile(
     local: &VolumeSnapshot,
     remote: &VolumeSnapshot,
     resolved: &BTreeSet<String>,
-) -> Result<ReconcilePlan, SyncError> {
+) -> Result<ReconcilePlan, Error> {
     common.validate()?;
     local.validate()?;
     remote.validate()?;
@@ -71,7 +72,10 @@ pub(crate) fn reconcile(
         || common.volume_id != remote.volume_id
         || common.cursor.sequence() > remote.cursor.sequence()
     {
-        return Err(SyncError::new("reconciliation ancestry is invalid"));
+        return Err(Error::corrupt(
+            "reconcile replica",
+            "reconciliation ancestry is invalid",
+        ));
     }
 
     let common_paths = common.paths()?;
@@ -147,9 +151,10 @@ pub(crate) fn reconcile(
             .difference(&resolved_conflicts)
             .cloned()
             .collect::<Vec<_>>();
-        return Err(SyncError::new(format!(
-            "no unresolved conflict exists for {missing:?}"
-        )));
+        return Err(Error::invalid(
+            "synchronize replica",
+            format!("no unresolved conflict exists for {missing:?}"),
+        ));
     }
     if !conflicts.is_empty() {
         conflicts.sort_by(|left, right| left.path.cmp(&right.path));
@@ -175,7 +180,7 @@ pub(crate) fn reconcile(
         .sequence()
         .checked_add(1)
         .and_then(NonZeroU64::new)
-        .ok_or_else(|| SyncError::new("Managed change sequence overflows"))?;
+        .ok_or_else(|| Error::corrupt("reconcile replica", "Managed change sequence overflows"))?;
     target.cursor = ChangeCursor::at(sequence, OperationId::generate());
     target.validate()?;
     Ok(ReconcilePlan {
@@ -296,13 +301,15 @@ fn build_target(
     local: &VolumeSnapshot,
     remote: &VolumeSnapshot,
     selected: BTreeMap<String, (Source, NodeId)>,
-) -> Result<VolumeSnapshot, SyncError> {
+) -> Result<VolumeSnapshot, Error> {
     let next_generation = Generation::from_bytes(
         remote
             .cursor
             .sequence()
             .checked_add(1)
-            .ok_or_else(|| SyncError::new("Managed change sequence overflows"))?
+            .ok_or_else(|| {
+                Error::corrupt("reconcile replica", "Managed change sequence overflows")
+            })?
             .to_be_bytes()
             .to_vec(),
     );
@@ -333,15 +340,18 @@ fn build_target(
         let parent_id = if parent.is_empty() {
             remote.root
         } else {
-            selected
-                .get(parent)
-                .map(|(_, node)| *node)
-                .ok_or_else(|| SyncError::new(format!("merged path {path:?} has no parent")))?
+            selected.get(parent).map(|(_, node)| *node).ok_or_else(|| {
+                Error::corrupt(
+                    "reconcile replica",
+                    format!("merged path {path:?} has no parent"),
+                )
+            })?
         };
         if nodes[&parent_id].kind != NodeKind::Directory {
-            return Err(SyncError::new(format!(
-                "merged path {path:?} has a non-directory parent"
-            )));
+            return Err(Error::corrupt(
+                "reconcile replica",
+                format!("merged path {path:?} has a non-directory parent"),
+            ));
         }
         directory_entries.entry(parent_id).or_default().insert(
             name.to_owned(),

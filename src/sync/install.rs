@@ -21,10 +21,9 @@ use std::path::{Path, PathBuf};
 
 use futures::{StreamExt as _, TryStreamExt as _};
 
+use crate::Error;
 use crate::filesystem::{NodeKind, VolumeSnapshot};
 use crate::managed::ManagedVolume;
-
-use super::SyncError;
 
 pub(crate) async fn install(
     root: &Path,
@@ -32,7 +31,7 @@ pub(crate) async fn install(
     target: &VolumeSnapshot,
     volume: &ManagedVolume,
     transfer_concurrency: usize,
-) -> Result<(), SyncError> {
+) -> Result<(), Error> {
     apply(root, current, target, volume, transfer_concurrency, false).await
 }
 
@@ -42,7 +41,7 @@ pub(crate) async fn repair(
     target: &VolumeSnapshot,
     volume: &ManagedVolume,
     transfer_concurrency: usize,
-) -> Result<(), SyncError> {
+) -> Result<(), Error> {
     apply(root, None, target, volume, transfer_concurrency, true).await
 }
 
@@ -53,7 +52,7 @@ async fn apply(
     volume: &ManagedVolume,
     transfer_concurrency: usize,
     authoritative: bool,
-) -> Result<(), SyncError> {
+) -> Result<(), Error> {
     let target_paths = target.paths()?;
     let current_paths = current.map(VolumeSnapshot::paths).transpose()?;
     let mut durability = Durability::default();
@@ -115,7 +114,7 @@ async fn apply(
         let version = node
             .file_version
             .and_then(|id| target.file_versions.get(&id))
-            .ok_or_else(|| SyncError::new("remote file has no file version"))?;
+            .ok_or_else(|| Error::corrupt("install replica", "remote file has no file version"))?;
         let unchanged = if authoritative {
             local_file_matches(volume, &destination, version, node.attributes.executable).await?
         } else {
@@ -133,8 +132,9 @@ async fn apply(
             continue;
         }
         if path_metadata(&destination)?.is_some_and(|metadata| metadata.is_dir()) {
-            std::fs::remove_dir_all(&destination)
-                .map_err(|error| SyncError::io("replace replica directory", error))?;
+            std::fs::remove_dir_all(&destination).map_err(|error| {
+                Error::from_io("replace replica directory", Some(&destination), error)
+            })?;
             durability.changed_parent(&destination);
             test_interrupt()?;
         }
@@ -142,7 +142,7 @@ async fn apply(
         files.push((destination, version.clone(), node.attributes.executable));
     }
     futures::stream::iter(files)
-        .map(Ok::<_, SyncError>)
+        .map(Ok::<_, Error>)
         .try_for_each_concurrent(
             transfer_concurrency,
             |(destination, version, executable)| async move {
@@ -165,11 +165,11 @@ async fn local_file_matches(
     path: &Path,
     expected: &crate::filesystem::FileVersion,
     executable: bool,
-) -> Result<bool, SyncError> {
+) -> Result<bool, Error> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(SyncError::io("inspect replica file", error)),
+        Err(error) => return Err(Error::from_io("inspect replica file", Some(path), error)),
     };
     if !supported_regular_file(&metadata) || is_executable(&metadata) != executable {
         return Ok(false);
@@ -177,18 +177,21 @@ async fn local_file_matches(
     Ok(volume.inspect_file(path).await? == *expected)
 }
 
-fn actual_paths(root: &Path) -> Result<Vec<PathBuf>, SyncError> {
+fn actual_paths(root: &Path) -> Result<Vec<PathBuf>, Error> {
     let mut paths = Vec::new();
     let mut pending = vec![root.to_owned()];
     while let Some(directory) = pending.pop() {
-        let children = std::fs::read_dir(&directory)
-            .map_err(|error| SyncError::io("scan interrupted installation", error))?;
+        let children = std::fs::read_dir(&directory).map_err(|error| {
+            Error::from_io("scan interrupted installation", Some(&directory), error)
+        })?;
         for child in children {
-            let child =
-                child.map_err(|error| SyncError::io("scan interrupted installation", error))?;
+            let child = child.map_err(|error| {
+                Error::from_io("scan interrupted installation", Some(&directory), error)
+            })?;
             let path = child.path();
-            let metadata = std::fs::symlink_metadata(&path)
-                .map_err(|error| SyncError::io("inspect interrupted installation", error))?;
+            let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+                Error::from_io("inspect interrupted installation", Some(&path), error)
+            })?;
             if metadata.is_dir() {
                 pending.push(path.clone());
             }
@@ -202,7 +205,7 @@ fn actual_paths(root: &Path) -> Result<Vec<PathBuf>, SyncError> {
     Ok(paths)
 }
 
-fn create_directory(path: &Path, durability: &mut Durability) -> Result<(), SyncError> {
+fn create_directory(path: &Path, durability: &mut Durability) -> Result<(), Error> {
     let mut missing = Vec::new();
     let mut candidate = path;
     while !candidate.exists() {
@@ -213,7 +216,7 @@ fn create_directory(path: &Path, durability: &mut Durability) -> Result<(), Sync
         candidate = parent;
     }
     std::fs::create_dir_all(path)
-        .map_err(|error| SyncError::io("create replica directory", error))?;
+        .map_err(|error| Error::from_io("create replica directory", Some(path), error))?;
     for directory in missing {
         durability.directories.insert(directory.clone());
         durability.changed_parent(&directory);
@@ -233,32 +236,35 @@ impl Durability {
         }
     }
 
-    fn sync(self) -> Result<(), SyncError> {
+    fn sync(self) -> Result<(), Error> {
         let mut directories = self.directories.into_iter().collect::<Vec<_>>();
         directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
         for directory in directories {
             if path_metadata(&directory)?.is_none_or(|metadata| !metadata.is_dir()) {
                 continue;
             }
-            File::open(directory)
+            File::open(&directory)
                 .and_then(|directory| directory.sync_all())
-                .map_err(|error| SyncError::io("persist replica directory", error))?;
+                .map_err(|error| {
+                    Error::from_io("persist replica directory", Some(&directory), error)
+                })?;
         }
         Ok(())
     }
 }
 
-fn sync_file(path: &Path) -> Result<(), SyncError> {
+fn sync_file(path: &Path) -> Result<(), Error> {
     File::open(path)
         .and_then(|file| file.sync_all())
-        .map_err(|error| SyncError::io("persist replica file attributes", error))
+        .map_err(|error| Error::from_io("persist replica file attributes", Some(path), error))
 }
 
 #[cfg(debug_assertions)]
-fn test_interrupt() -> Result<(), SyncError> {
+fn test_interrupt() -> Result<(), Error> {
     if std::env::var_os("OFS_INTERNAL_TEST_INTERRUPT").as_deref() == Some("during-install".as_ref())
     {
-        return Err(SyncError::new(
+        return Err(Error::invalid(
+            "synchronize replica",
             "internal test interrupted replica installation",
         ));
     }
@@ -266,27 +272,28 @@ fn test_interrupt() -> Result<(), SyncError> {
 }
 
 #[cfg(not(debug_assertions))]
-const fn test_interrupt() -> Result<(), SyncError> {
+const fn test_interrupt() -> Result<(), Error> {
     Ok(())
 }
 
-fn remove_path(path: &Path) -> Result<(), SyncError> {
+fn remove_path(path: &Path) -> Result<(), Error> {
     let Some(metadata) = path_metadata(path)? else {
         return Ok(());
     };
     if metadata.is_dir() {
         std::fs::remove_dir_all(path)
-            .map_err(|error| SyncError::io("remove replica directory", error))
+            .map_err(|error| Error::from_io("remove replica directory", Some(path), error))
     } else {
-        std::fs::remove_file(path).map_err(|error| SyncError::io("remove replica file", error))
+        std::fs::remove_file(path)
+            .map_err(|error| Error::from_io("remove replica file", Some(path), error))
     }
 }
 
-fn path_metadata(path: &Path) -> Result<Option<std::fs::Metadata>, SyncError> {
+fn path_metadata(path: &Path) -> Result<Option<std::fs::Metadata>, Error> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => Ok(Some(metadata)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(SyncError::io("inspect replica path", error)),
+        Err(error) => Err(Error::from_io("inspect replica path", Some(path), error)),
     }
 }
 
@@ -315,11 +322,11 @@ const fn is_executable(_metadata: &std::fs::Metadata) -> bool {
 }
 
 #[cfg(unix)]
-fn set_executable(path: &Path, executable: bool) -> Result<(), SyncError> {
+fn set_executable(path: &Path, executable: bool) -> Result<(), Error> {
     use std::os::unix::fs::PermissionsExt as _;
 
     let mut permissions = std::fs::metadata(path)
-        .map_err(|error| SyncError::io("read replica permissions", error))?
+        .map_err(|error| Error::from_io("read replica permissions", Some(path), error))?
         .permissions();
     let mode = permissions.mode();
     permissions.set_mode(if executable {
@@ -328,12 +335,13 @@ fn set_executable(path: &Path, executable: bool) -> Result<(), SyncError> {
         mode & !0o111
     });
     std::fs::set_permissions(path, permissions)
-        .map_err(|error| SyncError::io("write replica permissions", error))
+        .map_err(|error| Error::from_io("write replica permissions", Some(path), error))
 }
 
 #[cfg(not(unix))]
-fn set_executable(_path: &Path, _executable: bool) -> Result<(), SyncError> {
-    Err(SyncError::new(
+fn set_executable(_path: &Path, _executable: bool) -> Result<(), Error> {
+    Err(Error::unsupported(
+        "install replica",
         "Managed Sync executable attributes are not implemented on this platform",
     ))
 }

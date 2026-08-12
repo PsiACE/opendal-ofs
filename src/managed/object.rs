@@ -16,46 +16,34 @@
 // under the License.
 
 use futures::StreamExt as _;
-use opendal::{Buffer, ErrorKind, Operator};
+use opendal::{Buffer, ErrorKind as StorageErrorKind, Operator};
 
-use crate::filesystem::VolumeError;
-
-use super::error::{corrupt, unavailable};
+use crate::Error;
 
 pub(crate) async fn read(
     operator: &Operator,
     key: &str,
     maximum_bytes: usize,
-) -> Result<Option<Vec<u8>>, VolumeError> {
+) -> Result<Option<Vec<u8>>, Error> {
     let reader = match operator.reader(key).await {
         Ok(reader) => reader,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(_) => {
-            return Err(unavailable(
-                "read Managed metadata",
-                "object storage is unavailable",
-            ));
-        }
+        Err(error) if error.kind() == StorageErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(Error::from_storage("read Managed metadata", error)),
     };
     let mut stream = reader
         .into_stream(..)
         .await
-        .map_err(|_| unavailable("read Managed metadata", "object storage is unavailable"))?;
+        .map_err(|error| Error::from_storage("read Managed metadata", error))?;
     let mut bytes = Vec::with_capacity(maximum_bytes.min(64 * 1024));
     while let Some(buffer) = stream.next().await {
         let buffer = match buffer {
             Ok(buffer) => buffer,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(_) => {
-                return Err(unavailable(
-                    "read Managed metadata",
-                    "object storage is unavailable",
-                ));
-            }
+            Err(error) if error.kind() == StorageErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(Error::from_storage("read Managed metadata", error)),
         };
         for chunk in buffer {
             if bytes.len().saturating_add(chunk.len()) > maximum_bytes {
-                return Err(corrupt(
+                return Err(Error::corrupt(
                     "read Managed metadata",
                     "object exceeds its size limit",
                 ));
@@ -70,29 +58,23 @@ pub(crate) async fn read_with_revision(
     operator: &Operator,
     key: &str,
     maximum_bytes: usize,
-) -> Result<Option<(Vec<u8>, String)>, VolumeError> {
+) -> Result<Option<(Vec<u8>, String)>, Error> {
     let reader = match operator.reader(key).await {
         Ok(reader) => reader,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(_) => {
-            return Err(unavailable(
-                "read Managed metadata",
-                "object storage is unavailable",
-            ));
-        }
+        Err(error) if error.kind() == StorageErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(Error::from_storage("read Managed metadata", error)),
     };
     let metadata = reader.clone();
     let mut stream = reader
         .into_stream(..)
         .await
-        .map_err(|_| unavailable("read Managed metadata", "object storage is unavailable"))?;
+        .map_err(|error| Error::from_storage("read Managed metadata", error))?;
     let mut bytes = Vec::with_capacity(maximum_bytes.min(64 * 1024));
     while let Some(buffer) = stream.next().await {
-        let buffer = buffer
-            .map_err(|_| unavailable("read Managed metadata", "object storage is unavailable"))?;
+        let buffer = buffer.map_err(|error| Error::from_storage("read Managed metadata", error))?;
         for chunk in buffer {
             if bytes.len().saturating_add(chunk.len()) > maximum_bytes {
-                return Err(corrupt(
+                return Err(Error::corrupt(
                     "read Managed metadata",
                     "object exceeds its size limit",
                 ));
@@ -103,30 +85,25 @@ pub(crate) async fn read_with_revision(
     let revision = metadata
         .metadata()
         .and_then(|metadata| metadata.etag())
-        .ok_or_else(|| unavailable("read Managed metadata", "object revision is unavailable"))?
+        .ok_or_else(|| {
+            Error::unsupported("read Managed metadata", "object revision is unavailable")
+        })?
         .to_owned();
     Ok(Some((bytes, revision)))
 }
 
-pub(crate) async fn create(
-    operator: &Operator,
-    key: &str,
-    bytes: Vec<u8>,
-) -> Result<bool, VolumeError> {
+pub(crate) async fn create(operator: &Operator, key: &str, bytes: Vec<u8>) -> Result<bool, Error> {
     match operator.write_with(key, bytes).if_not_exists(true).await {
         Ok(_) => Ok(true),
         Err(error)
             if matches!(
                 error.kind(),
-                ErrorKind::AlreadyExists | ErrorKind::ConditionNotMatch
+                StorageErrorKind::AlreadyExists | StorageErrorKind::ConditionNotMatch
             ) =>
         {
             Ok(false)
         }
-        Err(_) => Err(unavailable(
-            "write Managed metadata",
-            "object storage is unavailable",
-        )),
+        Err(error) => Err(Error::from_storage("write Managed metadata", error)),
     }
 }
 
@@ -135,18 +112,15 @@ pub(crate) async fn replace(
     key: &str,
     expected_revision: &str,
     bytes: Vec<u8>,
-) -> Result<bool, VolumeError> {
+) -> Result<bool, Error> {
     match operator
         .write_with(key, bytes)
         .if_match(expected_revision)
         .await
     {
         Ok(_) => Ok(true),
-        Err(error) if error.kind() == ErrorKind::ConditionNotMatch => Ok(false),
-        Err(_) => Err(unavailable(
-            "publish Managed metadata",
-            "object storage is unavailable",
-        )),
+        Err(error) if error.kind() == StorageErrorKind::ConditionNotMatch => Ok(false),
+        Err(error) => Err(Error::from_storage("publish Managed metadata", error)),
     }
 }
 
@@ -154,20 +128,17 @@ pub(crate) async fn create_immutable(
     operator: &Operator,
     key: &str,
     bytes: Buffer,
-) -> Result<(), VolumeError> {
+) -> Result<(), Error> {
     match operator.write_with(key, bytes).if_not_exists(true).await {
         Ok(_) => Ok(()),
         Err(error)
             if matches!(
                 error.kind(),
-                ErrorKind::AlreadyExists | ErrorKind::ConditionNotMatch
+                StorageErrorKind::AlreadyExists | StorageErrorKind::ConditionNotMatch
             ) =>
         {
             Ok(())
         }
-        Err(_) => Err(unavailable(
-            "publish Managed data",
-            "object storage is unavailable",
-        )),
+        Err(error) => Err(Error::from_storage("publish Managed data", error)),
     }
 }

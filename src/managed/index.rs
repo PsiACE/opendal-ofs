@@ -25,10 +25,9 @@ use opendal::Operator;
 use serde::de::{DeserializeOwned, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::filesystem::VolumeError;
+use crate::Error;
 
 use super::container::{ContainerWriter, SectionRef, read_sections};
-use super::error::{corrupt, invalid};
 
 const LEAF_MAGIC: [u8; 8] = *b"OFSIDXL1";
 const INTERNAL_MAGIC: [u8; 8] = *b"OFSIDXI1";
@@ -132,7 +131,7 @@ impl<'de> Visitor<'de> for EncodedRecordVisitor {
 pub(crate) async fn write_index<K, V>(
     operator: &Operator,
     entries: &BTreeMap<K, V>,
-) -> Result<PageRef, VolumeError>
+) -> Result<PageRef, Error>
 where
     K: Ord + Serialize,
     V: Serialize,
@@ -144,7 +143,7 @@ pub(crate) async fn write_index_reusing<K, V>(
     operator: &Operator,
     entries: &BTreeMap<K, V>,
     known: &BTreeMap<crate::filesystem::Digest, u64>,
-) -> Result<PageRef, VolumeError>
+) -> Result<PageRef, Error>
 where
     K: Ord + Serialize,
     V: Serialize,
@@ -156,7 +155,7 @@ async fn write_index_with_reuse<K, V>(
     operator: &Operator,
     entries: &BTreeMap<K, V>,
     known: Option<&BTreeMap<crate::filesystem::Digest, u64>>,
-) -> Result<PageRef, VolumeError>
+) -> Result<PageRef, Error>
 where
     K: Ord + Serialize,
     V: Serialize,
@@ -184,7 +183,7 @@ async fn write_leaves<K, V>(
     operator: &Operator,
     entries: &BTreeMap<K, V>,
     known: Option<&BTreeMap<crate::filesystem::Digest, u64>>,
-) -> Result<Vec<PageRef>, VolumeError>
+) -> Result<Vec<PageRef>, Error>
 where
     K: Ord + Serialize,
     V: Serialize,
@@ -222,7 +221,7 @@ where
 pub(crate) async fn read_index<K, V>(
     operator: &Operator,
     root: &PageRef,
-) -> Result<(BTreeMap<K, V>, BTreeMap<crate::filesystem::Digest, u64>), VolumeError>
+) -> Result<(BTreeMap<K, V>, BTreeMap<crate::filesystem::Digest, u64>), Error>
 where
     K: Clone + DeserializeOwned + Ord + Serialize,
     V: DeserializeOwned,
@@ -240,8 +239,8 @@ where
 pub(crate) async fn visit_index<K, V>(
     operator: &Operator,
     root: &PageRef,
-    visitor: impl FnMut(K, V) -> Result<(), VolumeError>,
-) -> Result<BTreeMap<crate::filesystem::Digest, u64>, VolumeError>
+    visitor: impl FnMut(K, V) -> Result<(), Error>,
+) -> Result<BTreeMap<crate::filesystem::Digest, u64>, Error>
 where
     K: Clone + DeserializeOwned + Ord + Serialize,
     V: DeserializeOwned,
@@ -256,9 +255,9 @@ where
 }
 
 pub(crate) trait StreamingIndexVisitor<K, V> {
-    fn visit_section(&mut self, section: SectionRef) -> Result<(), VolumeError>;
+    fn visit_section(&mut self, section: SectionRef) -> Result<(), Error>;
 
-    fn visit_record(&mut self, key: K, value: V) -> Result<(), VolumeError>;
+    fn visit_record(&mut self, key: K, value: V) -> Result<(), Error>;
 }
 
 /// Visit index sections and records without accumulating container identities.
@@ -266,7 +265,7 @@ pub(crate) async fn visit_index_streaming<K, V>(
     operator: &Operator,
     root: &PageRef,
     visitor: &mut impl StreamingIndexVisitor<K, V>,
-) -> Result<(), VolumeError>
+) -> Result<(), Error>
 where
     K: Clone + DeserializeOwned + Ord + Serialize,
     V: DeserializeOwned,
@@ -295,15 +294,15 @@ enum TraversalTask {
 
 impl<K, V, F> StreamingIndexVisitor<K, V> for CollectingIndexVisitor<'_, F>
 where
-    F: FnMut(K, V) -> Result<(), VolumeError>,
+    F: FnMut(K, V) -> Result<(), Error>,
 {
-    fn visit_section(&mut self, section: SectionRef) -> Result<(), VolumeError> {
+    fn visit_section(&mut self, section: SectionRef) -> Result<(), Error> {
         if self
             .objects
             .insert(section.object, section.object_length)
             .is_some_and(|length| length != section.object_length)
         {
-            return Err(corrupt(
+            return Err(Error::corrupt(
                 "read Managed index",
                 "metadata container has conflicting lengths",
             ));
@@ -311,7 +310,7 @@ where
         Ok(())
     }
 
-    fn visit_record(&mut self, key: K, value: V) -> Result<(), VolumeError> {
+    fn visit_record(&mut self, key: K, value: V) -> Result<(), Error> {
         (self.records)(key, value)
     }
 }
@@ -320,7 +319,7 @@ async fn traverse_index<K, V>(
     operator: &Operator,
     root: &PageRef,
     visitor: &mut impl StreamingIndexVisitor<K, V>,
-) -> Result<(), VolumeError>
+) -> Result<(), Error>
 where
     K: Clone + DeserializeOwned + Ord + Serialize,
     V: DeserializeOwned,
@@ -351,7 +350,10 @@ where
                 unreachable!();
             };
             if depth > MAX_TREE_DEPTH {
-                return Err(corrupt("read Managed index", "index tree is too deep"));
+                return Err(Error::corrupt(
+                    "read Managed index",
+                    "index tree is too deep",
+                ));
             }
             let object = reference.section.object;
             let object_length = reference.section.object_length;
@@ -409,7 +411,10 @@ where
             continue;
         };
         if depth > MAX_TREE_DEPTH {
-            return Err(corrupt("read Managed index", "index tree is too deep"));
+            return Err(Error::corrupt(
+                "read Managed index",
+                "index tree is too deep",
+            ));
         }
         visitor.visit_section(reference.section)?;
         let (kind, records) = decode_page(&reference, &bytes)?;
@@ -418,7 +423,7 @@ where
                 if records.is_empty() {
                     if !is_root || !reference.first_key.is_empty() || !reference.last_key.is_empty()
                     {
-                        return Err(corrupt(
+                        return Err(Error::corrupt(
                             "read Managed index",
                             "empty index leaf has an invalid key range",
                         ));
@@ -433,13 +438,13 @@ where
                         decode_cbor(&record.0)?;
                     let key: K = decode_cbor(&key_bytes)?;
                     if encode_cbor(&key)? != key_bytes {
-                        return Err(corrupt(
+                        return Err(Error::corrupt(
                             "read Managed index",
                             "index key is not canonically encoded",
                         ));
                     }
                     if previous.as_ref().is_some_and(|previous| previous >= &key) {
-                        return Err(corrupt(
+                        return Err(Error::corrupt(
                             "read Managed index",
                             "index leaf records are not strictly ordered",
                         ));
@@ -454,7 +459,7 @@ where
                 if page_first.as_deref() != Some(reference.first_key.as_ref())
                     || page_last.as_deref() != Some(reference.last_key.as_ref())
                 {
-                    return Err(corrupt(
+                    return Err(Error::corrupt(
                         "read Managed index",
                         "index leaf range does not match its reference",
                     ));
@@ -462,7 +467,7 @@ where
             }
             PageKind::Internal => {
                 if records.len() < 2 {
-                    return Err(corrupt(
+                    return Err(Error::corrupt(
                         "read Managed index",
                         "internal index page has fewer than two children",
                     ));
@@ -485,7 +490,7 @@ where
 
     if previous.is_none() {
         if !root.first_key.is_empty() || !root.last_key.is_empty() {
-            return Err(corrupt(
+            return Err(Error::corrupt(
                 "read Managed index",
                 "empty index root has an invalid key range",
             ));
@@ -494,7 +499,7 @@ where
         if first_key.as_deref() != Some(root.first_key.as_ref())
             || last_key.as_deref() != Some(root.last_key.as_ref())
         {
-            return Err(corrupt(
+            return Err(Error::corrupt(
                 "read Managed index",
                 "index contents do not match the root range",
             ));
@@ -541,7 +546,7 @@ async fn write_pages(
     kind: PageKind,
     groups: Vec<Vec<PageItem>>,
     known: Option<&BTreeMap<crate::filesystem::Digest, u64>>,
-) -> Result<Vec<PageRef>, VolumeError> {
+) -> Result<Vec<PageRef>, Error> {
     let mut pages = Vec::with_capacity(groups.len());
     let mut containers = match known {
         Some(known) => ContainerWriter::reusing(operator, known),
@@ -558,7 +563,7 @@ async fn push_page(
     containers: &mut ContainerWriter<'_, (Box<[u8]>, Box<[u8]>)>,
     kind: PageKind,
     group: Vec<PageItem>,
-) -> Result<Vec<PageRef>, VolumeError> {
+) -> Result<Vec<PageRef>, Error> {
     let first_key = group
         .first()
         .map_or_else(Box::default, |item| item.first_key.clone());
@@ -575,13 +580,13 @@ async fn push_page(
         .collect())
 }
 
-fn encode_page(kind: PageKind, records: Vec<EncodedRecord>) -> Result<Vec<u8>, VolumeError> {
+fn encode_page(kind: PageKind, records: Vec<EncodedRecord>) -> Result<Vec<u8>, Error> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&kind.magic());
     ciborium::into_writer(&PageBody(records), &mut bytes)
-        .map_err(|_| invalid("write Managed index", "index page cannot be encoded"))?;
+        .map_err(|_| Error::invalid("write Managed index", "index page cannot be encoded"))?;
     if bytes.len() > MAX_PAGE_BYTES {
-        return Err(invalid(
+        return Err(Error::invalid(
             "write Managed index",
             "one index page exceeds its record-size bound",
         ));
@@ -600,13 +605,10 @@ fn page_reference(
     }
 }
 
-fn decode_page(
-    reference: &PageRef,
-    bytes: &[u8],
-) -> Result<(PageKind, Vec<EncodedRecord>), VolumeError> {
+fn decode_page(reference: &PageRef, bytes: &[u8]) -> Result<(PageKind, Vec<EncodedRecord>), Error> {
     let length = page_length(reference)?;
     if bytes.len() != length {
-        return Err(corrupt(
+        return Err(Error::corrupt(
             "read Managed index",
             "index page length does not match its reference",
         ));
@@ -617,10 +619,13 @@ fn decode_page(
     } else if let Some(body) = bytes.strip_prefix(&INTERNAL_MAGIC) {
         (PageKind::Internal, body)
     } else {
-        return Err(corrupt("read Managed index", "index page magic is invalid"));
+        return Err(Error::corrupt(
+            "read Managed index",
+            "index page magic is invalid",
+        ));
     };
     if kind.section_type() != reference.section.section_type {
-        return Err(corrupt(
+        return Err(Error::corrupt(
             "read Managed index",
             "index page type does not match its reference",
         ));
@@ -629,21 +634,21 @@ fn decode_page(
     Ok((kind, records))
 }
 
-fn page_length(reference: &PageRef) -> Result<usize, VolumeError> {
+fn page_length(reference: &PageRef) -> Result<usize, Error> {
     usize::try_from(reference.section.length)
         .ok()
         .filter(|length| *length <= MAX_PAGE_BYTES)
-        .ok_or_else(|| corrupt("read Managed index", "index page length is invalid"))
+        .ok_or_else(|| Error::corrupt("read Managed index", "index page length is invalid"))
 }
 
-fn validate_children<K>(parent: &PageRef, children: &[PageRef]) -> Result<(), VolumeError>
+fn validate_children<K>(parent: &PageRef, children: &[PageRef]) -> Result<(), Error>
 where
     K: DeserializeOwned + Ord + Serialize,
 {
     if children.first().map(|child| child.first_key.as_ref()) != Some(parent.first_key.as_ref())
         || children.last().map(|child| child.last_key.as_ref()) != Some(parent.last_key.as_ref())
     {
-        return Err(corrupt(
+        return Err(Error::corrupt(
             "read Managed index",
             "internal index range does not match its reference",
         ));
@@ -652,7 +657,7 @@ where
     let mut previous_last = None;
     for child in children {
         if child.first_key.is_empty() || child.last_key.is_empty() {
-            return Err(corrupt(
+            return Err(Error::corrupt(
                 "read Managed index",
                 "internal index child has an empty key range",
             ));
@@ -666,7 +671,7 @@ where
                 .as_ref()
                 .is_some_and(|previous: &K| previous >= &first)
         {
-            return Err(corrupt(
+            return Err(Error::corrupt(
                 "read Managed index",
                 "internal index child ranges are invalid",
             ));
@@ -676,25 +681,25 @@ where
     Ok(())
 }
 
-fn encode_cbor<T>(value: &T) -> Result<Vec<u8>, VolumeError>
+fn encode_cbor<T>(value: &T) -> Result<Vec<u8>, Error>
 where
     T: Serialize + ?Sized,
 {
     let mut bytes = Vec::new();
     ciborium::into_writer(value, &mut bytes)
-        .map_err(|_| invalid("write Managed index", "index record cannot be encoded"))?;
+        .map_err(|_| Error::invalid("write Managed index", "index record cannot be encoded"))?;
     Ok(bytes)
 }
 
-fn decode_cbor<T>(bytes: &[u8]) -> Result<T, VolumeError>
+fn decode_cbor<T>(bytes: &[u8]) -> Result<T, Error>
 where
     T: DeserializeOwned,
 {
     let mut input = Cursor::new(bytes);
     let value = ciborium::from_reader(&mut input)
-        .map_err(|_| corrupt("read Managed index", "index record is invalid"))?;
+        .map_err(|_| Error::corrupt("read Managed index", "index record is invalid"))?;
     if input.position() != bytes.len() as u64 {
-        return Err(corrupt(
+        return Err(Error::corrupt(
             "read Managed index",
             "index record has trailing bytes",
         ));

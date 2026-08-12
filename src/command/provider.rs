@@ -32,7 +32,10 @@ pub(super) fn open_operator(storage: &str, concurrency: NonZeroUsize) -> Result<
                 .layer(TimeoutLayer::new())
                 .layer(RetryLayer::new().with_jitter())
         })
-        .map_err(|_| {
-            anyhow!("cannot configure --storage; check its scheme, endpoint, bucket, and root")
+        .map_err(|error| {
+            anyhow!(
+                "cannot configure --storage ({}); check its scheme, endpoint, bucket, and root",
+                error.kind()
+            )
         })
 }

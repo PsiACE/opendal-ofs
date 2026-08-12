@@ -21,13 +21,12 @@ use std::path::Path;
 
 use futures::StreamExt as _;
 
+use crate::Error;
 use crate::filesystem::{
     ChangeCursor, DirectoryEntry, DirectoryRecord, FileVersion, FileVersionId, Generation,
     NodeAttributes, NodeId, NodeKind, NodeRecord, OperationId, VolumeSnapshot,
 };
 use crate::managed::ManagedVolume;
-
-use super::SyncError;
 
 pub(crate) enum ScannedTree {
     Unchanged,
@@ -44,19 +43,20 @@ pub(crate) async fn scan(
     root: &Path,
     base: &VolumeSnapshot,
     volume: &ManagedVolume,
-) -> Result<ScannedTree, SyncError> {
+) -> Result<ScannedTree, Error> {
     let local = scan_paths(root)?;
     let base_paths = base.paths()?;
 
-    let mut inspected = futures::stream::iter(
-        local
-            .iter()
-            .filter(|(_, entry)| entry.kind == NodeKind::RegularFile),
-    )
-    .map(|(path, _)| async move {
-        Ok::<_, SyncError>((path, volume.inspect_file(&root.join(path)).await?))
-    })
-    .buffer_unordered(32);
+    let mut inspected =
+        futures::stream::iter(
+            local
+                .iter()
+                .filter(|(_, entry)| entry.kind == NodeKind::RegularFile),
+        )
+        .map(|(path, _)| async move {
+            Ok::<_, Error>((path, volume.inspect_file(&root.join(path)).await?))
+        })
+        .buffer_unordered(32);
     let mut file_by_path = BTreeMap::<String, FileVersionId>::new();
     while let Some(result) = inspected.next().await {
         let (path, version) = result?;
@@ -72,7 +72,7 @@ pub(crate) async fn scan(
         .sequence()
         .checked_add(1)
         .and_then(NonZeroU64::new)
-        .ok_or_else(|| SyncError::new("Managed change sequence overflows"))?;
+        .ok_or_else(|| Error::corrupt("scan replica", "Managed change sequence overflows"))?;
     let mut ids = BTreeMap::from([(String::new(), base.root)]);
     let mut used = BTreeSet::from([base.root]);
     for (path, entry) in &local {
@@ -365,29 +365,33 @@ fn entry_signature(
     crate::filesystem::Digest::from_bytes(hasher.finalize().into())
 }
 
-fn scan_paths(root: &Path) -> Result<BTreeMap<String, LocalEntry>, SyncError> {
+fn scan_paths(root: &Path) -> Result<BTreeMap<String, LocalEntry>, Error> {
     let mut entries = BTreeMap::new();
     let mut pending = vec![(root.to_owned(), String::new())];
     let mut file_identities = BTreeSet::new();
     while let Some((directory, parent)) = pending.pop() {
         let children = std::fs::read_dir(&directory)
-            .map_err(|error| SyncError::io("scan local directory", error))?;
+            .map_err(|error| Error::from_io("scan local directory", Some(&directory), error))?;
         for child in children {
-            let child = child.map_err(|error| SyncError::io("scan local directory", error))?;
-            let name = child
-                .file_name()
-                .into_string()
-                .map_err(|_| SyncError::new("local directory contains a non-Unicode name"))?;
+            let child = child
+                .map_err(|error| Error::from_io("scan local directory", Some(&directory), error))?;
+            let name = child.file_name().into_string().map_err(|_| {
+                Error::invalid(
+                    "synchronize replica",
+                    "local directory contains a non-Unicode name",
+                )
+            })?;
             let path = if parent.is_empty() {
                 name
             } else {
                 format!("{parent}/{name}")
             };
-            let metadata = std::fs::symlink_metadata(child.path())
-                .map_err(|error| SyncError::io("inspect local path", error))?;
+            let child_path = child.path();
+            let metadata = std::fs::symlink_metadata(&child_path)
+                .map_err(|error| Error::from_io("inspect local path", Some(&child_path), error))?;
             let entry = local_entry(&metadata, &mut file_identities)?;
             if entry.kind == NodeKind::Directory {
-                pending.push((child.path(), path.clone()));
+                pending.push((child_path, path.clone()));
             }
             entries.insert(path, entry);
         }
@@ -399,20 +403,22 @@ fn scan_paths(root: &Path) -> Result<BTreeMap<String, LocalEntry>, SyncError> {
 fn local_entry(
     metadata: &std::fs::Metadata,
     file_identities: &mut BTreeSet<(u64, u64)>,
-) -> Result<LocalEntry, SyncError> {
+) -> Result<LocalEntry, Error> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
     let kind = if metadata.is_dir() {
         NodeKind::Directory
     } else if metadata.is_file() {
         if metadata.nlink() > 1 || !file_identities.insert((metadata.dev(), metadata.ino())) {
-            return Err(SyncError::new(
+            return Err(Error::unsupported(
+                "scan replica",
                 "local replica contains a hard-linked file, which Managed Sync does not support",
             ));
         }
         NodeKind::RegularFile
     } else {
-        return Err(SyncError::new(
+        return Err(Error::unsupported(
+            "scan replica",
             "local replica contains a symbolic link or special file",
         ));
     };
@@ -426,13 +432,14 @@ fn local_entry(
 fn local_entry(
     metadata: &std::fs::Metadata,
     _file_identities: &mut BTreeSet<(u64, u64)>,
-) -> Result<LocalEntry, SyncError> {
+) -> Result<LocalEntry, Error> {
     let kind = if metadata.is_dir() {
         NodeKind::Directory
     } else if metadata.is_file() {
         NodeKind::RegularFile
     } else {
-        return Err(SyncError::new(
+        return Err(Error::unsupported(
+            "scan replica",
             "local replica contains a symbolic link or special file",
         ));
     };

@@ -17,7 +17,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::filesystem::{NodeId, VolumeError, VolumeId};
+use crate::Error;
+use crate::filesystem::{NodeId, VolumeId};
 
 use super::record::Record;
 
@@ -50,14 +51,14 @@ impl ManagedFormat {
         self.root_node_id
     }
 
-    pub(crate) fn encode(self) -> Result<Vec<u8>, VolumeError> {
+    pub(crate) fn encode(self) -> Result<Vec<u8>, Error> {
         FORMAT_RECORD.encode(&VolumeFormat {
             volume_id: self.volume_id,
             root_node_id: self.root_node_id,
         })
     }
 
-    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, VolumeError> {
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, Error> {
         let format: VolumeFormat = FORMAT_RECORD.decode(bytes)?;
         Ok(Self {
             volume_id: format.volume_id,
