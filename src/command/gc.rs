@@ -24,11 +24,15 @@ use super::provider::open_operator;
 
 pub(super) async fn run(args: GcArgs) -> Result<()> {
     let metadata = ManagedMetadata::new(
-        open_operator(&args.storage, args.resources.transfer_concurrency)?,
+        open_operator(
+            &args.storage,
+            args.resources.transfer_concurrency,
+            args.resources.trace,
+        )?,
         args.resources.transfer_concurrency,
         args.resources.work_memory_mib,
     )?;
-    let volume = ofs_extras::open(metadata, None, "main").await?;
+    let volume = ofs_extras::open(metadata, None, "main", args.resources.trace).await?;
     let outcome = volume.collect_unreachable().await?;
     println!(
         "collected managed volume {}: scanned {}, deleted {} object(s), {} byte(s)",

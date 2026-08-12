@@ -53,6 +53,10 @@ pub(crate) struct GcArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct ManagedResourceArgs {
+    /// Trace Managed and OpenDAL storage operations to stderr.
+    #[arg(long, env = "OFS_TRACE")]
+    pub(crate) trace: bool,
+
     /// Maximum concurrency for storage operations.
     #[arg(
         long,
@@ -70,6 +74,20 @@ pub(crate) struct ManagedResourceArgs {
         value_name = "MIB"
     )]
     pub(crate) work_memory_mib: NonZeroUsize,
+}
+
+impl Cli {
+    pub(crate) const fn tracing_enabled(&self) -> bool {
+        match &self.command {
+            Command::Branch(args) => args.resources.trace,
+            Command::Gc(args) => args.resources.trace,
+            Command::Sync(args) => args.resources.trace,
+            Command::Status(_) => false,
+            Command::Volume(args) => match &args.command {
+                VolumeCommand::Create(args) => args.resources.trace,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Args)]

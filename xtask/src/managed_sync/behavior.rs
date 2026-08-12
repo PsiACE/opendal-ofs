@@ -34,13 +34,17 @@ pub(crate) fn run(keep: bool, case: Option<&str>, extension: Option<&str>) {
     fixture.create_bucket();
     if let Some(extension) = extension {
         match extension {
-            "fastcdc" => lifecycle::file_extension(&fixture, ofs, "fastcdc", false),
-            "zstd" => lifecycle::file_extension(&fixture, ofs, "zstd", true),
+            "pack" => lifecycle::smoke(&fixture, ofs),
+            "fastcdc" => lifecycle::file_extension(&fixture, ofs, "fastcdc", false, false),
+            "zstd" => lifecycle::file_extension(&fixture, ofs, "zstd", true, false),
             "branch" => lifecycle::branch(&fixture, ofs),
+            "tracing" => lifecycle::file_extension(&fixture, ofs, "tracing", false, true),
             "all" => {
-                lifecycle::file_extension(&fixture, ofs, "fastcdc", false);
-                lifecycle::file_extension(&fixture, ofs, "zstd", true);
+                lifecycle::smoke(&fixture, ofs);
+                lifecycle::file_extension(&fixture, ofs, "fastcdc", false, false);
+                lifecycle::file_extension(&fixture, ofs, "zstd", true, false);
                 lifecycle::branch(&fixture, ofs);
+                lifecycle::file_extension(&fixture, ofs, "tracing", false, true);
             }
             _ => unreachable!("clap validates extension IDs"),
         }

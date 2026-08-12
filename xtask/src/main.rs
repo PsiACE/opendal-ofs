@@ -197,7 +197,7 @@ struct CommandManagedSyncBehavior {
 
     #[arg(
         long,
-        value_parser = ["fastcdc", "zstd", "branch", "all"],
+        value_parser = ["pack", "fastcdc", "zstd", "branch", "tracing", "all"],
         value_name = "ID"
     )]
     ext: Option<String>,

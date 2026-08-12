@@ -43,14 +43,26 @@ pub(super) async fn run(args: SyncArgs) -> Result<()> {
     }
 
     let metadata = ManagedMetadata::new(
-        open_operator(&args.storage, args.resources.transfer_concurrency)?,
+        open_operator(
+            &args.storage,
+            args.resources.transfer_concurrency,
+            args.resources.trace,
+        )?,
         args.resources.transfer_concurrency,
         args.resources.work_memory_mib,
     )?;
     let stored = load_replica_state(&args.state)?;
     let volume = match &stored {
-        Some(state) => ofs_extras::open(metadata, Some(state.volume_id()), &args.branch).await?,
-        None => ofs_extras::open(metadata, None, &args.branch).await?,
+        Some(state) => {
+            ofs_extras::open(
+                metadata,
+                Some(state.volume_id()),
+                &args.branch,
+                args.resources.trace,
+            )
+            .await?
+        }
+        None => ofs_extras::open(metadata, None, &args.branch, args.resources.trace).await?,
     };
     let result = SyncEngine::new(volume.clone(), args.resources.transfer_concurrency)
         .sync(&root, &args.state, &args.resolve)

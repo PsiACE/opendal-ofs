@@ -16,22 +16,19 @@
 # under the License.
 
 [package]
-description = "Managed filesystem extensions"
+description = "Tracing access extension for Apache OpenDAL File System"
 edition.workspace = true
 license.workspace = true
-name = "ofs-extras"
+name = "ofs-ext-tracing"
 publish = false
 repository.workspace = true
 rust-version.workspace = true
 version = "0.0.24"
 
 [dependencies]
-ciborium = "0.2"
-ofs-core = { path = "../core" }
-ofs-ext-branch = { path = "../extensions/branch" }
-ofs-ext-fastcdc = { path = "../extensions/fastcdc" }
-ofs-ext-tracing = { path = "../extensions/tracing" }
-ofs-ext-zstd = { path = "../extensions/zstd" }
+ofs-core = { path = "../../core" }
+tokio = { version = "1", features = ["io-util"] }
+tracing = "0.1"
 
 [lints]
 workspace = true

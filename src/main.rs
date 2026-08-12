@@ -23,5 +23,17 @@ use clap::Parser as _;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    command::run(cli::Cli::parse()).await
+    let cli = cli::Cli::parse();
+    if cli.tracing_enabled() {
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_span_events(
+                tracing_subscriber::fmt::format::FmtSpan::NEW
+                    | tracing_subscriber::fmt::format::FmtSpan::CLOSE,
+            )
+            .with_writer(std::io::stderr)
+            .try_init()
+            .map_err(|error| anyhow::anyhow!("cannot initialize tracing: {error}"))?;
+    }
+    command::run(cli).await
 }

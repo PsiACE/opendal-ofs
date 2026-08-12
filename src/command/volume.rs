@@ -32,7 +32,11 @@ pub(super) async fn run(args: VolumeArgs) -> Result<()> {
 async fn create(args: VolumeCreateArgs) -> Result<()> {
     let crate::cli::VolumeModel::Managed = args.model;
     let metadata = ManagedMetadata::new(
-        open_operator(&args.storage, args.resources.transfer_concurrency)?,
+        open_operator(
+            &args.storage,
+            args.resources.transfer_concurrency,
+            args.resources.trace,
+        )?,
         args.resources.transfer_concurrency,
         args.resources.work_memory_mib,
     )?;
@@ -81,7 +85,7 @@ async fn create(args: VolumeCreateArgs) -> Result<()> {
     let volume = match file_extensions {
         Some(extensions) => {
             extensions
-                .configure(metadata)
+                .configure(metadata, args.resources.trace)
                 .initialize_extension()
                 .await?
         }

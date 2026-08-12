@@ -78,11 +78,11 @@ pub(super) fn growing(fixture: &Fixture, ofs: Ofs) {
 
 pub(super) fn extensions(fixture: &Fixture, ofs: Ofs) {
     for (name, zstd) in [("fastcdc", false), ("fastcdc-zstd", true)] {
-        file_extension(fixture, ofs, name, zstd);
+        file_extension(fixture, ofs, name, zstd, false);
     }
 }
 
-pub(super) fn file_extension(fixture: &Fixture, ofs: Ofs, name: &str, zstd: bool) {
+pub(super) fn file_extension(fixture: &Fixture, ofs: Ofs, name: &str, zstd: bool, tracing: bool) {
     let root = CaseRoot::new();
     let replica_a = root.path.join("replica-a");
     let replica_b = root.path.join("replica-b");
@@ -93,17 +93,28 @@ pub(super) fn file_extension(fixture: &Fixture, ofs: Ofs, name: &str, zstd: bool
     let storage = fixture.storage_url(&format!("extensions/{name}"));
 
     require_success(
-        ofs.volume_create_extensions(&storage, zstd),
+        ofs.volume_create_extensions(&storage, zstd, tracing),
         "create extension volume",
     );
     let mut contents = deterministic_bytes(3 * 1024 * 1024, 41);
     fs::write(replica_a.join("stream.bin"), &contents).expect("write extension source file");
-    require_success(
-        ofs.sync(&replica_a, &state_a, &storage),
+    let published = require_success(
+        ofs.sync_with_tracing(&replica_a, &state_a, &storage, tracing),
         "publish extension file",
     );
+    if tracing {
+        let trace = output_text(&published.stderr);
+        assert!(
+            trace.contains("managed.file.write"),
+            "tracing reports Managed logical-file access"
+        );
+        assert!(
+            trace.contains("write{path="),
+            "tracing reports OpenDAL storage access"
+        );
+    }
     require_success(
-        ofs.sync(&replica_b, &state_b, &storage),
+        ofs.sync_with_tracing(&replica_b, &state_b, &storage, tracing),
         "cold-install extension file",
     );
     assert_eq!(
@@ -115,14 +126,17 @@ pub(super) fn file_extension(fixture: &Fixture, ofs: Ofs, name: &str, zstd: bool
     contents[1024 * 1024..1024 * 1024 + 4096].fill(217);
     fs::write(replica_b.join("stream.bin"), &contents).expect("update extension file in replica B");
     require_success(
-        ofs.sync(&replica_b, &state_b, &storage),
+        ofs.sync_with_tracing(&replica_b, &state_b, &storage, tracing),
         "publish extension update",
     );
     require_success(
-        ofs.sync(&replica_a, &state_a, &storage),
+        ofs.sync_with_tracing(&replica_a, &state_a, &storage, tracing),
         "install extension update",
     );
-    require_success(ofs.gc(&storage), "collect extension volume");
+    require_success(
+        ofs.gc_with_tracing(&storage, tracing),
+        "collect extension volume",
+    );
     assert_eq!(
         tree_fingerprint(&replica_a),
         tree_fingerprint(&replica_b),

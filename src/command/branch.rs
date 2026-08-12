@@ -24,7 +24,11 @@ use crate::cli::{BranchArgs, BranchCommand};
 use super::provider::open_operator;
 
 pub(super) async fn run(args: BranchArgs) -> Result<()> {
-    let operator = open_operator(&args.storage, args.resources.transfer_concurrency)?;
+    let operator = open_operator(
+        &args.storage,
+        args.resources.transfer_concurrency,
+        args.resources.trace,
+    )?;
     let metadata = ManagedMetadata::new(
         operator.clone(),
         args.resources.transfer_concurrency,

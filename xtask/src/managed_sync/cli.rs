@@ -68,13 +68,21 @@ impl Ofs {
         command
     }
 
-    pub(super) fn volume_create_extensions(self, storage: &str, zstd: bool) -> Command {
+    pub(super) fn volume_create_extensions(
+        self,
+        storage: &str,
+        zstd: bool,
+        tracing: bool,
+    ) -> Command {
         let mut command = self.command();
         command.args([
             "volume", "create", storage, "--model", "managed", "--ext", "fastcdc",
         ]);
         if zstd {
             command.args(["--ext", "zstd"]);
+        }
+        if tracing {
+            command.arg("--trace");
         }
         command
     }
@@ -133,6 +141,20 @@ impl Ofs {
         command
     }
 
+    pub(super) fn sync_with_tracing(
+        self,
+        replica: &Path,
+        state: &Path,
+        storage: &str,
+        tracing: bool,
+    ) -> Command {
+        let mut command = self.sync(replica, state, storage);
+        if tracing {
+            command.arg("--trace");
+        }
+        command
+    }
+
     pub(super) fn status(self, replica: &Path, state: &Path) -> Command {
         let mut command = self.command();
         command
@@ -147,6 +169,14 @@ impl Ofs {
     pub(super) fn gc(self, storage: &str) -> Command {
         let mut command = self.command();
         command.arg("gc").arg(storage);
+        command
+    }
+
+    pub(super) fn gc_with_tracing(self, storage: &str, tracing: bool) -> Command {
+        let mut command = self.gc(storage);
+        if tracing {
+            command.arg("--trace");
+        }
         command
     }
 

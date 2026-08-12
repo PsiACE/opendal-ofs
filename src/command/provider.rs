@@ -19,18 +19,27 @@ use std::num::NonZeroUsize;
 
 use anyhow::{Result, anyhow};
 use opendal::Operator;
-use opendal::layers::{ConcurrentLimitLayer, RetryLayer, TimeoutLayer};
+use opendal::layers::{ConcurrentLimitLayer, RetryLayer, TimeoutLayer, TracingLayer};
 
-pub(super) fn open_operator(storage: &str, concurrency: NonZeroUsize) -> Result<Operator> {
+pub(super) fn open_operator(
+    storage: &str,
+    concurrency: NonZeroUsize,
+    tracing: bool,
+) -> Result<Operator> {
     let concurrency = concurrency.get();
     Operator::from_uri(storage)
         .map(|operator| {
-            operator
+            let operator = operator
                 .layer(
                     ConcurrentLimitLayer::new(concurrency).with_http_concurrent_limit(concurrency),
                 )
                 .layer(TimeoutLayer::new())
-                .layer(RetryLayer::new().with_jitter())
+                .layer(RetryLayer::new().with_jitter());
+            if tracing {
+                operator.layer(TracingLayer::new())
+            } else {
+                operator
+            }
         })
         .map_err(|error| {
             anyhow!(

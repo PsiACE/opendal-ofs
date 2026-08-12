@@ -19,8 +19,8 @@
 
 use ofs_core::filesystem::VolumeId;
 use ofs_core::managed::extension::{
-    ExtensionId, ExtentExtension as _, FileAccessInfo, FileLayoutExtension as _,
-    IdentityExtentAccess,
+    ExtensionId, ExtentExtension as _, FileAccessExtension as _, FileAccessInfo,
+    FileLayoutExtension as _, IdentityExtentAccess,
 };
 use ofs_core::managed::{
     AuthorityExtension as _, DefaultAuthorityAccess, ManagedMetadata, ManagedVolume,
@@ -29,6 +29,7 @@ use ofs_core::{Error, ErrorKind};
 use ofs_ext_branch::BranchExtension;
 pub use ofs_ext_branch::{BRANCH_EXTENSION_ID, BranchManager};
 use ofs_ext_fastcdc::{FASTCDC_EXTENSION_ID, FastCdcExtension};
+use ofs_ext_tracing::TracingExtension;
 use ofs_ext_zstd::{ZSTD_EXTENSION_ID, ZstdExtension};
 
 /// Supported file-extension composition selected when a volume is created.
@@ -47,14 +48,24 @@ pub fn with_branch(metadata: ManagedMetadata, name: impl Into<String>) -> Manage
 
 impl FileExtensions {
     /// Configure a metadata handle with this statically composed access.
-    pub fn configure(self, metadata: ManagedMetadata) -> ManagedMetadata {
-        match self {
-            Self::FastCdc => {
+    pub fn configure(self, metadata: ManagedMetadata, tracing: bool) -> ManagedMetadata {
+        match (self, tracing) {
+            (Self::FastCdc, false) => {
                 metadata.with_file_extension(FastCdcExtension::new().extend(IdentityExtentAccess))
             }
-            Self::FastCdcZstd { level } => metadata.with_file_extension(
+            (Self::FastCdc, true) => metadata.with_file_extension(
+                TracingExtension::new()
+                    .extend(FastCdcExtension::new().extend(IdentityExtentAccess)),
+            ),
+            (Self::FastCdcZstd { level }, false) => metadata.with_file_extension(
                 FastCdcExtension::new()
                     .extend(ZstdExtension::new(level).extend(IdentityExtentAccess)),
+            ),
+            (Self::FastCdcZstd { level }, true) => metadata.with_file_extension(
+                TracingExtension::new().extend(
+                    FastCdcExtension::new()
+                        .extend(ZstdExtension::new(level).extend(IdentityExtentAccess)),
+                ),
             ),
         }
     }
@@ -64,6 +75,7 @@ impl FileExtensions {
 pub async fn configure_existing(
     metadata: ManagedMetadata,
     authority: impl Into<String>,
+    tracing: bool,
 ) -> Result<ManagedMetadata, Error> {
     let file = metadata.file_extension().await?;
     let authority_extension = metadata.authority_extension().await?;
@@ -76,7 +88,7 @@ pub async fn configure_existing(
                     "the volume uses an unavailable file extension composition",
                 )
             })?
-            .configure(metadata),
+            .configure(metadata, tracing),
         None => metadata,
     };
     match authority_extension {
@@ -97,8 +109,9 @@ pub async fn open(
     metadata: ManagedMetadata,
     expected: Option<VolumeId>,
     authority: impl Into<String>,
+    tracing: bool,
 ) -> Result<ManagedVolume, Error> {
-    configure_existing(metadata, authority)
+    configure_existing(metadata, authority, tracing)
         .await?
         .open(expected)
         .await
