@@ -25,7 +25,7 @@ use super::record::Record;
 pub(crate) const FORMAT_KEY: &str = "managed/1/format";
 const MAX_FORMAT_BODY_BYTES: usize = 64 * 1024;
 
-const FORMAT_RECORD: Record = Record::new(*b"OFSFMT01", MAX_FORMAT_BODY_BYTES);
+const FORMAT_RECORD: Record = Record::new(*b"OFSFMT01", 1, MAX_FORMAT_BODY_BYTES);
 pub(crate) const MAX_FORMAT_BYTES: usize = FORMAT_RECORD.maximum_encoded_bytes();
 
 /// The sole Managed storage format understood by this build.
@@ -55,11 +55,18 @@ impl ManagedFormat {
         FORMAT_RECORD.encode(&VolumeFormat {
             volume_id: self.volume_id,
             root_node_id: self.root_node_id,
+            naming_policy: NamingPolicy::PortableV1,
         })
     }
 
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, Error> {
         let format: VolumeFormat = FORMAT_RECORD.decode(bytes)?;
+        if format.naming_policy != NamingPolicy::PortableV1 {
+            return Err(Error::unsupported(
+                "open Managed volume",
+                "volume naming policy is unsupported",
+            ));
+        }
         Ok(Self {
             volume_id: format.volume_id,
             root_node_id: format.root_node_id,
@@ -72,4 +79,11 @@ impl ManagedFormat {
 struct VolumeFormat {
     volume_id: VolumeId,
     root_node_id: NodeId,
+    naming_policy: NamingPolicy,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum NamingPolicy {
+    PortableV1,
 }

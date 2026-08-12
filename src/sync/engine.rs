@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 use std::path::Path;
 
@@ -181,9 +181,11 @@ impl SyncEngine {
                         "--resolve requires a current local and remote conflict",
                     ));
                 }
-                self.publish_target_files(&root, &observed.snapshot, &local)
+                let manifests = self.publish_target_files(&root, &observed, &local).await?;
+                let target = self
+                    .volume
+                    .prepare_publication(&observed, local, manifests)
                     .await?;
-                let target = self.volume.prepare_publication(&observed, local).await?;
                 state.begin_publication(
                     observed.revision(),
                     target,
@@ -236,11 +238,12 @@ impl SyncEngine {
                     });
                 }
                 let target_revision = if plan.publish {
-                    self.publish_target_files(&root, &observed.snapshot, &plan.target)
+                    let manifests = self
+                        .publish_target_files(&root, &observed, &plan.target)
                         .await?;
                     let target = self
                         .volume
-                        .prepare_publication(&observed, plan.target.clone())
+                        .prepare_publication(&observed, plan.target.clone(), manifests)
                         .await?;
                     state.begin_publication(
                         observed.revision(),
@@ -368,9 +371,11 @@ impl SyncEngine {
             });
         }
 
-        self.publish_target_files(root, &observed.snapshot, &local)
+        let manifests = self.publish_target_files(root, &observed, &local).await?;
+        let target = self
+            .volume
+            .prepare_publication(&observed, local, manifests)
             .await?;
-        let target = self.volume.prepare_publication(&observed, local).await?;
         state.begin_publication(
             observed.revision(),
             target,
@@ -473,11 +478,12 @@ impl SyncEngine {
     async fn publish_target_files(
         &self,
         root: &Path,
-        common: &VolumeSnapshot,
+        observed: &ManagedObservation,
         target: &VolumeSnapshot,
-    ) -> Result<(), Error> {
+    ) -> Result<BTreeMap<crate::filesystem::FileVersionId, crate::managed::ObjectRef>, Error> {
         let mut new_versions = BTreeSet::new();
-        let common_versions = common
+        let common_versions = observed
+            .snapshot
             .nodes
             .values()
             .filter_map(|node| node.file_version)
@@ -498,24 +504,32 @@ impl SyncEngine {
             files.push((path, version, publish));
         }
 
-        futures::stream::iter(files)
-            .map(Ok::<_, Error>)
-            .try_for_each_concurrent(
-                self.transfer_concurrency,
-                |(path, version, publish)| async move {
-                    let path = root.join(path);
-                    if publish {
-                        publish_file(&self.volume, &path, version).await?;
-                    } else if inspect_file(&path).await? != version {
-                        return Err(Error::conflict(
-                            "publish Managed files",
-                            "local file changed while being published",
-                        ));
-                    }
-                    Ok(())
-                },
-            )
-            .await
+        let manifests = futures::stream::iter(files)
+            .map(|(path, version, publish)| async move {
+                let path = root.join(path);
+                if publish {
+                    let manifest = publish_file(
+                        &self.volume,
+                        &path,
+                        version,
+                        observed.gc_epoch(),
+                        target.cursor,
+                    )
+                    .await?;
+                    Ok(Some((version, manifest)))
+                } else if inspect_file(&path).await? != version {
+                    Err(Error::conflict(
+                        "publish Managed files",
+                        "local file changed while being published",
+                    ))
+                } else {
+                    Ok(None)
+                }
+            })
+            .buffer_unordered(self.transfer_concurrency)
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(manifests.into_iter().flatten().collect())
     }
 }
 

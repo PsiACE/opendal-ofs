@@ -45,10 +45,6 @@ pub(crate) struct GcArgs {
     #[arg(env = "OFS_STORAGE_URL", value_name = "VOLUME")]
     pub(crate) storage: String,
 
-    /// Resume an interrupted collection.
-    #[arg(long)]
-    pub(crate) resume: bool,
-
     /// Maximum concurrency for storage operations.
     #[arg(
         long,

@@ -15,34 +15,32 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, RwLock};
 
-use opendal::{Buffer, Operator};
+use opendal::Operator;
 use serde::{Deserialize, Serialize};
 
 use crate::filesystem::{
-    ChangeCursor, Digest, DirectoryEntry, DirectoryRecord, NodeAttributes, NodeId, NodeKind,
+    ChangeCursor, DirectoryEntry, DirectoryRecord, FileVersionId, NodeAttributes, NodeId, NodeKind,
     NodeRecord, OperationId, VolumeId, VolumeSnapshot,
 };
 use crate::{Error, ErrorKind};
 
-use super::container::{self, SectionRef};
 use super::format::ManagedFormat;
-use super::index::{
-    PageRef, StreamingIndexVisitor, read_index, visit_index_streaming, write_index,
-    write_index_reusing,
-};
-use super::object;
+use super::object::{self, GcEpoch, ObjectClass, ObjectRef};
 use super::record::Record;
+use super::stream::{self, StreamKind, StreamRef};
 
 const HEAD_KEY: &str = "managed/1/head";
-const HEAD_RECORD: Record = Record::new(*b"OFSHEAD1", 64 * 1024);
-const COMMIT_RECORD: Record = Record::new(*b"OFSCMIT1", 1024 * 1024);
+const HEAD_RECORD: Record = Record::new(*b"OFSHEAD1", 1, 64 * 1024);
+const COMMIT_RECORD: Record = Record::new(*b"OFSCMIT1", 1, 4 * 1024 * 1024);
 
 #[derive(Clone)]
 pub struct ManagedVolume {
     format: ManagedFormat,
     operator: Operator,
+    file_versions: Arc<RwLock<BTreeMap<FileVersionId, FileVersionRecord>>>,
 }
 
 pub struct ManagedObservation {
@@ -50,11 +48,12 @@ pub struct ManagedObservation {
     head_revision: String,
     namespace_revision: NamespaceRevision,
     reclamation_watermark: ChangeCursor,
-    maintenance_generation: u64,
+    gc_epoch: GcEpoch,
     operations: BTreeMap<OperationId, OperationRecord>,
     commit: NamespaceCommit,
+    node_values: BTreeMap<NodeId, NodeValue>,
     directory_entries: BTreeMap<DirectoryKey, DirectoryEntry>,
-    objects: IndexObjects,
+    file_versions: BTreeMap<FileVersionId, FileVersionRecord>,
 }
 
 impl ManagedObservation {
@@ -63,34 +62,33 @@ impl ManagedObservation {
     }
 
     pub(crate) const fn maintenance_generation(&self) -> u64 {
-        self.maintenance_generation
+        self.gc_epoch.value()
     }
 
-    pub(crate) const fn accepts_prepared(&self, maintenance_generation: u64) -> bool {
-        maintenance_generation == self.maintenance_generation
+    pub(crate) const fn accepts_prepared(&self, gc_epoch: u64) -> bool {
+        gc_epoch == self.gc_epoch.value()
     }
 
     pub(crate) const fn can_read_revision(&self, revision: NamespaceRevision) -> bool {
         revision.cursor.sequence() >= self.reclamation_watermark.sequence()
             && revision.cursor.sequence() <= self.namespace_revision.cursor.sequence()
     }
-}
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct Head {
-    pub(super) namespace_commit: NamespaceRevision,
-    /// Oldest namespace cursor whose graph remains guaranteed after collection.
-    pub(super) reclamation_watermark: ChangeCursor,
-    pub(super) maintenance_generation: u64,
-    pub(super) maintenance: Option<GcFence>,
+    pub(crate) const fn gc_epoch(&self) -> GcEpoch {
+        self.gc_epoch
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+pub(super) struct Head {
+    pub(super) current_commit: NamespaceRevision,
+    pub(super) gc_epoch: GcEpoch,
+    pub(super) minimum_retained_cursor: ChangeCursor,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct NamespaceRevision {
-    commit: Digest,
-    pub(super) encoded_length: u64,
+    object: ObjectRef,
     cursor: ChangeCursor,
 }
 
@@ -100,72 +98,181 @@ impl NamespaceRevision {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct GcFence {
-    pub(super) owner: OperationId,
-    pub(super) namespace_commit: NamespaceRevision,
-    pub(super) maintenance_generation: u64,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct NamespaceCommit {
     volume_id: VolumeId,
     change_cursor: ChangeCursor,
-    node_index_root: PageRef,
-    directory_entry_index_root: PageRef,
-    operation_result_index_root: PageRef,
+    nodes: Vec<StreamRef>,
+    directory_entries: Vec<StreamRef>,
+    file_versions: Vec<StreamRef>,
+    changes: Vec<StreamRef>,
+    operation_results: Vec<StreamRef>,
+    projections: Vec<ObjectRef>,
+    extensions: Vec<ObjectRef>,
+}
+
+impl NamespaceCommit {
+    fn genesis(volume_id: VolumeId, nodes: StreamRef) -> Self {
+        Self {
+            volume_id,
+            change_cursor: ChangeCursor::Genesis,
+            nodes: vec![nodes],
+            directory_entries: Vec::new(),
+            file_versions: Vec::new(),
+            changes: Vec::new(),
+            operation_results: Vec::new(),
+            projections: Vec::new(),
+            extensions: Vec::new(),
+        }
+    }
+
+    fn streams(&self) -> impl Iterator<Item = StreamRef> + '_ {
+        self.nodes
+            .iter()
+            .chain(&self.directory_entries)
+            .chain(&self.file_versions)
+            .chain(&self.changes)
+            .chain(&self.operation_results)
+            .copied()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(deny_unknown_fields)]
 struct DirectoryKey {
-    parent: NodeId,
+    parent_node_id: NodeId,
     name: String,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+enum NodeValue {
+    Directory {
+        generation: u64,
+        attributes: NodeAttributes,
+        directory_generation: u64,
+    },
+    RegularFile {
+        generation: u64,
+        attributes: NodeAttributes,
+        file_version: FileVersionId,
+    },
+}
+
+impl NodeValue {
+    const fn generation(&self) -> u64 {
+        match self {
+            Self::Directory { generation, .. } | Self::RegularFile { generation, .. } => {
+                *generation
+            }
+        }
+    }
+
+    const fn directory_generation(&self) -> Option<u64> {
+        match self {
+            Self::Directory {
+                directory_generation,
+                ..
+            } => Some(*directory_generation),
+            Self::RegularFile { .. } => None,
+        }
+    }
+
+    fn record(&self) -> NodeRecord {
+        match self {
+            Self::Directory { attributes, .. } => NodeRecord {
+                kind: NodeKind::Directory,
+                attributes: *attributes,
+                file_version: None,
+            },
+            Self::RegularFile {
+                attributes,
+                file_version,
+                ..
+            } => NodeRecord {
+                kind: NodeKind::RegularFile,
+                attributes: *attributes,
+                file_version: Some(*file_version),
+            },
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+struct NodeMutation {
+    node_id: NodeId,
+    change_cursor: ChangeCursor,
+    value: Option<NodeValue>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct DirectoryMutation {
+    parent_node_id: NodeId,
+    name: String,
+    change_cursor: ChangeCursor,
+    value: Option<DirectoryEntry>,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+pub(super) struct FileVersionRecord {
+    pub(super) file_version: FileVersionId,
+    pub(super) file_size: u64,
+    pub(super) manifest: ObjectRef,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ChangeRecord {
+    change_cursor: ChangeCursor,
+    ordinal: u32,
+    operation_id: OperationId,
+    event: ChangeEvent,
+}
+
+#[derive(Deserialize, Serialize)]
+enum ChangeEvent {
+    NodeChanged {
+        node_id: NodeId,
+        generation: u64,
+    },
+    NodeRemoved {
+        node_id: NodeId,
+        previous_generation: u64,
+    },
+    EntryLinked {
+        parent_node_id: NodeId,
+        name: String,
+        node_id: NodeId,
+        kind: NodeKind,
+        directory_generation: u64,
+    },
+    EntryUnlinked {
+        parent_node_id: NodeId,
+        name: String,
+        node_id: NodeId,
+        directory_generation: u64,
+    },
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
 struct OperationRecord {
-    cursor: ChangeCursor,
+    operation_id: OperationId,
+    change_cursor: ChangeCursor,
 }
 
 struct StoredNamespace {
     snapshot: VolumeSnapshot,
     operations: BTreeMap<OperationId, OperationRecord>,
     commit: NamespaceCommit,
+    node_values: BTreeMap<NodeId, NodeValue>,
     directory_entries: BTreeMap<DirectoryKey, DirectoryEntry>,
-    objects: IndexObjects,
-}
-
-struct IndexObjects {
-    nodes: BTreeMap<crate::filesystem::Digest, u64>,
-    directory_entries: BTreeMap<crate::filesystem::Digest, u64>,
-    operations: BTreeMap<crate::filesystem::Digest, u64>,
-}
-
-struct ReachableIndexVisitor<'a, R> {
-    objects: &'a mut dyn FnMut(String, u64) -> Result<(), Error>,
-    records: R,
-}
-
-impl<K, V, R> StreamingIndexVisitor<K, V> for ReachableIndexVisitor<'_, R>
-where
-    R: FnMut(&mut dyn FnMut(String, u64) -> Result<(), Error>, K, V) -> Result<(), Error>,
-{
-    fn visit_section(&mut self, section: SectionRef) -> Result<(), Error> {
-        (self.objects)(container::object_key(section.object), section.object_length)
-    }
-
-    fn visit_record(&mut self, key: K, value: V) -> Result<(), Error> {
-        (self.records)(self.objects, key, value)
-    }
+    file_versions: BTreeMap<FileVersionId, FileVersionRecord>,
 }
 
 impl ManagedVolume {
     pub(super) fn new(format: ManagedFormat, operator: Operator) -> Self {
-        Self { format, operator }
+        Self {
+            format,
+            operator,
+            file_versions: Arc::new(RwLock::new(BTreeMap::new())),
+        }
     }
 
     pub const fn id(&self) -> VolumeId {
@@ -173,78 +280,87 @@ impl ManagedVolume {
     }
 
     pub(super) async fn initialize(&self) -> Result<(), Error> {
-        let snapshot = empty_snapshot(self.format);
-        let namespace_commit = self
-            .write_namespace(&snapshot, &BTreeMap::new(), None)
-            .await?;
-        let bytes = HEAD_RECORD.encode(&Head {
-            namespace_commit,
-            reclamation_watermark: ChangeCursor::Genesis,
-            maintenance_generation: 0,
-            maintenance: None,
-        })?;
-        if object::create(&self.operator, HEAD_KEY, bytes).await? {
-            return Ok(());
-        }
-        self.observe().await.map(drop)
-    }
-
-    pub async fn observe(&self) -> Result<ManagedObservation, Error> {
-        let (head, revision) = self.read_head().await?;
-        if head.maintenance.is_some() {
-            return Err(Error::new(
-                ErrorKind::Conflict,
-                "open Managed volume",
-                "data collection is active",
-            ));
-        }
-        let stored = self.read_namespace(head.namespace_commit).await?;
-        Ok(ManagedObservation {
-            snapshot: stored.snapshot,
-            head_revision: revision,
-            namespace_revision: head.namespace_commit,
-            reclamation_watermark: head.reclamation_watermark,
-            maintenance_generation: head.maintenance_generation,
-            operations: stored.operations,
-            commit: stored.commit,
-            directory_entries: stored.directory_entries,
-            objects: stored.objects,
-        })
-    }
-
-    pub(super) async fn read_head(&self) -> Result<(Head, String), Error> {
-        let (bytes, revision) = object::read_with_revision(
+        if object::read_control(
             &self.operator,
             HEAD_KEY,
             HEAD_RECORD.maximum_encoded_bytes(),
         )
         .await?
-        .ok_or_else(|| {
-            Error::new(
-                ErrorKind::Corrupt,
-                "open Managed volume",
-                "namespace head is missing",
-            )
-        })?;
-        let head: Head = HEAD_RECORD.decode(&bytes)?;
-        if head.reclamation_watermark.sequence() > head.namespace_commit.cursor.sequence()
-            || head.maintenance.is_some_and(|fence| {
-                fence.namespace_commit != head.namespace_commit
-                    || fence.maintenance_generation != head.maintenance_generation
-            })
+        .is_some()
         {
+            return self.observe().await.map(drop);
+        }
+        let root = NodeMutation {
+            node_id: self.format.root_node_id(),
+            change_cursor: ChangeCursor::Genesis,
+            value: Some(NodeValue::Directory {
+                generation: 1,
+                attributes: NodeAttributes::default(),
+                directory_generation: 1,
+            }),
+        };
+        let nodes = stream::write_records(
+            &self.operator,
+            GcEpoch::ZERO,
+            ObjectClass::NodeSegment,
+            StreamKind::NODE_MUTATIONS,
+            [root],
+        )
+        .await?;
+        let commit = NamespaceCommit::genesis(self.id(), nodes);
+        let revision = self.write_commit(GcEpoch::ZERO, &commit).await?;
+        let head = Head {
+            current_commit: revision,
+            gc_epoch: GcEpoch::ZERO,
+            minimum_retained_cursor: ChangeCursor::Genesis,
+        };
+        if object::create_control(&self.operator, HEAD_KEY, HEAD_RECORD.encode(&head)?).await? {
+            Ok(())
+        } else {
+            self.observe().await.map(drop)
+        }
+    }
+
+    pub async fn observe(&self) -> Result<ManagedObservation, Error> {
+        let (head, head_revision) = self.read_head().await?;
+        let stored = self.read_namespace(head.current_commit).await?;
+        Ok(ManagedObservation {
+            snapshot: stored.snapshot,
+            head_revision,
+            namespace_revision: head.current_commit,
+            reclamation_watermark: head.minimum_retained_cursor,
+            gc_epoch: head.gc_epoch,
+            operations: stored.operations,
+            commit: stored.commit,
+            node_values: stored.node_values,
+            directory_entries: stored.directory_entries,
+            file_versions: stored.file_versions,
+        })
+    }
+
+    pub(super) async fn read_head(&self) -> Result<(Head, String), Error> {
+        let (bytes, revision) = object::read_control_with_revision(
+            &self.operator,
+            HEAD_KEY,
+            HEAD_RECORD.maximum_encoded_bytes(),
+        )
+        .await?
+        .ok_or_else(|| Error::corrupt("open Managed volume", "namespace head is missing"))?;
+        let head: Head = HEAD_RECORD.decode(&bytes)?;
+        if head.minimum_retained_cursor.sequence() > head.current_commit.cursor.sequence() {
             return Err(Error::corrupt(
                 "read Managed namespace",
-                "namespace head references are invalid",
+                "namespace head retention is invalid",
             ));
         }
         Ok((head, revision))
     }
 
-    pub async fn prepare_publication(
+    pub(crate) async fn prepare_publication(
         &self,
         observed: &ManagedObservation,
         target: VolumeSnapshot,
+        manifests: BTreeMap<FileVersionId, ObjectRef>,
     ) -> Result<NamespaceRevision, Error> {
         target.validate()?;
         if target.volume_id != self.id()
@@ -252,25 +368,12 @@ impl ManagedVolume {
             || target.cursor.sequence() != observed.snapshot.cursor.sequence() + 1
             || target.cursor.operation().is_none()
         {
-            return Err(Error::new(
-                ErrorKind::Invalid,
+            return Err(Error::invalid(
                 "publish Managed namespace",
                 "publication ancestry is invalid",
             ));
         }
-        let operation = target
-            .cursor
-            .operation()
-            .expect("validated publication has an operation identity");
-        let mut operations = observed.operations.clone();
-        operations.insert(
-            operation,
-            OperationRecord {
-                cursor: target.cursor,
-            },
-        );
-        self.write_namespace(&target, &operations, Some(observed))
-            .await
+        self.write_namespace(observed, &target, manifests).await
     }
 
     pub async fn commit_publication(
@@ -281,37 +384,36 @@ impl ManagedVolume {
         if target.cursor.sequence() != observed.snapshot.cursor.sequence() + 1
             || target.cursor.operation().is_none()
         {
-            return Err(Error::new(
-                ErrorKind::Invalid,
+            return Err(Error::invalid(
                 "publish Managed namespace",
                 "prepared publication ancestry is invalid",
             ));
         }
-        let bytes = HEAD_RECORD.encode(&Head {
-            namespace_commit: target,
-            reclamation_watermark: observed.reclamation_watermark,
-            maintenance_generation: observed.maintenance_generation,
-            maintenance: None,
-        })?;
-        if object::replace(&self.operator, HEAD_KEY, &observed.head_revision, bytes).await? {
+        let head = Head {
+            current_commit: target,
+            gc_epoch: observed.gc_epoch,
+            minimum_retained_cursor: observed.reclamation_watermark,
+        };
+        if object::replace_control(
+            &self.operator,
+            HEAD_KEY,
+            &observed.head_revision,
+            HEAD_RECORD.encode(&head)?,
+        )
+        .await?
+        {
             return Ok(());
         }
-        let (current_head, _) = self.read_head().await?;
-        if current_head.maintenance.is_some() {
-            return Err(Error::new(
-                ErrorKind::Conflict,
-                "publish Managed namespace",
-                "data collection started",
-            ));
-        }
-        let current = self.read_namespace(current_head.namespace_commit).await?;
+        let current = self.observe().await?;
         let operation = target
             .cursor
             .operation()
             .expect("validated publication has an operation identity");
-        if current.operations.get(&operation).is_some_and(|result| {
-            result.cursor == target.cursor && current.snapshot.cursor == target.cursor
-        }) {
+        if current
+            .operations
+            .get(&operation)
+            .is_some_and(|result| result.change_cursor == target.cursor)
+        {
             Ok(())
         } else {
             Err(Error::new(
@@ -345,7 +447,7 @@ impl ManagedVolume {
         expected_revision: &str,
         head: &Head,
     ) -> Result<bool, Error> {
-        object::replace(
+        object::replace_control(
             &self.operator,
             HEAD_KEY,
             expected_revision,
@@ -357,152 +459,384 @@ impl ManagedVolume {
     pub(super) async fn visit_reachable_objects(
         &self,
         reference: NamespaceRevision,
-        mut visit: impl FnMut(String, u64) -> Result<(), Error>,
+        mut visit: impl FnMut(ObjectRef) -> Result<(), Error>,
     ) -> Result<(), Error> {
+        visit(reference.object)?;
         let commit = self.read_commit(reference).await?;
-        visit(commit_key(reference.commit), reference.encoded_length)?;
-
-        let mut index_visitor = ReachableIndexVisitor {
-            objects: &mut visit,
-            records: |visit: &mut dyn FnMut(String, u64) -> Result<(), Error>,
-                      _: NodeId,
-                      node: NodeRecord| {
-                if let Some(version) = node.file_version
-                    && let Some(object) = super::data::whole_object(version)?
-                {
-                    visit(super::data::whole_object_key(object.digest), object.length)?;
-                }
-                Ok(())
-            },
-        };
-        visit_index_streaming(&self.operator, &commit.node_index_root, &mut index_visitor).await?;
-
-        let mut index_visitor = ReachableIndexVisitor {
-            objects: &mut visit,
-            records: |_: &mut dyn FnMut(String, u64) -> Result<(), Error>,
-                      _: DirectoryKey,
-                      _: DirectoryEntry| Ok(()),
-        };
-        visit_index_streaming(
-            &self.operator,
-            &commit.directory_entry_index_root,
-            &mut index_visitor,
-        )
-        .await?;
-
-        let mut index_visitor = ReachableIndexVisitor {
-            objects: &mut visit,
-            records: |_: &mut dyn FnMut(String, u64) -> Result<(), Error>,
-                      _: OperationId,
-                      _: OperationRecord| Ok(()),
-        };
-        visit_index_streaming(
-            &self.operator,
-            &commit.operation_result_index_root,
-            &mut index_visitor,
-        )
-        .await
+        for stream in commit.streams() {
+            visit(stream.object)?;
+        }
+        for reference in commit.projections.iter().chain(&commit.extensions) {
+            visit(*reference)?;
+        }
+        let stored = self.read_namespace_streams(commit).await?;
+        for record in stored.file_versions.values() {
+            visit(record.manifest)?;
+            super::data::visit_manifest_objects(self, record.manifest, &mut visit).await?;
+        }
+        Ok(())
     }
 
     async fn write_namespace(
         &self,
-        snapshot: &VolumeSnapshot,
-        operations: &BTreeMap<OperationId, OperationRecord>,
-        previous: Option<&ManagedObservation>,
+        observed: &ManagedObservation,
+        target: &VolumeSnapshot,
+        manifests: BTreeMap<FileVersionId, ObjectRef>,
     ) -> Result<NamespaceRevision, Error> {
-        snapshot.validate()?;
-        let mut directory_entries = BTreeMap::new();
-        for (parent, directory) in &snapshot.directories {
-            for (name, entry) in &directory.entries {
-                directory_entries.insert(
-                    DirectoryKey {
-                        parent: *parent,
-                        name: name.clone(),
-                    },
-                    *entry,
-                );
+        let cursor = target.cursor;
+        let operation = cursor
+            .operation()
+            .expect("validated target has an operation identity");
+        let target_entries = flatten_directories(target);
+        let mut node_mutations = Vec::new();
+        let mut node_values = observed.node_values.clone();
+        let node_ids = observed
+            .snapshot
+            .nodes
+            .keys()
+            .chain(target.nodes.keys())
+            .copied()
+            .collect::<BTreeSet<_>>();
+        for node_id in node_ids {
+            let previous_record = observed.snapshot.nodes.get(&node_id);
+            let target_record = target.nodes.get(&node_id);
+            if previous_record == target_record {
+                continue;
             }
+            let value = match target_record {
+                Some(record) => {
+                    let generation = observed
+                        .node_values
+                        .get(&node_id)
+                        .map_or(Ok(1), |value| next_generation(value.generation()))?;
+                    let value = match record.kind {
+                        NodeKind::Directory => {
+                            let previous_entries = observed.snapshot.directories.get(&node_id);
+                            let target_entries = target.directories.get(&node_id);
+                            let directory_generation = observed
+                                .node_values
+                                .get(&node_id)
+                                .and_then(NodeValue::directory_generation)
+                                .map_or(Ok(1), |value| {
+                                    if previous_entries == target_entries {
+                                        Ok(value)
+                                    } else {
+                                        next_generation(value)
+                                    }
+                                })?;
+                            NodeValue::Directory {
+                                generation,
+                                attributes: record.attributes,
+                                directory_generation,
+                            }
+                        }
+                        NodeKind::RegularFile => NodeValue::RegularFile {
+                            generation,
+                            attributes: record.attributes,
+                            file_version: record.file_version.ok_or_else(|| {
+                                Error::invalid(
+                                    "publish Managed namespace",
+                                    "regular file has no file version",
+                                )
+                            })?,
+                        },
+                    };
+                    node_values.insert(node_id, value.clone());
+                    Some(value)
+                }
+                None => {
+                    node_values.remove(&node_id);
+                    None
+                }
+            };
+            node_mutations.push(NodeMutation {
+                node_id,
+                change_cursor: cursor,
+                value,
+            });
         }
 
-        let node_index_root = match previous {
-            Some(previous) if previous.snapshot.nodes == snapshot.nodes => {
-                previous.commit.node_index_root.clone()
+        let mut directory_mutations = Vec::new();
+        let entry_keys = observed
+            .directory_entries
+            .keys()
+            .chain(target_entries.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for key in entry_keys {
+            let previous = observed.directory_entries.get(&key);
+            let target = target_entries.get(&key);
+            if previous == target {
+                continue;
             }
-            Some(previous) => {
-                write_index_reusing(&self.operator, &snapshot.nodes, &previous.objects.nodes)
-                    .await?
-            }
-            None => write_index(&self.operator, &snapshot.nodes).await?,
-        };
-        let directory_entry_index_root = match previous {
-            Some(previous) if previous.directory_entries == directory_entries => {
-                previous.commit.directory_entry_index_root.clone()
-            }
-            Some(previous) => {
-                write_index_reusing(
-                    &self.operator,
-                    &directory_entries,
-                    &previous.objects.directory_entries,
-                )
-                .await?
-            }
-            None => write_index(&self.operator, &directory_entries).await?,
-        };
-        let operation_result_index_root = match previous {
-            Some(previous) if previous.operations == *operations => {
-                previous.commit.operation_result_index_root.clone()
-            }
-            Some(previous) => {
-                write_index_reusing(&self.operator, operations, &previous.objects.operations)
-                    .await?
-            }
-            None => write_index(&self.operator, operations).await?,
-        };
+            directory_mutations.push(DirectoryMutation {
+                parent_node_id: key.parent_node_id,
+                name: key.name,
+                change_cursor: cursor,
+                value: target.copied(),
+            });
+        }
 
-        let commit = NamespaceCommit {
-            volume_id: snapshot.volume_id,
-            change_cursor: snapshot.cursor,
-            node_index_root,
-            directory_entry_index_root,
-            operation_result_index_root,
-        };
-        let bytes = COMMIT_RECORD.encode(&commit)?;
-        let digest = Digest::from_bytes(blake3::hash(&bytes).into());
-        let reference = NamespaceRevision {
-            commit: digest,
-            encoded_length: bytes.len().try_into().map_err(|_| {
+        let mut file_version_records = Vec::new();
+        for node in target.nodes.values() {
+            let Some(version) = node.file_version else {
+                continue;
+            };
+            if observed.file_versions.contains_key(&version) {
+                continue;
+            }
+            let manifest = manifests.get(&version).copied().ok_or_else(|| {
                 Error::invalid(
                     "publish Managed namespace",
-                    "namespace commit length overflows",
+                    "new file version has no durable manifest",
                 )
-            })?,
-            cursor: snapshot.cursor,
-        };
-        object::create_immutable(&self.operator, &commit_key(digest), Buffer::from(bytes)).await?;
-        Ok(reference)
+            })?;
+            file_version_records.push(FileVersionRecord {
+                file_version: version,
+                file_size: version.logical_length(),
+                manifest,
+            });
+        }
+
+        let mut changes = Vec::new();
+        for mutation in &node_mutations {
+            let event = match &mutation.value {
+                Some(value) => ChangeEvent::NodeChanged {
+                    node_id: mutation.node_id,
+                    generation: value.generation(),
+                },
+                None => ChangeEvent::NodeRemoved {
+                    node_id: mutation.node_id,
+                    previous_generation: observed.node_values[&mutation.node_id].generation(),
+                },
+            };
+            changes.push(event);
+        }
+        for mutation in &directory_mutations {
+            let directory_generation = node_values
+                .get(&mutation.parent_node_id)
+                .and_then(NodeValue::directory_generation)
+                .or_else(|| {
+                    observed
+                        .node_values
+                        .get(&mutation.parent_node_id)
+                        .and_then(NodeValue::directory_generation)
+                })
+                .ok_or_else(|| {
+                    Error::invalid(
+                        "publish Managed namespace",
+                        "directory mutation parent is invalid",
+                    )
+                })?;
+            let event = match mutation.value {
+                Some(entry) => ChangeEvent::EntryLinked {
+                    parent_node_id: mutation.parent_node_id,
+                    name: mutation.name.clone(),
+                    node_id: entry.node,
+                    kind: entry.kind,
+                    directory_generation,
+                },
+                None => {
+                    let previous = observed.directory_entries[&DirectoryKey {
+                        parent_node_id: mutation.parent_node_id,
+                        name: mutation.name.clone(),
+                    }];
+                    ChangeEvent::EntryUnlinked {
+                        parent_node_id: mutation.parent_node_id,
+                        name: mutation.name.clone(),
+                        node_id: previous.node,
+                        directory_generation,
+                    }
+                }
+            };
+            changes.push(event);
+        }
+        let changes = changes
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, event)| {
+                Ok(ChangeRecord {
+                    change_cursor: cursor,
+                    ordinal: u32::try_from(ordinal).map_err(|_| {
+                        Error::invalid("publish Managed namespace", "change ordinal overflows")
+                    })?,
+                    operation_id: operation,
+                    event,
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+
+        let mut commit = observed.commit.clone();
+        commit.change_cursor = cursor;
+        append_stream(
+            &self.operator,
+            observed.gc_epoch,
+            &mut commit.nodes,
+            ObjectClass::NodeSegment,
+            StreamKind::NODE_MUTATIONS,
+            node_mutations,
+        )
+        .await?;
+        append_stream(
+            &self.operator,
+            observed.gc_epoch,
+            &mut commit.directory_entries,
+            ObjectClass::DirectorySegment,
+            StreamKind::DIRECTORY_MUTATIONS,
+            directory_mutations,
+        )
+        .await?;
+        append_stream(
+            &self.operator,
+            observed.gc_epoch,
+            &mut commit.file_versions,
+            ObjectClass::FileVersionSegment,
+            StreamKind::FILE_VERSION_RECORDS,
+            file_version_records,
+        )
+        .await?;
+        append_stream(
+            &self.operator,
+            observed.gc_epoch,
+            &mut commit.changes,
+            ObjectClass::ChangeSegment,
+            StreamKind::CHANGE_RECORDS,
+            changes,
+        )
+        .await?;
+        append_stream(
+            &self.operator,
+            observed.gc_epoch,
+            &mut commit.operation_results,
+            ObjectClass::OperationResultSegment,
+            StreamKind::OPERATION_RESULTS,
+            [OperationRecord {
+                operation_id: operation,
+                change_cursor: cursor,
+            }],
+        )
+        .await?;
+        self.write_commit(observed.gc_epoch, &commit).await
+    }
+
+    async fn write_commit(
+        &self,
+        gc_epoch: GcEpoch,
+        commit: &NamespaceCommit,
+    ) -> Result<NamespaceRevision, Error> {
+        let object = object::write_immutable(
+            &self.operator,
+            gc_epoch,
+            ObjectClass::NamespaceCommit,
+            COMMIT_RECORD.encode(commit)?,
+        )
+        .await?;
+        Ok(NamespaceRevision {
+            object,
+            cursor: commit.change_cursor,
+        })
     }
 
     async fn read_namespace(&self, reference: NamespaceRevision) -> Result<StoredNamespace, Error> {
         let commit = self.read_commit(reference).await?;
-        self.read_namespace_indexes(commit).await
+        self.read_namespace_streams(commit).await
     }
 
-    async fn read_namespace_indexes(
+    async fn read_namespace_streams(
         &self,
         commit: NamespaceCommit,
     ) -> Result<StoredNamespace, Error> {
-        let (nodes, node_objects): (BTreeMap<NodeId, NodeRecord>, _) =
-            read_index(&self.operator, &commit.node_index_root).await?;
-        let (directory_entries, directory_entry_objects): (
-            BTreeMap<DirectoryKey, DirectoryEntry>,
-            _,
-        ) = read_index(&self.operator, &commit.directory_entry_index_root).await?;
-        let (operations, operation_objects): (BTreeMap<OperationId, OperationRecord>, _) =
-            read_index(&self.operator, &commit.operation_result_index_root).await?;
+        let mut node_values = BTreeMap::new();
+        for reference in &commit.nodes {
+            require_stream(
+                *reference,
+                StreamKind::NODE_MUTATIONS,
+                ObjectClass::NodeSegment,
+            )?;
+            stream::visit_records(&self.operator, *reference, |mutation: NodeMutation| {
+                if mutation.change_cursor.sequence() > commit.change_cursor.sequence() {
+                    return Err(Error::corrupt(
+                        "read Managed namespace",
+                        "node mutation is newer than its commit",
+                    ));
+                }
+                match mutation.value {
+                    Some(value) => {
+                        node_values.insert(mutation.node_id, value);
+                    }
+                    None => {
+                        node_values.remove(&mutation.node_id);
+                    }
+                }
+                Ok(())
+            })
+            .await?;
+        }
+        let mut directory_entries = BTreeMap::new();
+        for reference in &commit.directory_entries {
+            require_stream(
+                *reference,
+                StreamKind::DIRECTORY_MUTATIONS,
+                ObjectClass::DirectorySegment,
+            )?;
+            stream::visit_records(&self.operator, *reference, |mutation: DirectoryMutation| {
+                let key = DirectoryKey {
+                    parent_node_id: mutation.parent_node_id,
+                    name: mutation.name,
+                };
+                match mutation.value {
+                    Some(value) => {
+                        directory_entries.insert(key, value);
+                    }
+                    None => {
+                        directory_entries.remove(&key);
+                    }
+                }
+                Ok(())
+            })
+            .await?;
+        }
+        let mut file_versions = BTreeMap::new();
+        for reference in &commit.file_versions {
+            require_stream(
+                *reference,
+                StreamKind::FILE_VERSION_RECORDS,
+                ObjectClass::FileVersionSegment,
+            )?;
+            stream::visit_records(&self.operator, *reference, |record: FileVersionRecord| {
+                file_versions.insert(record.file_version, record);
+                Ok(())
+            })
+            .await?;
+        }
+        for reference in &commit.changes {
+            require_stream(
+                *reference,
+                StreamKind::CHANGE_RECORDS,
+                ObjectClass::ChangeSegment,
+            )?;
+        }
+        let mut operations = BTreeMap::new();
+        for reference in &commit.operation_results {
+            require_stream(
+                *reference,
+                StreamKind::OPERATION_RESULTS,
+                ObjectClass::OperationResultSegment,
+            )?;
+            stream::visit_records(&self.operator, *reference, |record: OperationRecord| {
+                operations.insert(record.operation_id, record);
+                Ok(())
+            })
+            .await?;
+        }
 
-        let mut directories = nodes
+        let nodes = node_values
             .iter()
-            .filter(|(_, node)| node.kind == NodeKind::Directory)
+            .map(|(id, value)| (*id, value.record()))
+            .collect::<BTreeMap<_, _>>();
+        let mut directories = node_values
+            .iter()
+            .filter(|(_, value)| matches!(value, NodeValue::Directory { .. }))
             .map(|(id, _)| {
                 (
                     *id,
@@ -514,7 +848,7 @@ impl ManagedVolume {
             .collect::<BTreeMap<_, _>>();
         for (key, entry) in &directory_entries {
             directories
-                .get_mut(&key.parent)
+                .get_mut(&key.parent_node_id)
                 .ok_or_else(|| {
                     Error::corrupt(
                         "read Managed namespace",
@@ -532,92 +866,104 @@ impl ManagedVolume {
             directories,
         };
         snapshot.validate()?;
+        self.file_versions
+            .write()
+            .map_err(|_| Error::unavailable("read Managed namespace", "manifest cache failed"))?
+            .extend(
+                file_versions
+                    .iter()
+                    .map(|(version, record)| (*version, *record)),
+            );
         Ok(StoredNamespace {
             snapshot,
             operations,
             commit,
+            node_values,
             directory_entries,
-            objects: IndexObjects {
-                nodes: node_objects,
-                directory_entries: directory_entry_objects,
-                operations: operation_objects,
-            },
+            file_versions,
         })
     }
 
-    async fn read_commit(&self, reference: NamespaceRevision) -> Result<NamespaceCommit, Error> {
-        self.read_commit_if_present(reference)
-            .await?
-            .ok_or_else(|| Error::corrupt("read Managed namespace", "namespace commit is missing"))
+    pub(super) fn file_version_record(
+        &self,
+        version: FileVersionId,
+    ) -> Result<FileVersionRecord, Error> {
+        self.file_versions
+            .read()
+            .map_err(|_| Error::unavailable("read Managed file", "manifest cache failed"))?
+            .get(&version)
+            .copied()
+            .ok_or_else(|| Error::corrupt("read Managed file", "file version is not indexed"))
     }
 
-    async fn read_commit_if_present(
-        &self,
-        reference: NamespaceRevision,
-    ) -> Result<Option<NamespaceCommit>, Error> {
-        let length = usize::try_from(reference.encoded_length)
-            .ok()
-            .filter(|length| *length <= COMMIT_RECORD.maximum_encoded_bytes())
-            .ok_or_else(|| {
-                Error::corrupt(
-                    "read Managed namespace",
-                    "namespace commit length is invalid",
-                )
-            })?;
-        let bytes = object::read(&self.operator, &commit_key(reference.commit), length)
-            .await?
-            .map_or_else(|| Ok(None), |bytes| Ok(Some(bytes)))?;
-        let Some(bytes) = bytes else {
-            return Ok(None);
-        };
-        if bytes.len() != length || blake3::hash(&bytes).as_bytes() != reference.commit.as_bytes() {
+    async fn read_commit(&self, reference: NamespaceRevision) -> Result<NamespaceCommit, Error> {
+        if reference.object.class != ObjectClass::NamespaceCommit {
+            return Err(Error::corrupt(
+                "read Managed namespace",
+                "commit reference has the wrong object class",
+            ));
+        }
+        let bytes = object::read_immutable(
+            &self.operator,
+            reference.object,
+            COMMIT_RECORD.maximum_encoded_bytes(),
+        )
+        .await?;
+        let commit: NamespaceCommit = COMMIT_RECORD.decode(&bytes)?;
+        if commit.volume_id != self.id() || commit.change_cursor != reference.cursor {
             return Err(Error::corrupt(
                 "read Managed namespace",
                 "namespace commit does not match its reference",
             ));
         }
-        let commit: NamespaceCommit = COMMIT_RECORD.decode(&bytes)?;
-        if commit.volume_id != self.id() {
-            return Err(Error::corrupt(
-                "read Managed namespace",
-                "namespace commit belongs to another volume",
-            ));
-        }
-        if commit.change_cursor != reference.cursor {
-            return Err(Error::corrupt(
-                "read Managed namespace",
-                "namespace commit cursor does not match its reference",
-            ));
-        }
-        Ok(Some(commit))
+        Ok(commit)
     }
 }
 
-fn empty_snapshot(format: ManagedFormat) -> VolumeSnapshot {
-    let volume_id = format.volume_id();
-    let root = format.root_node_id();
-    VolumeSnapshot {
-        volume_id,
-        cursor: ChangeCursor::Genesis,
-        root,
-        nodes: BTreeMap::from([(
-            root,
-            NodeRecord {
-                kind: NodeKind::Directory,
-                attributes: NodeAttributes::default(),
-                file_version: None,
-            },
-        )]),
-        directories: BTreeMap::from([(
-            root,
-            DirectoryRecord {
-                entries: BTreeMap::new(),
-            },
-        )]),
+async fn append_stream<T: Serialize>(
+    operator: &Operator,
+    gc_epoch: GcEpoch,
+    streams: &mut Vec<StreamRef>,
+    class: ObjectClass,
+    kind: StreamKind,
+    records: impl IntoIterator<Item = T>,
+) -> Result<(), Error> {
+    let records = records.into_iter().collect::<Vec<_>>();
+    if records.is_empty() {
+        return Ok(());
     }
+    streams.push(stream::write_records(operator, gc_epoch, class, kind, records).await?);
+    Ok(())
 }
 
-fn commit_key(digest: Digest) -> String {
-    let digest = blake3::Hash::from_bytes(*digest.as_bytes()).to_hex();
-    format!("managed/1/objects/commit/{}/{digest}", &digest[..2])
+fn require_stream(reference: StreamRef, kind: StreamKind, class: ObjectClass) -> Result<(), Error> {
+    if reference.kind != kind || reference.object.class != class {
+        return Err(Error::corrupt(
+            "read Managed namespace",
+            "stream reference has the wrong type",
+        ));
+    }
+    Ok(())
+}
+
+fn flatten_directories(snapshot: &VolumeSnapshot) -> BTreeMap<DirectoryKey, DirectoryEntry> {
+    let mut entries = BTreeMap::new();
+    for (parent_node_id, directory) in &snapshot.directories {
+        for (name, entry) in &directory.entries {
+            entries.insert(
+                DirectoryKey {
+                    parent_node_id: *parent_node_id,
+                    name: name.clone(),
+                },
+                *entry,
+            );
+        }
+    }
+    entries
+}
+
+fn next_generation(generation: u64) -> Result<u64, Error> {
+    generation
+        .checked_add(1)
+        .ok_or_else(|| Error::corrupt("publish Managed namespace", "node generation overflows"))
 }

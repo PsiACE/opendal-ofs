@@ -619,7 +619,7 @@ fn gc(fixture: &Fixture) {
         "publish replacement before GC",
     );
 
-    run_ofs_success(ofs_gc(&storage, false), "collect unreachable objects");
+    run_ofs_success(ofs_gc(&storage), "collect unreachable objects");
     run_ofs_success(
         ofs_sync(&replica_b, &state_b, &storage),
         "cold restore after collection",
@@ -629,7 +629,7 @@ fn gc(fixture: &Fixture) {
         tree_fingerprint(&replica_b),
         "collection preserves every object needed for cold restore"
     );
-    run_ofs_success(ofs_gc(&storage, false), "repeat completed collection");
+    run_ofs_success(ofs_gc(&storage), "repeat completed collection");
 }
 
 fn recovery_gc(fixture: &Fixture) {
@@ -652,7 +652,7 @@ fn recovery_gc(fixture: &Fixture) {
     prepared.env("OFS_INTERNAL_TEST_INTERRUPT", "before-publish");
     run_ofs_failure(prepared, "interrupt prepared publication");
     let collected = run_ofs_success(
-        ofs_gc(&storage, false),
+        ofs_gc(&storage),
         "collect an interrupted prepared publication",
     );
     assert!(
@@ -673,16 +673,13 @@ fn recovery_gc(fixture: &Fixture) {
         "attach recovery peer",
     );
 
-    let mut interrupted_collection = ofs_gc(&storage, false);
-    interrupted_collection.env("OFS_INTERNAL_TEST_INTERRUPT", "after-gc-fence");
+    let mut interrupted_collection = ofs_gc(&storage);
+    interrupted_collection.env("OFS_INTERNAL_TEST_INTERRUPT", "after-gc-epoch-rotation");
     run_ofs_failure(
         interrupted_collection,
-        "interrupt collection after freezing the namespace",
+        "interrupt collection after rotating the object epoch",
     );
-    run_ofs_success(
-        ofs_gc(&storage, true),
-        "resume interrupted namespace collection",
-    );
+    run_ofs_success(ofs_gc(&storage), "repeat interrupted namespace collection");
     fs::write(
         replica_a.join("after-resume.txt"),
         b"collection recovery keeps publication available\n",
@@ -724,7 +721,7 @@ fn recovery_gc(fixture: &Fixture) {
         ofs_sync(&replica_b, &state_b, &storage),
         "advance beyond interrupted publication",
     );
-    run_ofs_success(ofs_gc(&storage, false), "collect superseded objects");
+    run_ofs_success(ofs_gc(&storage), "collect superseded objects");
     fs::write(
         replica_b.join("after-collection.txt"),
         b"operation receipt must survive namespace collection\n",
@@ -866,10 +863,7 @@ fn offline_gc(fixture: &Fixture) {
         ofs_sync(&replica_b, &state_b, &storage),
         "attach replica at the collection base",
     );
-    let collected = run_ofs_success(
-        ofs_gc(&storage, false),
-        "collect from the current namespace",
-    );
+    let collected = run_ofs_success(ofs_gc(&storage), "collect from the current namespace");
     assert!(
         !output_text(&collected.stdout).contains("deleted 0 object"),
         "collection reclaims superseded data"
@@ -1530,12 +1524,9 @@ fn ofs_status(replica: &Path, state: &Path) -> Command {
     command
 }
 
-fn ofs_gc(storage: &str, resume: bool) -> Command {
+fn ofs_gc(storage: &str) -> Command {
     let mut command = ofs_command();
     command.arg("gc").arg(storage);
-    if resume {
-        command.arg("--resume");
-    }
     command
 }
 

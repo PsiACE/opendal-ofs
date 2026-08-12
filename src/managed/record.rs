@@ -22,15 +22,27 @@ use serde::de::DeserializeOwned;
 
 use crate::Error;
 
+use super::object::{RangeChecksum, checksum};
+
+const SCHEMA_VERSION_BYTES: usize = size_of::<u16>();
+const BODY_LENGTH_BYTES: usize = size_of::<u64>();
+const CHECKSUM_BYTES: usize = size_of::<RangeChecksum>();
+
 pub(crate) struct Record {
     magic: [u8; 8],
+    schema_version: u16,
     maximum_body_bytes: usize,
 }
 
 impl Record {
-    pub(crate) const fn new(magic: [u8; 8], maximum_body_bytes: usize) -> Self {
+    pub(crate) const fn new(
+        magic: [u8; 8],
+        schema_version: u16,
+        maximum_body_bytes: usize,
+    ) -> Self {
         Self {
             magic,
+            schema_version,
             maximum_body_bytes,
         }
     }
@@ -38,8 +50,10 @@ impl Record {
     pub(crate) const fn maximum_encoded_bytes(&self) -> usize {
         self.magic
             .len()
+            .saturating_add(SCHEMA_VERSION_BYTES)
+            .saturating_add(BODY_LENGTH_BYTES)
             .saturating_add(self.maximum_body_bytes)
-            .saturating_add(32)
+            .saturating_add(CHECKSUM_BYTES)
     }
 
     pub(crate) fn encode<T: Serialize>(&self, value: &T) -> Result<Vec<u8>, Error> {
@@ -52,26 +66,67 @@ impl Record {
                 "record exceeds its size limit",
             ));
         }
-        let mut bytes = Vec::with_capacity(self.magic.len() + body.len() + 32);
+        let body_length = u64::try_from(body.len())
+            .map_err(|_| Error::invalid("encode Managed record", "record length overflows"))?;
+        let mut bytes = Vec::with_capacity(
+            self.magic.len()
+                + SCHEMA_VERSION_BYTES
+                + BODY_LENGTH_BYTES
+                + body.len()
+                + CHECKSUM_BYTES,
+        );
         bytes.extend_from_slice(&self.magic);
+        bytes.extend_from_slice(&self.schema_version.to_le_bytes());
+        bytes.extend_from_slice(&body_length.to_le_bytes());
         bytes.extend_from_slice(&body);
-        bytes.extend_from_slice(blake3::hash(&bytes).as_bytes());
+        bytes.extend_from_slice(checksum(&bytes).as_bytes());
         Ok(bytes)
     }
 
     pub(crate) fn decode<T: DeserializeOwned>(&self, bytes: &[u8]) -> Result<T, Error> {
-        let body = bytes
-            .strip_prefix(&self.magic)
-            .and_then(|bytes| bytes.get(..bytes.len().checked_sub(32)?))
-            .ok_or_else(|| Error::corrupt("decode Managed record", "record format is invalid"))?;
-        if body.len() > self.maximum_body_bytes
-            || blake3::hash(&bytes[..bytes.len() - 32]).as_bytes() != &bytes[bytes.len() - 32..]
+        let header_bytes = self.magic.len() + SCHEMA_VERSION_BYTES + BODY_LENGTH_BYTES;
+        let minimum_bytes = header_bytes + CHECKSUM_BYTES;
+        if bytes.len() < minimum_bytes || bytes[..self.magic.len()] != self.magic {
+            return Err(Error::corrupt(
+                "decode Managed record",
+                "record envelope is invalid",
+            ));
+        }
+        let version_offset = self.magic.len();
+        let version = u16::from_le_bytes(
+            bytes[version_offset..version_offset + SCHEMA_VERSION_BYTES]
+                .try_into()
+                .expect("version range has a fixed length"),
+        );
+        if version != self.schema_version {
+            return Err(Error::unsupported(
+                "decode Managed record",
+                "record schema version is unsupported",
+            ));
+        }
+        let length_offset = version_offset + SCHEMA_VERSION_BYTES;
+        let body_length = usize::try_from(u64::from_le_bytes(
+            bytes[length_offset..header_bytes]
+                .try_into()
+                .expect("length range has a fixed length"),
+        ))
+        .ok()
+        .filter(|length| *length <= self.maximum_body_bytes)
+        .ok_or_else(|| Error::corrupt("decode Managed record", "record length is invalid"))?;
+        let expected_length = header_bytes
+            .checked_add(body_length)
+            .and_then(|length| length.checked_add(CHECKSUM_BYTES))
+            .ok_or_else(|| Error::corrupt("decode Managed record", "record length overflows"))?;
+        if bytes.len() != expected_length
+            || checksum(&bytes[..bytes.len() - CHECKSUM_BYTES]).as_bytes()
+                != &bytes[bytes.len() - CHECKSUM_BYTES..]
         {
             return Err(Error::corrupt(
                 "decode Managed record",
                 "record checksum is invalid",
             ));
         }
+        let body = &bytes[header_bytes..header_bytes + body_length];
         let mut input = Cursor::new(body);
         let value = ciborium::from_reader(&mut input)
             .map_err(|_| Error::corrupt("decode Managed record", "record body is invalid"))?;

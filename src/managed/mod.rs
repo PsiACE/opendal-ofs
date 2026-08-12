@@ -17,18 +17,18 @@
 
 //! Managed volume authority and durable storage format.
 
-mod container;
 mod data;
 mod format;
 mod gc;
 mod head;
-mod index;
 mod object;
 mod record;
+mod stream;
 
 pub use format::ManagedFormat;
 pub use gc::GcOutcome;
 pub use head::{ManagedObservation, ManagedVolume, NamespaceRevision};
+pub(crate) use object::{GcEpoch, ObjectRef};
 
 use opendal::Operator;
 
@@ -63,7 +63,7 @@ impl ManagedMetadata {
     pub async fn initialize(&self) -> Result<ManagedVolume, Error> {
         let desired = ManagedFormat::v1(VolumeId::generate(), NodeId::generate());
         let encoded = desired.encode()?;
-        let format = if object::create(&self.operator, FORMAT_KEY, encoded).await? {
+        let format = if object::create_control(&self.operator, FORMAT_KEY, encoded).await? {
             desired
         } else {
             self.read_format().await?
@@ -74,7 +74,7 @@ impl ManagedMetadata {
     }
 
     pub async fn read_format(&self) -> Result<ManagedFormat, Error> {
-        let bytes = object::read(&self.operator, FORMAT_KEY, MAX_FORMAT_BYTES)
+        let bytes = object::read_control(&self.operator, FORMAT_KEY, MAX_FORMAT_BYTES)
             .await?
             .ok_or_else(|| {
                 Error::new(

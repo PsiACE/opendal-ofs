@@ -15,214 +15,186 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use blake3::Hasher;
-use futures::StreamExt as _;
-use opendal::{Buffer, ErrorKind as StorageErrorKind, Operator};
-use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
+use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::filesystem::FileVersionId;
-use crate::{Error, ErrorKind};
+use crate::Error;
+use crate::filesystem::{ChangeCursor, FileVersionId};
 
 use super::ManagedVolume;
+use super::object::{self, GcEpoch, ObjectClass, ObjectRef};
+use super::record::Record;
+use super::stream::{self, StreamKind, StreamRef};
 
-const IO_BUFFER_BYTES: usize = 256 * 1024;
-const UPLOAD_PART_BYTES: usize = 16 * 1024 * 1024;
+const MANIFEST_RECORD: Record = Record::new(*b"OFSMAN01", 1, 1024 * 1024);
 
-#[derive(Clone, Copy, Debug)]
-pub(super) struct WholeObject {
-    pub(super) digest: [u8; 32],
-    pub(super) length: u64,
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct FileManifest {
+    file_version: FileVersionId,
+    file_size: u64,
+    extent_segments: Vec<StreamRef>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+struct FileExtentMutation {
+    logical_offset: u64,
+    length: u64,
+    change_cursor: ChangeCursor,
+    shard: StreamRef,
+    object_offset: u64,
 }
 
 impl ManagedVolume {
-    /// Publish one immutable whole-file object before its version is committed.
+    /// Publish one immutable file manifest over independently durable shards.
     pub(crate) async fn publish_data(
         &self,
         source: &mut (impl AsyncRead + Unpin),
         version: FileVersionId,
-    ) -> Result<(), Error> {
-        let object = whole_object(version)?;
-        let mut writer = if let Some(object) = object {
-            let key = object_key(object.digest);
-            Some(
-                self.operator()
-                    .writer_with(&key)
-                    .if_not_exists(true)
-                    .chunk(UPLOAD_PART_BYTES)
-                    .await
-                    .map_err(|error| Error::from_storage("publish Managed file", error))?,
+        gc_epoch: GcEpoch,
+        change_cursor: ChangeCursor,
+    ) -> Result<ObjectRef, Error> {
+        let mut extent_segments = Vec::new();
+        if version.logical_length() != 0 {
+            let shard = stream::write_bytes(
+                self.operator(),
+                gc_epoch,
+                ObjectClass::FileShard,
+                StreamKind::FILE_BYTES,
+                source,
             )
-        } else {
-            None
-        };
-        let mut hasher = Hasher::new();
-        let mut length = 0_u64;
-        let mut buffer = vec![0; IO_BUFFER_BYTES];
-        let transfer = async {
-            loop {
-                let read = source
-                    .read(&mut buffer)
-                    .await
-                    .map_err(|error| Error::io("read Managed data source", error))?;
-                if read == 0 {
-                    break;
-                }
-                let bytes = &buffer[..read];
-                hasher.update(bytes);
-                length = length.checked_add(read as u64).ok_or_else(|| {
-                    Error::invalid("publish Managed data", "file length overflows")
-                })?;
-                if let Some(writer) = &mut writer {
-                    writer
-                        .write(Buffer::from(bytes.to_vec()))
-                        .await
-                        .map_err(|error| Error::from_storage("publish Managed file", error))?;
-                }
-            }
-            verify_source_identity(length, hasher.finalize().into(), version)
-        }
-        .await;
-        if let Err(error) = transfer {
-            if let Some(writer) = &mut writer {
-                let _ = writer.abort().await;
-            }
-            return Err(error);
-        }
-        let Some(object) = object else {
-            return Ok(());
-        };
-        let key = object_key(object.digest);
-        let mut writer = writer.expect("a non-empty Managed file has a data writer");
-
-        let close_error = match writer.close().await {
-            Ok(_) => return Ok(()),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    StorageErrorKind::AlreadyExists | StorageErrorKind::ConditionNotMatch
-                ) =>
+            .await?;
+            if shard.payload_length != version.logical_length()
+                || shard.payload_digest.as_bytes() != version.digest().as_bytes()
             {
-                let metadata = self
-                    .operator()
-                    .stat(&key)
-                    .await
-                    .map_err(|error| Error::from_storage("publish Managed file", error))?;
-                if metadata.content_length() == object.length {
-                    return Ok(());
-                }
-                return Err(Error::new(
-                    ErrorKind::Corrupt,
-                    "publish Managed data",
-                    "immutable object has an invalid length",
+                return Err(Error::conflict(
+                    "publish Managed file",
+                    "local file changed while being published",
                 ));
             }
-            Err(error) => error,
-        };
-        let mut sink = tokio::io::sink();
-        match stream_object(self.operator(), object, &mut sink).await {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == ErrorKind::Corrupt => Err(error),
-            Err(_) => Err(Error::from_storage("publish Managed file", close_error)),
+            extent_segments.push(
+                stream::write_records(
+                    self.operator(),
+                    gc_epoch,
+                    ObjectClass::FileExtentSegment,
+                    StreamKind::FILE_EXTENT_MUTATIONS,
+                    [FileExtentMutation {
+                        logical_offset: 0,
+                        length: version.logical_length(),
+                        change_cursor,
+                        shard,
+                        object_offset: 0,
+                    }],
+                )
+                .await?,
+            );
+        } else if version.digest().as_bytes() != blake3::hash(&[]).as_bytes() {
+            return Err(Error::invalid(
+                "publish Managed file",
+                "empty file content identity is invalid",
+            ));
         }
+        object::write_immutable(
+            self.operator(),
+            gc_epoch,
+            ObjectClass::FileManifest,
+            MANIFEST_RECORD.encode(&FileManifest {
+                file_version: version,
+                file_size: version.logical_length(),
+                extent_segments,
+            })?,
+        )
+        .await
     }
 
-    /// Read and verify one immutable whole-file object into a destination.
+    /// Read and verify one immutable file version into a destination.
     pub(crate) async fn read_data(
         &self,
         version: FileVersionId,
         destination: &mut (impl AsyncWrite + Unpin),
     ) -> Result<(), Error> {
-        if let Some(object) = whole_object(version)? {
-            stream_object(self.operator(), object, destination).await?;
+        let record = self.file_version_record(version)?;
+        let manifest = read_manifest(self, record.manifest).await?;
+        if manifest.file_version != version || manifest.file_size != version.logical_length() {
+            return Err(Error::corrupt(
+                "read Managed file",
+                "file manifest does not match its version",
+            ));
+        }
+        let mut extents = Vec::new();
+        for reference in manifest.extent_segments {
+            if reference.kind != StreamKind::FILE_EXTENT_MUTATIONS
+                || reference.object.class != ObjectClass::FileExtentSegment
+            {
+                return Err(Error::corrupt(
+                    "read Managed file",
+                    "file extent stream has the wrong type",
+                ));
+            }
+            extents.extend(
+                stream::read_records::<FileExtentMutation>(self.operator(), reference).await?,
+            );
+        }
+        extents.sort_by_key(|extent| extent.logical_offset);
+        let mut expected_offset = 0_u64;
+        for extent in extents {
+            if extent.logical_offset != expected_offset
+                || extent.object_offset != 0
+                || extent.length != extent.shard.payload_length
+                || extent.shard.kind != StreamKind::FILE_BYTES
+                || extent.shard.object.class != ObjectClass::FileShard
+            {
+                return Err(Error::corrupt(
+                    "read Managed file",
+                    "file extents do not form a contiguous byte stream",
+                ));
+            }
+            stream::copy_bytes(self.operator(), extent.shard, destination).await?;
+            expected_offset = expected_offset
+                .checked_add(extent.length)
+                .ok_or_else(|| Error::corrupt("read Managed file", "file length overflows"))?;
+        }
+        if expected_offset != manifest.file_size {
+            return Err(Error::corrupt(
+                "read Managed file",
+                "file extents do not cover the declared file size",
+            ));
         }
         Ok(())
     }
 }
 
-async fn stream_object(
-    operator: &Operator,
-    object: WholeObject,
-    destination: &mut (impl AsyncWrite + Unpin),
+pub(super) async fn visit_manifest_objects(
+    volume: &ManagedVolume,
+    reference: ObjectRef,
+    visit: &mut impl FnMut(ObjectRef) -> Result<(), Error>,
 ) -> Result<(), Error> {
-    let key = object_key(object.digest);
-    let reader = match operator.reader(&key).await {
-        Ok(reader) => reader,
-        Err(error) if error.kind() == StorageErrorKind::NotFound => {
-            return Err(Error::corrupt(
-                "read Managed data",
-                "referenced object is missing",
-            ));
-        }
-        Err(error) => return Err(Error::from_storage("read Managed data", error)),
-    };
-    let mut stream = reader
-        .into_stream(..)
-        .await
-        .map_err(|error| Error::from_storage("read Managed data", error))?;
-    let mut hasher = Hasher::new();
-    let mut length = 0_u64;
-    while let Some(buffer) = stream.next().await {
-        let buffer = match buffer {
-            Ok(buffer) => buffer,
-            Err(error) if error.kind() == StorageErrorKind::NotFound => {
-                return Err(Error::corrupt(
-                    "read Managed data",
-                    "referenced object is missing",
-                ));
-            }
-            Err(error) => return Err(Error::from_storage("read Managed data", error)),
-        };
-        for chunk in buffer {
-            hasher.update(&chunk);
-            length = length
-                .checked_add(chunk.len() as u64)
-                .ok_or_else(|| Error::corrupt("read Managed data", "object length overflows"))?;
-            destination
-                .write_all(&chunk)
-                .await
-                .map_err(|error| Error::io("write Managed data destination", error))?;
+    let manifest = read_manifest(volume, reference).await?;
+    for extent_segment in manifest.extent_segments {
+        visit(extent_segment.object)?;
+        let extents =
+            stream::read_records::<FileExtentMutation>(volume.operator(), extent_segment).await?;
+        for extent in extents {
+            visit(extent.shard.object)?;
         }
     }
-    if length != object.length || hasher.finalize().as_bytes() != &object.digest {
+    Ok(())
+}
+
+async fn read_manifest(
+    volume: &ManagedVolume,
+    reference: ObjectRef,
+) -> Result<FileManifest, Error> {
+    if reference.class != ObjectClass::FileManifest {
         return Err(Error::corrupt(
-            "read Managed data",
-            "object content does not match its identity",
-        ));
-    }
-    Ok(())
-}
-
-fn verify_source_identity(
-    length: u64,
-    digest: [u8; 32],
-    version: FileVersionId,
-) -> Result<(), Error> {
-    if length != version.logical_length() || digest != *version.digest().as_bytes() {
-        return Err(Error::invalid(
-            "publish Managed data",
-            "file changed while being published",
-        ));
-    }
-    Ok(())
-}
-
-pub(super) fn whole_object(version: FileVersionId) -> Result<Option<WholeObject>, Error> {
-    let digest = *version.digest().as_bytes();
-    match version.logical_length() {
-        0 if digest == *blake3::hash(&[]).as_bytes() => Ok(None),
-        0 => Err(Error::corrupt(
             "read Managed file",
-            "empty file content identity is invalid",
-        )),
-        length => Ok(Some(WholeObject { digest, length })),
+            "manifest reference has the wrong object class",
+        ));
     }
-}
-
-fn object_key(digest: [u8; 32]) -> String {
-    let digest = blake3::Hash::from_bytes(digest).to_hex();
-    format!("managed/1/objects/raw/{}/{}", &digest.as_str()[..2], digest)
-}
-
-pub(super) fn whole_object_key(digest: [u8; 32]) -> String {
-    object_key(digest)
+    let bytes = object::read_immutable(
+        volume.operator(),
+        reference,
+        MANIFEST_RECORD.maximum_encoded_bytes(),
+    )
+    .await?;
+    MANIFEST_RECORD.decode(&bytes)
 }

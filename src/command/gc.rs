@@ -26,7 +26,7 @@ pub(super) async fn run(args: GcArgs) -> Result<()> {
     let metadata =
         ManagedMetadata::object(open_operator(&args.storage, args.transfer_concurrency)?)?;
     let volume = metadata.open_for_gc().await?;
-    let outcome = volume.collect_unreachable(args.resume).await?;
+    let outcome = volume.collect_unreachable().await?;
     println!(
         "collected managed volume {}: scanned {}, deleted {} object(s), {} byte(s)",
         volume.id(),
