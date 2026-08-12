@@ -14,24 +14,16 @@
 [chat]: https://img.shields.io/discord/1081052318650339399
 [discord]: https://opendal.apache.org/discord
 
-`ofs` is the Apache OpenDAL filesystem project.
+`ofs` is the Apache OpenDAL filesystem project. The current runtime provides
+Managed volumes with local Sync replicas, following [RFC-0016].
 
 > [!IMPORTANT]
-> **Status: active redesign**
+> **Status: under development**
 >
-> We are actively working on the design of the next `ofs` release under
-> [RFC-0016]. The `main` branch is a buildable project scaffold and does not
-> currently provide a mount command or runtime API.
-
-## Previous releases
-
-The implementation used by earlier published releases is preserved on the
-[`backup`] branch. It predates RFC-0016 and remains available for reference
-while the new runtime is designed.
+> The Managed Sync format and commands are not released yet. Storage created by
+> this code should be treated as development data.
 
 [rfc-0016]: rfcs/0016_filesystem_architecture.md
-[`backup`]: https://github.com/apache/opendal-ofs/tree/backup
-
 ## Development
 
 See [CONTRIBUTING.md] for setup instructions. Run the repository checks with:

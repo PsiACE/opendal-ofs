@@ -29,7 +29,7 @@ pub(super) async fn run(args: VolumeArgs) -> Result<()> {
 }
 
 async fn create(args: VolumeCreateArgs) -> Result<()> {
-    debug_assert_eq!(args.model, "managed");
+    let crate::cli::VolumeModel::Managed = args.model;
     let metadata = ManagedMetadata::new(
         open_operator(&args.storage, args.resources.transfer_concurrency)?,
         args.resources.transfer_concurrency,

@@ -19,19 +19,17 @@ use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 use std::path::Path;
 
-use futures::TryStreamExt as _;
 use serde::de::DeserializeOwned;
 
 use crate::Error;
-use crate::filesystem::{ChangeCursor, NamespaceValue, OperationId};
-use crate::managed::{ManagedObservation, ManagedVolume, NamespaceRevision, StreamRef};
-use crate::workset::{Namespace, Workspace};
+use crate::filesystem::ChangeCursor;
+use crate::managed::{ManagedVolume, NamespaceRevision, StreamRef};
+use crate::namespace::Namespace;
 
 use super::ReplicaState;
-use super::install::{install, repair};
-use super::reconcile::{changed_paths, reconcile};
+use super::install::install;
+use super::reconcile::{ReconcilePlan, reconcile};
 use super::scan::{ScannedTree, scan};
-use super::transfer::publish_file;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SyncOutcome {
@@ -41,8 +39,8 @@ pub struct SyncOutcome {
 }
 
 pub struct SyncEngine {
-    transfer_concurrency: usize,
-    volume: ManagedVolume,
+    pub(super) transfer_concurrency: usize,
+    pub(super) volume: ManagedVolume,
 }
 
 impl SyncEngine {
@@ -235,28 +233,30 @@ impl SyncEngine {
                     &resolved,
                     self.volume.workset_options(),
                 )?;
-                if !plan.conflicts.is_empty() {
-                    let conflict_paths = plan
-                        .conflicts
-                        .into_iter()
-                        .map(|conflict| conflict.path)
-                        .collect::<Vec<_>>();
-                    state.retain_conflicts(conflict_paths.len(), observed.revision(), false);
-                    state.save(state_path)?;
-                    return Ok(SyncOutcome {
-                        conflict_paths,
-                        published: false,
-                        sequence: base.cursor.sequence(),
-                    });
-                }
-                let (target, revision) = if plan.publish {
-                    let target = self.publish_files(&root, &observed, &plan.target).await?;
-                    let revision = self
-                        .prepare_and_commit(state_path, &mut state, &observed, &target)
-                        .await?;
-                    (target, revision)
-                } else {
-                    (observed.namespace.clone(), observed.revision())
+                let (target, revision, published) = match plan {
+                    ReconcilePlan::Conflicted(conflicts) => {
+                        let conflict_paths = conflicts
+                            .into_iter()
+                            .map(|conflict| conflict.path)
+                            .collect::<Vec<_>>();
+                        state.retain_conflicts(conflict_paths.len(), observed.revision(), false);
+                        state.save(state_path)?;
+                        return Ok(SyncOutcome {
+                            conflict_paths,
+                            published: false,
+                            sequence: base.cursor.sequence(),
+                        });
+                    }
+                    ReconcilePlan::Publish(target) => {
+                        let target = self.publish_files(&root, &observed, &target).await?;
+                        let revision = self
+                            .prepare_and_commit(state_path, &mut state, &observed, &target)
+                            .await?;
+                        (target, revision, true)
+                    }
+                    ReconcilePlan::Remote => {
+                        (observed.namespace.clone(), observed.revision(), false)
+                    }
                 };
                 self.install_and_advance(
                     &root,
@@ -265,165 +265,14 @@ impl SyncEngine {
                     &target,
                     revision,
                     Some(&local),
-                    plan.publish,
+                    published,
                 )
                 .await
             }
         }
     }
 
-    async fn prepare_and_commit(
-        &self,
-        state_path: &Path,
-        state: &mut ReplicaState,
-        observed: &ManagedObservation,
-        target: &Namespace<StreamRef>,
-    ) -> Result<NamespaceRevision, Error> {
-        let operation = OperationId::generate();
-        let revision = self
-            .volume
-            .prepare_publication(observed, target, operation)
-            .await?;
-        state.begin_publication(
-            observed.revision(),
-            revision,
-            operation,
-            observed.maintenance_generation(),
-        )?;
-        state.save(state_path)?;
-        crate::fault::check("before-publish")?;
-        self.volume
-            .commit_publication(observed, revision, operation)
-            .await?;
-        crate::fault::check("after-publish")?;
-        Ok(revision)
-    }
-
-    async fn recover_install(
-        &self,
-        root: &Path,
-        state_path: &Path,
-        mut state: ReplicaState,
-        observed: ManagedObservation,
-        target: NamespaceRevision,
-        published: bool,
-    ) -> Result<SyncOutcome, Error> {
-        if !observed.can_read_revision(target) {
-            state.begin_install(observed.revision(), false);
-            state.save(state_path)?;
-            repair(
-                root,
-                &observed.namespace,
-                &self.volume,
-                self.transfer_concurrency,
-            )
-            .await?;
-            state.advance(observed.revision());
-            state.save(state_path)?;
-            return Ok(SyncOutcome {
-                conflict_paths: Vec::new(),
-                published: false,
-                sequence: observed.namespace.cursor.sequence(),
-            });
-        }
-        let loaded = if observed.revision() == target {
-            None
-        } else {
-            Some(self.volume.namespace(target).await?)
-        };
-        let target_namespace = loaded.as_ref().unwrap_or(&observed.namespace);
-        state.begin_install(target, published);
-        state.save(state_path)?;
-        repair(
-            root,
-            target_namespace,
-            &self.volume,
-            self.transfer_concurrency,
-        )
-        .await?;
-        state.advance(target);
-        state.save(state_path)?;
-        if observed.revision() != target {
-            return self
-                .install_and_advance(
-                    root,
-                    state_path,
-                    state,
-                    &observed.namespace,
-                    observed.revision(),
-                    Some(target_namespace),
-                    published,
-                )
-                .await;
-        }
-        Ok(SyncOutcome {
-            conflict_paths: Vec::new(),
-            published,
-            sequence: target.cursor().sequence(),
-        })
-    }
-
-    async fn conservative_rebase(
-        &self,
-        root: &Path,
-        state_path: &Path,
-        mut state: ReplicaState,
-        observed: ManagedObservation,
-        resolved: &BTreeSet<String>,
-    ) -> Result<SyncOutcome, Error> {
-        let local = match scan(
-            root,
-            &observed.namespace,
-            self.transfer_concurrency,
-            self.volume.workset_options(),
-        )
-        .await?
-        {
-            ScannedTree::Unchanged => {
-                state.advance(observed.revision());
-                state.save(state_path)?;
-                return Ok(SyncOutcome {
-                    conflict_paths: Vec::new(),
-                    published: false,
-                    sequence: observed.namespace.cursor.sequence(),
-                });
-            }
-            ScannedTree::Changed(namespace) => namespace,
-        };
-        let ambiguous = changed_paths(&observed.namespace, &local)?;
-        if ambiguous.is_empty() {
-            state.advance(observed.revision());
-            state.save(state_path)?;
-            return Ok(SyncOutcome {
-                conflict_paths: Vec::new(),
-                published: false,
-                sequence: observed.namespace.cursor.sequence(),
-            });
-        }
-        if resolved != &ambiguous {
-            let conflict_paths = ambiguous.into_iter().collect::<Vec<_>>();
-            state.retain_conflicts(conflict_paths.len(), observed.revision(), true);
-            state.save(state_path)?;
-            return Ok(SyncOutcome {
-                conflict_paths,
-                published: false,
-                sequence: state.common_revision().cursor().sequence(),
-            });
-        }
-        let target = self.publish_files(root, &observed, &local).await?;
-        let revision = self
-            .prepare_and_commit(state_path, &mut state, &observed, &target)
-            .await?;
-        state.advance(revision);
-        state.save(state_path)?;
-        Ok(SyncOutcome {
-            conflict_paths: Vec::new(),
-            published: true,
-            sequence: revision.cursor().sequence(),
-        })
-    }
-
-    async fn install_and_advance<C: DeserializeOwned>(
+    pub(super) async fn install_and_advance<C: DeserializeOwned>(
         &self,
         root: &Path,
         state_path: &Path,
@@ -449,104 +298,6 @@ impl SyncEngine {
             conflict_paths: Vec::new(),
             published,
             sequence: target_revision.cursor().sequence(),
-        })
-    }
-
-    async fn recover_pending(
-        &self,
-        root: &Path,
-        state_path: &Path,
-        mut state: ReplicaState,
-        observed: ManagedObservation,
-    ) -> Result<SyncOutcome, Error> {
-        let (expected, target, operation, maintenance_generation) = state
-            .pending_publication()
-            .expect("pending state has publication references");
-        if observed.revision() == target
-            || self
-                .volume
-                .operation_committed(operation, &observed)
-                .await?
-        {
-            return self
-                .recover_install(root, state_path, state, observed, target, true)
-                .await;
-        }
-        if !observed.accepts_prepared(maintenance_generation) {
-            state.cancel_pending(observed.revision());
-            state.save(state_path)?;
-            return Err(Error::invalid(
-                "synchronize replica",
-                "pending publication was invalidated by data collection; repeat sync to prepare it again",
-            ));
-        }
-        if observed.revision() != expected {
-            state.cancel_pending(observed.revision());
-            state.save(state_path)?;
-            return Err(Error::invalid(
-                "synchronize replica",
-                "pending publication conflicted with a newer remote change; repeat sync to reconcile",
-            ));
-        }
-        crate::fault::check("before-publish")?;
-        self.volume
-            .commit_publication(&observed, target, operation)
-            .await?;
-        crate::fault::check("after-publish")?;
-        let committed = self.volume.observe().await?;
-        self.recover_install(root, state_path, state, committed, target, true)
-            .await
-    }
-
-    async fn publish_files(
-        &self,
-        root: &Path,
-        observed: &ManagedObservation,
-        target: &Namespace<Option<StreamRef>>,
-    ) -> Result<Namespace<StreamRef>, Error> {
-        let workspace = Workspace::create(self.volume.workset_options())?;
-        let mut output = workspace.writer("published-namespace")?;
-        let publications = target
-            .entries
-            .stream()?
-            .map_ok(|record| async move {
-                let Some(node) = record.value.as_ref() else {
-                    return Err(Error::corrupt(
-                        "publish Managed files",
-                        "current namespace contains a tombstone",
-                    ));
-                };
-                let content = match &node.value {
-                    NamespaceValue::Directory { .. } => None,
-                    NamespaceValue::RegularFile {
-                        fingerprint,
-                        content,
-                        ..
-                    } => match content {
-                        Some(reference) => Some(*reference),
-                        None => Some(
-                            publish_file(
-                                &self.volume,
-                                &root.join(&record.path),
-                                *fingerprint,
-                                observed.gc_epoch(),
-                            )
-                            .await?,
-                        ),
-                    },
-                };
-                Ok::<_, Error>(record.map_content(|_| content.expect("regular file content")))
-            })
-            .try_buffered(self.transfer_concurrency);
-        futures::pin_mut!(publications);
-        while let Some(record) = publications.try_next().await? {
-            output.write(&record)?;
-        }
-        Ok(Namespace {
-            volume_id: target.volume_id,
-            cursor: target.cursor,
-            root: target.root,
-            entries: output.finish()?,
         })
     }
 }

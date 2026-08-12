@@ -15,7 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use serde::{Deserialize, Serialize};
+use std::fmt;
+
+use serde::de::{Error as _, SeqAccess, Visitor};
+use serde::ser::SerializeTuple as _;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use unicode_casefold::UnicodeCaseFold as _;
 use unicode_normalization::UnicodeNormalization as _;
 
@@ -28,16 +32,14 @@ use super::{ChangeCursor, FileFingerprint, FileVersionId, NodeAttributes, NodeId
 /// `content` is supplied by the volume implementation. A durable Managed
 /// namespace uses its immutable content reference; a local scan uses `()`
 /// until publication attaches that reference.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NamespaceRecord<C> {
     pub path: String,
     pub change_cursor: ChangeCursor,
     pub value: Option<NamespaceNode<C>>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NamespaceNode<C> {
     pub node_id: NodeId,
     pub generation: u64,
@@ -45,8 +47,7 @@ pub struct NamespaceNode<C> {
     pub value: NamespaceValue<C>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NamespaceValue<C> {
     Directory {
         generation: u64,
@@ -56,6 +57,123 @@ pub enum NamespaceValue<C> {
         fingerprint: FileFingerprint,
         content: C,
     },
+}
+
+impl<C: Serialize> Serialize for NamespaceRecord<C> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut tuple = serializer.serialize_tuple(3)?;
+        tuple.serialize_element(&self.path)?;
+        tuple.serialize_element(&self.change_cursor)?;
+        tuple.serialize_element(&self.value)?;
+        tuple.end()
+    }
+}
+
+impl<'de, C: Deserialize<'de>> Deserialize<'de> for NamespaceRecord<C> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let (path, change_cursor, value) = Deserialize::deserialize(deserializer)?;
+        Ok(Self {
+            path,
+            change_cursor,
+            value,
+        })
+    }
+}
+
+impl<C: Serialize> Serialize for NamespaceNode<C> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut tuple = serializer.serialize_tuple(4)?;
+        tuple.serialize_element(&self.node_id)?;
+        tuple.serialize_element(&self.generation)?;
+        tuple.serialize_element(&self.attributes)?;
+        tuple.serialize_element(&self.value)?;
+        tuple.end()
+    }
+}
+
+impl<'de, C: Deserialize<'de>> Deserialize<'de> for NamespaceNode<C> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let (node_id, generation, attributes, value) = Deserialize::deserialize(deserializer)?;
+        Ok(Self {
+            node_id,
+            generation,
+            attributes,
+            value,
+        })
+    }
+}
+
+impl<C: Serialize> Serialize for NamespaceValue<C> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Directory { generation } => {
+                let mut tuple = serializer.serialize_tuple(2)?;
+                tuple.serialize_element(&0_u8)?;
+                tuple.serialize_element(generation)?;
+                tuple.end()
+            }
+            Self::RegularFile {
+                version,
+                fingerprint,
+                content,
+            } => {
+                let mut tuple = serializer.serialize_tuple(4)?;
+                tuple.serialize_element(&1_u8)?;
+                tuple.serialize_element(version)?;
+                tuple.serialize_element(fingerprint)?;
+                tuple.serialize_element(content)?;
+                tuple.end()
+            }
+        }
+    }
+}
+
+impl<'de, C: Deserialize<'de>> Deserialize<'de> for NamespaceValue<C> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ValueVisitor<C>(std::marker::PhantomData<C>);
+
+        impl<'de, C: Deserialize<'de>> Visitor<'de> for ValueVisitor<C> {
+            type Value = NamespaceValue<C>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a positional namespace value")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut sequence: A,
+            ) -> Result<Self::Value, A::Error> {
+                let kind = sequence
+                    .next_element::<u8>()?
+                    .ok_or_else(|| A::Error::invalid_length(0, &self))?;
+                let value = match kind {
+                    0 => NamespaceValue::Directory {
+                        generation: sequence
+                            .next_element()?
+                            .ok_or_else(|| A::Error::invalid_length(1, &self))?,
+                    },
+                    1 => NamespaceValue::RegularFile {
+                        version: sequence
+                            .next_element()?
+                            .ok_or_else(|| A::Error::invalid_length(1, &self))?,
+                        fingerprint: sequence
+                            .next_element()?
+                            .ok_or_else(|| A::Error::invalid_length(2, &self))?,
+                        content: sequence
+                            .next_element()?
+                            .ok_or_else(|| A::Error::invalid_length(3, &self))?,
+                    },
+                    _ => return Err(A::Error::custom("unknown namespace value kind")),
+                };
+                if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                    return Err(A::Error::custom("namespace value has trailing fields"));
+                }
+                Ok(value)
+            }
+        }
+
+        deserializer.deserialize_seq(ValueVisitor(std::marker::PhantomData))
+    }
 }
 
 impl<C> NamespaceNode<C> {

@@ -28,24 +28,24 @@ pub(crate) const MAX_FORMAT_BYTES: usize = FORMAT_RECORD.maximum_encoded_bytes()
 
 /// The sole Managed storage format understood by this build.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ManagedFormat {
+pub(crate) struct ManagedFormat {
     volume_id: VolumeId,
     root_node_id: NodeId,
 }
 
 impl ManagedFormat {
-    pub const fn new(volume_id: VolumeId, root_node_id: NodeId) -> Self {
+    pub(crate) const fn new(volume_id: VolumeId, root_node_id: NodeId) -> Self {
         Self {
             volume_id,
             root_node_id,
         }
     }
 
-    pub const fn volume_id(self) -> VolumeId {
+    pub(crate) const fn volume_id(self) -> VolumeId {
         self.volume_id
     }
 
-    pub const fn root_node_id(self) -> NodeId {
+    pub(crate) const fn root_node_id(self) -> NodeId {
         self.root_node_id
     }
 

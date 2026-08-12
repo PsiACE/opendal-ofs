@@ -21,14 +21,15 @@ use std::collections::BTreeSet;
 use crate::Error;
 use crate::filesystem::{NamespaceNode, NamespaceRecord, NodeKind, validate_portable_path};
 use crate::managed::StreamRef;
-use crate::workset::{Namespace, SpoolReader, WorksetOptions, Workspace};
+use crate::namespace::Namespace;
+use crate::workset::{SpoolReader, WorksetOptions, Workspace};
 
 use super::ConflictRecord;
 
-pub(crate) struct ReconcilePlan {
-    pub(crate) target: Namespace<Option<StreamRef>>,
-    pub(crate) conflicts: Vec<ConflictRecord>,
-    pub(crate) publish: bool,
+pub(crate) enum ReconcilePlan {
+    Conflicted(Vec<ConflictRecord>),
+    Remote,
+    Publish(Namespace<Option<StreamRef>>),
 }
 
 pub(crate) fn changed_paths(
@@ -73,13 +74,20 @@ pub(crate) fn reconcile(
     let mut remote_records = OrderedRecords::open(remote)?;
     let mut directory_conflicts = directory_conflicts.into_iter().peekable();
     let mut active_directories = Vec::<(String, bool)>::new();
+    let mut unresolved_directories = 0_usize;
     let mut conflicts = Vec::new();
     let mut resolved_conflicts = BTreeSet::new();
     let mut differs_from_remote = false;
 
     while let Some(path) = next_path(&common_records, &local_records, &remote_records) {
-        active_directories
-            .retain(|(directory, _)| path == *directory || is_descendant(directory, &path));
+        while active_directories
+            .last()
+            .is_some_and(|(directory, _)| path != *directory && !is_descendant(directory, &path))
+        {
+            if !active_directories.pop().expect("active directory exists").1 {
+                unresolved_directories -= 1;
+            }
+        }
         while directory_conflicts
             .peek()
             .is_some_and(|directory| directory == &path)
@@ -90,6 +98,8 @@ pub(crate) fn reconcile(
             let is_resolved = resolved.contains(&directory);
             if is_resolved {
                 resolved_conflicts.insert(directory.clone());
+            } else {
+                unresolved_directories += 1;
             }
             active_directories.push((directory, is_resolved));
         }
@@ -98,9 +108,7 @@ pub(crate) fn reconcile(
         let local_record = local_records.take(&path)?;
         let remote_record = remote_records.take(&path)?;
         let remote_comparison = remote_record.clone();
-        let blocked = active_directories
-            .iter()
-            .any(|(_, is_resolved)| !is_resolved);
+        let blocked = unresolved_directories != 0;
         let forced_local = !blocked && !active_directories.is_empty();
 
         let selected = if blocked {
@@ -163,34 +171,22 @@ pub(crate) fn reconcile(
     conflicts.sort_by(|left, right| left.path.cmp(&right.path));
     conflicts.dedup_by(|left, right| left.path == right.path);
     if !conflicts.is_empty() {
-        return Ok(ReconcilePlan {
-            target: map_remote(remote, &workspace)?,
-            conflicts,
-            publish: false,
-        });
+        return Ok(ReconcilePlan::Conflicted(conflicts));
     }
     if !differs_from_remote {
-        return Ok(ReconcilePlan {
-            target: map_remote(remote, &workspace)?,
-            conflicts,
-            publish: false,
-        });
+        return Ok(ReconcilePlan::Remote);
     }
 
     let sequence =
         remote.cursor.sequence().checked_add(1).ok_or_else(|| {
             Error::corrupt("reconcile replica", "Managed change sequence overflows")
         })?;
-    Ok(ReconcilePlan {
-        target: Namespace {
-            volume_id: remote.volume_id,
-            cursor: crate::filesystem::ChangeCursor::from_sequence(sequence),
-            root: remote.root,
-            entries: target.finish()?,
-        },
-        conflicts,
-        publish: true,
-    })
+    Ok(ReconcilePlan::Publish(Namespace {
+        volume_id: remote.volume_id,
+        cursor: crate::filesystem::ChangeCursor::from_sequence(sequence),
+        root: remote.root,
+        entries: target.finish()?,
+    }))
 }
 
 fn directory_conflicts(
@@ -203,30 +199,30 @@ fn directory_conflicts(
     let mut remote = OrderedRecords::open(remote)?;
     let mut pending = Vec::<DirectoryWatch>::new();
     let mut conflicts = Vec::new();
+    let mut local_changes = 0_u64;
+    let mut remote_changes = 0_u64;
 
     while let Some(path) = next_path(&common, &local, &remote) {
-        let mut retained = Vec::with_capacity(pending.len());
-        for watch in pending.drain(..) {
-            if path == watch.path || is_descendant(&watch.path, &path) {
-                retained.push(watch);
-            } else if watch.changed {
+        while pending
+            .last()
+            .is_some_and(|watch| path != watch.path && !is_descendant(&watch.path, &path))
+        {
+            let watch = pending.pop().expect("pending directory exists");
+            if watch.changed(local_changes, remote_changes) {
                 conflicts.push(watch.path);
             }
         }
-        pending = retained;
 
         let common_record = common.take(&path)?;
         let local_record = local.take(&path)?;
         let remote_record = remote.take(&path)?;
         let local_changed = !same_entry(common_record.as_ref(), local_record.as_ref());
         let remote_changed = !same_entry(common_record.as_ref(), remote_record.as_ref());
-        for watch in &mut pending {
-            if is_descendant(&watch.path, &path) {
-                watch.changed |= match watch.side {
-                    WatchedSide::Local => local_changed,
-                    WatchedSide::Remote => remote_changed,
-                };
-            }
+        if local_changed {
+            local_changes = local_changes.saturating_add(1);
+        }
+        if remote_changed {
+            remote_changes = remote_changes.saturating_add(1);
         }
 
         if kind(common_record.as_ref()) == Some(NodeKind::Directory) {
@@ -236,23 +232,22 @@ fn directory_conflicts(
                 pending.push(DirectoryWatch {
                     path: path.clone(),
                     side: WatchedSide::Remote,
-                    changed: false,
+                    baseline: remote_changes,
                 });
             } else if local_kept && !remote_kept {
                 pending.push(DirectoryWatch {
                     path,
                     side: WatchedSide::Local,
-                    changed: false,
+                    baseline: local_changes,
                 });
             }
         }
     }
-    conflicts.extend(
-        pending
-            .into_iter()
-            .filter(|watch| watch.changed)
-            .map(|watch| watch.path),
-    );
+    conflicts.extend(pending.into_iter().filter_map(|watch| {
+        watch
+            .changed(local_changes, remote_changes)
+            .then_some(watch.path)
+    }));
     conflicts.sort();
     conflicts.dedup();
     Ok(conflicts)
@@ -267,7 +262,16 @@ enum WatchedSide {
 struct DirectoryWatch {
     path: String,
     side: WatchedSide,
-    changed: bool,
+    baseline: u64,
+}
+
+impl DirectoryWatch {
+    fn changed(&self, local_changes: u64, remote_changes: u64) -> bool {
+        match self.side {
+            WatchedSide::Local => local_changes != self.baseline,
+            WatchedSide::Remote => remote_changes != self.baseline,
+        }
+    }
 }
 
 struct OrderedRecords<C> {
@@ -407,25 +411,6 @@ fn conflict<L, R>(
 fn digest<C>(record: Option<&NamespaceRecord<C>>) -> Option<crate::filesystem::Digest> {
     let (_, fingerprint, _) = record?.value.as_ref()?.file()?;
     Some(fingerprint.digest())
-}
-
-fn map_remote(
-    remote: &Namespace<StreamRef>,
-    workspace: &Workspace,
-) -> Result<Namespace<Option<StreamRef>>, Error> {
-    let mut source = OrderedRecords::open(remote)?;
-    let mut entries = workspace.writer("remote-namespace")?;
-    while let Some(path) = source.path().map(str::to_owned) {
-        if let Some(record) = source.take(&path)?.and_then(live_remote_record) {
-            entries.write(&record)?;
-        }
-    }
-    Ok(Namespace {
-        volume_id: remote.volume_id,
-        cursor: remote.cursor,
-        root: remote.root,
-        entries: entries.finish()?,
-    })
 }
 
 fn require_same_volume<L, R>(left: &Namespace<L>, right: &Namespace<R>) -> Result<(), Error> {

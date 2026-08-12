@@ -20,10 +20,10 @@
 use std::fs;
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use super::{Fixture, output_text};
+use super::cli::{Ofs, output_text, require_success};
+use super::fixture::Fixture;
 
 const TINY_FILE_COUNT: u64 = 1_000_000;
 const TINY_FILE_BYTES: u64 = 4 * 1024;
@@ -35,7 +35,8 @@ const STREAM_BUFFER_BYTES: usize = 1024 * 1024;
 
 pub(crate) fn run(profile: &str, keep: bool) {
     let profile = Profile::parse(profile);
-    build_release();
+    let ofs = Ofs::release();
+    ofs.build();
     let fixture = Fixture::new(keep).start();
     fixture.create_bucket();
     let work = ScaleRoot::new(keep);
@@ -56,11 +57,11 @@ pub(crate) fn run(profile: &str, keep: bool) {
 
     stage("generate fixture", || generate(profile, &replicas[0]));
     stage("create volume", || {
-        ofs_success(volume_create(&storage), "create scale volume");
+        require_success(ofs.volume_create(&storage), "create scale volume");
     });
     stage("initial publish", || {
-        ofs_success(
-            sync(&replicas[0], &states[0], &storage),
+        require_success(
+            ofs.sync(&replicas[0], &states[0], &storage),
             "publish scale fixture",
         );
     });
@@ -68,14 +69,14 @@ pub(crate) fn run(profile: &str, keep: bool) {
         report_inventory(&fixture, profile)
     });
     stage("cold restore", || {
-        ofs_success(
-            sync(&replicas[1], &states[1], &storage),
+        require_success(
+            ofs.sync(&replicas[1], &states[1], &storage),
             "cold restore scale fixture",
         );
     });
     require_same_tree(&replicas[0], &replicas[1], "initial cold restore");
-    require_noop(&replicas[0], &states[0], &storage);
-    require_noop(&replicas[1], &states[1], &storage);
+    require_noop(ofs, &replicas[0], &states[0], &storage);
+    require_noop(ofs, &replicas[1], &states[1], &storage);
 
     stage("mutate replica A", || {
         mutate(profile, Side::A, &replicas[0])
@@ -84,37 +85,37 @@ pub(crate) fn run(profile: &str, keep: bool) {
         mutate(profile, Side::B, &replicas[1])
     });
     stage("publish replica A", || {
-        ofs_success(
-            sync(&replicas[0], &states[0], &storage),
+        require_success(
+            ofs.sync(&replicas[0], &states[0], &storage),
             "publish scale changes from A",
         );
     });
     stage("merge replica B", || {
-        ofs_success(
-            sync(&replicas[1], &states[1], &storage),
+        require_success(
+            ofs.sync(&replicas[1], &states[1], &storage),
             "merge scale changes from B",
         );
     });
     stage("converge replica A", || {
-        ofs_success(
-            sync(&replicas[0], &states[0], &storage),
+        require_success(
+            ofs.sync(&replicas[0], &states[0], &storage),
             "converge scale replica A",
         );
     });
     require_same_tree(&replicas[0], &replicas[1], "two-writer convergence");
 
     stage("collect unreachable data", || {
-        ofs_success(gc(&storage), "collect scale volume");
+        require_success(ofs.gc(&storage), "collect scale volume");
     });
     stage("post-GC cold restore", || {
-        ofs_success(
-            sync(&replicas[2], &states[2], &storage),
+        require_success(
+            ofs.sync(&replicas[2], &states[2], &storage),
             "restore scale volume after collection",
         );
     });
     require_same_tree(&replicas[0], &replicas[2], "post-GC cold restore");
     for (replica, state) in replicas.iter().zip(&states) {
-        require_noop(replica, state, &storage);
+        require_noop(ofs, replica, state, &storage);
     }
 
     let summary = tree_summary(&replicas[0]);
@@ -342,8 +343,8 @@ fn require_same_tree(left: &Path, right: &Path, phase: &str) {
     assert_eq!(left, right, "Managed Sync trees differ after {phase}");
 }
 
-fn require_noop(replica: &Path, state: &Path, storage: &str) {
-    let output = ofs_success(sync(replica, state, storage), "verify scale no-op");
+fn require_noop(ofs: Ofs, replica: &Path, state: &Path, storage: &str) {
+    let output = require_success(ofs.sync(replica, state, storage), "verify scale no-op");
     assert!(
         !output_text(&output.stdout).contains("(published)"),
         "unchanged scale sync published a new generation"
@@ -386,66 +387,6 @@ fn report_inventory(fixture: &Fixture, profile: Profile) {
     println!(
         "scale inventory: phase=initial metadata_objects={metadata_objects} metadata_encoded_bytes={metadata_bytes}"
     );
-}
-
-fn build_release() {
-    let mut command = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
-    command
-        .current_dir(env!("CARGO_WORKSPACE_DIR"))
-        .args(["build", "--release", "--bin", "ofs"]);
-    require_success(command, "build release ofs");
-}
-
-fn volume_create(storage: &str) -> Command {
-    let mut command = ofs_command();
-    command.args(["volume", "create", storage, "--model", "managed"]);
-    command
-}
-
-fn sync(replica: &Path, state: &Path, storage: &str) -> Command {
-    let mut command = ofs_command();
-    command
-        .arg("sync")
-        .arg(storage)
-        .arg(replica)
-        .arg("--state")
-        .arg(state)
-        .arg("--transfer-concurrency")
-        .arg("16");
-    command
-}
-
-fn gc(storage: &str) -> Command {
-    let mut command = ofs_command();
-    command.args(["gc", storage]);
-    command
-}
-
-fn ofs_command() -> Command {
-    let mut command =
-        Command::new(Path::new(env!("CARGO_WORKSPACE_DIR")).join("target/release/ofs"));
-    command
-        .env("AWS_ACCESS_KEY_ID", "minioadmin")
-        .env("AWS_SECRET_ACCESS_KEY", "minioadmin")
-        .env("AWS_REGION", "us-east-1")
-        .env("AWS_EC2_METADATA_DISABLED", "true");
-    command
-}
-
-fn ofs_success(command: Command, action: &str) -> Output {
-    require_success(command, action)
-}
-
-fn require_success(mut command: Command, action: &str) -> Output {
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("{action}: {error}"));
-    assert!(
-        output.status.success(),
-        "{action} failed: {}",
-        output_text(&output.stderr)
-    );
-    output
 }
 
 struct ScaleRoot {

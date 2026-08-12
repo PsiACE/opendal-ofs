@@ -15,19 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod engine;
-mod install;
-mod local_fs;
-mod local_scan;
-mod publication;
-mod reconcile;
-mod recovery;
-mod rename;
-mod scan;
-mod state;
-mod state_file;
-mod transfer;
+//! Ordered namespace projection shared by Managed authority and Sync.
 
-pub use engine::{SyncEngine, SyncOutcome};
-pub(crate) use state::ConflictRecord;
-pub use state::ReplicaState;
+use serde::de::DeserializeOwned;
+
+use crate::Error;
+use crate::filesystem::{ChangeCursor, NamespaceRecord, NodeId, VolumeId};
+use crate::workset::{Spool, SpoolReader};
+
+#[derive(Clone)]
+pub(crate) struct Namespace<C> {
+    pub(crate) volume_id: VolumeId,
+    pub(crate) cursor: ChangeCursor,
+    pub(crate) root: NodeId,
+    pub(crate) entries: Spool<NamespaceRecord<C>>,
+}
+
+impl<C: DeserializeOwned> Namespace<C> {
+    pub(crate) fn reader(&self) -> Result<SpoolReader<NamespaceRecord<C>>, Error> {
+        self.entries.reader()
+    }
+}

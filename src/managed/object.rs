@@ -15,17 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Immutable Managed objects addressed independently from their contents.
+//! Identity and key layout of immutable Managed objects.
 
 use std::fmt;
-use std::ops::Range;
 
-use blake3::Hasher;
-use opendal::{Buffer, ErrorKind as StorageErrorKind, Operator, Writer};
 use serde::{Deserialize, Serialize};
 
 use crate::Error;
 use crate::filesystem::{Checksum, Digest};
+
+pub(crate) use super::storage::ImmutableWriter;
 
 const OBJECT_PREFIX: &str = "managed/1/objects/";
 
@@ -96,13 +95,37 @@ impl GcEpoch {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) enum ObjectClass {
     NamespaceCommit,
     NamespaceSegment,
     OperationResultSegment,
     FileData,
+}
+
+impl Serialize for ObjectClass {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u8(match self {
+            Self::NamespaceCommit => 1,
+            Self::NamespaceSegment => 2,
+            Self::OperationResultSegment => 3,
+            Self::FileData => 4,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for ObjectClass {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match u8::deserialize(deserializer)? {
+            1 => Ok(Self::NamespaceCommit),
+            2 => Ok(Self::NamespaceSegment),
+            3 => Ok(Self::OperationResultSegment),
+            4 => Ok(Self::FileData),
+            value => Err(serde::de::Error::custom(format_args!(
+                "unknown object class {value}"
+            ))),
+        }
+    }
 }
 
 impl ObjectClass {
@@ -154,202 +177,6 @@ impl ObjectRef {
 
 pub(crate) fn checksum(bytes: &[u8]) -> Checksum {
     Checksum::from_bytes(blake3::hash(bytes).into())
-}
-
-pub(crate) struct ControlObject {
-    pub(crate) bytes: Vec<u8>,
-    pub(crate) revision: String,
-}
-
-pub(crate) enum ControlCondition<'a> {
-    Missing,
-    Revision(&'a str),
-}
-
-pub(crate) async fn read_control(
-    operator: &Operator,
-    key: &str,
-    maximum_bytes: usize,
-) -> Result<Option<ControlObject>, Error> {
-    let reader = match operator.reader(key).await {
-        Ok(reader) => reader,
-        Err(error) if error.kind() == StorageErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(Error::from_storage("read Managed control object", error)),
-    };
-    let bytes = match reader.read(..).await {
-        Ok(bytes) => bytes.to_vec(),
-        Err(error) if error.kind() == StorageErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(Error::from_storage("read Managed control object", error)),
-    };
-    if bytes.len() > maximum_bytes {
-        return Err(Error::corrupt(
-            "read Managed control object",
-            "control object exceeds its size limit",
-        ));
-    }
-    let revision = reader
-        .metadata()
-        .and_then(|metadata| metadata.etag())
-        .ok_or_else(|| {
-            Error::unsupported(
-                "read Managed control object",
-                "object revision is unavailable",
-            )
-        })?
-        .to_owned();
-    Ok(Some(ControlObject { bytes, revision }))
-}
-
-pub(crate) async fn write_control(
-    operator: &Operator,
-    key: &str,
-    bytes: Vec<u8>,
-    condition: ControlCondition<'_>,
-) -> Result<bool, Error> {
-    let write = operator.write_with(key, bytes);
-    let result = match condition {
-        ControlCondition::Missing => write.if_not_exists(true).await,
-        ControlCondition::Revision(revision) => write.if_match(revision).await,
-    };
-    match result {
-        Ok(_) => Ok(true),
-        Err(error)
-            if matches!(
-                error.kind(),
-                StorageErrorKind::AlreadyExists | StorageErrorKind::ConditionNotMatch
-            ) =>
-        {
-            Ok(false)
-        }
-        Err(error) => Err(Error::from_storage("publish Managed control object", error)),
-    }
-}
-
-pub(crate) struct ImmutableWriter {
-    gc_epoch: GcEpoch,
-    class: ObjectClass,
-    id: ObjectId,
-    writer: Writer,
-    hasher: Hasher,
-    encoded_length: u64,
-}
-
-impl ImmutableWriter {
-    pub(crate) async fn open(
-        operator: &Operator,
-        gc_epoch: GcEpoch,
-        class: ObjectClass,
-    ) -> Result<Self, Error> {
-        let id = ObjectId::generate();
-        let key = object_key(gc_epoch, class, id);
-        let writer = operator
-            .writer_with(&key)
-            .if_not_exists(true)
-            .await
-            .map_err(|error| Error::from_storage("open Managed object writer", error))?;
-        Ok(Self {
-            gc_epoch,
-            class,
-            id,
-            writer,
-            hasher: Hasher::new(),
-            encoded_length: 0,
-        })
-    }
-
-    pub(crate) async fn write(&mut self, bytes: Vec<u8>) -> Result<(), Error> {
-        self.encoded_length = self
-            .encoded_length
-            .checked_add(bytes.len() as u64)
-            .ok_or_else(|| Error::invalid("write Managed object", "object length overflows"))?;
-        self.hasher.update(&bytes);
-        self.writer
-            .write(Buffer::from(bytes))
-            .await
-            .map_err(|error| Error::from_storage("write Managed object", error))
-    }
-
-    pub(crate) async fn abort(mut self) -> Result<(), Error> {
-        self.writer
-            .abort()
-            .await
-            .map_err(|error| Error::from_storage("abort Managed object", error))
-    }
-
-    pub(crate) async fn close(mut self) -> Result<ObjectRef, Error> {
-        self.writer
-            .close()
-            .await
-            .map_err(|error| Error::from_storage("finish Managed object", error))?;
-        Ok(ObjectRef {
-            gc_epoch: self.gc_epoch,
-            class: self.class,
-            id: self.id,
-            encoded_length: self.encoded_length,
-            digest: Digest::from_bytes(self.hasher.finalize().into()),
-        })
-    }
-}
-
-pub(crate) async fn read_immutable(
-    operator: &Operator,
-    reference: ObjectRef,
-    maximum_bytes: usize,
-) -> Result<Vec<u8>, Error> {
-    let length = usize::try_from(reference.encoded_length)
-        .ok()
-        .filter(|length| *length <= maximum_bytes)
-        .ok_or_else(|| Error::corrupt("read Managed object", "object length is invalid"))?;
-    let key = reference.key();
-    let bytes = operator
-        .read(&key)
-        .await
-        .map_err(|error| missing_object("read Managed object", error))?
-        .to_vec();
-    if bytes.len() != length || blake3::hash(&bytes).as_bytes() != reference.digest.as_bytes() {
-        return Err(Error::corrupt(
-            "read Managed object",
-            "object does not match its reference",
-        ));
-    }
-    Ok(bytes)
-}
-
-pub(crate) async fn read_range(
-    operator: &Operator,
-    reference: ObjectRef,
-    range: Range<u64>,
-) -> Result<Vec<u8>, Error> {
-    if range.start > range.end || range.end > reference.encoded_length {
-        return Err(Error::corrupt(
-            "read Managed object range",
-            "object range is invalid",
-        ));
-    }
-    let expected = usize::try_from(range.end - range.start)
-        .map_err(|_| Error::corrupt("read Managed object range", "range length overflows"))?;
-    let key = reference.key();
-    let bytes = operator
-        .read_with(&key)
-        .range(range)
-        .await
-        .map_err(|error| missing_object("read Managed object range", error))?
-        .to_vec();
-    if bytes.len() != expected {
-        return Err(Error::unavailable(
-            "read Managed object range",
-            "object storage returned an incomplete range",
-        ));
-    }
-    Ok(bytes)
-}
-
-fn missing_object(operation: &'static str, error: opendal::Error) -> Error {
-    if error.kind() == StorageErrorKind::NotFound {
-        Error::corrupt(operation, "referenced object is missing")
-    } else {
-        Error::from_storage(operation, error)
-    }
 }
 
 pub(crate) fn object_key(gc_epoch: GcEpoch, class: ObjectClass, id: ObjectId) -> String {

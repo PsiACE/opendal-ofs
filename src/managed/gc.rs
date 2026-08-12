@@ -58,8 +58,12 @@ impl ManagedVolume {
                 "namespace authority changed before metadata compaction",
             ));
         }
+        let workspace = Workspace::create(self.workset_options())?;
+        let mut records = workspace.writer("gc-reachable")?;
         let collection_commit = self
-            .compact_for_collection(previous_commit, collection_epoch)
+            .compact_for_collection(previous_commit, collection_epoch, |reference| {
+                records.write(&ObjectRecord::from_ref(reference))
+            })
             .await?;
         rotated.current_commit = collection_commit;
         if !self.replace_head(&revision, &rotated).await? {
@@ -70,28 +74,12 @@ impl ManagedVolume {
             ));
         }
 
-        let workspace = Workspace::create(self.workset_options())?;
-        let marks = self
-            .reachable_workset(&workspace, collection_commit)
-            .await?;
+        let marks = workset::sort(&workspace, &records.finish()?, |record| record.identity)?;
         let candidates = self.inventory_workset(&workspace, collection_epoch).await?;
         let outcome = self.sweep_worksets(&marks, &candidates).await?;
         self.advance_reclamation_watermark(collection_commit.cursor())
             .await?;
         Ok(outcome)
-    }
-
-    async fn reachable_workset(
-        &self,
-        workspace: &Workspace,
-        commit: super::NamespaceRevision,
-    ) -> Result<Spool<ObjectRecord>, Error> {
-        let mut records = workspace.writer("gc-reachable")?;
-        self.visit_reachable_objects(commit, |reference| {
-            records.write(&ObjectRecord::from_ref(reference))
-        })
-        .await?;
-        workset::sort(workspace, &records.finish()?, |record| record.identity)
     }
 
     async fn inventory_workset(
@@ -189,7 +177,7 @@ impl ManagedVolume {
         &self,
         completed: crate::filesystem::ChangeCursor,
     ) -> Result<(), Error> {
-        for _ in 0..8 {
+        loop {
             let (mut head, revision) = self.read_head().await?;
             if head.minimum_retained_cursor.sequence() >= completed.sequence() {
                 return Ok(());
@@ -199,11 +187,6 @@ impl ManagedVolume {
                 return Ok(());
             }
         }
-        Err(Error::new(
-            ErrorKind::Conflict,
-            "collect Managed objects",
-            "namespace kept changing while publishing the reclamation watermark",
-        ))
     }
 }
 

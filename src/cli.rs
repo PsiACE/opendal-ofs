@@ -159,9 +159,14 @@ pub(crate) struct VolumeCreateArgs {
     pub(crate) storage: String,
 
     /// Namespace authority model.
-    #[arg(long, value_parser = ["managed"], value_name = "MODEL")]
-    pub(crate) model: String,
+    #[arg(long, value_enum, value_name = "MODEL")]
+    pub(crate) model: VolumeModel,
 
     #[command(flatten)]
     pub(crate) resources: ManagedResourceArgs,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(crate) enum VolumeModel {
+    Managed,
 }

@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{Cursor, Write as _};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -24,9 +22,6 @@ use serde::{Deserialize, Serialize};
 use crate::Error;
 use crate::filesystem::{ChangeCursor, Digest, OperationId, VolumeId};
 use crate::managed::NamespaceRevision;
-
-const MAGIC: &[u8; 8] = b"OFSSTAT1";
-const MAXIMUM_STATE_BYTES: usize = 16 * 1024;
 
 /// A recoverable binding between one local replica and its remote namespace.
 ///
@@ -79,16 +74,11 @@ impl ReplicaState {
     }
 
     pub fn load(path: &Path) -> Result<Option<Self>, Error> {
-        let bytes = match fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => {
-                return Err(Error::from_io("read replica state", Some(path), error));
-            }
-        };
-        let state = decode(&bytes)?;
-        state.validate()?;
-        Ok(Some(state))
+        let state = super::state_file::load(path)?;
+        if let Some(state) = &state {
+            state.validate()?;
+        }
+        Ok(state)
     }
 
     pub(crate) fn save_new(&self, path: &Path) -> Result<(), Error> {
@@ -101,51 +91,7 @@ impl ReplicaState {
 
     fn persist(&self, path: &Path, replace: bool) -> Result<(), Error> {
         self.validate()?;
-        let parent = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty());
-        if let Some(parent) = parent {
-            fs::create_dir_all(parent).map_err(|error| {
-                Error::from_io("create replica state directory", Some(parent), error)
-            })?;
-        }
-        let temporary = temporary_path(path, OperationId::generate());
-        let bytes = encode(self)?;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .map_err(|error| Error::from_io("create replica state", Some(&temporary), error))?;
-        file.write_all(&bytes)
-            .and_then(|()| file.sync_all())
-            .map_err(|error| Error::from_io("persist replica state", Some(&temporary), error))?;
-        if replace {
-            fs::rename(&temporary, path)
-                .map_err(|error| Error::from_io("install replica state", Some(path), error))?;
-        } else {
-            fs::hard_link(&temporary, path).map_err(|error| {
-                let _ = fs::remove_file(&temporary);
-                if error.kind() == std::io::ErrorKind::AlreadyExists {
-                    Error::invalid(
-                        "synchronize replica",
-                        format!(
-                            "cannot attach with an existing replica state: {}",
-                            path.display()
-                        ),
-                    )
-                } else {
-                    Error::from_io("install new replica state", Some(path), error)
-                }
-            })?;
-            fs::remove_file(&temporary).map_err(|error| {
-                Error::from_io(
-                    "remove replica state temporary file",
-                    Some(&temporary),
-                    error,
-                )
-            })?;
-        }
-        sync_parent(path)
+        super::state_file::persist(self, path, replace)
     }
 
     fn validate(&self) -> Result<(), Error> {
@@ -300,70 +246,4 @@ impl ReplicaState {
         state.begin_install(target, false);
         state
     }
-}
-
-fn encode(state: &ReplicaState) -> Result<Vec<u8>, Error> {
-    let mut body = Vec::new();
-    ciborium::into_writer(state, &mut body)
-        .map_err(|_| Error::corrupt("persist replica state", "state cannot be encoded"))?;
-    if body.len() > MAXIMUM_STATE_BYTES {
-        return Err(Error::corrupt(
-            "persist replica state",
-            "state exceeds its size limit",
-        ));
-    }
-    let mut bytes = Vec::with_capacity(MAGIC.len() + body.len() + 32);
-    bytes.extend_from_slice(MAGIC);
-    bytes.extend_from_slice(&body);
-    bytes.extend_from_slice(blake3::hash(&bytes).as_bytes());
-    Ok(bytes)
-}
-
-fn decode(bytes: &[u8]) -> Result<ReplicaState, Error> {
-    let body = bytes
-        .strip_prefix(MAGIC)
-        .and_then(|bytes| bytes.get(..bytes.len().checked_sub(32)?))
-        .ok_or_else(|| Error::corrupt("read replica state", "state is invalid"))?;
-    if body.len() > MAXIMUM_STATE_BYTES
-        || blake3::hash(&bytes[..bytes.len() - 32]).as_bytes() != &bytes[bytes.len() - 32..]
-    {
-        return Err(Error::corrupt(
-            "read replica state",
-            "state checksum is invalid",
-        ));
-    }
-    let mut input = Cursor::new(body);
-    let state = ciborium::from_reader(&mut input)
-        .map_err(|_| Error::corrupt("read replica state", "state is invalid"))?;
-    if input.position() != body.len() as u64 {
-        return Err(Error::corrupt(
-            "read replica state",
-            "state has trailing bytes",
-        ));
-    }
-    Ok(state)
-}
-
-fn temporary_path(path: &Path, operation: OperationId) -> PathBuf {
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("state");
-    path.with_file_name(format!(".{name}.{operation}.tmp"))
-}
-
-#[cfg(unix)]
-fn sync_parent(path: &Path) -> Result<(), Error> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty());
-    let parent = parent.unwrap_or_else(|| Path::new("."));
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| Error::from_io("persist replica state directory", Some(parent), error))
-}
-
-#[cfg(not(unix))]
-fn sync_parent(_path: &Path) -> Result<(), Error> {
-    Ok(())
 }

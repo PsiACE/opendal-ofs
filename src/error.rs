@@ -81,10 +81,6 @@ impl Error {
         Self::new(ErrorKind::Corrupt, operation, message)
     }
 
-    pub(crate) fn unavailable(operation: &'static str, message: impl Into<String>) -> Self {
-        Self::new(ErrorKind::Unavailable, operation, message)
-    }
-
     pub(crate) fn from_io(
         operation: &'static str,
         path: Option<&Path>,

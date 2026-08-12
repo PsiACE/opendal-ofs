@@ -21,6 +21,7 @@
 
 mod error;
 mod fault;
+mod namespace;
 
 pub mod filesystem;
 pub mod managed;

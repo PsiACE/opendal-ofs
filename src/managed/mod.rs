@@ -21,8 +21,11 @@ mod data;
 mod format;
 mod gc;
 mod head;
+mod namespace;
 mod object;
+mod publication;
 mod record;
+mod storage;
 mod stream;
 mod wire;
 
@@ -71,7 +74,7 @@ impl ManagedMetadata {
         Ok(Self {
             operator,
             stream_concurrency: stream_concurrency.get(),
-            worksets: WorksetOptions::from_mib(work_memory_mib.get())?,
+            worksets: WorksetOptions::new(work_memory_mib, stream_concurrency)?,
         })
     }
 
@@ -79,11 +82,11 @@ impl ManagedMetadata {
     pub async fn initialize(&self) -> Result<ManagedVolume, Error> {
         let desired = ManagedFormat::new(VolumeId::generate(), NodeId::generate());
         let encoded = desired.encode()?;
-        let format = if object::write_control(
+        let format = if storage::write_control(
             &self.operator,
             FORMAT_KEY,
             encoded,
-            object::ControlCondition::Missing,
+            storage::ControlCondition::Missing,
         )
         .await?
         {
@@ -102,7 +105,7 @@ impl ManagedMetadata {
     }
 
     async fn read_format(&self) -> Result<ManagedFormat, Error> {
-        let control = object::read_control(&self.operator, FORMAT_KEY, MAX_FORMAT_BYTES)
+        let control = storage::read_control(&self.operator, FORMAT_KEY, MAX_FORMAT_BYTES)
             .await?
             .ok_or_else(|| {
                 Error::new(
