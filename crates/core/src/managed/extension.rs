@@ -216,7 +216,8 @@ pub struct AccessContext {
 }
 
 impl AccessContext {
-    pub(crate) fn new(operator: Operator) -> Self {
+    /// Construct an extension context from an already-configured operator.
+    pub fn new(operator: Operator) -> Self {
         Self { operator }
     }
 

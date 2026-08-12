@@ -85,7 +85,7 @@ impl GcEpoch {
         Self(value)
     }
 
-    pub(crate) fn next(self) -> Result<Self, Error> {
+    pub fn next(self) -> Result<Self, Error> {
         self.0
             .checked_add(1)
             .map(Self)

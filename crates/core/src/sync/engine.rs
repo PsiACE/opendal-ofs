@@ -89,6 +89,14 @@ impl SyncEngine {
                     "replica state belongs to a different volume",
                 ));
             }
+            if state.authority_id() != observed.authority_id()
+                || state.authority_name() != self.volume.authority_name()
+            {
+                return Err(Error::invalid(
+                    "synchronize replica",
+                    "replica state belongs to a different namespace authority",
+                ));
+            }
         }
         if let Some((target, published)) = stored.as_ref().and_then(ReplicaState::installation) {
             return self
@@ -114,7 +122,13 @@ impl SyncEngine {
                         "--resolve requires an unresolved conflict in replica state",
                     ));
                 }
-                let state = ReplicaState::new(root.clone(), self.volume.id(), observed.revision());
+                let state = ReplicaState::new(
+                    root.clone(),
+                    self.volume.id(),
+                    observed.authority_id(),
+                    self.volume.authority_name().to_owned(),
+                    observed.revision(),
+                );
                 state_file::persist(&state, state_path, false)?;
                 state
             }
@@ -129,6 +143,8 @@ impl SyncEngine {
                 let mut state = ReplicaState::for_cold_install(
                     root.clone(),
                     self.volume.id(),
+                    observed.authority_id(),
+                    self.volume.authority_name().to_owned(),
                     observed.revision(),
                 );
                 state_file::persist(&state, state_path, false)?;

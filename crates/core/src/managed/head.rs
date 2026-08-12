@@ -56,6 +56,10 @@ pub(crate) struct ManagedObservation {
 }
 
 impl ManagedObservation {
+    pub(crate) const fn authority_id(&self) -> super::AuthorityId {
+        self.authority.id()
+    }
+
     pub(crate) const fn revision(&self) -> NamespaceRevision {
         self.namespace_revision
     }
@@ -125,6 +129,11 @@ impl ManagedVolume {
 
     pub const fn id(&self) -> VolumeId {
         self.format.volume_id()
+    }
+
+    /// Selected namespace authority name.
+    pub fn authority_name(&self) -> &str {
+        &self.authority_name
     }
 
     pub(crate) const fn pack_target_bytes(&self) -> Option<u64> {

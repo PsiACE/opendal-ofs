@@ -183,6 +183,7 @@ struct CommandManagedSyncBehavior {
             "gc",
             "growing",
             "extensions",
+            "branch",
             "install-recovery",
             "offline-gc",
             "reconcile",
@@ -194,13 +195,23 @@ struct CommandManagedSyncBehavior {
     )]
     case: Option<String>,
 
+    #[arg(
+        long,
+        value_parser = ["fastcdc", "zstd", "branch", "all"],
+        value_name = "ID"
+    )]
+    ext: Option<String>,
+
     #[arg(long, help = "Leave the fixture running after the command exits.")]
     keep: bool,
 }
 
 impl CommandManagedSyncBehavior {
     fn run(self) {
-        managed_sync::run_fixture(self.keep, self.case.as_deref());
+        if self.case.is_some() && self.ext.is_some() {
+            panic!("--case and --ext are mutually exclusive");
+        }
+        managed_sync::run_fixture(self.keep, self.case.as_deref(), self.ext.as_deref());
     }
 }
 

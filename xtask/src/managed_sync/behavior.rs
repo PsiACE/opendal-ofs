@@ -27,16 +27,32 @@ use std::path::Path;
 use super::cli::Ofs;
 use super::fixture::Fixture;
 
-pub(crate) fn run(keep: bool, case: Option<&str>) {
+pub(crate) fn run(keep: bool, case: Option<&str>, extension: Option<&str>) {
     let ofs = Ofs::debug();
     ofs.build();
     let fixture = Fixture::new(keep).start();
     fixture.create_bucket();
+    if let Some(extension) = extension {
+        match extension {
+            "fastcdc" => lifecycle::file_extension(&fixture, ofs, "fastcdc", false),
+            "zstd" => lifecycle::file_extension(&fixture, ofs, "zstd", true),
+            "branch" => lifecycle::branch(&fixture, ofs),
+            "all" => {
+                lifecycle::file_extension(&fixture, ofs, "fastcdc", false);
+                lifecycle::file_extension(&fixture, ofs, "zstd", true);
+                lifecycle::branch(&fixture, ofs);
+            }
+            _ => unreachable!("clap validates extension IDs"),
+        }
+        println!("Managed Sync extension smoke passed: {extension}");
+        return;
+    }
     match case {
         Some("admission") => lifecycle::admission(&fixture, ofs),
         Some("gc") => recovery::gc(&fixture, ofs),
         Some("growing") => lifecycle::growing(&fixture, ofs),
         Some("extensions") => lifecycle::extensions(&fixture, ofs),
+        Some("branch") => lifecycle::branch(&fixture, ofs),
         Some("install-recovery") => recovery::install_recovery(&fixture, ofs),
         Some("offline-gc") => recovery::offline_gc(&fixture, ofs),
         Some("reconcile") => reconciliation::reconcile(&fixture, ofs),
@@ -48,6 +64,7 @@ pub(crate) fn run(keep: bool, case: Option<&str>) {
             lifecycle::admission(&fixture, ofs);
             lifecycle::smoke(&fixture, ofs);
             lifecycle::extensions(&fixture, ofs);
+            lifecycle::branch(&fixture, ofs);
             reconciliation::reconcile(&fixture, ofs);
             reconciliation::rename(&fixture, ofs);
             recovery::offline_gc(&fixture, ofs);

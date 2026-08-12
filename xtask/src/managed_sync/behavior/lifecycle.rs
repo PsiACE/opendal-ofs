@@ -78,53 +78,132 @@ pub(super) fn growing(fixture: &Fixture, ofs: Ofs) {
 
 pub(super) fn extensions(fixture: &Fixture, ofs: Ofs) {
     for (name, zstd) in [("fastcdc", false), ("fastcdc-zstd", true)] {
-        let root = CaseRoot::new();
-        let replica_a = root.path.join("replica-a");
-        let replica_b = root.path.join("replica-b");
-        let state_a = root.path.join("state-a");
-        let state_b = root.path.join("state-b");
-        fs::create_dir_all(&replica_a).expect("create extension replica A");
-        fs::create_dir_all(&replica_b).expect("create extension replica B");
-        let storage = fixture.storage_url(&format!("extensions/{name}"));
-
-        require_success(
-            ofs.volume_create_extensions(&storage, zstd),
-            "create extension volume",
-        );
-        let mut contents = deterministic_bytes(3 * 1024 * 1024, 41);
-        fs::write(replica_a.join("stream.bin"), &contents).expect("write extension source file");
-        require_success(
-            ofs.sync(&replica_a, &state_a, &storage),
-            "publish extension file",
-        );
-        require_success(
-            ofs.sync(&replica_b, &state_b, &storage),
-            "cold-install extension file",
-        );
-        assert_eq!(
-            tree_fingerprint(&replica_a),
-            tree_fingerprint(&replica_b),
-            "an extension file converges across replicas"
-        );
-
-        contents[1024 * 1024..1024 * 1024 + 4096].fill(217);
-        fs::write(replica_b.join("stream.bin"), &contents)
-            .expect("update extension file in replica B");
-        require_success(
-            ofs.sync(&replica_b, &state_b, &storage),
-            "publish extension update",
-        );
-        require_success(
-            ofs.sync(&replica_a, &state_a, &storage),
-            "install extension update",
-        );
-        require_success(ofs.gc(&storage), "collect extension volume");
-        assert_eq!(
-            tree_fingerprint(&replica_a),
-            tree_fingerprint(&replica_b),
-            "an updated extension file remains readable after collection"
-        );
+        file_extension(fixture, ofs, name, zstd);
     }
+}
+
+pub(super) fn file_extension(fixture: &Fixture, ofs: Ofs, name: &str, zstd: bool) {
+    let root = CaseRoot::new();
+    let replica_a = root.path.join("replica-a");
+    let replica_b = root.path.join("replica-b");
+    let state_a = root.path.join("state-a");
+    let state_b = root.path.join("state-b");
+    fs::create_dir_all(&replica_a).expect("create extension replica A");
+    fs::create_dir_all(&replica_b).expect("create extension replica B");
+    let storage = fixture.storage_url(&format!("extensions/{name}"));
+
+    require_success(
+        ofs.volume_create_extensions(&storage, zstd),
+        "create extension volume",
+    );
+    let mut contents = deterministic_bytes(3 * 1024 * 1024, 41);
+    fs::write(replica_a.join("stream.bin"), &contents).expect("write extension source file");
+    require_success(
+        ofs.sync(&replica_a, &state_a, &storage),
+        "publish extension file",
+    );
+    require_success(
+        ofs.sync(&replica_b, &state_b, &storage),
+        "cold-install extension file",
+    );
+    assert_eq!(
+        tree_fingerprint(&replica_a),
+        tree_fingerprint(&replica_b),
+        "an extension file converges across replicas"
+    );
+
+    contents[1024 * 1024..1024 * 1024 + 4096].fill(217);
+    fs::write(replica_b.join("stream.bin"), &contents).expect("update extension file in replica B");
+    require_success(
+        ofs.sync(&replica_b, &state_b, &storage),
+        "publish extension update",
+    );
+    require_success(
+        ofs.sync(&replica_a, &state_a, &storage),
+        "install extension update",
+    );
+    require_success(ofs.gc(&storage), "collect extension volume");
+    assert_eq!(
+        tree_fingerprint(&replica_a),
+        tree_fingerprint(&replica_b),
+        "an updated extension file remains readable after collection"
+    );
+}
+
+pub(super) fn branch(fixture: &Fixture, ofs: Ofs) {
+    let root = CaseRoot::new();
+    let main = root.path.join("main");
+    let feature_a = root.path.join("feature-a");
+    let feature_b = root.path.join("feature-b");
+    let main_state = root.path.join("main-state");
+    let feature_a_state = root.path.join("feature-a-state");
+    let feature_b_state = root.path.join("feature-b-state");
+    for replica in [&main, &feature_a, &feature_b] {
+        fs::create_dir_all(replica).expect("create branch replica");
+    }
+    let storage = fixture.storage_url("branch");
+
+    require_success(ofs.volume_create_branch(&storage), "create branch volume");
+    fs::write(main.join("shared.txt"), b"main\n").expect("write main file");
+    require_success(
+        ofs.sync_branch(&main, &main_state, &storage, "main"),
+        "publish main branch",
+    );
+    require_success(
+        ofs.branch_create(&storage, "feature", "main"),
+        "create feature branch",
+    );
+    require_success(
+        ofs.sync_branch(&feature_a, &feature_a_state, &storage, "feature"),
+        "cold-install feature branch",
+    );
+    fs::write(feature_a.join("shared.txt"), b"feature\n").expect("change feature file");
+    fs::write(feature_a.join("feature.txt"), b"isolated\n").expect("add feature file");
+    require_success(
+        ofs.sync_branch(&feature_a, &feature_a_state, &storage, "feature"),
+        "publish feature branch",
+    );
+    require_success(
+        ofs.sync_branch(&feature_b, &feature_b_state, &storage, "feature"),
+        "install feature branch on a second replica",
+    );
+    assert_eq!(
+        tree_fingerprint(&feature_a),
+        tree_fingerprint(&feature_b),
+        "two replicas of one branch converge"
+    );
+    require_success(
+        ofs.sync_branch(&main, &main_state, &storage, "main"),
+        "observe isolated main branch",
+    );
+    assert_eq!(
+        fs::read(main.join("shared.txt")).expect("read main file"),
+        b"main\n",
+        "feature publication does not change main"
+    );
+    assert!(
+        !main.join("feature.txt").exists(),
+        "feature-only paths remain isolated"
+    );
+
+    require_success(ofs.gc(&storage), "collect branch volume");
+    require_success(
+        ofs.sync_branch(&feature_b, &feature_b_state, &storage, "feature"),
+        "read feature branch after collection",
+    );
+    let branches = output_text(&require_success(ofs.branch_list(&storage), "list branches").stdout);
+    assert_eq!(branches, "feature\nmain", "branch list is name ordered");
+    require_success(
+        ofs.branch_delete(&storage, "feature"),
+        "delete feature branch",
+    );
+    require_success(ofs.gc(&storage), "collect deleted branch");
+    let branches =
+        output_text(&require_success(ofs.branch_list(&storage), "list remaining branches").stdout);
+    assert_eq!(
+        branches, "main",
+        "deleted branches are no longer selectable"
+    );
 }
 
 pub(super) fn admission(fixture: &Fixture, ofs: Ofs) {

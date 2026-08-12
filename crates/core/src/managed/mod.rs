@@ -36,7 +36,7 @@ mod wire;
 
 pub use authority::{
     AuthorityAccess, AuthorityExtension, AuthorityFuture, AuthorityHead, AuthorityId,
-    AuthorityObservation, AuthorityRoots, CollectionFence, DefaultAuthorityAccess,
+    AuthorityObservation, AuthorityRoot, AuthorityRoots, CollectionFence, DefaultAuthorityAccess,
 };
 pub(crate) use data::FileDataRef;
 pub(crate) use format::ManagedFormat;

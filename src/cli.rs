@@ -29,6 +29,8 @@ pub(crate) struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
+    /// Create, list, and delete Managed branches.
+    Branch(BranchArgs),
     /// Collect immutable data no longer reachable from the Managed namespace.
     Gc(GcArgs),
     /// Reconcile and publish a local Managed Sync replica.
@@ -82,6 +84,10 @@ pub(crate) struct SyncArgs {
     /// Durable replica state stored outside the replica directory.
     #[arg(long, value_name = "PATH")]
     pub(crate) state: PathBuf,
+
+    /// Namespace authority selected for this replica.
+    #[arg(long, default_value = "main", value_name = "NAME")]
+    pub(crate) branch: String,
 
     /// Resolve an existing conflict by publishing the current local path.
     #[arg(long, value_name = "RELATIVE-PATH")]
@@ -185,7 +191,35 @@ pub(crate) enum VolumeModel {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub(crate) enum ManagedExtension {
+    Branch,
     #[value(name = "fastcdc")]
     FastCdc,
     Zstd,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct BranchArgs {
+    /// OpenDAL storage URL of an existing Branch-enabled Managed volume.
+    #[arg(env = "OFS_STORAGE_URL", value_name = "VOLUME")]
+    pub(crate) storage: String,
+
+    #[command(subcommand)]
+    pub(crate) command: BranchCommand,
+
+    #[command(flatten)]
+    pub(crate) resources: ManagedResourceArgs,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum BranchCommand {
+    /// Create a branch from an existing branch.
+    Create {
+        name: String,
+        #[arg(long, default_value = "main")]
+        from: String,
+    },
+    /// Delete a non-default branch.
+    Delete { name: String },
+    /// List live branches.
+    List,
 }

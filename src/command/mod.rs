@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod branch;
 mod gc;
 mod provider;
 mod status;
@@ -27,6 +28,7 @@ use crate::cli::{Cli, Command};
 
 pub(crate) async fn run(cli: Cli) -> Result<()> {
     match cli.command {
+        Command::Branch(args) => branch::run(args).await,
         Command::Gc(args) => gc::run(args).await,
         Command::Sync(args) => sync::run(args).await,
         Command::Status(args) => status::run(args),

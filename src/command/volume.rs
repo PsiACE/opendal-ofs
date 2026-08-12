@@ -36,20 +36,29 @@ async fn create(args: VolumeCreateArgs) -> Result<()> {
         args.resources.transfer_concurrency,
         args.resources.work_memory_mib,
     )?;
-    let file_extensions = match args.extensions.as_slice() {
-        [] => None,
-        [crate::cli::ManagedExtension::FastCdc] => Some(FileExtensions::FastCdc),
-        [
-            crate::cli::ManagedExtension::FastCdc,
-            crate::cli::ManagedExtension::Zstd,
-        ]
-        | [
-            crate::cli::ManagedExtension::Zstd,
-            crate::cli::ManagedExtension::FastCdc,
-        ] => Some(FileExtensions::FastCdcZstd {
+    let extension_count = |extension| {
+        args.extensions
+            .iter()
+            .filter(|candidate| **candidate == extension)
+            .count()
+    };
+    if args
+        .extensions
+        .iter()
+        .any(|extension| extension_count(*extension) != 1)
+    {
+        anyhow::bail!("each --ext may be enabled only once");
+    }
+    let branch = extension_count(crate::cli::ManagedExtension::Branch) == 1;
+    let fastcdc = extension_count(crate::cli::ManagedExtension::FastCdc) == 1;
+    let zstd = extension_count(crate::cli::ManagedExtension::Zstd) == 1;
+    let file_extensions = match (fastcdc, zstd) {
+        (false, false) => None,
+        (true, false) => Some(FileExtensions::FastCdc),
+        (true, true) => Some(FileExtensions::FastCdcZstd {
             level: args.zstd_level,
         }),
-        _ => anyhow::bail!("--ext accepts fast-cdc once, optionally composed with zstd once"),
+        (false, true) => anyhow::bail!("the zstd extension requires fastcdc"),
     };
     if file_extensions.is_some() && args.pack_target_mib.is_some() {
         anyhow::bail!("--pack-target-mib cannot be combined with --ext");
@@ -64,6 +73,11 @@ async fn create(args: VolumeCreateArgs) -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("--pack-target-mib overflows"))
         })
         .transpose()?;
+    let metadata = if branch {
+        ofs_extras::with_branch(metadata, "main")
+    } else {
+        metadata
+    };
     let volume = match file_extensions {
         Some(extensions) => {
             extensions

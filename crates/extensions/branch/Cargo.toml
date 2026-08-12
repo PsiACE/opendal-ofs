@@ -16,21 +16,21 @@
 # under the License.
 
 [package]
-description = "Managed filesystem extensions"
+description = "Branch namespace authority extension for Apache OpenDAL File System"
 edition.workspace = true
 license.workspace = true
-name = "ofs-extras"
+name = "ofs-ext-branch"
 publish = false
 repository.workspace = true
 rust-version.workspace = true
 version = "0.0.24"
 
 [dependencies]
+blake3.workspace = true
 ciborium = "0.2"
-ofs-core = { path = "../core" }
-ofs-ext-branch = { path = "../extensions/branch" }
-ofs-ext-fastcdc = { path = "../extensions/fastcdc" }
-ofs-ext-zstd = { path = "../extensions/zstd" }
+ofs-core = { path = "../../core" }
+opendal = "0.57.0"
+serde = { version = "1", features = ["derive"] }
 
 [lints]
 workspace = true

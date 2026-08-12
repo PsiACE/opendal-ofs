@@ -49,8 +49,8 @@ pub(super) async fn run(args: SyncArgs) -> Result<()> {
     )?;
     let stored = load_replica_state(&args.state)?;
     let volume = match &stored {
-        Some(state) => ofs_extras::open(metadata, Some(state.volume_id())).await?,
-        None => ofs_extras::open(metadata, None).await?,
+        Some(state) => ofs_extras::open(metadata, Some(state.volume_id()), &args.branch).await?,
+        None => ofs_extras::open(metadata, None, &args.branch).await?,
     };
     let result = SyncEngine::new(volume.clone(), args.resources.transfer_concurrency)
         .sync(&root, &args.state, &args.resolve)

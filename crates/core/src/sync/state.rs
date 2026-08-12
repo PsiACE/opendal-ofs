@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::Error;
 use crate::filesystem::{ChangeCursor, Digest, OperationId, VolumeId};
-use crate::managed::NamespaceRevision;
+use crate::managed::{AuthorityId, NamespaceRevision};
 
 /// A recoverable binding between one local replica and its remote namespace.
 ///
@@ -31,6 +31,8 @@ use crate::managed::NamespaceRevision;
 pub struct ReplicaState {
     root: PathBuf,
     volume_id: VolumeId,
+    authority_id: AuthorityId,
+    authority_name: String,
     common: NamespaceRevision,
     observed: NamespaceRevision,
     phase: SyncPhase,
@@ -61,10 +63,18 @@ pub(crate) struct ConflictRecord {
 }
 
 impl ReplicaState {
-    pub(crate) fn new(root: PathBuf, volume_id: VolumeId, common: NamespaceRevision) -> Self {
+    pub(crate) fn new(
+        root: PathBuf,
+        volume_id: VolumeId,
+        authority_id: AuthorityId,
+        authority_name: String,
+        common: NamespaceRevision,
+    ) -> Self {
         Self {
             root,
             volume_id,
+            authority_id,
+            authority_name,
             common,
             observed: common,
             phase: SyncPhase::Clean,
@@ -106,6 +116,14 @@ impl ReplicaState {
 
     pub const fn volume_id(&self) -> VolumeId {
         self.volume_id
+    }
+
+    pub const fn authority_id(&self) -> AuthorityId {
+        self.authority_id
+    }
+
+    pub fn authority_name(&self) -> &str {
+        &self.authority_name
     }
 
     pub const fn common_revision(&self) -> NamespaceRevision {
@@ -219,9 +237,11 @@ impl ReplicaState {
     pub(crate) fn for_cold_install(
         root: PathBuf,
         volume_id: VolumeId,
+        authority_id: AuthorityId,
+        authority_name: String,
         target: NamespaceRevision,
     ) -> Self {
-        let mut state = Self::new(root, volume_id, target);
+        let mut state = Self::new(root, volume_id, authority_id, authority_name, target);
         state.begin_install(target, false);
         state
     }

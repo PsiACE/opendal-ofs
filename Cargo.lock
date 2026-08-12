@@ -1179,6 +1179,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ofs-ext-branch"
+version = "0.0.24"
+dependencies = [
+ "blake3",
+ "ciborium",
+ "ofs-core",
+ "opendal",
+ "serde",
+]
+
+[[package]]
 name = "ofs-ext-fastcdc"
 version = "0.0.24"
 dependencies = [
@@ -1208,6 +1219,7 @@ version = "0.0.24"
 dependencies = [
  "ciborium",
  "ofs-core",
+ "ofs-ext-branch",
  "ofs-ext-fastcdc",
  "ofs-ext-zstd",
 ]

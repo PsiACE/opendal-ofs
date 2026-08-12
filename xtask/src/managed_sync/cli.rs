@@ -79,6 +79,44 @@ impl Ofs {
         command
     }
 
+    pub(super) fn volume_create_branch(self, storage: &str) -> Command {
+        let mut command = self.command();
+        command.args([
+            "volume", "create", storage, "--model", "managed", "--ext", "branch",
+        ]);
+        command
+    }
+
+    pub(super) fn branch_create(self, storage: &str, name: &str, source: &str) -> Command {
+        let mut command = self.command();
+        command.args(["branch", storage, "create", name, "--from", source]);
+        command
+    }
+
+    pub(super) fn branch_delete(self, storage: &str, name: &str) -> Command {
+        let mut command = self.command();
+        command.args(["branch", storage, "delete", name]);
+        command
+    }
+
+    pub(super) fn branch_list(self, storage: &str) -> Command {
+        let mut command = self.command();
+        command.args(["branch", storage, "list"]);
+        command
+    }
+
+    pub(super) fn sync_branch(
+        self,
+        replica: &Path,
+        state: &Path,
+        storage: &str,
+        branch: &str,
+    ) -> Command {
+        let mut command = self.sync(replica, state, storage);
+        command.arg("--branch").arg(branch);
+        command
+    }
+
     pub(super) fn sync(self, replica: &Path, state: &Path, storage: &str) -> Command {
         let mut command = self.command();
         command

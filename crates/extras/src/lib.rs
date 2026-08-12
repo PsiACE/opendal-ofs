@@ -22,8 +22,12 @@ use ofs_core::managed::extension::{
     ExtensionId, ExtentExtension as _, FileAccessInfo, FileLayoutExtension as _,
     IdentityExtentAccess,
 };
-use ofs_core::managed::{ManagedMetadata, ManagedVolume};
+use ofs_core::managed::{
+    AuthorityExtension as _, DefaultAuthorityAccess, ManagedMetadata, ManagedVolume,
+};
 use ofs_core::{Error, ErrorKind};
+use ofs_ext_branch::BranchExtension;
+pub use ofs_ext_branch::{BRANCH_EXTENSION_ID, BranchManager};
 use ofs_ext_fastcdc::{FASTCDC_EXTENSION_ID, FastCdcExtension};
 use ofs_ext_zstd::{ZSTD_EXTENSION_ID, ZstdExtension};
 
@@ -34,6 +38,11 @@ pub enum FileExtensions {
     FastCdc,
     /// FastCDC layout over independently compressed Zstandard extents.
     FastCdcZstd { level: i32 },
+}
+
+/// Configure the Branch namespace authority extension.
+pub fn with_branch(metadata: ManagedMetadata, name: impl Into<String>) -> ManagedMetadata {
+    metadata.with_authority_extension(BranchExtension::new().extend(DefaultAuthorityAccess), name)
 }
 
 impl FileExtensions {
@@ -52,26 +61,47 @@ impl FileExtensions {
 }
 
 /// Configure the extension access described by an existing volume.
-pub async fn configure_existing(metadata: ManagedMetadata) -> Result<ManagedMetadata, Error> {
-    let Some(info) = metadata.file_extension().await? else {
-        return Ok(metadata);
+pub async fn configure_existing(
+    metadata: ManagedMetadata,
+    authority: impl Into<String>,
+) -> Result<ManagedMetadata, Error> {
+    let file = metadata.file_extension().await?;
+    let authority_extension = metadata.authority_extension().await?;
+    let metadata = match file {
+        Some(info) => detect(&info)?
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::Unsupported,
+                    "open Managed volume",
+                    "the volume uses an unavailable file extension composition",
+                )
+            })?
+            .configure(metadata),
+        None => metadata,
     };
-    let extensions = detect(&info)?.ok_or_else(|| {
-        Error::new(
+    match authority_extension {
+        Some(extension) if extension.id == BRANCH_EXTENSION_ID => {
+            Ok(with_branch(metadata, authority))
+        }
+        Some(_) => Err(Error::new(
             ErrorKind::Unsupported,
             "open Managed volume",
-            "the volume uses an unavailable file extension composition",
-        )
-    })?;
-    Ok(extensions.configure(metadata))
+            "the volume uses an unavailable namespace authority extension",
+        )),
+        None => Ok(metadata),
+    }
 }
 
 /// Configure and open an existing volume.
 pub async fn open(
     metadata: ManagedMetadata,
     expected: Option<VolumeId>,
+    authority: impl Into<String>,
 ) -> Result<ManagedVolume, Error> {
-    configure_existing(metadata).await?.open(expected).await
+    configure_existing(metadata, authority)
+        .await?
+        .open(expected)
+        .await
 }
 
 fn detect(info: &FileAccessInfo) -> Result<Option<FileExtensions>, Error> {
