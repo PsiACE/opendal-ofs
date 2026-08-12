@@ -27,6 +27,7 @@ use crate::filesystem::{
 };
 use crate::{Error, ErrorKind};
 
+use super::data::{FileExtent, FileExtentRecord, FileLayout};
 use super::format::ManagedFormat;
 use super::object::{self, GcEpoch, ObjectClass, ObjectRef};
 use super::record::Record;
@@ -42,6 +43,7 @@ pub struct ManagedVolume {
     format: ManagedFormat,
     operator: Operator,
     file_versions: Arc<RwLock<BTreeMap<FileVersionId, FileVersionRecord>>>,
+    file_extents: Arc<RwLock<BTreeMap<FileVersionId, Vec<FileExtent>>>>,
 }
 
 pub struct ManagedObservation {
@@ -116,6 +118,7 @@ struct NamespaceCommit {
     nodes: Vec<StreamRef>,
     directory_entries: Vec<StreamRef>,
     file_versions: Vec<StreamRef>,
+    file_extents: Vec<StreamRef>,
     changes: Vec<StreamRef>,
     operation_results: Vec<StreamRef>,
     projections: Vec<ProjectionRef>,
@@ -127,6 +130,7 @@ super::wire::tuple_wire!(NamespaceCommit {
     nodes: Vec<StreamRef>,
     directory_entries: Vec<StreamRef>,
     file_versions: Vec<StreamRef>,
+    file_extents: Vec<StreamRef>,
     changes: Vec<StreamRef>,
     operation_results: Vec<StreamRef>,
     projections: Vec<ProjectionRef>,
@@ -261,6 +265,7 @@ impl NamespaceCommit {
             nodes: vec![nodes],
             directory_entries: Vec::new(),
             file_versions: Vec::new(),
+            file_extents: Vec::new(),
             changes: Vec::new(),
             operation_results: Vec::new(),
             projections: Vec::new(),
@@ -273,6 +278,7 @@ impl NamespaceCommit {
             .iter()
             .chain(&self.directory_entries)
             .chain(&self.file_versions)
+            .chain(&self.file_extents)
             .chain(&self.changes)
             .chain(&self.operation_results)
             .copied()
@@ -451,13 +457,11 @@ pub(super) struct FileVersionRecord {
     pub(super) file_version: FileVersionId,
     pub(super) file_size: u64,
     pub(super) content_fingerprint: FileFingerprint,
-    pub(super) manifest: ObjectRef,
 }
 super::wire::tuple_wire!(FileVersionRecord {
     file_version: FileVersionId,
     file_size: u64,
     content_fingerprint: FileFingerprint,
-    manifest: ObjectRef,
 });
 
 #[derive(Debug)]
@@ -652,6 +656,7 @@ struct StoredNamespace {
     node_values: BTreeMap<NodeId, NodeValue>,
     directory_entries: BTreeMap<DirectoryKey, DirectoryEntry>,
     file_versions: BTreeMap<FileVersionId, FileVersionRecord>,
+    file_extents: BTreeMap<FileVersionId, Vec<FileExtent>>,
 }
 
 impl ManagedVolume {
@@ -660,6 +665,7 @@ impl ManagedVolume {
             format,
             operator,
             file_versions: Arc::new(RwLock::new(BTreeMap::new())),
+            file_extents: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
 
@@ -748,7 +754,7 @@ impl ManagedVolume {
         &self,
         observed: &ManagedObservation,
         target: VolumeSnapshot,
-        manifests: BTreeMap<FileVersionId, ObjectRef>,
+        layouts: BTreeMap<FileVersionId, FileLayout>,
     ) -> Result<NamespaceRevision, Error> {
         target.validate()?;
         if target.volume_id != self.id()
@@ -761,7 +767,7 @@ impl ManagedVolume {
                 "publication ancestry is invalid",
             ));
         }
-        self.write_namespace(observed, &target, manifests).await
+        self.write_namespace(observed, &target, layouts).await
     }
 
     pub async fn commit_publication(
@@ -873,9 +879,10 @@ impl ManagedVolume {
             ));
         }
         let stored = self.read_namespace_streams(commit).await?;
-        for record in stored.file_versions.values() {
-            visit(record.manifest)?;
-            super::data::visit_manifest_objects(self, record.manifest, &mut visit).await?;
+        for extents in stored.file_extents.values() {
+            for extent in extents {
+                visit(extent.shard.object)?;
+            }
         }
         Ok(())
     }
@@ -917,6 +924,19 @@ impl ManagedVolume {
             .into_iter()
             .filter_map(|(version, record)| live_versions.contains(&version).then_some(record))
             .collect::<Vec<_>>();
+        let file_extents = stored
+            .file_extents
+            .into_iter()
+            .filter(|(version, _)| live_versions.contains(version))
+            .flat_map(|(version, extents)| {
+                extents.into_iter().map(move |extent| FileExtentRecord {
+                    file_version: version,
+                    logical_range: extent.logical_range,
+                    shard: extent.shard,
+                    object_range: extent.object_range,
+                })
+            })
+            .collect::<Vec<_>>();
         let operation_results = stored.operations.into_values().collect::<Vec<_>>();
 
         let mut commit = NamespaceCommit {
@@ -925,6 +945,7 @@ impl ManagedVolume {
             nodes: Vec::new(),
             directory_entries: Vec::new(),
             file_versions: Vec::new(),
+            file_extents: Vec::new(),
             changes: Vec::new(),
             operation_results: Vec::new(),
             projections: stored.commit.projections,
@@ -960,6 +981,15 @@ impl ManagedVolume {
         append_stream(
             &self.operator,
             gc_epoch,
+            &mut commit.file_extents,
+            ObjectClass::FileExtentSegment,
+            StreamKind::FILE_EXTENT_RECORDS,
+            file_extents,
+        )
+        .await?;
+        append_stream(
+            &self.operator,
+            gc_epoch,
             &mut commit.operation_results,
             ObjectClass::OperationResultSegment,
             StreamKind::OPERATION_RESULTS,
@@ -973,7 +1003,7 @@ impl ManagedVolume {
         &self,
         observed: &ManagedObservation,
         target: &VolumeSnapshot,
-        manifests: BTreeMap<FileVersionId, ObjectRef>,
+        mut layouts: BTreeMap<FileVersionId, FileLayout>,
     ) -> Result<NamespaceRevision, Error> {
         let cursor = target.cursor;
         let operation = cursor
@@ -1070,17 +1100,19 @@ impl ManagedVolume {
         }
 
         let mut file_version_records = Vec::new();
+        let mut file_extent_records = Vec::new();
+        let mut recorded_versions = BTreeSet::new();
         for node in target.nodes.values() {
             let Some(version) = node.file_version else {
                 continue;
             };
-            if observed.file_versions.contains_key(&version) {
+            if observed.file_versions.contains_key(&version) || !recorded_versions.insert(version) {
                 continue;
             }
-            let manifest = manifests.get(&version).copied().ok_or_else(|| {
+            let layout = layouts.remove(&version).ok_or_else(|| {
                 Error::invalid(
                     "publish Managed namespace",
-                    "new file version has no durable manifest",
+                    "new file version has no durable layout",
                 )
             })?;
             let fingerprint = node.file_fingerprint.ok_or_else(|| {
@@ -1093,8 +1125,8 @@ impl ManagedVolume {
                 file_version: version,
                 file_size: fingerprint.logical_length(),
                 content_fingerprint: fingerprint,
-                manifest,
             });
+            file_extent_records.extend(Self::extent_records(version, layout));
         }
 
         let mut changes = Vec::new();
@@ -1192,6 +1224,15 @@ impl ManagedVolume {
             ObjectClass::FileVersionSegment,
             StreamKind::FILE_VERSION_RECORDS,
             file_version_records,
+        )
+        .await?;
+        append_stream(
+            &self.operator,
+            observed.gc_epoch,
+            &mut commit.file_extents,
+            ObjectClass::FileExtentSegment,
+            StreamKind::FILE_EXTENT_RECORDS,
+            file_extent_records,
         )
         .await?;
         append_stream(
@@ -1323,6 +1364,26 @@ impl ManagedVolume {
             })
             .await?;
         }
+        let mut file_extents = BTreeMap::<FileVersionId, Vec<FileExtent>>::new();
+        for reference in &commit.file_extents {
+            require_stream(
+                *reference,
+                StreamKind::FILE_EXTENT_RECORDS,
+                ObjectClass::FileExtentSegment,
+            )?;
+            stream::visit_records(&self.operator, *reference, |record: FileExtentRecord| {
+                file_extents
+                    .entry(record.file_version)
+                    .or_default()
+                    .push(FileExtent {
+                        logical_range: record.logical_range,
+                        shard: record.shard,
+                        object_range: record.object_range,
+                    });
+                Ok(())
+            })
+            .await?;
+        }
         for reference in &commit.changes {
             require_stream(
                 *reference,
@@ -1384,11 +1445,19 @@ impl ManagedVolume {
         snapshot.validate()?;
         self.file_versions
             .write()
-            .map_err(|_| Error::unavailable("read Managed namespace", "manifest cache failed"))?
+            .map_err(|_| Error::unavailable("read Managed namespace", "file cache failed"))?
             .extend(
                 file_versions
                     .iter()
                     .map(|(version, record)| (*version, *record)),
+            );
+        self.file_extents
+            .write()
+            .map_err(|_| Error::unavailable("read Managed namespace", "file cache failed"))?
+            .extend(
+                file_extents
+                    .iter()
+                    .map(|(version, extents)| (*version, extents.clone())),
             );
         Ok(StoredNamespace {
             snapshot,
@@ -1397,6 +1466,7 @@ impl ManagedVolume {
             node_values,
             directory_entries,
             file_versions,
+            file_extents,
         })
     }
 
@@ -1406,10 +1476,20 @@ impl ManagedVolume {
     ) -> Result<FileVersionRecord, Error> {
         self.file_versions
             .read()
-            .map_err(|_| Error::unavailable("read Managed file", "manifest cache failed"))?
+            .map_err(|_| Error::unavailable("read Managed file", "file cache failed"))?
             .get(&version)
             .copied()
             .ok_or_else(|| Error::corrupt("read Managed file", "file version is not indexed"))
+    }
+
+    pub(super) fn file_extents(&self, version: FileVersionId) -> Result<Vec<FileExtent>, Error> {
+        Ok(self
+            .file_extents
+            .read()
+            .map_err(|_| Error::unavailable("read Managed file", "file cache failed"))?
+            .get(&version)
+            .cloned()
+            .unwrap_or_default())
     }
 
     async fn read_commit(&self, reference: NamespaceRevision) -> Result<NamespaceCommit, Error> {

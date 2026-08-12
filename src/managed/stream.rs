@@ -22,7 +22,7 @@ use std::io::Cursor;
 use opendal::Operator;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
+use tokio::io::{AsyncWrite, AsyncWriteExt as _};
 
 use crate::Error;
 
@@ -53,7 +53,7 @@ impl StreamKind {
     pub(crate) const FILE_VERSION_RECORDS: Self = Self(3);
     pub(crate) const CHANGE_RECORDS: Self = Self(4);
     pub(crate) const OPERATION_RESULTS: Self = Self(5);
-    pub(crate) const FILE_EXTENT_MUTATIONS: Self = Self(6);
+    pub(crate) const FILE_EXTENT_RECORDS: Self = Self(6);
     pub(crate) const FILE_BYTES: Self = Self(9);
 
     pub(crate) const fn value(self) -> u16 {
@@ -146,7 +146,7 @@ pub(crate) async fn write_records<T: Serialize>(
     kind: StreamKind,
     records: impl IntoIterator<Item = T>,
 ) -> Result<StreamRef, Error> {
-    let schema_version = 1;
+    let schema_version = 1_u16;
     let mut writer = ImmutableWriter::open(operator, gc_epoch, class, WRITER_CHUNK_BYTES).await?;
     let mut payload_hasher = blake3::Hasher::new();
     let mut payload_length = 0_u64;
@@ -225,73 +225,47 @@ pub(crate) async fn write_bytes(
     gc_epoch: GcEpoch,
     class: ObjectClass,
     kind: StreamKind,
-    source: &mut (impl AsyncRead + Unpin),
+    bytes: Vec<u8>,
 ) -> Result<StreamRef, Error> {
-    let schema_version = 1;
-    let mut writer = ImmutableWriter::open(operator, gc_epoch, class, WRITER_CHUNK_BYTES).await?;
-    let mut hasher = blake3::Hasher::new();
-    let mut payload_length = 0_u64;
-    let mut block_hasher = blake3::Hasher::new();
-    let mut block_offset = 0_u64;
-    let mut block_length = 0_u64;
-    let mut blocks = Vec::new();
-    let mut buffer = vec![0; 256 * 1024];
-    loop {
-        let read = source
-            .read(&mut buffer)
-            .await
-            .map_err(|error| Error::io("read Managed stream source", error))?;
-        if read == 0 {
-            break;
-        }
-        let bytes = &buffer[..read];
-        writer.write(bytes).await?;
-        hasher.update(bytes);
-        let mut observed = bytes;
-        while !observed.is_empty() {
-            let remaining = (DATA_BLOCK_BYTES - block_length) as usize;
-            let length = remaining.min(observed.len());
-            block_hasher.update(&observed[..length]);
-            block_length += length as u64;
-            observed = &observed[length..];
-            if block_length == DATA_BLOCK_BYTES {
-                blocks.push(ChecksummedRange {
-                    offset: block_offset,
-                    length: block_length,
-                    checksum: RangeChecksum::from_bytes(block_hasher.finalize().into()),
-                });
-                block_offset += block_length;
-                block_length = 0;
-                block_hasher = blake3::Hasher::new();
-            }
-        }
-        payload_length = payload_length
-            .checked_add(read as u64)
-            .ok_or_else(|| Error::invalid("write Managed stream", "payload length overflows"))?;
-    }
-    if block_length != 0 {
-        blocks.push(ChecksummedRange {
-            offset: block_offset,
-            length: block_length,
-            checksum: RangeChecksum::from_bytes(block_hasher.finalize().into()),
-        });
-    }
+    let schema_version = 1_u16;
+    let payload_length = bytes.len() as u64;
+    let payload_digest = PayloadDigest::from_bytes(blake3::hash(&bytes).into());
+    let blocks = bytes
+        .chunks(DATA_BLOCK_BYTES as usize)
+        .enumerate()
+        .map(|(index, block)| ChecksummedRange {
+            offset: index as u64 * DATA_BLOCK_BYTES,
+            length: block.len() as u64,
+            checksum: checksum(block),
+        })
+        .collect();
     let mut block_index = Vec::new();
     ciborium::into_writer(&DataBlockIndex { blocks }, &mut block_index)
         .map_err(|_| Error::invalid("write Managed stream", "block index cannot be encoded"))?;
-    finish_stream(
-        writer,
+    let (tail, footer_range) = encode_stream_tail(
         kind,
         schema_version,
         payload_length,
-        PayloadDigest::from_bytes(hasher.finalize().into()),
+        payload_digest,
         vec![EmbeddedProjection {
             kind: BLOCK_CHECKSUM_INDEX,
             schema_version: 1,
             bytes: block_index,
         }],
-    )
-    .await
+    )?;
+
+    let mut encoded = bytes;
+    encoded.reserve(tail.len());
+    encoded.extend_from_slice(&tail);
+    let object = super::object::write_immutable(operator, gc_epoch, class, encoded).await?;
+    Ok(StreamRef {
+        kind,
+        schema_version,
+        object,
+        payload_length,
+        payload_digest,
+        footer_range,
+    })
 }
 
 pub(crate) async fn copy_bytes(
@@ -526,19 +500,6 @@ async fn write_frame(
         length: header.len() as u64 + frame_length,
         checksum: RangeChecksum::from_bytes(frame_checksum.finalize().into()),
     })
-}
-
-pub(crate) async fn read_records<T: DeserializeOwned>(
-    operator: &Operator,
-    reference: StreamRef,
-) -> Result<Vec<T>, Error> {
-    let mut records = Vec::new();
-    visit_records(operator, reference, |record| {
-        records.push(record);
-        Ok(())
-    })
-    .await?;
-    Ok(records)
 }
 
 pub(crate) async fn visit_records<T: DeserializeOwned>(
@@ -793,6 +754,28 @@ async fn finish_stream(
     digest: PayloadDigest,
     projections: Vec<EmbeddedProjection>,
 ) -> Result<StreamRef, Error> {
+    let (tail, footer_range) =
+        encode_stream_tail(kind, schema_version, payload_length, digest, projections)?;
+    writer.write(&tail).await?;
+    let object = writer.close().await?;
+    Ok(StreamRef {
+        kind,
+        schema_version,
+        object,
+        payload_length,
+        payload_digest: digest,
+        footer_range,
+    })
+}
+
+fn encode_stream_tail(
+    kind: StreamKind,
+    schema_version: u16,
+    payload_length: u64,
+    digest: PayloadDigest,
+    projections: Vec<EmbeddedProjection>,
+) -> Result<(Vec<u8>, ChecksummedRange), Error> {
+    let mut tail = Vec::new();
     let mut projection_refs = Vec::with_capacity(projections.len());
     let mut footer_offset = payload_length;
     for projection in projections {
@@ -802,7 +785,7 @@ async fn finish_stream(
             length,
             checksum: checksum(&projection.bytes),
         };
-        writer.write(&projection.bytes).await?;
+        tail.extend_from_slice(&projection.bytes);
         footer_offset = footer_offset
             .checked_add(length)
             .ok_or_else(|| Error::invalid("write Managed stream", "stream length overflows"))?;
@@ -824,7 +807,6 @@ async fn finish_stream(
     )
     .map_err(|_| Error::invalid("write Managed stream", "footer cannot be encoded"))?;
     if footer.len() > MAXIMUM_FOOTER_BYTES {
-        writer.abort().await;
         return Err(Error::invalid(
             "write Managed stream",
             "footer exceeds its size limit",
@@ -832,7 +814,7 @@ async fn finish_stream(
     }
     let footer_length = footer.len() as u64;
     let footer_checksum = checksum(&footer);
-    writer.write(&footer).await?;
+    tail.extend_from_slice(&footer);
     let mut trailer = Vec::with_capacity(TRAILER_BYTES);
     trailer.extend_from_slice(&TRAILER_MAGIC);
     trailer.extend_from_slice(&schema_version.to_le_bytes());
@@ -841,20 +823,15 @@ async fn finish_stream(
     trailer.extend_from_slice(&footer_length.to_le_bytes());
     trailer.extend_from_slice(footer_checksum.as_bytes());
     trailer.extend_from_slice(checksum(&trailer).as_bytes());
-    writer.write(&trailer).await?;
-    let object = writer.close().await?;
-    Ok(StreamRef {
-        kind,
-        schema_version,
-        object,
-        payload_length,
-        payload_digest: digest,
-        footer_range: ChecksummedRange {
+    tail.extend_from_slice(&trailer);
+    Ok((
+        tail,
+        ChecksummedRange {
             offset: footer_offset,
             length: footer_length,
             checksum: footer_checksum,
         },
-    })
+    ))
 }
 
 async fn read_footer(operator: &Operator, reference: StreamRef) -> Result<StreamFooter, Error> {

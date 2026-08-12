@@ -144,7 +144,6 @@ pub(crate) enum ObjectClass {
     ChangeSegment,
     OperationResultSegment,
     FileExtentSegment,
-    FileManifest,
     FileShard,
     ProjectionManifest,
     ProjectionSegment,
@@ -162,7 +161,6 @@ impl ObjectClass {
             Self::ChangeSegment => "change-segment",
             Self::OperationResultSegment => "operation-result-segment",
             Self::FileExtentSegment => "file-extent-segment",
-            Self::FileManifest => "file-manifest",
             Self::FileShard => "file-shard",
             Self::ProjectionManifest => "projection-manifest",
             Self::ProjectionSegment => "projection-segment",
@@ -180,12 +178,11 @@ impl ObjectClass {
             Self::ChangeSegment => 4,
             Self::OperationResultSegment => 5,
             Self::FileExtentSegment => 6,
-            Self::FileManifest => 7,
-            Self::FileShard => 8,
-            Self::ProjectionManifest => 9,
-            Self::ProjectionSegment => 10,
-            Self::ExtensionManifest => 11,
-            Self::ExtensionData => 12,
+            Self::FileShard => 7,
+            Self::ProjectionManifest => 8,
+            Self::ProjectionSegment => 9,
+            Self::ExtensionManifest => 10,
+            Self::ExtensionData => 11,
         }
     }
 
@@ -198,7 +195,6 @@ impl ObjectClass {
             Self::ChangeSegment,
             Self::OperationResultSegment,
             Self::FileExtentSegment,
-            Self::FileManifest,
             Self::FileShard,
             Self::ProjectionManifest,
             Self::ProjectionSegment,
@@ -218,12 +214,11 @@ impl ObjectClass {
             4 => Some(Self::ChangeSegment),
             5 => Some(Self::OperationResultSegment),
             6 => Some(Self::FileExtentSegment),
-            7 => Some(Self::FileManifest),
-            8 => Some(Self::FileShard),
-            9 => Some(Self::ProjectionManifest),
-            10 => Some(Self::ProjectionSegment),
-            11 => Some(Self::ExtensionManifest),
-            12 => Some(Self::ExtensionData),
+            7 => Some(Self::FileShard),
+            8 => Some(Self::ProjectionManifest),
+            9 => Some(Self::ProjectionSegment),
+            10 => Some(Self::ExtensionManifest),
+            11 => Some(Self::ExtensionData),
             _ => None,
         }
     }
@@ -393,7 +388,6 @@ pub(crate) struct ImmutableWriter {
     gc_epoch: GcEpoch,
     class: ObjectClass,
     id: ObjectId,
-    key: String,
     writer: Writer,
     hasher: Hasher,
     encoded_length: u64,
@@ -418,7 +412,6 @@ impl ImmutableWriter {
             gc_epoch,
             class,
             id,
-            key,
             writer,
             hasher: Hasher::new(),
             encoded_length: 0,
@@ -449,11 +442,6 @@ impl ImmutableWriter {
             encoded_length: self.encoded_length,
             digest: ObjectDigest::from_bytes(self.hasher.finalize().into()),
         })
-    }
-
-    pub(crate) async fn abort(mut self) {
-        let _ = self.writer.abort().await;
-        let _ = self.key;
     }
 }
 

@@ -26,10 +26,11 @@ mod record;
 mod stream;
 mod wire;
 
+pub(crate) use data::FileLayout;
 pub use format::ManagedFormat;
 pub use gc::GcOutcome;
 pub use head::{ManagedObservation, ManagedVolume, NamespaceRevision};
-pub(crate) use object::{GcEpoch, ObjectRef};
+pub(crate) use object::GcEpoch;
 
 use opendal::Operator;
 

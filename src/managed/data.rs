@@ -20,56 +20,44 @@ use std::ops::Range;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite};
 
 use crate::Error;
-use crate::filesystem::{ChangeCursor, FileFingerprint, FileVersionId};
+use crate::filesystem::{FileFingerprint, FileVersionId};
 
 use super::ManagedVolume;
-use super::object::{self, GcEpoch, ObjectClass, ObjectRef};
-use super::record::Record;
+use super::object::{GcEpoch, ObjectClass};
 use super::stream::{self, StreamKind, StreamRef};
 
-const MANIFEST_RECORD: Record = Record::new(*b"OFSMAN01", 1, 1024 * 1024);
 const SHARD_TARGET_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
-struct FileManifest {
-    file_version: FileVersionId,
-    file_size: u64,
-    content_fingerprint: FileFingerprint,
-    extent_segments: Vec<StreamRef>,
+pub(crate) struct FileLayout {
+    pub(super) extents: Vec<FileExtent>,
 }
-super::wire::tuple_wire!(FileManifest {
-    file_version: FileVersionId,
-    file_size: u64,
-    content_fingerprint: FileFingerprint,
-    extent_segments: Vec<StreamRef>,
-});
 
 #[derive(Clone, Copy, Debug)]
-struct FileExtentMutation {
-    logical_range: ByteRange,
-    change_cursor: ChangeCursor,
-    extent: DataExtent,
+pub(super) struct FileExtentRecord {
+    pub(super) file_version: FileVersionId,
+    pub(super) logical_range: ByteRange,
+    pub(super) shard: StreamRef,
+    pub(super) object_range: ByteRange,
 }
-super::wire::tuple_wire!(FileExtentMutation {
+super::wire::tuple_wire!(FileExtentRecord {
+    file_version: FileVersionId,
     logical_range: ByteRange,
-    change_cursor: ChangeCursor,
-    extent: DataExtent,
-});
-
-#[derive(Clone, Copy, Debug)]
-struct DataExtent {
-    shard: StreamRef,
-    object_range: ByteRange,
-}
-super::wire::tuple_wire!(DataExtent {
     shard: StreamRef,
     object_range: ByteRange,
 });
 
 #[derive(Clone, Copy, Debug)]
-struct ByteRange {
-    offset: u64,
-    length: u64,
+pub(super) struct FileExtent {
+    pub(super) logical_range: ByteRange,
+    pub(super) shard: StreamRef,
+    pub(super) object_range: ByteRange,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ByteRange {
+    pub(super) offset: u64,
+    pub(super) length: u64,
 }
 super::wire::tuple_wire!(ByteRange {
     offset: u64,
@@ -77,25 +65,23 @@ super::wire::tuple_wire!(ByteRange {
 });
 
 impl ManagedVolume {
-    /// Publish one immutable file manifest over independently durable shards.
+    /// Publish one file layout over independently durable shards.
     pub(crate) async fn publish_data(
         &self,
         source: &mut (impl AsyncRead + Unpin),
-        version: FileVersionId,
         fingerprint: FileFingerprint,
         base_version: Option<FileVersionId>,
         gc_epoch: GcEpoch,
-        change_cursor: ChangeCursor,
-    ) -> Result<ObjectRef, Error> {
+    ) -> Result<FileLayout, Error> {
         let reusable = match base_version {
-            Some(base) => self.file_extents(base).await?,
+            Some(base) => self.file_extents(base)?,
             None => Vec::new(),
         };
         let mut extents = Vec::new();
         let mut file_hasher = blake3::Hasher::new();
         let mut logical_offset = 0_u64;
         loop {
-            let mut bytes = Vec::with_capacity(SHARD_TARGET_BYTES as usize);
+            let mut bytes = Vec::new();
             (&mut *source)
                 .take(SHARD_TARGET_BYTES)
                 .read_to_end(&mut bytes)
@@ -113,37 +99,32 @@ impl ManagedVolume {
                 .find(|extent| {
                     extent.logical_range.offset == logical_offset
                         && extent.logical_range.length == length
-                        && extent.extent.object_range.offset == 0
-                        && extent.extent.object_range.length == length
-                        && extent.extent.shard.payload_length == length
-                        && extent.extent.shard.payload_digest.as_bytes()
-                            == payload_digest.as_bytes()
+                        && extent.object_range.offset == 0
+                        && extent.object_range.length == length
+                        && extent.shard.payload_length == length
+                        && extent.shard.payload_digest.as_bytes() == payload_digest.as_bytes()
                 })
-                .map(|extent| extent.extent.shard);
+                .map(|extent| extent.shard);
             let shard = match reusable_shard {
                 Some(shard) => shard,
                 None => {
-                    let mut source = std::io::Cursor::new(bytes);
                     stream::write_bytes(
                         self.operator(),
                         gc_epoch,
                         ObjectClass::FileShard,
                         StreamKind::FILE_BYTES,
-                        &mut source,
+                        bytes,
                     )
                     .await?
                 }
             };
-            extents.push(FileExtentMutation {
+            extents.push(FileExtent {
                 logical_range: ByteRange {
                     offset: logical_offset,
                     length,
                 },
-                change_cursor,
-                extent: DataExtent {
-                    shard,
-                    object_range: ByteRange { offset: 0, length },
-                },
+                shard,
+                object_range: ByteRange { offset: 0, length },
             });
             logical_offset = logical_offset
                 .checked_add(length)
@@ -165,32 +146,7 @@ impl ManagedVolume {
                 "empty file content identity is invalid",
             ));
         }
-        let extent_segments = if extents.is_empty() {
-            Vec::new()
-        } else {
-            vec![
-                stream::write_records(
-                    self.operator(),
-                    gc_epoch,
-                    ObjectClass::FileExtentSegment,
-                    StreamKind::FILE_EXTENT_MUTATIONS,
-                    extents,
-                )
-                .await?,
-            ]
-        };
-        object::write_immutable(
-            self.operator(),
-            gc_epoch,
-            ObjectClass::FileManifest,
-            MANIFEST_RECORD.encode(&FileManifest {
-                file_version: version,
-                file_size: fingerprint.logical_length(),
-                content_fingerprint: fingerprint,
-                extent_segments,
-            })?,
-        )
-        .await
+        Ok(FileLayout { extents })
     }
 
     /// Read and verify one immutable file version into a destination.
@@ -218,43 +174,19 @@ impl ManagedVolume {
                 "logical byte range is invalid",
             ));
         }
-        let manifest = read_manifest(self, record.manifest).await?;
-        if manifest.file_version != version
-            || manifest.file_size != record.file_size
-            || manifest.content_fingerprint != record.content_fingerprint
-        {
-            return Err(Error::corrupt(
-                "read Managed file",
-                "file manifest does not match its version",
-            ));
-        }
-        let mut extents = Vec::new();
-        for reference in manifest.extent_segments {
-            if reference.kind != StreamKind::FILE_EXTENT_MUTATIONS
-                || reference.object.class != ObjectClass::FileExtentSegment
-            {
-                return Err(Error::corrupt(
-                    "read Managed file",
-                    "file extent stream has the wrong type",
-                ));
-            }
-            extents.extend(
-                stream::read_records::<FileExtentMutation>(self.operator(), reference).await?,
-            );
-        }
+        let mut extents = self.file_extents(version)?;
         extents.sort_by_key(|extent| extent.logical_range.offset);
         let mut expected_offset = 0_u64;
         for extent in extents {
             if extent.logical_range.offset != expected_offset
                 || extent
-                    .extent
                     .object_range
                     .offset
-                    .checked_add(extent.extent.object_range.length)
-                    .is_none_or(|end| end > extent.extent.shard.payload_length)
-                || extent.logical_range.length != extent.extent.object_range.length
-                || extent.extent.shard.kind != StreamKind::FILE_BYTES
-                || extent.extent.shard.object.class != ObjectClass::FileShard
+                    .checked_add(extent.object_range.length)
+                    .is_none_or(|end| end > extent.shard.payload_length)
+                || extent.logical_range.length != extent.object_range.length
+                || extent.shard.kind != StreamKind::FILE_BYTES
+                || extent.shard.object.class != ObjectClass::FileShard
             {
                 return Err(Error::corrupt(
                     "read Managed file",
@@ -265,20 +197,20 @@ impl ManagedVolume {
             if extent.logical_range.offset < range.end && extent_end > range.start {
                 let selected_start = range.start.max(extent.logical_range.offset);
                 let selected_end = range.end.min(extent_end);
-                let object_start = extent.extent.object_range.offset + selected_start
-                    - extent.logical_range.offset;
+                let object_start =
+                    extent.object_range.offset + selected_start - extent.logical_range.offset;
                 let object_end =
-                    extent.extent.object_range.offset + selected_end - extent.logical_range.offset;
+                    extent.object_range.offset + selected_end - extent.logical_range.offset;
                 if object_start == 0
-                    && object_end == extent.extent.shard.payload_length
+                    && object_end == extent.shard.payload_length
                     && range.start <= extent.logical_range.offset
                     && range.end >= extent_end
                 {
-                    stream::copy_bytes(self.operator(), extent.extent.shard, destination).await?;
+                    stream::copy_bytes(self.operator(), extent.shard, destination).await?;
                 } else {
                     stream::copy_byte_range(
                         self.operator(),
-                        extent.extent.shard,
+                        extent.shard,
                         object_start..object_end,
                         destination,
                     )
@@ -289,7 +221,7 @@ impl ManagedVolume {
                 .checked_add(extent.logical_range.length)
                 .ok_or_else(|| Error::corrupt("read Managed file", "file length overflows"))?;
         }
-        if expected_offset != manifest.file_size {
+        if expected_offset != record.file_size {
             return Err(Error::corrupt(
                 "read Managed file",
                 "file extents do not cover the declared file size",
@@ -298,51 +230,18 @@ impl ManagedVolume {
         Ok(())
     }
 
-    async fn file_extents(&self, version: FileVersionId) -> Result<Vec<FileExtentMutation>, Error> {
-        let record = self.file_version_record(version)?;
-        let manifest = read_manifest(self, record.manifest).await?;
-        let mut extents = Vec::new();
-        for reference in manifest.extent_segments {
-            extents.extend(
-                stream::read_records::<FileExtentMutation>(self.operator(), reference).await?,
-            );
-        }
-        Ok(extents)
+    pub(super) fn extent_records(
+        version: FileVersionId,
+        layout: FileLayout,
+    ) -> impl Iterator<Item = FileExtentRecord> {
+        layout
+            .extents
+            .into_iter()
+            .map(move |extent| FileExtentRecord {
+                file_version: version,
+                logical_range: extent.logical_range,
+                shard: extent.shard,
+                object_range: extent.object_range,
+            })
     }
-}
-
-pub(super) async fn visit_manifest_objects(
-    volume: &ManagedVolume,
-    reference: ObjectRef,
-    visit: &mut impl FnMut(ObjectRef) -> Result<(), Error>,
-) -> Result<(), Error> {
-    let manifest = read_manifest(volume, reference).await?;
-    for extent_segment in manifest.extent_segments {
-        visit(extent_segment.object)?;
-        let extents =
-            stream::read_records::<FileExtentMutation>(volume.operator(), extent_segment).await?;
-        for extent in extents {
-            visit(extent.extent.shard.object)?;
-        }
-    }
-    Ok(())
-}
-
-async fn read_manifest(
-    volume: &ManagedVolume,
-    reference: ObjectRef,
-) -> Result<FileManifest, Error> {
-    if reference.class != ObjectClass::FileManifest {
-        return Err(Error::corrupt(
-            "read Managed file",
-            "manifest reference has the wrong object class",
-        ));
-    }
-    let bytes = object::read_immutable(
-        volume.operator(),
-        reference,
-        MANIFEST_RECORD.maximum_encoded_bytes(),
-    )
-    .await?;
-    MANIFEST_RECORD.decode(&bytes)
 }

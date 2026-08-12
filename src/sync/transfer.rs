@@ -22,10 +22,9 @@ use tokio::fs::File;
 use tokio::io::AsyncReadExt as _;
 
 use crate::Error;
-use crate::filesystem::ChangeCursor;
 use crate::filesystem::{Digest, FileFingerprint, FileVersionId, OperationId};
 use crate::managed::ManagedVolume;
-use crate::managed::{GcEpoch, ObjectRef};
+use crate::managed::{FileLayout, GcEpoch};
 
 const IO_BUFFER_BYTES: usize = 256 * 1024;
 
@@ -58,24 +57,15 @@ pub(super) async fn inspect_file(path: &Path) -> Result<FileFingerprint, Error> 
 pub(super) async fn publish_file(
     volume: &ManagedVolume,
     path: &Path,
-    version: FileVersionId,
     fingerprint: FileFingerprint,
     base_version: Option<FileVersionId>,
     gc_epoch: GcEpoch,
-    change_cursor: ChangeCursor,
-) -> Result<ObjectRef, Error> {
+) -> Result<FileLayout, Error> {
     let mut file = File::open(path)
         .await
         .map_err(|error| Error::from_io("publish local file", Some(path), error))?;
     volume
-        .publish_data(
-            &mut file,
-            version,
-            fingerprint,
-            base_version,
-            gc_epoch,
-            change_cursor,
-        )
+        .publish_data(&mut file, fingerprint, base_version, gc_epoch)
         .await
         .map_err(|error| error.with_context("path", path.display()))
 }

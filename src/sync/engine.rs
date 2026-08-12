@@ -189,10 +189,10 @@ impl SyncEngine {
                         "--resolve requires a current local and remote conflict",
                     ));
                 }
-                let manifests = self.publish_target_files(&root, &observed, &local).await?;
+                let layouts = self.publish_target_files(&root, &observed, &local).await?;
                 let target = self
                     .volume
-                    .prepare_publication(&observed, local, manifests)
+                    .prepare_publication(&observed, local, layouts)
                     .await?;
                 let operation = target
                     .cursor()
@@ -253,12 +253,12 @@ impl SyncEngine {
                     });
                 }
                 let target_revision = if plan.publish {
-                    let manifests = self
+                    let layouts = self
                         .publish_target_files(&root, &observed, &plan.target)
                         .await?;
                     let target = self
                         .volume
-                        .prepare_publication(&observed, plan.target.clone(), manifests)
+                        .prepare_publication(&observed, plan.target.clone(), layouts)
                         .await?;
                     let operation = target
                         .cursor()
@@ -393,10 +393,10 @@ impl SyncEngine {
             });
         }
 
-        let manifests = self.publish_target_files(root, &observed, &local).await?;
+        let layouts = self.publish_target_files(root, &observed, &local).await?;
         let target = self
             .volume
-            .prepare_publication(&observed, local, manifests)
+            .prepare_publication(&observed, local, layouts)
             .await?;
         let operation = target
             .cursor()
@@ -507,7 +507,7 @@ impl SyncEngine {
         root: &Path,
         observed: &ManagedObservation,
         target: &VolumeSnapshot,
-    ) -> Result<BTreeMap<crate::filesystem::FileVersionId, crate::managed::ObjectRef>, Error> {
+    ) -> Result<BTreeMap<crate::filesystem::FileVersionId, crate::managed::FileLayout>, Error> {
         let mut new_versions = BTreeSet::new();
         let common_versions = observed
             .snapshot
@@ -542,22 +542,20 @@ impl SyncEngine {
             files.push((path, version, fingerprint, base_version, publish));
         }
 
-        let manifests = futures::stream::iter(files)
+        let layouts = futures::stream::iter(files)
             .map(
                 |(path, version, fingerprint, base_version, publish)| async move {
                     let path = root.join(path);
                     if publish {
-                        let manifest = publish_file(
+                        let layout = publish_file(
                             &self.volume,
                             &path,
-                            version,
                             fingerprint,
                             base_version,
                             observed.gc_epoch(),
-                            target.cursor,
                         )
                         .await?;
-                        Ok(Some((version, manifest)))
+                        Ok(Some((version, layout)))
                     } else if inspect_file(&path).await? != fingerprint {
                         Err(Error::conflict(
                             "publish Managed files",
@@ -571,7 +569,7 @@ impl SyncEngine {
             .buffer_unordered(self.transfer_concurrency)
             .try_collect::<Vec<_>>()
             .await?;
-        Ok(manifests.into_iter().flatten().collect())
+        Ok(layouts.into_iter().flatten().collect())
     }
 }
 
