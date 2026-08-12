@@ -15,15 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::path::Path;
-
 use blake3::Hasher;
 use futures::StreamExt as _;
 use opendal::{Buffer, ErrorKind as StorageErrorKind, Operator};
-use tokio::fs::File;
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
-use crate::filesystem::{Digest, FileVersion, FileVersionId, OperationId};
+use crate::filesystem::FileVersion;
 use crate::{Error, ErrorKind};
 
 use super::ManagedVolume;
@@ -38,66 +35,64 @@ pub(super) struct WholeObject {
 }
 
 impl ManagedVolume {
-    /// Inspect a local file without publishing data.
-    pub async fn inspect_file(&self, path: &Path) -> Result<FileVersion, Error> {
-        let mut file = File::open(path)
-            .await
-            .map_err(|error| Error::from_io("inspect local file", Some(path), error))?;
-        let (logical_size, logical_digest) =
-            inspect_reader(&mut file, path, "inspect local file").await?;
-        Ok(FileVersion::new(FileVersionId::new(
-            Digest::from_bytes(logical_digest),
-            logical_size,
-        )))
-    }
-
     /// Publish one immutable whole-file object before its version is committed.
-    pub async fn publish_file(&self, path: &Path, version: &FileVersion) -> Result<(), Error> {
-        let mut file = File::open(path)
-            .await
-            .map_err(|error| Error::from_io("publish local file", Some(path), error))?;
-        let Some(object) = whole_object(version)? else {
-            let (length, digest) = inspect_reader(&mut file, path, "publish local file").await?;
-            return verify_local_identity(length, digest, version);
+    pub(crate) async fn publish_data(
+        &self,
+        source: &mut (impl AsyncRead + Unpin),
+        version: &FileVersion,
+    ) -> Result<(), Error> {
+        let object = whole_object(version)?;
+        let mut writer = if let Some(object) = object {
+            let key = object_key(object.digest);
+            Some(
+                self.operator()
+                    .writer_with(&key)
+                    .if_not_exists(true)
+                    .chunk(UPLOAD_PART_BYTES)
+                    .await
+                    .map_err(|error| Error::from_storage("publish Managed file", error))?,
+            )
+        } else {
+            None
         };
-
-        let key = object_key(object.digest);
-        let mut writer = self
-            .operator()
-            .writer_with(&key)
-            .if_not_exists(true)
-            .chunk(UPLOAD_PART_BYTES)
-            .await
-            .map_err(|error| Error::from_storage("publish Managed file", error))?;
         let mut hasher = Hasher::new();
         let mut length = 0_u64;
         let mut buffer = vec![0; IO_BUFFER_BYTES];
         let transfer = async {
             loop {
-                let read = file
+                let read = source
                     .read(&mut buffer)
                     .await
-                    .map_err(|error| Error::from_io("publish local file", Some(path), error))?;
+                    .map_err(|error| Error::io("read Managed data source", error))?;
                 if read == 0 {
                     break;
                 }
                 let bytes = &buffer[..read];
                 hasher.update(bytes);
-                length = length
-                    .checked_add(read as u64)
-                    .ok_or_else(|| Error::invalid("publish local file", "file length overflows"))?;
-                writer
-                    .write(Buffer::from(bytes.to_vec()))
-                    .await
-                    .map_err(|error| Error::from_storage("publish Managed file", error))?;
+                length = length.checked_add(read as u64).ok_or_else(|| {
+                    Error::invalid("publish Managed data", "file length overflows")
+                })?;
+                if let Some(writer) = &mut writer {
+                    writer
+                        .write(Buffer::from(bytes.to_vec()))
+                        .await
+                        .map_err(|error| Error::from_storage("publish Managed file", error))?;
+                }
             }
-            verify_local_identity(length, hasher.finalize().into(), version)
+            verify_source_identity(length, hasher.finalize().into(), version)
         }
         .await;
         if let Err(error) = transfer {
-            let _ = writer.abort().await;
+            if let Some(writer) = &mut writer {
+                let _ = writer.abort().await;
+            }
             return Err(error);
         }
+        let Some(object) = object else {
+            return Ok(());
+        };
+        let key = object_key(object.digest);
+        let mut writer = writer.expect("a non-empty Managed file has a data writer");
 
         let close_error = match writer.close().await {
             Ok(_) => return Ok(()),
@@ -117,90 +112,37 @@ impl ManagedVolume {
                 }
                 return Err(Error::new(
                     ErrorKind::Corrupt,
-                    "publish local file",
+                    "publish Managed data",
                     "immutable object has an invalid length",
                 ));
             }
             Err(error) => error,
         };
-        match stream_object(self.operator(), object, None).await {
+        let mut sink = tokio::io::sink();
+        match stream_object(self.operator(), object, &mut sink).await {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == ErrorKind::Corrupt => Err(error),
             Err(_) => Err(Error::from_storage("publish Managed file", close_error)),
         }
     }
 
-    /// Materialize and verify a complete file beside its final destination.
-    pub async fn materialize_file(
+    /// Read and verify one immutable whole-file object into a destination.
+    pub(crate) async fn read_data(
         &self,
         version: &FileVersion,
-        destination: &Path,
+        destination: &mut (impl AsyncWrite + Unpin),
     ) -> Result<(), Error> {
-        let parent = destination.parent().unwrap_or_else(|| Path::new("."));
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|error| Error::from_io("create replica directory", Some(parent), error))?;
-        let name = destination
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("file");
-        let temporary =
-            destination.with_file_name(format!(".{name}.{}.tmp", OperationId::generate()));
-        let result = async {
-            let mut file = File::create(&temporary).await.map_err(|error| {
-                Error::from_io("create replica staging file", Some(&temporary), error)
-            })?;
-            if let Some(object) = whole_object(version)? {
-                stream_object(self.operator(), object, Some(&mut file)).await?;
-            }
-            file.sync_all().await.map_err(|error| {
-                Error::from_io("persist replica staging file", Some(&temporary), error)
-            })?;
-            drop(file);
-            tokio::fs::rename(&temporary, destination)
-                .await
-                .map_err(|error| {
-                    Error::from_io("install replica file", Some(destination), error)
-                })?;
-            Ok(())
-        }
-        .await;
-        if let Err(error) = result {
-            let _ = tokio::fs::remove_file(&temporary).await;
-            return Err(error);
+        if let Some(object) = whole_object(version)? {
+            stream_object(self.operator(), object, destination).await?;
         }
         Ok(())
     }
 }
 
-async fn inspect_reader(
-    file: &mut File,
-    path: &Path,
-    action: &'static str,
-) -> Result<(u64, [u8; 32]), Error> {
-    let mut hasher = Hasher::new();
-    let mut length = 0_u64;
-    let mut buffer = vec![0; IO_BUFFER_BYTES];
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .await
-            .map_err(|error| Error::from_io(action, Some(path), error))?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-        length = length
-            .checked_add(read as u64)
-            .ok_or_else(|| Error::invalid(action, "file length overflows"))?;
-    }
-    Ok((length, hasher.finalize().into()))
-}
-
 async fn stream_object(
     operator: &Operator,
     object: WholeObject,
-    mut destination: Option<&mut File>,
+    destination: &mut (impl AsyncWrite + Unpin),
 ) -> Result<(), Error> {
     let key = object_key(object.digest);
     let reader = match operator.reader(&key).await {
@@ -235,11 +177,10 @@ async fn stream_object(
             length = length
                 .checked_add(chunk.len() as u64)
                 .ok_or_else(|| Error::corrupt("read Managed data", "object length overflows"))?;
-            if let Some(file) = destination.as_mut() {
-                file.write_all(&chunk)
-                    .await
-                    .map_err(|error| Error::io("write replica staging file", error))?;
-            }
+            destination
+                .write_all(&chunk)
+                .await
+                .map_err(|error| Error::io("write Managed data destination", error))?;
         }
     }
     if length != object.length || hasher.finalize().as_bytes() != &object.digest {
@@ -251,14 +192,14 @@ async fn stream_object(
     Ok(())
 }
 
-fn verify_local_identity(
+fn verify_source_identity(
     length: u64,
     digest: [u8; 32],
     version: &FileVersion,
 ) -> Result<(), Error> {
     if length != version.logical_length() || digest != *version.digest().as_bytes() {
         return Err(Error::invalid(
-            "publish local file",
+            "publish Managed data",
             "file changed while being published",
         ));
     }

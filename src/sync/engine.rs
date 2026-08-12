@@ -29,6 +29,7 @@ use super::ReplicaState;
 use super::install::{install, repair};
 use super::reconcile::{changed_paths, reconcile};
 use super::scan::{ScannedTree, scan};
+use super::transfer::{inspect_file, publish_file};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SyncOutcome {
@@ -165,7 +166,7 @@ impl SyncEngine {
             Some(self.volume.snapshot(common_revision).await?)
         };
         let base = loaded_base.as_ref().unwrap_or(&observed.snapshot);
-        let local = scan(&root, base, &self.volume).await?;
+        let local = scan(&root, base).await?;
         let remote_changed = observed.revision() != common_revision;
         match (local, remote_changed) {
             (ScannedTree::Unchanged, false) => Ok(SyncOutcome {
@@ -334,7 +335,7 @@ impl SyncEngine {
         observed: ManagedObservation,
         resolved: &BTreeSet<String>,
     ) -> Result<SyncOutcome, Error> {
-        let local = match scan(root, &observed.snapshot, &self.volume).await? {
+        let local = match scan(root, &observed.snapshot).await? {
             ScannedTree::Unchanged => {
                 state.advance(observed.revision());
                 state.save(state_path)?;
@@ -502,8 +503,8 @@ impl SyncEngine {
                 |(path, version, publish)| async move {
                     let path = root.join(path);
                     if publish {
-                        self.volume.publish_file(&path, version).await?;
-                    } else if self.volume.inspect_file(&path).await? != *version {
+                        publish_file(&self.volume, &path, version).await?;
+                    } else if inspect_file(&path).await? != *version {
                         return Err(Error::conflict(
                             "publish Managed files",
                             "local file changed while being published",

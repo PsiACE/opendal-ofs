@@ -25,6 +25,8 @@ use crate::Error;
 use crate::filesystem::{NodeKind, VolumeSnapshot};
 use crate::managed::ManagedVolume;
 
+use super::transfer::{inspect_file, materialize_file};
+
 pub(crate) async fn install(
     root: &Path,
     current: Option<&VolumeSnapshot>,
@@ -116,7 +118,7 @@ async fn apply(
             .and_then(|id| target.file_versions.get(&id))
             .ok_or_else(|| Error::corrupt("install replica", "remote file has no file version"))?;
         let unchanged = if authoritative {
-            local_file_matches(volume, &destination, version, node.attributes.executable).await?
+            local_file_matches(&destination, version, node.attributes.executable).await?
         } else {
             current_paths.as_ref().is_some_and(|paths| {
                 paths.get(path).is_some_and(|current_id| {
@@ -146,7 +148,7 @@ async fn apply(
         .try_for_each_concurrent(
             transfer_concurrency,
             |(destination, version, executable)| async move {
-                volume.materialize_file(&version, &destination).await?;
+                materialize_file(volume, &version, &destination).await?;
                 if executable {
                     set_executable(&destination, true)?;
                     sync_file(&destination)?;
@@ -161,7 +163,6 @@ async fn apply(
 }
 
 async fn local_file_matches(
-    volume: &ManagedVolume,
     path: &Path,
     expected: &crate::filesystem::FileVersion,
     executable: bool,
@@ -174,7 +175,7 @@ async fn local_file_matches(
     if !supported_regular_file(&metadata) || is_executable(&metadata) != executable {
         return Ok(false);
     }
-    Ok(volume.inspect_file(path).await? == *expected)
+    Ok(inspect_file(path).await? == *expected)
 }
 
 fn actual_paths(root: &Path) -> Result<Vec<PathBuf>, Error> {

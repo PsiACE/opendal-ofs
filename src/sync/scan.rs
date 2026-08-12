@@ -21,12 +21,12 @@ use std::path::Path;
 
 use futures::StreamExt as _;
 
+use super::transfer::inspect_file;
 use crate::Error;
 use crate::filesystem::{
     ChangeCursor, DirectoryEntry, DirectoryRecord, FileVersion, FileVersionId, Generation,
     NodeAttributes, NodeId, NodeKind, NodeRecord, OperationId, VolumeSnapshot,
 };
-use crate::managed::ManagedVolume;
 
 pub(crate) enum ScannedTree {
     Unchanged,
@@ -39,24 +39,17 @@ struct LocalEntry {
     executable: bool,
 }
 
-pub(crate) async fn scan(
-    root: &Path,
-    base: &VolumeSnapshot,
-    volume: &ManagedVolume,
-) -> Result<ScannedTree, Error> {
+pub(crate) async fn scan(root: &Path, base: &VolumeSnapshot) -> Result<ScannedTree, Error> {
     let local = scan_paths(root)?;
     let base_paths = base.paths()?;
 
-    let mut inspected =
-        futures::stream::iter(
-            local
-                .iter()
-                .filter(|(_, entry)| entry.kind == NodeKind::RegularFile),
-        )
-        .map(|(path, _)| async move {
-            Ok::<_, Error>((path, volume.inspect_file(&root.join(path)).await?))
-        })
-        .buffer_unordered(32);
+    let mut inspected = futures::stream::iter(
+        local
+            .iter()
+            .filter(|(_, entry)| entry.kind == NodeKind::RegularFile),
+    )
+    .map(|(path, _)| async move { Ok::<_, Error>((path, inspect_file(&root.join(path)).await?)) })
+    .buffer_unordered(32);
     let mut file_by_path = BTreeMap::<String, FileVersionId>::new();
     while let Some(result) = inspected.next().await {
         let (path, version) = result?;

@@ -20,6 +20,7 @@ mod install;
 mod reconcile;
 mod scan;
 mod state;
+mod transfer;
 
 pub use engine::{SyncEngine, SyncOutcome};
 pub use state::{ConflictRecord, ReplicaState};
