@@ -362,10 +362,9 @@ fn report_inventory(fixture: &Fixture, profile: Profile) {
         "node-segment",
         "directory-segment",
         "file-version-segment",
-        "file-extent-segment",
         "change-segment",
         "operation-result-segment",
-        "file-shard",
+        "file-data",
     ];
     let mut metadata_objects = 0_u64;
     let mut metadata_bytes = 0_u64;
@@ -378,7 +377,7 @@ fn report_inventory(fixture: &Fixture, profile: Profile) {
         println!(
             "scale inventory: phase=initial class={class} objects={objects} encoded_bytes={bytes}"
         );
-        if *class == "file-shard" {
+        if *class == "file-data" {
             println!(
                 "scale inventory: phase=initial payload_objects={objects} payload_encoded_bytes={bytes}"
             );

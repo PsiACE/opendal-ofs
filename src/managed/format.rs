@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use serde::{Deserialize, Serialize};
-
 use crate::Error;
 use crate::filesystem::{NodeId, VolumeId};
 
@@ -25,7 +23,7 @@ use super::record::Record;
 pub(crate) const FORMAT_KEY: &str = "managed/1/format";
 const MAX_FORMAT_BODY_BYTES: usize = 64 * 1024;
 
-const FORMAT_RECORD: Record = Record::new(*b"OFSFMT01", 1, MAX_FORMAT_BODY_BYTES);
+const FORMAT_RECORD: Record = Record::new(*b"OFSFMT01", MAX_FORMAT_BODY_BYTES);
 pub(crate) const MAX_FORMAT_BYTES: usize = FORMAT_RECORD.maximum_encoded_bytes();
 
 /// The sole Managed storage format understood by this build.
@@ -36,7 +34,7 @@ pub struct ManagedFormat {
 }
 
 impl ManagedFormat {
-    pub const fn v1(volume_id: VolumeId, root_node_id: NodeId) -> Self {
+    pub const fn new(volume_id: VolumeId, root_node_id: NodeId) -> Self {
         Self {
             volume_id,
             root_node_id,
@@ -55,18 +53,11 @@ impl ManagedFormat {
         FORMAT_RECORD.encode(&VolumeFormat {
             volume_id: self.volume_id,
             root_node_id: self.root_node_id,
-            naming_policy: NamingPolicy::PortableV1,
         })
     }
 
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, Error> {
         let format: VolumeFormat = FORMAT_RECORD.decode(bytes)?;
-        if format.naming_policy != NamingPolicy::PortableV1 {
-            return Err(Error::unsupported(
-                "open Managed volume",
-                "volume naming policy is unsupported",
-            ));
-        }
         Ok(Self {
             volume_id: format.volume_id,
             root_node_id: format.root_node_id,
@@ -78,16 +69,8 @@ impl ManagedFormat {
 struct VolumeFormat {
     volume_id: VolumeId,
     root_node_id: NodeId,
-    naming_policy: NamingPolicy,
 }
 super::wire::tuple_wire!(VolumeFormat {
     volume_id: VolumeId,
     root_node_id: NodeId,
-    naming_policy: NamingPolicy,
 });
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-enum NamingPolicy {
-    PortableV1,
-}

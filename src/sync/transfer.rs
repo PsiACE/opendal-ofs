@@ -23,8 +23,8 @@ use tokio::io::AsyncReadExt as _;
 
 use crate::Error;
 use crate::filesystem::{Digest, FileFingerprint, FileVersionId, OperationId};
+use crate::managed::GcEpoch;
 use crate::managed::ManagedVolume;
-use crate::managed::{FileLayout, GcEpoch};
 
 const IO_BUFFER_BYTES: usize = 256 * 1024;
 
@@ -58,14 +58,13 @@ pub(super) async fn publish_file(
     volume: &ManagedVolume,
     path: &Path,
     fingerprint: FileFingerprint,
-    base_version: Option<FileVersionId>,
     gc_epoch: GcEpoch,
-) -> Result<FileLayout, Error> {
+) -> Result<crate::managed::StreamRef, Error> {
     let mut file = File::open(path)
         .await
         .map_err(|error| Error::from_io("publish local file", Some(path), error))?;
     volume
-        .publish_data(&mut file, fingerprint, base_version, gc_epoch)
+        .publish_data(&mut file, fingerprint, gc_epoch)
         .await
         .map_err(|error| error.with_context("path", path.display()))
 }
@@ -89,7 +88,7 @@ pub(super) async fn materialize_file(
             Error::from_io("create replica staging file", Some(&temporary), error)
         })?;
         volume
-            .read_data(version, &mut file)
+            .read_data(version, .., &mut file)
             .await
             .map_err(|error| error.with_context("path", temporary.display()))?;
         file.sync_all().await.map_err(|error| {

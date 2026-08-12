@@ -27,23 +27,20 @@ use crate::filesystem::{
 };
 use crate::{Error, ErrorKind};
 
-use super::data::{FileExtent, FileExtentRecord, FileLayout};
 use super::format::ManagedFormat;
 use super::object::{self, GcEpoch, ObjectClass, ObjectRef};
 use super::record::Record;
 use super::stream::{self, StreamKind, StreamRef};
 
 const HEAD_KEY: &str = "managed/1/head";
-const HEAD_RECORD: Record = Record::new(*b"OFSHEAD1", 1, 64 * 1024);
-const COMMIT_RECORD: Record = Record::new(*b"OFSCMIT1", 1, 4 * 1024 * 1024);
-const PROJECTION_RECORD: Record = Record::new(*b"OFSPROJ1", 1, 4 * 1024 * 1024);
+const HEAD_RECORD: Record = Record::new(*b"OFSHEAD1", 64 * 1024);
+const COMMIT_RECORD: Record = Record::new(*b"OFSCMIT1", 4 * 1024 * 1024);
 
 #[derive(Clone)]
 pub struct ManagedVolume {
     format: ManagedFormat,
     operator: Operator,
     file_versions: Arc<RwLock<BTreeMap<FileVersionId, FileVersionRecord>>>,
-    file_extents: Arc<RwLock<BTreeMap<FileVersionId, Vec<FileExtent>>>>,
 }
 
 pub struct ManagedObservation {
@@ -60,13 +57,11 @@ pub struct ManagedObservation {
 #[derive(Default)]
 pub(crate) struct StagedFileRecords {
     file_versions: Vec<StreamRef>,
-    file_extents: Vec<StreamRef>,
 }
 
 impl StagedFileRecords {
     pub(crate) fn extend(&mut self, other: Self) {
         self.file_versions.extend(other.file_versions);
-        self.file_extents.extend(other.file_extents);
     }
 }
 
@@ -129,11 +124,8 @@ struct NamespaceCommit {
     nodes: Vec<StreamRef>,
     directory_entries: Vec<StreamRef>,
     file_versions: Vec<StreamRef>,
-    file_extents: Vec<StreamRef>,
     changes: Vec<StreamRef>,
     operation_results: Vec<StreamRef>,
-    projections: Vec<ProjectionRef>,
-    extensions: Vec<ExtensionRef>,
 }
 super::wire::tuple_wire!(NamespaceCommit {
     volume_id: VolumeId,
@@ -141,131 +133,8 @@ super::wire::tuple_wire!(NamespaceCommit {
     nodes: Vec<StreamRef>,
     directory_entries: Vec<StreamRef>,
     file_versions: Vec<StreamRef>,
-    file_extents: Vec<StreamRef>,
     changes: Vec<StreamRef>,
     operation_results: Vec<StreamRef>,
-    projections: Vec<ProjectionRef>,
-    extensions: Vec<ExtensionRef>,
-});
-
-#[derive(Clone, Debug)]
-struct ProjectionRef {
-    kind: String,
-    schema_version: u16,
-    source: ProjectionSource,
-    manifest: ObjectRef,
-}
-super::wire::tuple_wire!(ProjectionRef {
-    kind: String,
-    schema_version: u16,
-    source: ProjectionSource,
-    manifest: ObjectRef,
-});
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum ProjectionSource {
-    Namespace {
-        volume_id: VolumeId,
-        change_cursor: ChangeCursor,
-        stream_kinds: Vec<StreamKind>,
-    },
-    Payloads {
-        payload_digests: Vec<super::object::PayloadDigest>,
-    },
-}
-
-impl Serialize for ProjectionSource {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        use serde::ser::SerializeTuple as _;
-        match self {
-            Self::Namespace {
-                volume_id,
-                change_cursor,
-                stream_kinds,
-            } => {
-                let mut tuple = serializer.serialize_tuple(4)?;
-                tuple.serialize_element(&0_u8)?;
-                tuple.serialize_element(volume_id)?;
-                tuple.serialize_element(change_cursor)?;
-                tuple.serialize_element(stream_kinds)?;
-                tuple.end()
-            }
-            Self::Payloads { payload_digests } => {
-                let mut tuple = serializer.serialize_tuple(2)?;
-                tuple.serialize_element(&1_u8)?;
-                tuple.serialize_element(payload_digests)?;
-                tuple.end()
-            }
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for ProjectionSource {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct ProjectionSourceVisitor;
-
-        impl<'de> serde::de::Visitor<'de> for ProjectionSourceVisitor {
-            type Value = ProjectionSource;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("a Managed projection source array")
-            }
-
-            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
-            where
-                A: serde::de::SeqAccess<'de>,
-            {
-                let tag = next_element(&mut sequence, "projection source tag")?;
-                let value = match tag {
-                    0_u8 => Self::Value::Namespace {
-                        volume_id: next_element(&mut sequence, "source volume identity")?,
-                        change_cursor: next_element(&mut sequence, "source change cursor")?,
-                        stream_kinds: next_element(&mut sequence, "source stream kinds")?,
-                    },
-                    1_u8 => Self::Value::Payloads {
-                        payload_digests: next_element(&mut sequence, "source payload digests")?,
-                    },
-                    _ => return Err(serde::de::Error::custom("unknown projection source tag")),
-                };
-                require_sequence_end(&mut sequence)?;
-                Ok(value)
-            }
-        }
-
-        deserializer.deserialize_seq(ProjectionSourceVisitor)
-    }
-}
-
-#[derive(Clone, Debug)]
-struct ProjectionManifest {
-    kind: String,
-    schema_version: u16,
-    source: ProjectionSource,
-    streams: Vec<StreamRef>,
-}
-super::wire::tuple_wire!(ProjectionManifest {
-    kind: String,
-    schema_version: u16,
-    source: ProjectionSource,
-    streams: Vec<StreamRef>,
-});
-
-#[derive(Clone, Debug)]
-struct ExtensionRef {
-    kind: String,
-    schema_version: u16,
-    manifest: ObjectRef,
-}
-super::wire::tuple_wire!(ExtensionRef {
-    kind: String,
-    schema_version: u16,
-    manifest: ObjectRef,
 });
 
 impl NamespaceCommit {
@@ -276,11 +145,8 @@ impl NamespaceCommit {
             nodes: vec![nodes],
             directory_entries: Vec::new(),
             file_versions: Vec::new(),
-            file_extents: Vec::new(),
             changes: Vec::new(),
             operation_results: Vec::new(),
-            projections: Vec::new(),
-            extensions: Vec::new(),
         }
     }
 
@@ -289,7 +155,6 @@ impl NamespaceCommit {
             .iter()
             .chain(&self.directory_entries)
             .chain(&self.file_versions)
-            .chain(&self.file_extents)
             .chain(&self.changes)
             .chain(&self.operation_results)
             .copied()
@@ -481,13 +346,13 @@ super::wire::tuple_wire!(DirectoryMutation {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct FileVersionRecord {
     pub(super) file_version: FileVersionId,
-    pub(super) file_size: u64,
     pub(super) content_fingerprint: FileFingerprint,
+    pub(super) data: StreamRef,
 }
 super::wire::tuple_wire!(FileVersionRecord {
     file_version: FileVersionId,
-    file_size: u64,
     content_fingerprint: FileFingerprint,
+    data: StreamRef,
 });
 
 #[derive(Debug)]
@@ -688,7 +553,6 @@ impl ManagedVolume {
             format,
             operator,
             file_versions: Arc::new(RwLock::new(BTreeMap::new())),
-            file_extents: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
 
@@ -731,7 +595,14 @@ impl ManagedVolume {
             gc_epoch: GcEpoch::ZERO,
             minimum_retained_cursor: ChangeCursor::Genesis,
         };
-        if object::create_control(&self.operator, HEAD_KEY, HEAD_RECORD.encode(&head)?).await? {
+        if object::write_control(
+            &self.operator,
+            HEAD_KEY,
+            HEAD_RECORD.encode(&head)?,
+            object::ControlCondition::Missing,
+        )
+        .await?
+        {
             Ok(())
         } else {
             self.observe().await.map(drop)
@@ -754,21 +625,21 @@ impl ManagedVolume {
     }
 
     pub(super) async fn read_head(&self) -> Result<(Head, String), Error> {
-        let (bytes, revision) = object::read_control_with_revision(
+        let control = object::read_control(
             &self.operator,
             HEAD_KEY,
             HEAD_RECORD.maximum_encoded_bytes(),
         )
         .await?
         .ok_or_else(|| Error::corrupt("open Managed volume", "namespace head is missing"))?;
-        let head: Head = HEAD_RECORD.decode(&bytes)?;
+        let head: Head = HEAD_RECORD.decode(&control.bytes)?;
         if head.minimum_retained_cursor.sequence() > head.current_commit.change_cursor.sequence() {
             return Err(Error::corrupt(
                 "read Managed namespace",
                 "namespace head retention is invalid",
             ));
         }
-        Ok((head, revision))
+        Ok((head, control.revision))
     }
 
     pub(crate) async fn prepare_publication(
@@ -794,17 +665,15 @@ impl ManagedVolume {
     pub(crate) async fn stage_file_records(
         &self,
         gc_epoch: GcEpoch,
-        files: Vec<(FileVersionId, FileFingerprint, FileLayout)>,
+        files: Vec<(FileVersionId, FileFingerprint, StreamRef)>,
     ) -> Result<StagedFileRecords, Error> {
         let mut file_versions = Vec::with_capacity(files.len());
-        let mut file_extents = Vec::new();
-        for (version, fingerprint, layout) in files {
+        for (file_version, content_fingerprint, data) in files {
             file_versions.push(FileVersionRecord {
-                file_version: version,
-                file_size: fingerprint.logical_length(),
-                content_fingerprint: fingerprint,
+                file_version,
+                content_fingerprint,
+                data,
             });
-            file_extents.extend(Self::extent_records(version, layout));
         }
         let mut staged = StagedFileRecords::default();
         append_stream(
@@ -814,15 +683,6 @@ impl ManagedVolume {
             ObjectClass::FileVersionSegment,
             StreamKind::FILE_VERSION_RECORDS,
             file_versions,
-        )
-        .await?;
-        append_stream(
-            &self.operator,
-            gc_epoch,
-            &mut staged.file_extents,
-            ObjectClass::FileExtentSegment,
-            StreamKind::FILE_EXTENT_RECORDS,
-            file_extents,
         )
         .await?;
         Ok(staged)
@@ -845,11 +705,11 @@ impl ManagedVolume {
             gc_epoch: observed.gc_epoch,
             minimum_retained_cursor: observed.reclamation_watermark,
         };
-        if object::replace_control(
+        if object::write_control(
             &self.operator,
             HEAD_KEY,
-            &observed.head_revision,
             HEAD_RECORD.encode(&head)?,
+            object::ControlCondition::Revision(&observed.head_revision),
         )
         .await?
         {
@@ -882,7 +742,7 @@ impl ManagedVolume {
             ));
         }
         let commit = self.read_commit(head.current_commit).await?;
-        self.read_namespace_streams_at(commit, revision.change_cursor)
+        self.read_namespace_streams(commit, revision.change_cursor)
             .await
             .map(|stored| stored.snapshot)
     }
@@ -904,11 +764,11 @@ impl ManagedVolume {
         expected_revision: &str,
         head: &Head,
     ) -> Result<bool, Error> {
-        object::replace_control(
+        object::write_control(
             &self.operator,
             HEAD_KEY,
-            expected_revision,
             HEAD_RECORD.encode(head)?,
+            object::ControlCondition::Revision(expected_revision),
         )
         .await
     }
@@ -923,27 +783,14 @@ impl ManagedVolume {
         for stream in commit.streams() {
             visit(stream.object)?;
         }
-        for reference in &commit.projections {
-            visit(reference.manifest)?;
-            let projection = self.read_projection_manifest(reference).await?;
-            for stream in projection.streams {
-                visit(stream.object)?;
-            }
-        }
-        if !commit.extensions.is_empty() {
-            return Err(Error::unsupported(
-                "collect Managed data",
-                "namespace contains an unsupported semantic extension",
-            ));
-        }
-        for reference in &commit.file_extents {
+        for reference in &commit.file_versions {
             require_stream(
                 *reference,
-                StreamKind::FILE_EXTENT_RECORDS,
-                ObjectClass::FileExtentSegment,
+                StreamKind::FILE_VERSION_RECORDS,
+                ObjectClass::FileVersionSegment,
             )?;
-            stream::visit_records(&self.operator, *reference, |record: FileExtentRecord| {
-                visit(record.shard.object)
+            stream::visit_records(&self.operator, *reference, |record: FileVersionRecord| {
+                visit(record.data.object)
             })
             .await?;
         }
@@ -989,11 +836,8 @@ impl ManagedVolume {
             nodes: Vec::new(),
             directory_entries: Vec::new(),
             file_versions: Vec::new(),
-            file_extents: Vec::new(),
             changes: Vec::new(),
             operation_results: Vec::new(),
-            projections: source.projections.clone(),
-            extensions: Vec::new(),
         };
         append_stream(
             &self.operator,
@@ -1045,25 +889,6 @@ impl ManagedVolume {
         .await?
         {
             target.file_versions.push(reference);
-        }
-        for reference in &source.file_extents {
-            require_stream(
-                *reference,
-                StreamKind::FILE_EXTENT_RECORDS,
-                ObjectClass::FileExtentSegment,
-            )?;
-        }
-        if let Some(reference) = stream::rewrite_records::<FileExtentRecord>(
-            &self.operator,
-            &source.file_extents,
-            gc_epoch,
-            ObjectClass::FileExtentSegment,
-            StreamKind::FILE_EXTENT_RECORDS,
-            |record| live_versions.contains(&record.file_version),
-        )
-        .await?
-        {
-            target.file_extents.push(reference);
         }
         Ok(())
     }
@@ -1267,7 +1092,6 @@ impl ManagedVolume {
         let mut commit = observed.commit.clone();
         commit.change_cursor = cursor;
         commit.file_versions.extend(files.file_versions);
-        commit.file_extents.extend(files.file_extents);
         append_stream(
             &self.operator,
             observed.gc_epoch,
@@ -1315,13 +1139,11 @@ impl ManagedVolume {
         gc_epoch: GcEpoch,
         commit: &NamespaceCommit,
     ) -> Result<NamespaceRevision, Error> {
-        let object = object::write_immutable(
-            &self.operator,
-            gc_epoch,
-            ObjectClass::NamespaceCommit,
-            COMMIT_RECORD.encode(commit)?,
-        )
-        .await?;
+        let mut writer =
+            object::ImmutableWriter::open(&self.operator, gc_epoch, ObjectClass::NamespaceCommit)
+                .await?;
+        writer.write(COMMIT_RECORD.encode(commit)?).await?;
+        let object = writer.close().await?;
         Ok(NamespaceRevision {
             object,
             change_cursor: commit.change_cursor,
@@ -1330,18 +1152,11 @@ impl ManagedVolume {
 
     async fn read_namespace(&self, reference: NamespaceRevision) -> Result<StoredNamespace, Error> {
         let commit = self.read_commit(reference).await?;
-        self.read_namespace_streams(commit).await
+        let view_cursor = commit.change_cursor;
+        self.read_namespace_streams(commit, view_cursor).await
     }
 
     async fn read_namespace_streams(
-        &self,
-        commit: NamespaceCommit,
-    ) -> Result<StoredNamespace, Error> {
-        let view_cursor = commit.change_cursor;
-        self.read_namespace_streams_at(commit, view_cursor).await
-    }
-
-    async fn read_namespace_streams_at(
         &self,
         commit: NamespaceCommit,
         view_cursor: ChangeCursor,
@@ -1354,7 +1169,22 @@ impl ManagedVolume {
                 ObjectClass::FileVersionSegment,
             )?;
             stream::visit_records(&self.operator, *reference, |record: FileVersionRecord| {
-                file_versions.insert(record.file_version, record);
+                if record.data.kind != StreamKind::FILE_BYTES
+                    || record.data.object.class != ObjectClass::FileData
+                    || record.data.payload_length != record.content_fingerprint.logical_length()
+                    || record.data.payload_digest != record.content_fingerprint.digest()
+                {
+                    return Err(Error::corrupt(
+                        "read Managed namespace",
+                        "file version has invalid data",
+                    ));
+                }
+                if file_versions.insert(record.file_version, record).is_some() {
+                    return Err(Error::corrupt(
+                        "read Managed namespace",
+                        "file version is recorded more than once",
+                    ));
+                }
                 Ok(())
             })
             .await?;
@@ -1386,26 +1216,6 @@ impl ManagedVolume {
                 })?
                 .entries
                 .insert(key.name, entry);
-        }
-        let mut file_extents = BTreeMap::<FileVersionId, Vec<FileExtent>>::new();
-        for reference in &commit.file_extents {
-            require_stream(
-                *reference,
-                StreamKind::FILE_EXTENT_RECORDS,
-                ObjectClass::FileExtentSegment,
-            )?;
-            stream::visit_records(&self.operator, *reference, |record: FileExtentRecord| {
-                file_extents
-                    .entry(record.file_version)
-                    .or_default()
-                    .push(FileExtent {
-                        logical_range: record.logical_range,
-                        shard: record.shard,
-                        object_range: record.object_range,
-                    });
-                Ok(())
-            })
-            .await?;
         }
         for reference in &commit.changes {
             require_stream(
@@ -1442,10 +1252,6 @@ impl ManagedVolume {
             .write()
             .map_err(|_| Error::unavailable("read Managed namespace", "file cache failed"))?
             .append(&mut file_versions);
-        self.file_extents
-            .write()
-            .map_err(|_| Error::unavailable("read Managed namespace", "file cache failed"))?
-            .append(&mut file_extents);
         Ok(StoredNamespace {
             snapshot,
             operations,
@@ -1542,16 +1348,6 @@ impl ManagedVolume {
             .ok_or_else(|| Error::corrupt("read Managed file", "file version is not indexed"))
     }
 
-    pub(super) fn file_extents(&self, version: FileVersionId) -> Result<Vec<FileExtent>, Error> {
-        Ok(self
-            .file_extents
-            .read()
-            .map_err(|_| Error::unavailable("read Managed file", "file cache failed"))?
-            .get(&version)
-            .cloned()
-            .unwrap_or_default())
-    }
-
     async fn read_commit(&self, reference: NamespaceRevision) -> Result<NamespaceCommit, Error> {
         if reference.object.class != ObjectClass::NamespaceCommit {
             return Err(Error::corrupt(
@@ -1572,42 +1368,7 @@ impl ManagedVolume {
                 "namespace commit does not match its reference",
             ));
         }
-        if !commit.extensions.is_empty() {
-            return Err(Error::unsupported(
-                "read Managed namespace",
-                "namespace contains an unsupported semantic extension",
-            ));
-        }
         Ok(commit)
-    }
-
-    async fn read_projection_manifest(
-        &self,
-        reference: &ProjectionRef,
-    ) -> Result<ProjectionManifest, Error> {
-        if reference.manifest.class != ObjectClass::ProjectionManifest {
-            return Err(Error::corrupt(
-                "read Managed projection",
-                "projection manifest has the wrong object class",
-            ));
-        }
-        let bytes = object::read_immutable(
-            &self.operator,
-            reference.manifest,
-            PROJECTION_RECORD.maximum_encoded_bytes(),
-        )
-        .await?;
-        let manifest: ProjectionManifest = PROJECTION_RECORD.decode(&bytes)?;
-        if manifest.kind != reference.kind
-            || manifest.schema_version != reference.schema_version
-            || manifest.source != reference.source
-        {
-            return Err(Error::corrupt(
-                "read Managed projection",
-                "projection manifest does not match its reference",
-            ));
-        }
-        Ok(manifest)
     }
 }
 

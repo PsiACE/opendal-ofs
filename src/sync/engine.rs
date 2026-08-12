@@ -535,41 +535,29 @@ impl SyncEngine {
             if common_versions.contains(&version) {
                 continue;
             }
-            let base_version = observed
-                .snapshot
-                .nodes
-                .get(&node_id)
-                .and_then(|node| node.file_version);
             let publish = new_versions.insert(version);
-            files.push((path, version, fingerprint, base_version, publish));
+            files.push((path, version, fingerprint, publish));
         }
 
         let mut staged = crate::managed::StagedFileRecords::default();
         for batch in files.chunks(FILE_RECORD_BATCH_FILES) {
             let layouts = futures::stream::iter(batch.iter().cloned())
-                .map(
-                    |(path, version, fingerprint, base_version, publish)| async move {
-                        let path = root.join(path);
-                        if publish {
-                            let layout = publish_file(
-                                &self.volume,
-                                &path,
-                                fingerprint,
-                                base_version,
-                                observed.gc_epoch(),
-                            )
-                            .await?;
-                            Ok(Some((version, fingerprint, layout)))
-                        } else if inspect_file(&path).await? != fingerprint {
-                            Err(Error::conflict(
-                                "publish Managed files",
-                                "local file changed while being published",
-                            ))
-                        } else {
-                            Ok(None)
-                        }
-                    },
-                )
+                .map(|(path, version, fingerprint, publish)| async move {
+                    let path = root.join(path);
+                    if publish {
+                        let layout =
+                            publish_file(&self.volume, &path, fingerprint, observed.gc_epoch())
+                                .await?;
+                        Ok(Some((version, fingerprint, layout)))
+                    } else if inspect_file(&path).await? != fingerprint {
+                        Err(Error::conflict(
+                            "publish Managed files",
+                            "local file changed while being published",
+                        ))
+                    } else {
+                        Ok(None)
+                    }
+                })
                 .buffer_unordered(self.transfer_concurrency)
                 .try_collect::<Vec<_>>()
                 .await?;

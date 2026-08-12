@@ -22,27 +22,20 @@ use serde::de::DeserializeOwned;
 
 use crate::Error;
 
-use super::object::{RangeChecksum, checksum};
+use super::object::checksum;
 
-const SCHEMA_VERSION_BYTES: usize = size_of::<u16>();
 const BODY_LENGTH_BYTES: usize = size_of::<u64>();
-const CHECKSUM_BYTES: usize = size_of::<RangeChecksum>();
+const CHECKSUM_BYTES: usize = size_of::<crate::filesystem::Checksum>();
 
 pub(crate) struct Record {
     magic: [u8; 8],
-    schema_version: u16,
     maximum_body_bytes: usize,
 }
 
 impl Record {
-    pub(crate) const fn new(
-        magic: [u8; 8],
-        schema_version: u16,
-        maximum_body_bytes: usize,
-    ) -> Self {
+    pub(crate) const fn new(magic: [u8; 8], maximum_body_bytes: usize) -> Self {
         Self {
             magic,
-            schema_version,
             maximum_body_bytes,
         }
     }
@@ -50,7 +43,6 @@ impl Record {
     pub(crate) const fn maximum_encoded_bytes(&self) -> usize {
         self.magic
             .len()
-            .saturating_add(SCHEMA_VERSION_BYTES)
             .saturating_add(BODY_LENGTH_BYTES)
             .saturating_add(self.maximum_body_bytes)
             .saturating_add(CHECKSUM_BYTES)
@@ -68,15 +60,9 @@ impl Record {
         }
         let body_length = u64::try_from(body.len())
             .map_err(|_| Error::invalid("encode Managed record", "record length overflows"))?;
-        let mut bytes = Vec::with_capacity(
-            self.magic.len()
-                + SCHEMA_VERSION_BYTES
-                + BODY_LENGTH_BYTES
-                + body.len()
-                + CHECKSUM_BYTES,
-        );
+        let mut bytes =
+            Vec::with_capacity(self.magic.len() + BODY_LENGTH_BYTES + body.len() + CHECKSUM_BYTES);
         bytes.extend_from_slice(&self.magic);
-        bytes.extend_from_slice(&self.schema_version.to_le_bytes());
         bytes.extend_from_slice(&body_length.to_le_bytes());
         bytes.extend_from_slice(&body);
         bytes.extend_from_slice(checksum(&bytes).as_bytes());
@@ -84,7 +70,7 @@ impl Record {
     }
 
     pub(crate) fn decode<T: DeserializeOwned>(&self, bytes: &[u8]) -> Result<T, Error> {
-        let header_bytes = self.magic.len() + SCHEMA_VERSION_BYTES + BODY_LENGTH_BYTES;
+        let header_bytes = self.magic.len() + BODY_LENGTH_BYTES;
         let minimum_bytes = header_bytes + CHECKSUM_BYTES;
         if bytes.len() < minimum_bytes || bytes[..self.magic.len()] != self.magic {
             return Err(Error::corrupt(
@@ -92,19 +78,7 @@ impl Record {
                 "record envelope is invalid",
             ));
         }
-        let version_offset = self.magic.len();
-        let version = u16::from_le_bytes(
-            bytes[version_offset..version_offset + SCHEMA_VERSION_BYTES]
-                .try_into()
-                .expect("version range has a fixed length"),
-        );
-        if version != self.schema_version {
-            return Err(Error::unsupported(
-                "decode Managed record",
-                "record schema version is unsupported",
-            ));
-        }
-        let length_offset = version_offset + SCHEMA_VERSION_BYTES;
+        let length_offset = self.magic.len();
         let body_length = usize::try_from(u64::from_le_bytes(
             bytes[length_offset..header_bytes]
                 .try_into()
