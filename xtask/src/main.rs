@@ -22,7 +22,6 @@ use std::process::Command as StdCommand;
 use clap::Parser;
 use clap::Subcommand;
 
-mod calibration;
 mod managed_sync;
 
 fn main() {
@@ -42,12 +41,10 @@ impl Command {
         match self.sub {
             SubCommand::Behavior(cmd) => cmd.run(),
             SubCommand::Build(cmd) => cmd.run(),
-            SubCommand::Calibrate(cmd) => cmd.run(),
             SubCommand::Check(cmd) => cmd.run(),
             SubCommand::E2e(cmd) => cmd.run(),
             SubCommand::Licenses(cmd) => cmd.run(),
             SubCommand::Lint(cmd) => cmd.run(),
-            SubCommand::Scale(cmd) => cmd.run(),
             SubCommand::Test(cmd) => cmd.run(),
         }
     }
@@ -59,8 +56,6 @@ enum SubCommand {
     Behavior(CommandBehavior),
     #[clap(about = "Build workspace binaries.")]
     Build(CommandBuild),
-    #[clap(about = "Compare Managed Sync behavior and resource use across revisions.")]
-    Calibrate(CommandCalibrate),
     #[clap(about = "Check all workspace targets.")]
     Check(CommandCheck),
     #[clap(about = "Run end-to-end scenarios that require external credentials.")]
@@ -69,125 +64,8 @@ enum SubCommand {
     Licenses(CommandLicenses),
     #[clap(about = "Run source and documentation linters.")]
     Lint(CommandLint),
-    #[clap(about = "Run fixed-scale acceptance profiles.")]
-    Scale(CommandScale),
     #[clap(about = "Run all workspace tests.")]
     Test(CommandTest),
-}
-
-#[derive(Parser)]
-#[clap(name = "calibrate")]
-struct CommandCalibrate {
-    #[command(subcommand)]
-    target: CalibrateTarget,
-}
-
-impl CommandCalibrate {
-    fn run(self) {
-        match self.target {
-            CalibrateTarget::ManagedSync(cmd) => cmd.run(),
-        }
-    }
-}
-
-#[derive(Subcommand)]
-enum CalibrateTarget {
-    #[clap(about = "Compare the current Managed Sync implementation with a local revision.")]
-    ManagedSync(CommandManagedSyncCalibrate),
-}
-
-#[derive(Parser)]
-#[clap(name = "managed-sync")]
-struct CommandManagedSyncCalibrate {
-    #[arg(long, default_value = calibration::DEFAULT_REFERENCE, value_name = "REVISION")]
-    reference: String,
-
-    #[arg(long, default_value = "3", value_name = "N")]
-    samples: usize,
-
-    #[arg(long, value_name = "DIRECTORY")]
-    output: Option<std::path::PathBuf>,
-
-    #[arg(long, help = "Retain work trees, logs, audit events, and the fixture.")]
-    keep: bool,
-}
-
-impl CommandManagedSyncCalibrate {
-    fn run(self) {
-        calibration::run(
-            &self.reference,
-            self.samples,
-            self.output.as_deref(),
-            self.keep,
-        );
-    }
-}
-
-#[derive(Parser)]
-#[clap(name = "scale")]
-struct CommandScale {
-    #[command(subcommand)]
-    target: ScaleTarget,
-}
-
-impl CommandScale {
-    fn run(self) {
-        match self.target {
-            ScaleTarget::ManagedSync(cmd) => cmd.run(),
-        }
-    }
-}
-
-#[derive(Subcommand)]
-enum ScaleTarget {
-    #[clap(about = "Run a fixed Managed Sync scale profile.")]
-    ManagedSync(CommandManagedSyncScale),
-}
-
-#[derive(Parser)]
-#[clap(name = "managed-sync")]
-struct CommandManagedSyncScale {
-    #[command(subcommand)]
-    profile: ManagedSyncScaleProfile,
-
-    #[arg(
-        long,
-        global = true,
-        default_value = ".local/move/scale",
-        value_name = "DIRECTORY",
-        help = "Directory for the incremental JSON report."
-    )]
-    output: std::path::PathBuf,
-
-    #[arg(
-        long,
-        global = true,
-        help = "Retain the work tree and object-store fixture."
-    )]
-    keep: bool,
-}
-
-impl CommandManagedSyncScale {
-    fn run(self) {
-        managed_sync::scale::run(self.profile.name(), &self.output, self.keep);
-    }
-}
-
-#[derive(Subcommand)]
-enum ManagedSyncScaleProfile {
-    #[clap(name = "tiny-files", about = "Run 1,000,000 unique 4 KiB files.")]
-    TinyFiles,
-    #[clap(name = "large-files", about = "Run three distinct 10 GiB files.")]
-    LargeFiles,
-}
-
-impl ManagedSyncScaleProfile {
-    const fn name(&self) -> &'static str {
-        match self {
-            Self::TinyFiles => "tiny-files",
-            Self::LargeFiles => "large-files",
-        }
-    }
 }
 
 #[derive(Parser)]

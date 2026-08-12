@@ -17,9 +17,6 @@
 
 //! Managed Sync behavior fixture.
 
-pub(crate) mod evaluation;
-pub(crate) mod scale;
-
 use std::env;
 use std::fs;
 use std::io::Read;
@@ -1208,7 +1205,6 @@ fn deterministic_bytes(length: usize, seed: u8) -> Vec<u8> {
 }
 
 pub(crate) struct Fixture {
-    audit_state: Option<PathBuf>,
     compose_file: PathBuf,
     keep: bool,
     minio_port: u16,
@@ -1502,24 +1498,8 @@ fn build_ofs() {
     run(&mut command);
 }
 
-fn build_ofs_release() {
-    let mut command = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
-    command.current_dir(env!("CARGO_WORKSPACE_DIR")).args([
-        "build",
-        "--release",
-        "--locked",
-        "--bin",
-        "ofs",
-    ]);
-    run(&mut command);
-}
-
 fn ofs_volume_create(storage: &str) -> Command {
-    ofs_volume_create_with(&ofs_debug_binary(), storage)
-}
-
-fn ofs_volume_create_with(binary: &Path, storage: &str) -> Command {
-    let mut command = ofs_command_with(binary);
+    let mut command = ofs_command();
     command
         .arg("volume")
         .arg("create")
@@ -1529,11 +1509,7 @@ fn ofs_volume_create_with(binary: &Path, storage: &str) -> Command {
 }
 
 fn ofs_sync(replica: &Path, state: &Path, storage: &str) -> Command {
-    ofs_sync_with(&ofs_debug_binary(), replica, state, storage)
-}
-
-fn ofs_sync_with(binary: &Path, replica: &Path, state: &Path, storage: &str) -> Command {
-    let mut command = ofs_command_with(binary);
+    let mut command = ofs_command();
     command
         .arg("sync")
         .arg(storage)
@@ -1544,11 +1520,7 @@ fn ofs_sync_with(binary: &Path, replica: &Path, state: &Path, storage: &str) -> 
 }
 
 fn ofs_status(replica: &Path, state: &Path) -> Command {
-    ofs_status_with(&ofs_debug_binary(), replica, state)
-}
-
-fn ofs_status_with(binary: &Path, replica: &Path, state: &Path) -> Command {
-    let mut command = ofs_command_with(binary);
+    let mut command = ofs_command();
     command
         .arg("status")
         .arg(replica)
@@ -1559,11 +1531,7 @@ fn ofs_status_with(binary: &Path, replica: &Path, state: &Path) -> Command {
 }
 
 fn ofs_gc(storage: &str, resume: bool) -> Command {
-    ofs_gc_with_binary(&ofs_debug_binary(), storage, resume)
-}
-
-fn ofs_gc_with_binary(binary: &Path, storage: &str, resume: bool) -> Command {
-    let mut command = ofs_command_with(binary);
+    let mut command = ofs_command();
     command.arg("gc").arg(storage);
     if resume {
         command.arg("--resume");
@@ -1583,12 +1551,8 @@ fn ofs_debug_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_WORKSPACE_DIR")).join("target/debug/ofs")
 }
 
-fn ofs_release_binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_WORKSPACE_DIR")).join("target/release/ofs")
-}
-
-fn ofs_command_with(binary: &Path) -> Command {
-    let mut command = Command::new(binary);
+fn ofs_command() -> Command {
+    let mut command = Command::new(ofs_debug_binary());
     command
         .env("AWS_ACCESS_KEY_ID", "minioadmin")
         .env("AWS_SECRET_ACCESS_KEY", "minioadmin")
@@ -1658,7 +1622,6 @@ impl Fixture {
             .unwrap_or(DEFAULT_MINIO_PORT);
         let workspace = PathBuf::from(env!("CARGO_WORKSPACE_DIR"));
         Self {
-            audit_state: None,
             compose_file: workspace.join("fixtures/managed-sync/compose.yaml"),
             keep,
             minio_port,
@@ -1672,40 +1635,6 @@ impl Fixture {
         run(self.compose().args(["up", "--detach", "minio"]));
         self.wait_until_ready();
         self
-    }
-
-    pub(crate) fn start_audited(mut self, audit_state: PathBuf) -> Self {
-        assert_eq!(
-            audit_state.file_name().and_then(|name| name.to_str()),
-            Some("audit.json"),
-            "Managed Sync audit state must be named audit.json"
-        );
-        let audit_directory = audit_state
-            .parent()
-            .expect("Managed Sync audit state has a parent");
-        fs::create_dir_all(audit_directory).expect("create Managed Sync audit directory");
-        assert!(
-            !audit_state.exists(),
-            "Managed Sync audit state already exists"
-        );
-        self.audit_state = Some(audit_state);
-        self.started = true;
-        run(self.compose().args(["up", "--detach", "audit"]));
-        let deadline = Instant::now() + FIXTURE_READY_TIMEOUT;
-        while Instant::now() < deadline {
-            if self
-                .compose()
-                .args(["exec", "-T", "audit", "test", "-s", "/tmp/audit.ready"])
-                .output()
-                .is_ok_and(|output| output.status.success())
-            {
-                run(self.compose().args(["up", "--detach", "minio"]));
-                self.wait_until_ready();
-                return self;
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-        panic!("Managed Sync audit fixture did not become ready");
     }
 
     fn start_bub(mut self) -> Self {
@@ -1758,68 +1687,6 @@ impl Fixture {
         ]));
     }
 
-    pub(crate) fn create_evaluation_user(&self) {
-        run(self.compose().args([
-            "run",
-            "--rm",
-            "--no-deps",
-            "minio-client",
-            "admin",
-            "user",
-            "add",
-            "local",
-            evaluation::PRODUCT_ACCESS_KEY,
-            evaluation::PRODUCT_SECRET_KEY,
-        ]));
-        run(self.compose().args([
-            "run",
-            "--rm",
-            "--no-deps",
-            "minio-client",
-            "admin",
-            "policy",
-            "attach",
-            "local",
-            "readwrite",
-            "--user",
-            evaluation::PRODUCT_ACCESS_KEY,
-        ]));
-    }
-
-    pub(crate) fn inventory(&self, root: &str) -> serde_json::Value {
-        let mut command = self.compose();
-        command.args([
-            "run",
-            "--rm",
-            "--no-deps",
-            "-T",
-            "minio-client",
-            "ls",
-            "--recursive",
-            "--json",
-            &format!("local/managed-sync/{root}"),
-        ]);
-        evaluation::inventory(command)
-    }
-
-    pub(crate) fn publish_audit_marker_with(&self, mut command: Command) {
-        assert!(
-            self.audit_state.is_some(),
-            "Managed Sync audit fixture has audit state"
-        );
-        evaluation::use_product_credentials(&mut command);
-        run_ofs_success(command, "publish MinIO audit barrier");
-    }
-
-    pub(crate) fn finish_audit_with(&self, marker: &str, command: Command) {
-        let audit_state = self
-            .audit_state
-            .as_ref()
-            .expect("audited fixture has audit state");
-        self.publish_audit_marker_with(command);
-        evaluation::wait_for_audit_marker(audit_state, marker, FIXTURE_READY_TIMEOUT);
-    }
-
     pub(crate) fn storage_url(&self, root: &str) -> String {
         format!(
             "s3://managed-sync/{root}?endpoint=http%3A%2F%2F127.0.0.1%3A{}&region=us-east-1",
@@ -1870,14 +1737,6 @@ impl Fixture {
             .env("OFS_MANAGED_SYNC_MINIO_PORT", self.minio_port.to_string())
             .args(["--project-name", &self.project, "--file"])
             .arg(&self.compose_file);
-        if let Some(audit_state) = &self.audit_state {
-            command.env("OFS_MANAGED_SYNC_AUDIT_ENABLE", "on").env(
-                "OFS_MANAGED_SYNC_AUDIT_DIR",
-                audit_state
-                    .parent()
-                    .expect("Managed Sync audit state has a parent"),
-            );
-        }
         command
     }
 

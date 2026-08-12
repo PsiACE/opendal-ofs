@@ -16,20 +16,6 @@
 # under the License.
 
 services:
-  audit:
-    image: python:3.13-alpine3.22
-    stop_grace_period: 1s
-    command:
-      - python
-      - /fixture/audit.py
-      - --state
-      - /evidence/audit.json
-      - --ready
-      - /tmp/audit.ready
-    volumes:
-      - ./audit.py:/fixture/audit.py:ro,Z
-      - ${OFS_MANAGED_SYNC_AUDIT_DIR:-/tmp/ofs-managed-sync-audit}:/evidence:Z
-
   bub-a: &bub-client
     build:
       context: ../..
@@ -56,13 +42,10 @@ services:
     image: quay.io/minio/minio:RELEASE.2024-09-22T00-33-43Z
     command: server /data
     environment:
-      MINIO_AUDIT_WEBHOOK_BATCH_SIZE_HARNESS: "1000"
-      MINIO_AUDIT_WEBHOOK_ENABLE_HARNESS: ${OFS_MANAGED_SYNC_AUDIT_ENABLE:-off}
-      MINIO_AUDIT_WEBHOOK_ENDPOINT_HARNESS: http://audit:8080
       MINIO_ROOT_PASSWORD: minioadmin
       MINIO_ROOT_USER: minioadmin
-      NO_PROXY: audit,minio,127.0.0.1,localhost
-      no_proxy: audit,minio,127.0.0.1,localhost
+      NO_PROXY: minio,127.0.0.1,localhost
+      no_proxy: minio,127.0.0.1,localhost
     ports:
       - "127.0.0.1:${OFS_MANAGED_SYNC_MINIO_PORT:-19000}:9000"
     volumes:
