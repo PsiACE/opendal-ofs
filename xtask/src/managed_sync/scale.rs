@@ -64,6 +64,9 @@ pub(crate) fn run(profile: &str, keep: bool) {
             "publish scale fixture",
         );
     });
+    stage("inspect initial inventory", || {
+        report_inventory(&fixture, profile)
+    });
     stage("cold restore", || {
         ofs_success(
             sync(&replicas[1], &states[1], &storage),
@@ -351,6 +354,42 @@ fn stage(name: &str, action: impl FnOnce()) {
     let started = Instant::now();
     action();
     println!("scale stage: {name} elapsed={:?}", started.elapsed());
+}
+
+fn report_inventory(fixture: &Fixture, profile: Profile) {
+    const CLASSES: &[&str] = &[
+        "namespace-commit",
+        "node-segment",
+        "directory-segment",
+        "file-version-segment",
+        "file-extent-segment",
+        "change-segment",
+        "operation-result-segment",
+        "file-shard",
+    ];
+    let mut metadata_objects = 0_u64;
+    let mut metadata_bytes = 0_u64;
+    for class in CLASSES {
+        let target = format!(
+            "local/managed-sync/scale/{}/managed/1/objects/0/{class}",
+            profile.name()
+        );
+        let (objects, bytes) = fixture.storage_usage(&target);
+        println!(
+            "scale inventory: phase=initial class={class} objects={objects} encoded_bytes={bytes}"
+        );
+        if *class == "file-shard" {
+            println!(
+                "scale inventory: phase=initial payload_objects={objects} payload_encoded_bytes={bytes}"
+            );
+        } else {
+            metadata_objects += objects;
+            metadata_bytes += bytes;
+        }
+    }
+    println!(
+        "scale inventory: phase=initial metadata_objects={metadata_objects} metadata_encoded_bytes={metadata_bytes}"
+    );
 }
 
 fn build_release() {

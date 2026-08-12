@@ -1689,6 +1689,35 @@ impl Fixture {
         )
     }
 
+    pub(crate) fn storage_usage(&self, target: &str) -> (u64, u64) {
+        let output = self
+            .compose()
+            .args([
+                "run",
+                "--rm",
+                "--no-deps",
+                "minio-client",
+                "du",
+                "--json",
+                target,
+            ])
+            .output()
+            .expect("inspect Managed storage usage");
+        assert!(
+            output.status.success(),
+            "inspect Managed storage usage failed: {}",
+            output_text(&output.stderr)
+        );
+        let document: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("Managed storage usage is valid JSON");
+        let field = |name| {
+            document[name]
+                .as_u64()
+                .unwrap_or_else(|| panic!("Managed storage usage field {name} is an integer"))
+        };
+        (field("objects"), field("size"))
+    }
+
     fn container_storage_url(&self, root: &str) -> String {
         format!(
             "s3://managed-sync/{root}?endpoint=http%3A%2F%2F127.0.0.1%3A{}&region=us-east-1",
