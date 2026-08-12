@@ -15,74 +15,70 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::ops::{Bound, RangeBounds};
-
-use tokio::io::{AsyncRead, AsyncWrite};
-
 use crate::Error;
-use crate::filesystem::FileFingerprint;
+use crate::filesystem::{Digest, FileFingerprint};
 
-use super::ManagedVolume;
-use super::object::{GcEpoch, ObjectClass};
-use super::stream::{self, StreamKind, StreamRef};
+use super::object::{GcEpoch, ObjectClass, ObjectId, ObjectLocator, ObjectRef};
+use super::stream::{STREAM_TAIL_BYTES, StreamKind, StreamRef};
 
-impl ManagedVolume {
-    /// Publish one file as an immutable byte stream.
-    pub(crate) async fn publish_data(
-        &self,
-        source: &mut (impl AsyncRead + Unpin),
+/// Minimal durable reference carried by a regular-file namespace entry.
+///
+/// Its enclosing namespace record supplies the logical length and payload
+/// digest. The field context fixes the object class and stream kind.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FileDataRef {
+    gc_epoch: GcEpoch,
+    object_id: ObjectId,
+    object_digest: Digest,
+}
+
+super::wire::tuple_wire!(FileDataRef {
+    gc_epoch: GcEpoch,
+    object_id: ObjectId,
+    object_digest: Digest,
+});
+
+impl FileDataRef {
+    pub(super) fn from_stream(
+        reference: StreamRef,
         fingerprint: FileFingerprint,
-        gc_epoch: GcEpoch,
-    ) -> Result<StreamRef, Error> {
-        stream::write_byte_stream(
-            self.operator(),
-            gc_epoch,
-            source,
-            fingerprint.logical_length(),
-            fingerprint.digest(),
-        )
-        .await
-    }
-
-    /// Read one logical byte range and verify complete-file reads.
-    pub(crate) async fn read_data(
-        &self,
-        content: (FileFingerprint, StreamRef),
-        range: impl RangeBounds<u64>,
-        destination: &mut (impl AsyncWrite + Unpin),
-    ) -> Result<(), Error> {
-        let (fingerprint, stream) = content;
-        let file_size = fingerprint.logical_length();
-        let start = match range.start_bound() {
-            Bound::Included(offset) => *offset,
-            Bound::Excluded(offset) => offset.checked_add(1).ok_or_else(|| {
-                Error::invalid("read Managed file range", "range start overflows")
-            })?,
-            Bound::Unbounded => 0,
-        };
-        let end = match range.end_bound() {
-            Bound::Included(offset) => offset
-                .checked_add(1)
-                .ok_or_else(|| Error::invalid("read Managed file range", "range end overflows"))?,
-            Bound::Excluded(offset) => *offset,
-            Bound::Unbounded => file_size,
-        };
-        if start > end || end > file_size {
-            return Err(Error::invalid(
-                "read Managed file range",
-                "logical byte range is invalid",
-            ));
-        }
-        if stream.kind != StreamKind::FILE_BYTES
-            || stream.object.class != ObjectClass::FileData
-            || stream.payload_length != file_size
-            || stream.payload_digest != fingerprint.digest()
+    ) -> Result<Self, Error> {
+        if reference
+            .require(StreamKind::FILE_BYTES, ObjectClass::FileData)
+            .is_err()
+            || reference.payload_length != fingerprint.logical_length()
+            || reference.payload_digest != fingerprint.digest()
         {
             return Err(Error::corrupt(
-                "read Managed file",
+                "publish Managed file",
                 "file data does not match its fingerprint",
             ));
         }
-        stream::copy_byte_stream(self.operator(), stream, start..end, destination).await
+        Ok(Self {
+            gc_epoch: reference.object.locator.gc_epoch,
+            object_id: reference.object.locator.id,
+            object_digest: reference.object.digest,
+        })
+    }
+
+    pub(crate) fn stream_ref(self, fingerprint: FileFingerprint) -> Result<StreamRef, Error> {
+        let payload_length = fingerprint.logical_length();
+        let encoded_length = payload_length
+            .checked_add(STREAM_TAIL_BYTES as u64)
+            .ok_or_else(|| Error::corrupt("read Managed file", "file length overflows"))?;
+        Ok(StreamRef {
+            kind: StreamKind::FILE_BYTES,
+            object: ObjectRef {
+                locator: ObjectLocator {
+                    gc_epoch: self.gc_epoch,
+                    class: ObjectClass::FileData,
+                    id: self.object_id,
+                },
+                encoded_length,
+                digest: self.object_digest,
+            },
+            payload_length,
+            payload_digest: fingerprint.digest(),
+        })
     }
 }

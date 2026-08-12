@@ -73,28 +73,7 @@ impl ReplicaState {
         }
     }
 
-    pub fn load(path: &Path) -> Result<Option<Self>, Error> {
-        let state = super::state_file::load(path)?;
-        if let Some(state) = &state {
-            state.validate()?;
-        }
-        Ok(state)
-    }
-
-    pub(crate) fn save_new(&self, path: &Path) -> Result<(), Error> {
-        self.persist(path, false)
-    }
-
-    pub(crate) fn save(&self, path: &Path) -> Result<(), Error> {
-        self.persist(path, true)
-    }
-
-    fn persist(&self, path: &Path, replace: bool) -> Result<(), Error> {
-        self.validate()?;
-        super::state_file::persist(self, path, replace)
-    }
-
-    fn validate(&self) -> Result<(), Error> {
+    pub(super) fn validate(&self) -> Result<(), Error> {
         if self.observed.cursor().sequence() < self.common.cursor().sequence() {
             return Err(Error::invalid(
                 "synchronize replica",

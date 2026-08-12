@@ -18,14 +18,14 @@
 use std::fs;
 
 use anyhow::{Context, Result, bail};
-use ofs::sync::ReplicaState;
+use ofs::sync::load_replica_state;
 
 use crate::cli::StatusArgs;
 
 pub(super) fn run(args: StatusArgs) -> Result<()> {
     let root = fs::canonicalize(&args.replica)
         .with_context(|| format!("cannot open replica directory: {}", args.replica.display()))?;
-    let state = ReplicaState::load(&args.state)?
+    let state = load_replica_state(&args.state)?
         .ok_or_else(|| anyhow::anyhow!("replica state does not exist: {}", args.state.display()))?;
     if state.root() != root {
         bail!("replica state belongs to a different local directory");

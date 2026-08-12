@@ -20,7 +20,7 @@ use std::collections::BTreeSet;
 
 use crate::Error;
 use crate::filesystem::{NamespaceNode, NamespaceRecord, NodeKind, validate_portable_path};
-use crate::managed::StreamRef;
+use crate::managed::FileDataRef;
 use crate::namespace::Namespace;
 use crate::workset::{SpoolReader, WorksetOptions, Workspace};
 
@@ -29,12 +29,12 @@ use super::ConflictRecord;
 pub(crate) enum ReconcilePlan {
     Conflicted(Vec<ConflictRecord>),
     Remote,
-    Publish(Namespace<Option<StreamRef>>),
+    Publish(Namespace<Option<FileDataRef>>),
 }
 
 pub(crate) fn changed_paths(
-    base: &Namespace<StreamRef>,
-    side: &Namespace<Option<StreamRef>>,
+    base: &Namespace<FileDataRef>,
+    side: &Namespace<Option<FileDataRef>>,
 ) -> Result<BTreeSet<String>, Error> {
     require_same_volume(base, side)?;
     let mut base = OrderedRecords::open(base)?;
@@ -51,9 +51,9 @@ pub(crate) fn changed_paths(
 }
 
 pub(crate) fn reconcile(
-    common: &Namespace<StreamRef>,
-    local: &Namespace<Option<StreamRef>>,
-    remote: &Namespace<StreamRef>,
+    common: &Namespace<FileDataRef>,
+    local: &Namespace<Option<FileDataRef>>,
+    remote: &Namespace<FileDataRef>,
     resolved: &BTreeSet<String>,
     worksets: WorksetOptions,
 ) -> Result<ReconcilePlan, Error> {
@@ -190,9 +190,9 @@ pub(crate) fn reconcile(
 }
 
 fn directory_conflicts(
-    common: &Namespace<StreamRef>,
-    local: &Namespace<Option<StreamRef>>,
-    remote: &Namespace<StreamRef>,
+    common: &Namespace<FileDataRef>,
+    local: &Namespace<Option<FileDataRef>>,
+    remote: &Namespace<FileDataRef>,
 ) -> Result<Vec<String>, Error> {
     let mut common = OrderedRecords::open(common)?;
     let mut local = OrderedRecords::open(local)?;
@@ -385,14 +385,14 @@ fn kind<C>(record: Option<&NamespaceRecord<C>>) -> Option<NodeKind> {
 }
 
 fn live_local_record(
-    record: NamespaceRecord<Option<StreamRef>>,
-) -> Option<NamespaceRecord<Option<StreamRef>>> {
+    record: NamespaceRecord<Option<FileDataRef>>,
+) -> Option<NamespaceRecord<Option<FileDataRef>>> {
     record.value.is_some().then_some(record)
 }
 
 fn live_remote_record(
-    record: NamespaceRecord<StreamRef>,
-) -> Option<NamespaceRecord<Option<StreamRef>>> {
+    record: NamespaceRecord<FileDataRef>,
+) -> Option<NamespaceRecord<Option<FileDataRef>>> {
     record.value.is_some().then(|| record.map_content(Some))
 }
 

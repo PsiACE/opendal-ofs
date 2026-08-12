@@ -25,7 +25,7 @@ use crate::filesystem::{
     ChangeCursor, FileVersionId, NamespaceNode, NamespaceRecord, NamespaceValue, NodeAttributes,
     NodeId, NodeKind,
 };
-use crate::managed::{self, StreamRef};
+use crate::managed::{self, FileDataRef};
 use crate::namespace::Namespace;
 use crate::workset;
 
@@ -34,12 +34,12 @@ use super::rename::RenameCandidates;
 
 pub(crate) enum ScannedTree {
     Unchanged,
-    Changed(Namespace<Option<StreamRef>>),
+    Changed(Namespace<Option<FileDataRef>>),
 }
 
 pub(crate) async fn scan(
     root: &Path,
-    base: &Namespace<managed::StreamRef>,
+    base: &Namespace<managed::FileDataRef>,
     concurrency: usize,
     worksets: workset::WorksetOptions,
 ) -> Result<ScannedTree, Error> {
@@ -50,8 +50,6 @@ pub(crate) async fn scan(
         .sequence()
         .checked_add(1)
         .map(ChangeCursor::from_sequence);
-    let record_cursor = next_cursor.unwrap_or(base.cursor);
-
     let mut output = workspace.writer("scanned-namespace")?;
     let mut renames = RenameCandidates::new(&workspace)?;
     let mut changed_directories = workspace.writer("changed-directories")?;
@@ -75,7 +73,7 @@ pub(crate) async fn scan(
                 local_head = local_reader.next()?;
                 changed = true;
                 write_parent(&mut changed_directories, &local.path)?;
-                write_new_local(&mut output, &mut renames, local, record_cursor)?;
+                write_new_local(&mut output, &mut renames, local)?;
             }
             Ordering::Greater => {
                 let base_record = base_head.take().expect("base namespace record exists");
@@ -107,14 +105,13 @@ pub(crate) async fn scan(
                     let node = reuse_same_path(&local, base_node)?;
                     output.write(&NamespaceRecord {
                         path,
-                        change_cursor: record_cursor,
                         value: Some(node),
                     })?;
                 } else {
                     changed = true;
                     write_parent(&mut changed_directories, &path)?;
                     renames.removed_node(path.clone(), base_node)?;
-                    write_new_local(&mut output, &mut renames, local, record_cursor)?;
+                    write_new_local(&mut output, &mut renames, local)?;
                 }
             }
         }
@@ -126,7 +123,7 @@ pub(crate) async fn scan(
         ));
     }
 
-    let renames = renames.resolve(&workspace, record_cursor)?;
+    let renames = renames.resolve(&workspace)?;
     if !changed {
         return Ok(ScannedTree::Unchanged);
     }
@@ -146,9 +143,9 @@ pub(crate) async fn scan(
 
 fn merge_path_records(
     workspace: &workset::Workspace,
-    main: &workset::Spool<NamespaceRecord<Option<StreamRef>>>,
-    renames: &workset::Spool<NamespaceRecord<Option<StreamRef>>>,
-) -> Result<workset::Spool<NamespaceRecord<Option<StreamRef>>>, Error> {
+    main: &workset::Spool<NamespaceRecord<Option<FileDataRef>>>,
+    renames: &workset::Spool<NamespaceRecord<Option<FileDataRef>>>,
+) -> Result<workset::Spool<NamespaceRecord<Option<FileDataRef>>>, Error> {
     let mut main = main.reader()?;
     let mut renames = renames.reader()?;
     let mut left = main.next()?;
@@ -185,15 +182,13 @@ fn merge_path_records(
 }
 
 fn write_new_local(
-    output: &mut workset::SpoolWriter<NamespaceRecord<Option<StreamRef>>>,
+    output: &mut workset::SpoolWriter<NamespaceRecord<Option<FileDataRef>>>,
     renames: &mut RenameCandidates,
     local: LocalRecord,
-    cursor: ChangeCursor,
 ) -> Result<(), Error> {
     match local.kind {
         NodeKind::Directory => output.write(&NamespaceRecord {
             path: local.path,
-            change_cursor: cursor,
             value: Some(new_directory()),
         }),
         NodeKind::RegularFile => renames.local(local),
@@ -214,10 +209,10 @@ fn write_parent(output: &mut workset::SpoolWriter<String>, path: &str) -> Result
 
 fn advance_directory_generations(
     workspace: &workset::Workspace,
-    base: &Namespace<StreamRef>,
-    target: &workset::Spool<NamespaceRecord<Option<StreamRef>>>,
+    base: &Namespace<FileDataRef>,
+    target: &workset::Spool<NamespaceRecord<Option<FileDataRef>>>,
     changed_directories: &workset::Spool<String>,
-) -> Result<workset::Spool<NamespaceRecord<Option<StreamRef>>>, Error> {
+) -> Result<workset::Spool<NamespaceRecord<Option<FileDataRef>>>, Error> {
     let mut base = base.reader()?;
     let mut target = target.reader()?;
     let mut changed = changed_directories.reader()?;
@@ -260,8 +255,8 @@ fn advance_directory_generations(
 
 fn reuse_same_path(
     local: &LocalRecord,
-    base: NamespaceNode<StreamRef>,
-) -> Result<NamespaceNode<Option<StreamRef>>, Error> {
+    base: NamespaceNode<FileDataRef>,
+) -> Result<NamespaceNode<Option<FileDataRef>>, Error> {
     let attributes = NodeAttributes {
         executable: local.executable,
     };
@@ -311,7 +306,7 @@ fn reuse_same_path(
     }
 }
 
-fn same_base_entry(local: &LocalRecord, node: &NamespaceNode<StreamRef>) -> bool {
+fn same_base_entry(local: &LocalRecord, node: &NamespaceNode<FileDataRef>) -> bool {
     if node.kind() != local.kind || node.attributes.executable != local.executable {
         return false;
     }
@@ -323,7 +318,7 @@ fn same_base_entry(local: &LocalRecord, node: &NamespaceNode<StreamRef>) -> bool
     }
 }
 
-fn new_directory() -> NamespaceNode<Option<StreamRef>> {
+fn new_directory() -> NamespaceNode<Option<FileDataRef>> {
     NamespaceNode {
         node_id: NodeId::generate(),
         generation: 1,

@@ -23,13 +23,14 @@ use serde::de::DeserializeOwned;
 
 use crate::Error;
 use crate::filesystem::ChangeCursor;
-use crate::managed::{ManagedVolume, NamespaceRevision, StreamRef};
+use crate::managed::{FileDataRef, ManagedVolume, NamespaceRevision};
 use crate::namespace::Namespace;
 
 use super::ReplicaState;
 use super::install::install;
 use super::reconcile::{ReconcilePlan, reconcile};
 use super::scan::{ScannedTree, scan};
+use super::state_file;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SyncOutcome {
@@ -74,7 +75,7 @@ impl SyncEngine {
         }
 
         let observed = self.volume.observe().await?;
-        let stored = ReplicaState::load(state_path)?;
+        let stored = state_file::load(state_path)?;
         if let Some(state) = &stored {
             if state.root() != root {
                 return Err(Error::invalid(
@@ -114,7 +115,7 @@ impl SyncEngine {
                     ));
                 }
                 let state = ReplicaState::new(root.clone(), self.volume.id(), observed.revision());
-                state.save_new(state_path)?;
+                state_file::persist(&state, state_path, false)?;
                 state
             }
             None => {
@@ -130,8 +131,8 @@ impl SyncEngine {
                     self.volume.id(),
                     observed.revision(),
                 );
-                state.save_new(state_path)?;
-                install::<StreamRef>(
+                state_file::persist(&state, state_path, false)?;
+                install::<FileDataRef>(
                     &root,
                     None,
                     &observed.namespace,
@@ -140,7 +141,7 @@ impl SyncEngine {
                 )
                 .await?;
                 state.advance(observed.revision());
-                state.save(state_path)?;
+                state_file::persist(&state, state_path, true)?;
                 return Ok(SyncOutcome {
                     conflict_paths: Vec::new(),
                     published: false,
@@ -159,7 +160,7 @@ impl SyncEngine {
                 == observed.revision().cursor().sequence()
         {
             state.rebase_equivalent(observed.revision())?;
-            state.save(state_path)?;
+            state_file::persist(&state, state_path, true)?;
         }
         if !observed.can_read_revision(state.common_revision()) {
             return self
@@ -200,7 +201,7 @@ impl SyncEngine {
                     .prepare_and_commit(state_path, &mut state, &observed, &target)
                     .await?;
                 state.advance(revision);
-                state.save(state_path)?;
+                state_file::persist(&state, state_path, true)?;
                 Ok(SyncOutcome {
                     conflict_paths: Vec::new(),
                     published: true,
@@ -240,7 +241,7 @@ impl SyncEngine {
                             .map(|conflict| conflict.path)
                             .collect::<Vec<_>>();
                         state.retain_conflicts(conflict_paths.len(), observed.revision(), false);
-                        state.save(state_path)?;
+                        state_file::persist(&state, state_path, true)?;
                         return Ok(SyncOutcome {
                             conflict_paths,
                             published: false,
@@ -277,13 +278,13 @@ impl SyncEngine {
         root: &Path,
         state_path: &Path,
         mut state: ReplicaState,
-        target: &Namespace<StreamRef>,
+        target: &Namespace<FileDataRef>,
         target_revision: NamespaceRevision,
         current: Option<&Namespace<C>>,
         published: bool,
     ) -> Result<SyncOutcome, Error> {
         state.begin_install(target_revision, published);
-        state.save(state_path)?;
+        state_file::persist(&state, state_path, true)?;
         install(
             root,
             current,
@@ -293,7 +294,7 @@ impl SyncEngine {
         )
         .await?;
         state.advance(target_revision);
-        state.save(state_path)?;
+        state_file::persist(&state, state_path, true)?;
         Ok(SyncOutcome {
             conflict_paths: Vec::new(),
             published,

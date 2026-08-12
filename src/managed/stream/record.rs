@@ -25,7 +25,8 @@ use serde::de::DeserializeOwned;
 use crate::Error;
 use crate::filesystem::Digest;
 
-use super::super::object::{GcEpoch, ImmutableWriter, ObjectClass, checksum};
+use super::super::object::{GcEpoch, ObjectClass, checksum};
+use super::super::storage::ImmutableWriter;
 use super::{
     STREAM_TAIL_BYTES, StreamKind, StreamRef, finish_stream, validate_stream_layout,
     validate_stream_tail,
@@ -204,13 +205,13 @@ async fn write_frame(
 ) -> Result<(), Error> {
     let frame_length = u64::try_from(frame.len())
         .map_err(|_| Error::invalid("write Managed stream", "frame length overflows"))?;
-    let mut header = Vec::with_capacity(FRAME_HEADER_BYTES);
-    header.extend_from_slice(&FRAME_MAGIC);
-    header.extend_from_slice(&frame_length.to_le_bytes());
-    header.extend_from_slice(&record_count.to_le_bytes());
-    header.extend_from_slice(checksum(&frame).as_bytes());
-    writer.write(header).await?;
-    writer.write(frame).await?;
+    let mut encoded = Vec::with_capacity(FRAME_HEADER_BYTES + frame.len());
+    encoded.extend_from_slice(&FRAME_MAGIC);
+    encoded.extend_from_slice(&frame_length.to_le_bytes());
+    encoded.extend_from_slice(&record_count.to_le_bytes());
+    encoded.extend_from_slice(checksum(&frame).as_bytes());
+    encoded.extend_from_slice(&frame);
+    writer.write(encoded).await?;
     *payload_length = payload_length
         .checked_add(FRAME_HEADER_BYTES as u64)
         .and_then(|length| length.checked_add(frame_length))

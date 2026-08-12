@@ -23,7 +23,7 @@ use opendal::{Buffer, ErrorKind as StorageErrorKind, Operator, Writer};
 use crate::Error;
 use crate::filesystem::Digest;
 
-use super::object::{GcEpoch, ObjectClass, ObjectId, ObjectRef, object_key};
+use super::object::{GcEpoch, ObjectClass, ObjectLocator, ObjectRef};
 
 pub(crate) struct ControlObject {
     pub(crate) bytes: Vec<u8>,
@@ -105,9 +105,7 @@ pub(crate) async fn write_control(
 }
 
 pub(crate) struct ImmutableWriter {
-    gc_epoch: GcEpoch,
-    class: ObjectClass,
-    id: ObjectId,
+    locator: ObjectLocator,
     writer: Writer,
     hasher: Hasher,
     encoded_length: u64,
@@ -119,17 +117,15 @@ impl ImmutableWriter {
         gc_epoch: GcEpoch,
         class: ObjectClass,
     ) -> Result<Self, Error> {
-        let id = ObjectId::generate();
-        let key = object_key(gc_epoch, class, id);
+        let locator = ObjectLocator::generate(gc_epoch, class);
+        let key = locator.key();
         let writer = operator
             .writer_with(&key)
             .if_not_exists(true)
             .await
             .map_err(|error| Error::from_storage("open Managed object writer", error))?;
         Ok(Self {
-            gc_epoch,
-            class,
-            id,
+            locator,
             writer,
             hasher: Hasher::new(),
             encoded_length: 0,
@@ -168,9 +164,7 @@ impl ImmutableWriter {
             return Err(error);
         }
         Ok(ObjectRef {
-            gc_epoch: self.gc_epoch,
-            class: self.class,
-            id: self.id,
+            locator: self.locator,
             encoded_length: self.encoded_length,
             digest: Digest::from_bytes(self.hasher.finalize().into()),
         })

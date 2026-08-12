@@ -22,9 +22,7 @@ use crate::workset::{self, Spool, Workspace};
 use crate::{Error, ErrorKind};
 
 use super::ManagedVolume;
-use super::object::{GcEpoch, ObjectClass, ObjectId, ObjectRef};
-
-const OBJECT_PREFIX: &str = "managed/1/objects/";
+use super::object::{GcEpoch, OBJECT_PREFIX, ObjectLocator, ObjectRef};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct GcOutcome {
@@ -102,7 +100,7 @@ impl ManagedVolume {
             if !entry.metadata().is_file() {
                 continue;
             }
-            let identity = ObjectIdentity::parse(entry.path()).ok_or_else(|| {
+            let identity = ObjectLocator::parse_key(entry.path()).ok_or_else(|| {
                 Error::corrupt("collect Managed objects", "object key is invalid")
             })?;
             if identity.gc_epoch.value() >= current_epoch.value() {
@@ -210,57 +208,16 @@ fn next_unique_mark(
     Ok(next)
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-struct ObjectIdentity {
-    gc_epoch: GcEpoch,
-    class: ObjectClass,
-    id: ObjectId,
-}
-
-impl ObjectIdentity {
-    const fn from_ref(reference: ObjectRef) -> Self {
-        Self {
-            gc_epoch: reference.gc_epoch,
-            class: reference.class,
-            id: reference.id,
-        }
-    }
-
-    fn parse(path: &str) -> Option<Self> {
-        let mut parts = path.strip_prefix(OBJECT_PREFIX)?.split('/');
-        let gc_epoch = GcEpoch::from_value(parts.next()?.parse().ok()?);
-        let class = ObjectClass::parse(parts.next()?)?;
-        let prefix = parts.next()?;
-        let encoded = parts.next()?;
-        if parts.next().is_some() || prefix.len() != 2 || encoded.len() != 32 {
-            return None;
-        }
-        let mut id = [0_u8; 16];
-        for (index, byte) in id.iter_mut().enumerate() {
-            *byte = u8::from_str_radix(&encoded[index * 2..index * 2 + 2], 16).ok()?;
-        }
-        (format!("{:02x}", id[0]) == prefix).then_some(Self {
-            gc_epoch,
-            class,
-            id: ObjectId::from_bytes(id),
-        })
-    }
-
-    fn key(self) -> String {
-        super::object::object_key(self.gc_epoch, self.class, self.id)
-    }
-}
-
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 struct ObjectRecord {
-    identity: ObjectIdentity,
+    identity: ObjectLocator,
     length: u64,
 }
 
 impl ObjectRecord {
     const fn from_ref(reference: ObjectRef) -> Self {
         Self {
-            identity: ObjectIdentity::from_ref(reference),
+            identity: reference.locator,
             length: reference.encoded_length,
         }
     }

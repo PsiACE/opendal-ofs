@@ -23,10 +23,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::Error;
 use crate::filesystem::{
-    ChangeCursor, FileFingerprint, FileVersionId, NamespaceNode, NamespaceRecord, NamespaceValue,
-    NodeAttributes, NodeId,
+    FileFingerprint, FileVersionId, NamespaceNode, NamespaceRecord, NamespaceValue, NodeAttributes,
+    NodeId,
 };
-use crate::managed::StreamRef;
+use crate::managed::FileDataRef;
 use crate::workset;
 
 use super::local_scan::LocalRecord;
@@ -43,7 +43,7 @@ struct LocalCandidate {
 struct BaseCandidate {
     path: String,
     fingerprint: FileFingerprint,
-    node: NamespaceNode<StreamRef>,
+    node: NamespaceNode<FileDataRef>,
 }
 
 pub(super) struct RenameCandidates {
@@ -71,7 +71,7 @@ impl RenameCandidates {
 
     pub(super) fn removed_record(
         &mut self,
-        record: NamespaceRecord<StreamRef>,
+        record: NamespaceRecord<FileDataRef>,
     ) -> Result<(), Error> {
         let node = record
             .value
@@ -82,7 +82,7 @@ impl RenameCandidates {
     pub(super) fn removed_node(
         &mut self,
         path: String,
-        node: NamespaceNode<StreamRef>,
+        node: NamespaceNode<FileDataRef>,
     ) -> Result<(), Error> {
         let Some((_, fingerprint, _)) = node.file() else {
             return Ok(());
@@ -97,8 +97,7 @@ impl RenameCandidates {
     pub(super) fn resolve(
         self,
         workspace: &workset::Workspace,
-        cursor: ChangeCursor,
-    ) -> Result<workset::Spool<NamespaceRecord<Option<StreamRef>>>, Error> {
+    ) -> Result<workset::Spool<NamespaceRecord<Option<FileDataRef>>>, Error> {
         let local = workset::sort(
             workspace,
             &self.local.finish()?,
@@ -110,11 +109,11 @@ impl RenameCandidates {
             |candidate: &BaseCandidate| (candidate.fingerprint, candidate.path.clone()),
         )?;
         let mut output = workspace.writer("resolved-renames")?;
-        resolve_file_renames(&local, &base, &mut output, cursor)?;
+        resolve_file_renames(&local, &base, &mut output)?;
         workset::sort(
             workspace,
             &output.finish()?,
-            |record: &NamespaceRecord<Option<StreamRef>>| record.path.clone(),
+            |record: &NamespaceRecord<Option<FileDataRef>>| record.path.clone(),
         )
     }
 }
@@ -122,8 +121,7 @@ impl RenameCandidates {
 fn resolve_file_renames(
     local: &workset::Spool<LocalCandidate>,
     base: &workset::Spool<BaseCandidate>,
-    output: &mut workset::SpoolWriter<NamespaceRecord<Option<StreamRef>>>,
-    cursor: ChangeCursor,
+    output: &mut workset::SpoolWriter<NamespaceRecord<Option<FileDataRef>>>,
 ) -> Result<(), Error> {
     let mut local_reader = local.reader()?;
     let mut base_reader = base.reader()?;
@@ -142,14 +140,10 @@ fn resolve_file_renames(
                     .as_ref()
                     .expect("local rename candidate exists")
                     .fingerprint;
-                if let Some(local) = take_local_group(
-                    fingerprint,
-                    &mut local_reader,
-                    &mut local_head,
-                    output,
-                    cursor,
-                )? {
-                    write_new_file(output, local, cursor)?;
+                if let Some(local) =
+                    take_local_group(fingerprint, &mut local_reader, &mut local_head, output)?
+                {
+                    write_new_file(output, local)?;
                 }
             }
             Ordering::Greater => {
@@ -164,17 +158,12 @@ fn resolve_file_renames(
                     .as_ref()
                     .expect("local rename candidate exists")
                     .fingerprint;
-                let local = take_local_group(
-                    fingerprint,
-                    &mut local_reader,
-                    &mut local_head,
-                    output,
-                    cursor,
-                )?;
+                let local =
+                    take_local_group(fingerprint, &mut local_reader, &mut local_head, output)?;
                 let base = take_base_group(fingerprint, &mut base_reader, &mut base_head)?;
                 match (local, base) {
-                    (Some(local), Some(base)) => write_renamed_file(output, local, base, cursor)?,
-                    (Some(local), None) => write_new_file(output, local, cursor)?,
+                    (Some(local), Some(base)) => write_renamed_file(output, local, base)?,
+                    (Some(local), None) => write_new_file(output, local)?,
                     (None, _) => {}
                 }
             }
@@ -187,8 +176,7 @@ fn take_local_group(
     fingerprint: FileFingerprint,
     reader: &mut workset::SpoolReader<LocalCandidate>,
     head: &mut Option<LocalCandidate>,
-    output: &mut workset::SpoolWriter<NamespaceRecord<Option<StreamRef>>>,
-    cursor: ChangeCursor,
+    output: &mut workset::SpoolWriter<NamespaceRecord<Option<FileDataRef>>>,
 ) -> Result<Option<LocalCandidate>, Error> {
     let first = head.take().expect("local rename candidate exists");
     *head = reader.next()?;
@@ -198,13 +186,13 @@ fn take_local_group(
     {
         return Ok(Some(first));
     }
-    write_new_file(output, first, cursor)?;
+    write_new_file(output, first)?;
     while head
         .as_ref()
         .is_some_and(|candidate| candidate.fingerprint == fingerprint)
     {
         let candidate = head.take().expect("local rename candidate exists");
-        write_new_file(output, candidate, cursor)?;
+        write_new_file(output, candidate)?;
         *head = reader.next()?;
     }
     Ok(None)
@@ -233,13 +221,11 @@ fn take_base_group(
 }
 
 fn write_new_file(
-    output: &mut workset::SpoolWriter<NamespaceRecord<Option<StreamRef>>>,
+    output: &mut workset::SpoolWriter<NamespaceRecord<Option<FileDataRef>>>,
     local: LocalCandidate,
-    cursor: ChangeCursor,
 ) -> Result<(), Error> {
     output.write(&NamespaceRecord {
         path: local.path,
-        change_cursor: cursor,
         value: Some(NamespaceNode {
             node_id: NodeId::generate(),
             generation: 1,
@@ -256,10 +242,9 @@ fn write_new_file(
 }
 
 fn write_renamed_file(
-    output: &mut workset::SpoolWriter<NamespaceRecord<Option<StreamRef>>>,
+    output: &mut workset::SpoolWriter<NamespaceRecord<Option<FileDataRef>>>,
     local: LocalCandidate,
     base: BaseCandidate,
-    cursor: ChangeCursor,
 ) -> Result<(), Error> {
     let BaseCandidate { node, .. } = base;
     let NamespaceValue::RegularFile {
@@ -283,7 +268,6 @@ fn write_renamed_file(
     };
     output.write(&NamespaceRecord {
         path: local.path,
-        change_cursor: cursor,
         value: Some(NamespaceNode {
             node_id: node.node_id,
             generation,

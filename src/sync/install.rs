@@ -23,7 +23,7 @@ use serde::de::DeserializeOwned;
 
 use crate::Error;
 use crate::filesystem::NamespaceValue;
-use crate::managed::{ManagedVolume, StreamRef};
+use crate::managed::{FileDataRef, ManagedVolume};
 use crate::namespace::Namespace;
 use crate::workset::{self, Spool, Workspace};
 
@@ -33,7 +33,7 @@ use super::transfer::materialize_file;
 pub(crate) async fn install<C: DeserializeOwned>(
     root: &Path,
     current: Option<&Namespace<C>>,
-    target: &Namespace<StreamRef>,
+    target: &Namespace<FileDataRef>,
     volume: &ManagedVolume,
     transfer_concurrency: usize,
 ) -> Result<(), Error> {
@@ -43,17 +43,17 @@ pub(crate) async fn install<C: DeserializeOwned>(
 /// Repair an interrupted installation from the current authoritative snapshot.
 pub(crate) async fn repair(
     root: &Path,
-    target: &Namespace<StreamRef>,
+    target: &Namespace<FileDataRef>,
     volume: &ManagedVolume,
     transfer_concurrency: usize,
 ) -> Result<(), Error> {
-    apply::<StreamRef>(root, None, target, volume, transfer_concurrency, true).await
+    apply::<FileDataRef>(root, None, target, volume, transfer_concurrency, true).await
 }
 
 async fn apply<C: DeserializeOwned>(
     root: &Path,
     current: Option<&Namespace<C>>,
-    target: &Namespace<StreamRef>,
+    target: &Namespace<FileDataRef>,
     volume: &ManagedVolume,
     transfer_concurrency: usize,
     authoritative: bool,
@@ -167,7 +167,7 @@ async fn install_file(
     volume: &ManagedVolume,
     destination: std::path::PathBuf,
     fingerprint: crate::filesystem::FileFingerprint,
-    content: StreamRef,
+    content: FileDataRef,
     executable: bool,
     authoritative: bool,
 ) -> Result<Option<std::path::PathBuf>, Error> {
@@ -188,7 +188,7 @@ async fn install_file(
 
 fn namespace_removals<C: DeserializeOwned>(
     current: Option<&Namespace<C>>,
-    target: &Namespace<StreamRef>,
+    target: &Namespace<FileDataRef>,
     workspace: &Workspace,
 ) -> Result<Spool<StoredPath>, Error> {
     let mut removed = workspace.writer("removed")?;
@@ -221,7 +221,7 @@ fn namespace_removals<C: DeserializeOwned>(
 
 fn repair_removals(
     root: &Path,
-    target: &Namespace<StreamRef>,
+    target: &Namespace<FileDataRef>,
     workspace: &Workspace,
 ) -> Result<Spool<StoredPath>, Error> {
     let mut actual = workspace.writer("actual-paths")?;

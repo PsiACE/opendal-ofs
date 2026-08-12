@@ -25,7 +25,8 @@ use serde::Serialize;
 use crate::Error;
 use crate::filesystem::Digest;
 
-use super::object::{ImmutableWriter, ObjectRef, checksum};
+use super::object::{ObjectRef, checksum};
+use super::storage::ImmutableWriter;
 
 pub(crate) use bytes::{copy_byte_stream, write_byte_stream};
 pub(crate) use record::{RecordStreamReader, RecordStreamWriter, write_records};
@@ -33,16 +34,17 @@ pub(crate) use record::{RecordStreamReader, RecordStreamWriter, write_records};
 const TRAILER_MAGIC: [u8; 8] = *b"OFSSTR01";
 const FOOTER_BYTES: usize = 8 + 32;
 const TRAILER_BYTES: usize = 8 + 2 + 8 + 8 + 32 + 32;
-const STREAM_TAIL_BYTES: usize = FOOTER_BYTES + TRAILER_BYTES;
+pub(super) const STREAM_TAIL_BYTES: usize = FOOTER_BYTES + TRAILER_BYTES;
 
 #[derive(Clone, Copy, Debug, serde::Deserialize, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
 pub(crate) struct StreamKind(u16);
 
 impl StreamKind {
-    pub(crate) const NAMESPACE_RECORDS: Self = Self(1);
-    pub(crate) const OPERATION_RESULTS: Self = Self(2);
+    pub(crate) const NAMESPACE_SNAPSHOT: Self = Self(1);
+    pub(crate) const OPERATION_RECEIPTS: Self = Self(2);
     pub(crate) const FILE_BYTES: Self = Self(3);
+    pub(crate) const NAMESPACE_CHANGES: Self = Self(4);
 
     pub(crate) const fn value(self) -> u16 {
         self.0
@@ -62,6 +64,22 @@ super::wire::tuple_wire!(StreamRef {
     payload_length: u64,
     payload_digest: Digest,
 });
+
+impl StreamRef {
+    pub(crate) fn require(
+        self,
+        kind: StreamKind,
+        class: super::object::ObjectClass,
+    ) -> Result<(), Error> {
+        if self.kind != kind || self.object.locator.class != class {
+            return Err(Error::corrupt(
+                "read Managed stream",
+                "stream reference has the wrong type",
+            ));
+        }
+        Ok(())
+    }
+}
 
 async fn finish_stream(
     mut writer: ImmutableWriter,

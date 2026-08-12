@@ -21,7 +21,8 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use crate::Error;
 use crate::filesystem::Digest;
 
-use super::super::object::{GcEpoch, ImmutableWriter, ObjectClass};
+use super::super::object::{GcEpoch, ObjectClass};
+use super::super::storage::ImmutableWriter;
 use super::{
     STREAM_TAIL_BYTES, StreamKind, StreamRef, finish_stream, validate_stream_layout,
     validate_stream_tail,

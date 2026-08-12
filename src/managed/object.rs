@@ -24,9 +24,7 @@ use serde::{Deserialize, Serialize};
 use crate::Error;
 use crate::filesystem::{Checksum, Digest};
 
-pub(crate) use super::storage::ImmutableWriter;
-
-const OBJECT_PREFIX: &str = "managed/1/objects/";
+pub(super) const OBJECT_PREFIX: &str = "managed/1/objects/";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct ObjectId([u8; 16]);
@@ -99,18 +97,13 @@ impl GcEpoch {
 pub(crate) enum ObjectClass {
     NamespaceCommit,
     NamespaceSegment,
-    OperationResultSegment,
+    OperationReceiptSegment,
     FileData,
 }
 
 impl Serialize for ObjectClass {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_u8(match self {
-            Self::NamespaceCommit => 1,
-            Self::NamespaceSegment => 2,
-            Self::OperationResultSegment => 3,
-            Self::FileData => 4,
-        })
+        serializer.serialize_u8(self.code())
     }
 }
 
@@ -119,7 +112,7 @@ impl<'de> Deserialize<'de> for ObjectClass {
         match u8::deserialize(deserializer)? {
             1 => Ok(Self::NamespaceCommit),
             2 => Ok(Self::NamespaceSegment),
-            3 => Ok(Self::OperationResultSegment),
+            3 => Ok(Self::OperationReceiptSegment),
             4 => Ok(Self::FileData),
             value => Err(serde::de::Error::custom(format_args!(
                 "unknown object class {value}"
@@ -132,16 +125,25 @@ impl ObjectClass {
     pub(crate) const ALL: [Self; 4] = [
         Self::NamespaceCommit,
         Self::NamespaceSegment,
-        Self::OperationResultSegment,
+        Self::OperationReceiptSegment,
         Self::FileData,
     ];
 
+    const fn code(self) -> u8 {
+        match self {
+            Self::NamespaceCommit => 1,
+            Self::NamespaceSegment => 2,
+            Self::OperationReceiptSegment => 3,
+            Self::FileData => 4,
+        }
+    }
+
     pub(crate) const fn key_segment(self) -> &'static str {
         match self {
-            Self::NamespaceCommit => "namespace-commit",
-            Self::NamespaceSegment => "namespace-segment",
-            Self::OperationResultSegment => "operation-result-segment",
-            Self::FileData => "file-data",
+            Self::NamespaceCommit => "01-namespace-commit",
+            Self::NamespaceSegment => "02-namespace-segment",
+            Self::OperationReceiptSegment => "03-operation-receipt-segment",
+            Self::FileData => "04-file-data",
         }
     }
 
@@ -152,40 +154,85 @@ impl ObjectClass {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ObjectRef {
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct ObjectLocator {
     pub(crate) gc_epoch: GcEpoch,
     pub(crate) class: ObjectClass,
     pub(crate) id: ObjectId,
+}
+
+super::wire::tuple_wire!(ObjectLocator {
+    gc_epoch: GcEpoch,
+    class: ObjectClass,
+    id: ObjectId,
+});
+
+impl ObjectLocator {
+    pub(crate) fn generate(gc_epoch: GcEpoch, class: ObjectClass) -> Self {
+        Self {
+            gc_epoch,
+            class,
+            id: ObjectId::generate(),
+        }
+    }
+
+    pub(crate) fn key(self) -> String {
+        let prefix = self.id.as_bytes()[0];
+        format!(
+            "{OBJECT_PREFIX}{:020}/{}/{prefix:02x}/{}",
+            self.gc_epoch.value(),
+            self.class.key_segment(),
+            self.id,
+        )
+    }
+
+    pub(crate) fn parse_key(path: &str) -> Option<Self> {
+        let mut parts = path.strip_prefix(OBJECT_PREFIX)?.split('/');
+        let epoch = parts.next()?;
+        if epoch.len() != 20 {
+            return None;
+        }
+        let gc_epoch = GcEpoch::from_value(epoch.parse().ok()?);
+        let class = ObjectClass::parse(parts.next()?)?;
+        let prefix = parts.next()?;
+        let encoded = parts.next()?;
+        if parts.next().is_some() || prefix.len() != 2 || encoded.len() != 32 {
+            return None;
+        }
+        let mut id = [0_u8; 16];
+        for (index, byte) in id.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&encoded[index * 2..index * 2 + 2], 16).ok()?;
+        }
+        let locator = Self {
+            gc_epoch,
+            class,
+            id: ObjectId::from_bytes(id),
+        };
+        (locator.key() == path && format!("{:02x}", id[0]) == prefix).then_some(locator)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ObjectRef {
+    pub(crate) locator: ObjectLocator,
     pub(crate) encoded_length: u64,
     pub(crate) digest: Digest,
 }
 
 super::wire::tuple_wire!(ObjectRef {
-    gc_epoch: GcEpoch,
-    class: ObjectClass,
-    id: ObjectId,
+    locator: ObjectLocator,
     encoded_length: u64,
     digest: Digest,
 });
 
 impl ObjectRef {
     pub(crate) fn key(self) -> String {
-        object_key(self.gc_epoch, self.class, self.id)
+        self.locator.key()
     }
 }
 
 pub(crate) fn checksum(bytes: &[u8]) -> Checksum {
     Checksum::from_bytes(blake3::hash(bytes).into())
-}
-
-pub(crate) fn object_key(gc_epoch: GcEpoch, class: ObjectClass, id: ObjectId) -> String {
-    let prefix = id.as_bytes()[0];
-    format!(
-        "{OBJECT_PREFIX}{}/{}/{prefix:02x}/{id}",
-        gc_epoch.value(),
-        class.key_segment(),
-    )
 }
 
 fn deserialize_fixed_bytes<'de, D, const N: usize>(deserializer: D) -> Result<[u8; N], D::Error>

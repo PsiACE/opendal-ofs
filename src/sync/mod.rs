@@ -31,3 +31,8 @@ mod transfer;
 pub use engine::{SyncEngine, SyncOutcome};
 pub(crate) use state::ConflictRecord;
 pub use state::ReplicaState;
+
+/// Load and validate the lightweight state of one local replica.
+pub fn load_replica_state(path: &std::path::Path) -> Result<Option<ReplicaState>, crate::Error> {
+    state_file::load(path)
+}

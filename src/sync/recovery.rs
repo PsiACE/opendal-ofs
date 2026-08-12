@@ -42,7 +42,7 @@ impl SyncEngine {
         let published = published && observed.can_read_revision(target);
         let current = observed.revision();
         state.begin_install(current, published);
-        state.save(state_path)?;
+        super::state_file::persist(&state, state_path, true)?;
         repair(
             root,
             &observed.namespace,
@@ -51,7 +51,7 @@ impl SyncEngine {
         )
         .await?;
         state.advance(current);
-        state.save(state_path)?;
+        super::state_file::persist(&state, state_path, true)?;
         Ok(SyncOutcome {
             conflict_paths: Vec::new(),
             published,
@@ -72,7 +72,7 @@ impl SyncEngine {
         if observed.revision() == target
             || self
                 .volume
-                .operation_committed(operation, &observed)
+                .operation_committed(operation, target.cursor(), &observed)
                 .await?
         {
             return self
@@ -81,7 +81,7 @@ impl SyncEngine {
         }
         if !observed.accepts_prepared(maintenance_generation) {
             state.cancel_pending(observed.revision());
-            state.save(state_path)?;
+            super::state_file::persist(&state, state_path, true)?;
             return Err(Error::invalid(
                 "synchronize replica",
                 "pending publication was invalidated by data collection; repeat sync to prepare it again",
@@ -89,7 +89,7 @@ impl SyncEngine {
         }
         if observed.revision() != expected {
             state.cancel_pending(observed.revision());
-            state.save(state_path)?;
+            super::state_file::persist(&state, state_path, true)?;
             return Err(Error::invalid(
                 "synchronize replica",
                 "pending publication conflicted with a newer remote change; repeat sync to reconcile",
@@ -123,7 +123,7 @@ impl SyncEngine {
         {
             ScannedTree::Unchanged => {
                 state.advance(observed.revision());
-                state.save(state_path)?;
+                super::state_file::persist(&state, state_path, true)?;
                 return Ok(SyncOutcome {
                     conflict_paths: Vec::new(),
                     published: false,
@@ -135,7 +135,7 @@ impl SyncEngine {
         let ambiguous = changed_paths(&observed.namespace, &local)?;
         if ambiguous.is_empty() {
             state.advance(observed.revision());
-            state.save(state_path)?;
+            super::state_file::persist(&state, state_path, true)?;
             return Ok(SyncOutcome {
                 conflict_paths: Vec::new(),
                 published: false,
@@ -145,7 +145,7 @@ impl SyncEngine {
         if resolved != &ambiguous {
             let conflict_paths = ambiguous.into_iter().collect::<Vec<_>>();
             state.retain_conflicts(conflict_paths.len(), observed.revision(), true);
-            state.save(state_path)?;
+            super::state_file::persist(&state, state_path, true)?;
             return Ok(SyncOutcome {
                 conflict_paths,
                 published: false,
@@ -157,7 +157,7 @@ impl SyncEngine {
             .prepare_and_commit(state_path, &mut state, &observed, &target)
             .await?;
         state.advance(revision);
-        state.save(state_path)?;
+        super::state_file::persist(&state, state_path, true)?;
         Ok(SyncOutcome {
             conflict_paths: Vec::new(),
             published: true,

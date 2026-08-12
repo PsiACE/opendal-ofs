@@ -24,13 +24,14 @@ use crate::filesystem::{ChangeCursor, VolumeId};
 use crate::namespace::Namespace;
 use crate::workset::WorksetOptions;
 
+use super::data::FileDataRef;
 use super::format::ManagedFormat;
+use super::layout::NamespaceCommit;
 use super::namespace;
 use super::object::{GcEpoch, ObjectRef};
-use super::publication::{self, NamespaceCommit};
+use super::publication;
 use super::record::Record;
 use super::storage;
-use super::stream::StreamRef;
 
 const HEAD_KEY: &str = "managed/1/head";
 const HEAD_RECORD: Record = Record::new(*b"OFSHEAD1", 64 * 1024);
@@ -44,7 +45,7 @@ pub struct ManagedVolume {
 }
 
 pub(crate) struct ManagedObservation {
-    pub(crate) namespace: Namespace<StreamRef>,
+    pub(crate) namespace: Namespace<FileDataRef>,
     pub(super) head_revision: String,
     namespace_revision: NamespaceRevision,
     pub(super) reclamation_watermark: ChangeCursor,
@@ -211,14 +212,5 @@ impl ManagedVolume {
             storage::ControlCondition::Revision(expected_revision),
         )
         .await
-    }
-
-    pub(super) async fn compact_for_collection(
-        &self,
-        reference: NamespaceRevision,
-        gc_epoch: GcEpoch,
-        visit: impl FnMut(ObjectRef) -> Result<(), Error>,
-    ) -> Result<NamespaceRevision, Error> {
-        publication::compact_for_collection(self, reference, gc_epoch, visit).await
     }
 }

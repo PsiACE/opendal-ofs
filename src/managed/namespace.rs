@@ -22,6 +22,7 @@ use std::collections::BinaryHeap;
 
 use futures::StreamExt as _;
 use opendal::Operator;
+use serde::{Deserialize, Serialize};
 
 use crate::Error;
 use crate::filesystem::{
@@ -30,9 +31,11 @@ use crate::filesystem::{
 use crate::namespace::Namespace;
 use crate::workset::{MergeRuns, Spool, Workspace};
 
+use super::data::FileDataRef;
 use super::head::{ManagedVolume, NamespaceRevision};
+use super::layout::{NamespaceChangeSegment, NamespaceCommit};
 use super::object::{GcEpoch, ObjectClass, ObjectRef};
-use super::publication::{self, NamespaceCommit};
+use super::publication;
 use super::stream::{self, RecordStreamReader, RecordStreamWriter, StreamKind, StreamRef};
 
 pub(super) async fn write_genesis(
@@ -40,9 +43,8 @@ pub(super) async fn write_genesis(
     root_node_id: NodeId,
     gc_epoch: GcEpoch,
 ) -> Result<StreamRef, Error> {
-    let root = NamespaceRecord::<StreamRef> {
+    let root = NamespaceRecord::<FileDataRef> {
         path: String::new(),
-        change_cursor: ChangeCursor::GENESIS,
         value: Some(NamespaceNode {
             node_id: root_node_id,
             generation: 1,
@@ -54,7 +56,7 @@ pub(super) async fn write_genesis(
         operator,
         gc_epoch,
         ObjectClass::NamespaceSegment,
-        StreamKind::NAMESPACE_RECORDS,
+        StreamKind::NAMESPACE_SNAPSHOT,
         [root],
     )
     .await
@@ -64,7 +66,7 @@ impl ManagedVolume {
     pub(crate) async fn namespace(
         &self,
         revision: NamespaceRevision,
-    ) -> Result<Namespace<StreamRef>, Error> {
+    ) -> Result<Namespace<FileDataRef>, Error> {
         let (head, _) = self.read_head().await?;
         if revision.change_cursor.sequence() < head.minimum_retained_cursor.sequence()
             || revision.change_cursor.sequence() > head.current_commit.change_cursor.sequence()
@@ -75,7 +77,7 @@ impl ManagedVolume {
             ));
         }
         let reference = if revision.change_cursor == head.minimum_retained_cursor
-            && revision.object.gc_epoch < head.current_commit.object.gc_epoch
+            && revision.object.locator.gc_epoch < head.current_commit.object.locator.gc_epoch
         {
             head.current_commit
         } else {
@@ -86,17 +88,9 @@ impl ManagedVolume {
     }
 }
 
-pub(super) async fn write_full(
+pub(super) async fn write_snapshot(
     volume: &ManagedVolume,
-    namespace: &Namespace<StreamRef>,
-    gc_epoch: GcEpoch,
-) -> Result<StreamRef, Error> {
-    write_full_visiting(volume, namespace, gc_epoch, |_| Ok(())).await
-}
-
-pub(super) async fn write_full_visiting(
-    volume: &ManagedVolume,
-    namespace: &Namespace<StreamRef>,
+    namespace: &Namespace<FileDataRef>,
     gc_epoch: GcEpoch,
     mut visit_file: impl FnMut(ObjectRef) -> Result<(), Error>,
 ) -> Result<StreamRef, Error> {
@@ -105,16 +99,21 @@ pub(super) async fn write_full_visiting(
         &volume.operator,
         gc_epoch,
         ObjectClass::NamespaceSegment,
-        StreamKind::NAMESPACE_RECORDS,
+        StreamKind::NAMESPACE_SNAPSHOT,
     )
     .await?;
     while let Some(record) = source.next()? {
         if let Some(NamespaceNode {
-            value: NamespaceValue::RegularFile { content, .. },
+            value:
+                NamespaceValue::RegularFile {
+                    fingerprint,
+                    content,
+                    ..
+                },
             ..
         }) = record.value.as_ref()
         {
-            visit_file(content.object)?;
+            visit_file(content.stream_ref(*fingerprint)?.object)?;
         }
         writer.write(&record).await?;
     }
@@ -123,8 +122,8 @@ pub(super) async fn write_full_visiting(
 
 pub(super) async fn write_delta(
     volume: &ManagedVolume,
-    previous: &Namespace<StreamRef>,
-    target: &Namespace<StreamRef>,
+    previous: &Namespace<FileDataRef>,
+    target: &Namespace<FileDataRef>,
     gc_epoch: GcEpoch,
 ) -> Result<Option<StreamRef>, Error> {
     let mut previous = previous.reader()?;
@@ -167,7 +166,7 @@ pub(super) async fn write_delta(
                     &volume.operator,
                     gc_epoch,
                     ObjectClass::NamespaceSegment,
-                    StreamKind::NAMESPACE_RECORDS,
+                    StreamKind::NAMESPACE_CHANGES,
                 )
                 .await?,
             );
@@ -175,11 +174,7 @@ pub(super) async fn write_delta(
         writer
             .as_mut()
             .expect("namespace delta writer is open")
-            .write(&NamespaceRecord {
-                path,
-                change_cursor: target.cursor,
-                value,
-            })
+            .write(&NamespaceRecord { path, value })
             .await?;
     }
     match writer {
@@ -188,16 +183,113 @@ pub(super) async fn write_delta(
     }
 }
 
+pub(super) async fn merge_change_segments(
+    volume: &ManagedVolume,
+    older: NamespaceChangeSegment,
+    newer: NamespaceChangeSegment,
+    gc_epoch: GcEpoch,
+) -> Result<NamespaceChangeSegment, Error> {
+    for reference in [older.stream, newer.stream] {
+        reference.require(StreamKind::NAMESPACE_CHANGES, ObjectClass::NamespaceSegment)?;
+    }
+    let mut left =
+        RecordStreamReader::<NamespaceRecord<FileDataRef>>::open(&volume.operator, older.stream)
+            .await?;
+    let mut right =
+        RecordStreamReader::<NamespaceRecord<FileDataRef>>::open(&volume.operator, newer.stream)
+            .await?;
+    let mut left_head = left.next().await?;
+    let mut right_head = right.next().await?;
+    let mut previous_left = None::<String>;
+    let mut previous_right = None::<String>;
+    let mut writer = RecordStreamWriter::open(
+        &volume.operator,
+        gc_epoch,
+        ObjectClass::NamespaceSegment,
+        StreamKind::NAMESPACE_CHANGES,
+    )
+    .await?;
+    while left_head.is_some() || right_head.is_some() {
+        if let Some(record) = left_head.as_ref() {
+            require_increasing_path(&mut previous_left, &record.path)?;
+        }
+        if let Some(record) = right_head.as_ref() {
+            require_increasing_path(&mut previous_right, &record.path)?;
+        }
+        let ordering = match (&left_head, &right_head) {
+            (Some(left), Some(right)) => left.path.cmp(&right.path),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => break,
+        };
+        let selected = match ordering {
+            Ordering::Less => {
+                let record = left_head.take().expect("left change exists");
+                previous_left = Some(record.path.clone());
+                left_head = left.next().await?;
+                record
+            }
+            Ordering::Greater => {
+                let record = right_head.take().expect("right change exists");
+                previous_right = Some(record.path.clone());
+                right_head = right.next().await?;
+                record
+            }
+            Ordering::Equal => {
+                let left_record = left_head.take().expect("left change exists");
+                let right_record = right_head.take().expect("right change exists");
+                previous_left = Some(left_record.path.clone());
+                previous_right = Some(right_record.path.clone());
+                left_head = left.next().await?;
+                right_head = right.next().await?;
+                right_record
+            }
+        };
+        writer.write(&selected).await?;
+    }
+    NamespaceChangeSegment::merged(older, newer, writer.close().await?)
+}
+
 pub(super) async fn read(
     volume: &ManagedVolume,
     commit: &NamespaceCommit,
     view_cursor: ChangeCursor,
-) -> Result<Namespace<StreamRef>, Error> {
+) -> Result<Namespace<FileDataRef>, Error> {
+    if view_cursor == commit.namespace_snapshot.change_cursor {
+        return read_snapshot(volume, commit, view_cursor).await;
+    }
+    if view_cursor != commit.change_cursor {
+        return Err(Error::corrupt(
+            "read Managed namespace",
+            "commit cursor does not match the requested view",
+        ));
+    }
+    if commit.namespace_changes.is_empty() {
+        return Err(Error::corrupt(
+            "read Managed namespace",
+            "namespace commit has no change stream for its cursor",
+        ));
+    }
+    if commit.namespace_snapshot.change_cursor > view_cursor {
+        return Err(Error::corrupt(
+            "read Managed namespace",
+            "snapshot is newer than the requested view",
+        ));
+    }
     let workspace = Workspace::create(volume.worksets)?;
-    let mut output = workspace.writer("namespace")?;
     let mut streams = MergeRuns::new(workspace.merge_fan_in());
-    let downloads = futures::stream::iter(commit.namespace_streams())
-        .map(|reference| download(volume, &workspace, reference, commit.change_cursor))
+    streams.push(
+        download_snapshot(
+            volume,
+            &workspace,
+            commit.namespace_snapshot.stream,
+            commit.namespace_snapshot.change_cursor,
+        )
+        .await?,
+        |group| merge_group(&workspace, group, view_cursor),
+    )?;
+    let downloads = futures::stream::iter(commit.namespace_changes.iter().copied())
+        .map(|segment| download_changes(volume, &workspace, segment, commit.change_cursor))
         .buffer_unordered(volume.stream_concurrency);
     futures::pin_mut!(downloads);
     while let Some(stream) = downloads.next().await {
@@ -206,41 +298,65 @@ pub(super) async fn read(
     let merged = streams
         .finish(|group| merge_group(&workspace, group, view_cursor))?
         .ok_or_else(|| Error::corrupt("read Managed namespace", "namespace has no streams"))?;
+    finish_view(volume, commit, view_cursor, &workspace, merged)
+}
+
+async fn read_snapshot(
+    volume: &ManagedVolume,
+    commit: &NamespaceCommit,
+    view_cursor: ChangeCursor,
+) -> Result<Namespace<FileDataRef>, Error> {
+    let reference = commit.namespace_snapshot.stream;
+    reference.require(
+        StreamKind::NAMESPACE_SNAPSHOT,
+        ObjectClass::NamespaceSegment,
+    )?;
+    let workspace = Workspace::create(volume.worksets)?;
+    let mut output = workspace.writer("namespace")?;
+    let mut remote =
+        RecordStreamReader::<NamespaceRecord<FileDataRef>>::open(&volume.operator, reference)
+            .await?;
+    let mut previous = None::<String>;
+    let mut root_seen = false;
+    while let Some(record) = remote.next().await? {
+        validate_record(volume, &record, &mut previous, &mut root_seen)?;
+        output.write(&record)?;
+    }
+    finish_namespace(volume, commit, view_cursor, output.finish()?, root_seen)
+}
+
+fn finish_view(
+    volume: &ManagedVolume,
+    commit: &NamespaceCommit,
+    view_cursor: ChangeCursor,
+    workspace: &Workspace,
+    merged: Spool<VersionedRecord>,
+) -> Result<Namespace<FileDataRef>, Error> {
+    let mut output = workspace.writer("namespace")?;
     let mut records = merged.reader()?;
     let mut previous_output = None::<String>;
     let mut root_seen = false;
     while let Some(record) = records.next()? {
-        if record.change_cursor > view_cursor {
-            continue;
-        }
-        let Some(node) = record.value.as_ref() else {
+        let Some(node) = record.value else {
             continue;
         };
-        validate_portable_path(&record.path)?;
-        if previous_output
-            .as_ref()
-            .is_some_and(|previous| previous >= &record.path)
-        {
-            return Err(Error::corrupt(
-                "read Managed namespace",
-                "namespace view is not strictly path ordered",
-            ));
-        }
-        validate_content(node)?;
-        if record.path.is_empty() {
-            if node.node_id != volume.format.root_node_id()
-                || !matches!(node.value, NamespaceValue::Directory { .. })
-            {
-                return Err(Error::corrupt(
-                    "read Managed namespace",
-                    "namespace root is invalid",
-                ));
-            }
-            root_seen = true;
-        }
-        previous_output = Some(record.path.clone());
+        let record = NamespaceRecord {
+            path: record.path,
+            value: Some(node),
+        };
+        validate_record(volume, &record, &mut previous_output, &mut root_seen)?;
         output.write(&record)?;
     }
+    finish_namespace(volume, commit, view_cursor, output.finish()?, root_seen)
+}
+
+fn finish_namespace(
+    volume: &ManagedVolume,
+    commit: &NamespaceCommit,
+    view_cursor: ChangeCursor,
+    entries: Spool<NamespaceRecord<FileDataRef>>,
+    root_seen: bool,
+) -> Result<Namespace<FileDataRef>, Error> {
     if !root_seen {
         return Err(Error::corrupt(
             "read Managed namespace",
@@ -251,52 +367,73 @@ pub(super) async fn read(
         volume_id: commit.volume_id,
         cursor: view_cursor,
         root: volume.format.root_node_id(),
-        entries: output.finish()?,
+        entries,
     })
 }
 
-async fn download(
+async fn download_snapshot(
     volume: &ManagedVolume,
     workspace: &Workspace,
     reference: StreamRef,
-    commit_cursor: ChangeCursor,
-) -> Result<Spool<NamespaceRecord<StreamRef>>, Error> {
-    require_stream(
-        reference,
-        StreamKind::NAMESPACE_RECORDS,
+    cursor: ChangeCursor,
+) -> Result<Spool<VersionedRecord>, Error> {
+    reference.require(
+        StreamKind::NAMESPACE_SNAPSHOT,
         ObjectClass::NamespaceSegment,
     )?;
     let mut remote =
-        RecordStreamReader::<NamespaceRecord<StreamRef>>::open(&volume.operator, reference).await?;
+        RecordStreamReader::<NamespaceRecord<FileDataRef>>::open(&volume.operator, reference)
+            .await?;
     let mut local = workspace.writer("namespace-input")?;
     let mut previous = None::<String>;
     while let Some(record) = remote.next().await? {
-        if previous
-            .as_ref()
-            .is_some_and(|previous| previous >= &record.path)
-        {
-            return Err(Error::corrupt(
-                "read Managed namespace",
-                "namespace stream is not strictly path ordered",
-            ));
-        }
-        if record.change_cursor.sequence() > commit_cursor.sequence() {
-            return Err(Error::corrupt(
-                "read Managed namespace",
-                "namespace record is newer than its commit",
-            ));
-        }
+        require_increasing_path(&mut previous, &record.path)?;
         previous = Some(record.path.clone());
-        local.write(&record)?;
+        local.write(&VersionedRecord {
+            path: record.path,
+            change_cursor: cursor,
+            value: record.value,
+        })?;
+    }
+    local.finish()
+}
+
+async fn download_changes(
+    volume: &ManagedVolume,
+    workspace: &Workspace,
+    segment: NamespaceChangeSegment,
+    commit_cursor: ChangeCursor,
+) -> Result<Spool<VersionedRecord>, Error> {
+    let reference = segment.stream;
+    reference.require(StreamKind::NAMESPACE_CHANGES, ObjectClass::NamespaceSegment)?;
+    if segment.end_cursor > commit_cursor || segment.source_bytes == 0 {
+        return Err(Error::corrupt(
+            "read Managed namespace",
+            "namespace change descriptor is invalid",
+        ));
+    }
+    let mut remote =
+        RecordStreamReader::<NamespaceRecord<FileDataRef>>::open(&volume.operator, reference)
+            .await?;
+    let mut local = workspace.writer("namespace-input")?;
+    let mut previous = None::<String>;
+    while let Some(record) = remote.next().await? {
+        require_increasing_path(&mut previous, &record.path)?;
+        previous = Some(record.path.clone());
+        local.write(&VersionedRecord {
+            path: record.path,
+            change_cursor: segment.end_cursor,
+            value: record.value,
+        })?;
     }
     local.finish()
 }
 
 fn merge_group(
     workspace: &Workspace,
-    streams: &[Spool<NamespaceRecord<StreamRef>>],
+    streams: &[Spool<VersionedRecord>],
     view_cursor: ChangeCursor,
-) -> Result<Spool<NamespaceRecord<StreamRef>>, Error> {
+) -> Result<Spool<VersionedRecord>, Error> {
     let mut readers = streams
         .iter()
         .map(Spool::reader)
@@ -311,7 +448,7 @@ fn merge_group(
 
     while let Some(first) = heap.pop() {
         let path = first.record.path.clone();
-        let mut selected = None::<NamespaceRecord<StreamRef>>;
+        let mut selected = None::<VersionedRecord>;
         let mut item = Some(first);
         loop {
             let NamespaceItem { record, source } = item.take().expect("namespace item exists");
@@ -345,7 +482,7 @@ fn merge_group(
 }
 
 struct NamespaceItem {
-    record: NamespaceRecord<StreamRef>,
+    record: VersionedRecord,
     source: usize,
 }
 
@@ -373,34 +510,65 @@ impl Ord for NamespaceItem {
     }
 }
 
-fn validate_content(node: &NamespaceNode<StreamRef>) -> Result<(), Error> {
-    if let NamespaceValue::RegularFile {
-        fingerprint,
-        content,
-        ..
-    } = node.value
-        && (content.kind != StreamKind::FILE_BYTES
-            || content.object.class != ObjectClass::FileData
-            || content.payload_length != fingerprint.logical_length()
-            || content.payload_digest != fingerprint.digest())
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct VersionedRecord {
+    path: String,
+    change_cursor: ChangeCursor,
+    value: Option<NamespaceNode<FileDataRef>>,
+}
+
+fn validate_record(
+    volume: &ManagedVolume,
+    record: &NamespaceRecord<FileDataRef>,
+    previous: &mut Option<String>,
+    root_seen: &mut bool,
+) -> Result<(), Error> {
+    require_increasing_path(previous, &record.path)?;
+    let node = record
+        .value
+        .as_ref()
+        .ok_or_else(|| Error::corrupt("read Managed namespace", "snapshot contains a deletion"))?;
+    validate_portable_path(&record.path)?;
+    validate_content(node)?;
+    if record.path.is_empty() {
+        if node.node_id != volume.format.root_node_id()
+            || !matches!(node.value, NamespaceValue::Directory { .. })
+        {
+            return Err(Error::corrupt(
+                "read Managed namespace",
+                "namespace root is invalid",
+            ));
+        }
+        *root_seen = true;
+    }
+    *previous = Some(record.path.clone());
+    Ok(())
+}
+
+fn require_increasing_path(previous: &mut Option<String>, path: &str) -> Result<(), Error> {
+    if previous
+        .as_ref()
+        .is_some_and(|previous| previous.as_str() >= path)
     {
         return Err(Error::corrupt(
             "read Managed namespace",
-            "file content does not match its namespace record",
+            "namespace stream is not strictly path ordered",
         ));
     }
     Ok(())
 }
 
-pub(super) fn require_stream(
-    reference: StreamRef,
-    kind: StreamKind,
-    class: ObjectClass,
-) -> Result<(), Error> {
-    if reference.kind != kind || reference.object.class != class {
+fn validate_content(node: &NamespaceNode<FileDataRef>) -> Result<(), Error> {
+    if let NamespaceValue::RegularFile {
+        fingerprint,
+        content,
+        ..
+    } = node.value
+        && content.stream_ref(fingerprint).is_err()
+    {
         return Err(Error::corrupt(
             "read Managed namespace",
-            "stream reference has the wrong type",
+            "file content does not match its namespace record",
         ));
     }
     Ok(())

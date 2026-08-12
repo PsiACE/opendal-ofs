@@ -23,9 +23,9 @@ use futures::TryStreamExt as _;
 
 use crate::Error;
 use crate::filesystem::{NamespaceValue, OperationId};
-use crate::managed::{ManagedObservation, NamespaceRevision, StreamRef};
+use crate::managed::{FileDataRef, ManagedObservation, NamespaceRevision};
 use crate::namespace::Namespace;
-use crate::workset::Workspace;
+use crate::workset::{self, Workspace};
 
 use super::SyncEngine;
 use super::state::ReplicaState;
@@ -37,7 +37,7 @@ impl SyncEngine {
         state_path: &Path,
         state: &mut ReplicaState,
         observed: &ManagedObservation,
-        target: &Namespace<StreamRef>,
+        target: &Namespace<FileDataRef>,
     ) -> Result<NamespaceRevision, Error> {
         let operation = OperationId::generate();
         let revision = self
@@ -50,7 +50,7 @@ impl SyncEngine {
             operation,
             observed.maintenance_generation(),
         )?;
-        state.save(state_path)?;
+        super::state_file::persist(state, state_path, true)?;
         crate::fault::check("before-publish")?;
         self.volume
             .commit_publication(observed, revision, operation)
@@ -63,45 +63,91 @@ impl SyncEngine {
         &self,
         root: &Path,
         observed: &ManagedObservation,
-        target: &Namespace<Option<StreamRef>>,
-    ) -> Result<Namespace<StreamRef>, Error> {
+        target: &Namespace<Option<FileDataRef>>,
+    ) -> Result<Namespace<FileDataRef>, Error> {
         let workspace = Workspace::create(self.volume.workset_options())?;
-        let mut output = workspace.writer("published-namespace")?;
+        let mut completed = workspace.writer("completed-file-publications")?;
         let publications = target
             .entries
             .stream()?
-            .map_ok(|record| async move {
+            .try_filter_map(|record| async move {
                 let Some(node) = record.value.as_ref() else {
                     return Err(Error::corrupt(
                         "publish Managed files",
                         "current namespace contains a tombstone",
                     ));
                 };
-                let content = match &node.value {
-                    NamespaceValue::Directory { .. } => None,
+                let publication = match &node.value {
                     NamespaceValue::RegularFile {
                         fingerprint,
-                        content,
+                        content: None,
                         ..
-                    } => match content {
-                        Some(reference) => Some(*reference),
-                        None => Some(
-                            publish_file(
-                                &self.volume,
-                                &root.join(&record.path),
-                                *fingerprint,
-                                observed.gc_epoch(),
-                            )
-                            .await?,
-                        ),
-                    },
+                    } => Some((record.path, *fingerprint)),
+                    NamespaceValue::Directory { .. }
+                    | NamespaceValue::RegularFile {
+                        content: Some(_), ..
+                    } => None,
                 };
-                Ok::<_, Error>(record.map_content(|_| content.expect("regular file content")))
+                Ok(publication)
             })
-            .try_buffered(self.transfer_concurrency);
+            .map_ok(|(path, fingerprint)| async move {
+                let content = publish_file(
+                    &self.volume,
+                    &root.join(&path),
+                    fingerprint,
+                    observed.gc_epoch(),
+                )
+                .await?;
+                Ok::<_, Error>((path, content))
+            })
+            .try_buffer_unordered(self.transfer_concurrency);
         futures::pin_mut!(publications);
-        while let Some(record) = publications.try_next().await? {
-            output.write(&record)?;
+        while let Some(publication) = publications.try_next().await? {
+            completed.write(&publication)?;
+        }
+
+        let completed = workset::sort(
+            &workspace,
+            &completed.finish()?,
+            |(path, _): &(String, FileDataRef)| path.clone(),
+        )?;
+        let mut completed_reader = completed.reader()?;
+        let mut target_reader = target.reader()?;
+        let mut output = workspace.writer("published-namespace")?;
+        while let Some(record) = target_reader.next()? {
+            let node = record
+                .value
+                .as_ref()
+                .expect("current namespace was validated before publication");
+            let content = match &node.value {
+                NamespaceValue::Directory { .. } => None,
+                NamespaceValue::RegularFile {
+                    content: Some(reference),
+                    ..
+                } => Some(*reference),
+                NamespaceValue::RegularFile { content: None, .. } => {
+                    let Some((path, reference)) = completed_reader.next()? else {
+                        return Err(Error::corrupt(
+                            "publish Managed files",
+                            "published file result is missing",
+                        ));
+                    };
+                    if path != record.path {
+                        return Err(Error::corrupt(
+                            "publish Managed files",
+                            "published file result does not match its namespace path",
+                        ));
+                    }
+                    Some(reference)
+                }
+            };
+            output.write(&record.map_content(|_| content.expect("regular file content")))?;
+        }
+        if completed_reader.next()?.is_some() {
+            return Err(Error::corrupt(
+                "publish Managed files",
+                "published file result has no namespace entry",
+            ));
         }
         Ok(Namespace {
             volume_id: target.volume_id,

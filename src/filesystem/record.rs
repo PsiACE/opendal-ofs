@@ -25,7 +25,7 @@ use unicode_normalization::UnicodeNormalization as _;
 
 use crate::Error;
 
-use super::{ChangeCursor, FileFingerprint, FileVersionId, NodeAttributes, NodeId, NodeKind};
+use super::{FileFingerprint, FileVersionId, NodeAttributes, NodeId, NodeKind};
 
 /// One path-ordered row in a Managed namespace stream.
 ///
@@ -35,7 +35,6 @@ use super::{ChangeCursor, FileFingerprint, FileVersionId, NodeAttributes, NodeId
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NamespaceRecord<C> {
     pub path: String,
-    pub change_cursor: ChangeCursor,
     pub value: Option<NamespaceNode<C>>,
 }
 
@@ -61,9 +60,8 @@ pub enum NamespaceValue<C> {
 
 impl<C: Serialize> Serialize for NamespaceRecord<C> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut tuple = serializer.serialize_tuple(3)?;
+        let mut tuple = serializer.serialize_tuple(2)?;
         tuple.serialize_element(&self.path)?;
-        tuple.serialize_element(&self.change_cursor)?;
         tuple.serialize_element(&self.value)?;
         tuple.end()
     }
@@ -71,12 +69,8 @@ impl<C: Serialize> Serialize for NamespaceRecord<C> {
 
 impl<'de, C: Deserialize<'de>> Deserialize<'de> for NamespaceRecord<C> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let (path, change_cursor, value) = Deserialize::deserialize(deserializer)?;
-        Ok(Self {
-            path,
-            change_cursor,
-            value,
-        })
+        let (path, value) = Deserialize::deserialize(deserializer)?;
+        Ok(Self { path, value })
     }
 }
 
@@ -222,7 +216,6 @@ impl<C> NamespaceRecord<C> {
     pub fn map_content<D>(self, map: impl FnOnce(C) -> D + Copy) -> NamespaceRecord<D> {
         NamespaceRecord {
             path: self.path,
-            change_cursor: self.change_cursor,
             value: self.value.map(|value| value.map_content(map)),
         }
     }

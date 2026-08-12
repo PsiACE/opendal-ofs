@@ -19,7 +19,7 @@ use std::fs;
 
 use anyhow::{Context, Result, bail};
 use ofs::managed::ManagedMetadata;
-use ofs::sync::{ReplicaState, SyncEngine};
+use ofs::sync::{SyncEngine, load_replica_state};
 
 use crate::cli::SyncArgs;
 
@@ -47,7 +47,7 @@ pub(super) async fn run(args: SyncArgs) -> Result<()> {
         args.resources.transfer_concurrency,
         args.resources.work_memory_mib,
     )?;
-    let stored = ReplicaState::load(&args.state)?;
+    let stored = load_replica_state(&args.state)?;
     let volume = match &stored {
         Some(state) => metadata.open(Some(state.volume_id())).await?,
         None => metadata.open(None).await?,

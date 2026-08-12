@@ -18,9 +18,11 @@
 //! Managed volume authority and durable storage format.
 
 mod data;
+mod file;
 mod format;
 mod gc;
 mod head;
+mod layout;
 mod namespace;
 mod object;
 mod publication;
@@ -29,12 +31,12 @@ mod storage;
 mod stream;
 mod wire;
 
+pub(crate) use data::FileDataRef;
 pub(crate) use format::ManagedFormat;
 pub use gc::GcOutcome;
 pub(crate) use head::ManagedObservation;
 pub use head::{ManagedVolume, NamespaceRevision};
 pub(crate) use object::GcEpoch;
-pub(crate) use stream::StreamRef;
 
 use std::num::NonZeroUsize;
 

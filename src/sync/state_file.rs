@@ -35,10 +35,13 @@ pub(super) fn load(path: &Path) -> Result<Option<ReplicaState>, Error> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(Error::from_io("read replica state", Some(path), error)),
     };
-    decode(&bytes).map(Some)
+    let state = decode(&bytes)?;
+    state.validate()?;
+    Ok(Some(state))
 }
 
 pub(super) fn persist(state: &ReplicaState, path: &Path, replace: bool) -> Result<(), Error> {
+    state.validate()?;
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty());
