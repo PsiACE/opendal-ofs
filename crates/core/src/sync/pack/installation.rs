@@ -23,8 +23,8 @@ use futures::stream::{FuturesUnordered, StreamExt as _};
 use serde::{Deserialize, Serialize};
 
 use crate::Error;
-use crate::filesystem::FileFingerprint;
-use crate::managed::{ManagedVolume, ObjectLocator, PackRangeReader};
+use crate::filesystem::ContentRef;
+use crate::managed::{ManagedVolume, ObjectLocator, SegmentRangeReader};
 use crate::workset::{self, Spool, SpoolWriter, Workspace};
 
 use super::super::local_fs::{self, DirectoryDurability, StoredPath};
@@ -35,7 +35,7 @@ pub(crate) struct Installation {
     locator: ObjectLocator,
     offset: u64,
     destination: StoredPath,
-    fingerprint: FileFingerprint,
+    fingerprint: ContentRef,
     executable: bool,
     authoritative: bool,
 }
@@ -45,7 +45,7 @@ impl Installation {
         locator: ObjectLocator,
         offset: u64,
         destination: &Path,
-        fingerprint: FileFingerprint,
+        fingerprint: ContentRef,
         executable: bool,
         authoritative: bool,
     ) -> Result<Self, Error> {
@@ -163,7 +163,7 @@ async fn install_object(
         }
         run_end = file
             .offset
-            .checked_add(file.fingerprint.logical_length())
+            .checked_add(file.fingerprint.length())
             .ok_or_else(|| Error::corrupt("install Managed pack", "file range overflows"))?;
         run.as_mut().expect("Pack run exists").write(&file)?;
     }
@@ -186,7 +186,7 @@ async fn install_range(
         .ok_or_else(|| Error::corrupt("install Managed pack", "Pack range run is empty"))?;
     let mut end = first
         .offset
-        .checked_add(first.fingerprint.logical_length())
+        .checked_add(first.fingerprint.length())
         .ok_or_else(|| Error::corrupt("install Managed pack", "file range overflows"))?;
     while let Some(file) = source.next()? {
         if file.offset != end {
@@ -196,10 +196,11 @@ async fn install_range(
             ));
         }
         end = end
-            .checked_add(file.fingerprint.logical_length())
+            .checked_add(file.fingerprint.length())
             .ok_or_else(|| Error::corrupt("install Managed pack", "file range overflows"))?;
     }
-    let mut reader = PackRangeReader::open(volume.operator(), locator, first.offset..end).await?;
+    let mut reader =
+        SegmentRangeReader::open(volume.operator(), locator, first.offset..end).await?;
     let mut source = files.reader()?;
     while let Some(file) = source.next()? {
         install_file(&mut reader, &file).await?;
@@ -208,7 +209,7 @@ async fn install_range(
     Ok(())
 }
 
-async fn install_file(reader: &mut PackRangeReader, file: &Installation) -> Result<(), Error> {
+async fn install_file(reader: &mut SegmentRangeReader, file: &Installation) -> Result<(), Error> {
     let destination = file.destination.to_path_buf();
     if local_fs::path_metadata(&destination)?.is_some_and(|metadata| metadata.is_dir()) {
         local_fs::remove_replaced_directory(&destination)?;

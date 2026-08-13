@@ -25,12 +25,12 @@ use unicode_normalization::UnicodeNormalization as _;
 
 use crate::Error;
 
-use super::{FileFingerprint, FileVersionId, NodeAttributes, NodeId, NodeKind};
+use super::{ContentRef, FileVersionId, NodeAttributes, NodeId, NodeKind};
 
 /// One path-ordered row in a Managed namespace stream.
 ///
-/// `content` is supplied by the volume implementation. A durable Managed
-/// namespace uses its immutable content reference; a local scan uses `()`
+/// `data` is supplied by the volume implementation. A durable Managed
+/// namespace uses its immutable data reference; a local scan uses `()`
 /// until publication attaches that reference.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NamespaceRecord<C> {
@@ -53,8 +53,8 @@ pub enum NamespaceValue<C> {
     },
     RegularFile {
         version: FileVersionId,
-        fingerprint: FileFingerprint,
-        content: C,
+        content: ContentRef,
+        data: C,
     },
 }
 
@@ -108,14 +108,14 @@ impl<C: Serialize> Serialize for NamespaceValue<C> {
             }
             Self::RegularFile {
                 version,
-                fingerprint,
                 content,
+                data,
             } => {
                 let mut tuple = serializer.serialize_tuple(4)?;
                 tuple.serialize_element(&1_u8)?;
                 tuple.serialize_element(version)?;
-                tuple.serialize_element(fingerprint)?;
                 tuple.serialize_element(content)?;
+                tuple.serialize_element(data)?;
                 tuple.end()
             }
         }
@@ -150,10 +150,10 @@ impl<'de, C: Deserialize<'de>> Deserialize<'de> for NamespaceValue<C> {
                         version: sequence
                             .next_element()?
                             .ok_or_else(|| A::Error::invalid_length(1, &self))?,
-                        fingerprint: sequence
+                        content: sequence
                             .next_element()?
                             .ok_or_else(|| A::Error::invalid_length(2, &self))?,
-                        content: sequence
+                        data: sequence
                             .next_element()?
                             .ok_or_else(|| A::Error::invalid_length(3, &self))?,
                     },
@@ -178,18 +178,18 @@ impl<C> NamespaceNode<C> {
         }
     }
 
-    pub const fn file(&self) -> Option<(FileVersionId, FileFingerprint, &C)> {
+    pub const fn file(&self) -> Option<(FileVersionId, ContentRef, &C)> {
         match &self.value {
             NamespaceValue::RegularFile {
                 version,
-                fingerprint,
                 content,
-            } => Some((*version, *fingerprint, content)),
+                data,
+            } => Some((*version, *content, data)),
             NamespaceValue::Directory { .. } => None,
         }
     }
 
-    pub fn map_content<D>(self, map: impl FnOnce(C) -> D) -> NamespaceNode<D> {
+    pub fn map_data<D>(self, map: impl FnOnce(C) -> D) -> NamespaceNode<D> {
         NamespaceNode {
             node_id: self.node_id,
             generation: self.generation,
@@ -200,12 +200,12 @@ impl<C> NamespaceNode<C> {
                 }
                 NamespaceValue::RegularFile {
                     version,
-                    fingerprint,
                     content,
+                    data,
                 } => NamespaceValue::RegularFile {
                     version,
-                    fingerprint,
-                    content: map(content),
+                    content,
+                    data: map(data),
                 },
             },
         }
@@ -213,10 +213,10 @@ impl<C> NamespaceNode<C> {
 }
 
 impl<C> NamespaceRecord<C> {
-    pub fn map_content<D>(self, map: impl FnOnce(C) -> D + Copy) -> NamespaceRecord<D> {
+    pub fn map_data<D>(self, map: impl FnOnce(C) -> D + Copy) -> NamespaceRecord<D> {
         NamespaceRecord {
             path: self.path,
-            value: self.value.map(|value| value.map_content(map)),
+            value: self.value.map(|value| value.map_data(map)),
         }
     }
 }

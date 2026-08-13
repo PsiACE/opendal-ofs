@@ -34,7 +34,7 @@ use crate::workset::{MergeRuns, Spool, Workspace};
 use super::data::FileDataRef;
 use super::head::{ManagedVolume, NamespaceRevision};
 use super::layout::{NamespaceChangeSegment, NamespaceCommit};
-use super::object::{GcEpoch, ObjectClass, ObjectLocator};
+use super::object::{GcEpoch, ObjectClass};
 use super::publication;
 use super::stream::{self, RecordStreamReader, RecordStreamWriter, StreamKind, StreamRef};
 
@@ -93,7 +93,6 @@ pub(super) async fn write_snapshot(
     volume: &ManagedVolume,
     namespace: &Namespace<FileDataRef>,
     gc_epoch: GcEpoch,
-    mut visit_file: impl FnMut(ObjectLocator) -> Result<(), Error>,
 ) -> Result<StreamRef, Error> {
     let mut source = namespace.reader()?;
     let mut writer = RecordStreamWriter::open(
@@ -104,13 +103,6 @@ pub(super) async fn write_snapshot(
     )
     .await?;
     while let Some(record) = source.next()? {
-        if let Some(NamespaceNode {
-            value: NamespaceValue::RegularFile { content, .. },
-            ..
-        }) = record.value.as_ref()
-        {
-            visit_file(content.object_locator())?;
-        }
         writer.write(&record).await?;
     }
     writer.close().await
@@ -525,7 +517,7 @@ fn validate_record(
         .as_ref()
         .ok_or_else(|| Error::corrupt("read Managed namespace", "snapshot contains a deletion"))?;
     validate_portable_path(&record.path)?;
-    validate_content(node)?;
+    validate_content(volume, node)?;
     if record.path.is_empty() {
         if node.node_id != volume.format.root_node_id()
             || !matches!(node.value, NamespaceValue::Directory { .. })
@@ -554,13 +546,14 @@ fn require_increasing_path(previous: &mut Option<String>, path: &str) -> Result<
     Ok(())
 }
 
-fn validate_content(node: &NamespaceNode<FileDataRef>) -> Result<(), Error> {
-    if let NamespaceValue::RegularFile {
-        fingerprint,
-        content,
-        ..
-    } = node.value
-        && content.validate(fingerprint).is_err()
+fn validate_content(
+    volume: &ManagedVolume,
+    node: &NamespaceNode<FileDataRef>,
+) -> Result<(), Error> {
+    if let NamespaceValue::RegularFile { content, data, .. } = &node.value
+        && data
+            .validate(*content, volume.file_decoding_count())
+            .is_err()
     {
         return Err(Error::corrupt(
             "read Managed namespace",

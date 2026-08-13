@@ -20,7 +20,7 @@
 use ofs_core::filesystem::VolumeId;
 use ofs_core::managed::extension::{
     ExtensionId, ExtentExtension as _, FileAccessExtension as _, FileAccessInfo,
-    FileLayoutExtension as _, IdentityExtentAccess,
+    FilePartitionExtension as _, IdentityExtentAccess,
 };
 use ofs_core::managed::{
     AuthorityExtension as _, DefaultAuthorityAccess, ManagedMetadata, ManagedVolume,
@@ -118,19 +118,19 @@ pub async fn open(
 }
 
 fn detect(info: &FileAccessInfo) -> Result<Option<FileExtensions>, Error> {
-    if info.layout.id != FASTCDC_EXTENSION_ID {
+    if info.partitioning.id != FASTCDC_EXTENSION_ID {
         return Ok(None);
     }
     let identities = info
-        .extents
+        .decodings
         .iter()
         .map(|extension| extension.id)
         .collect::<Vec<ExtensionId>>();
-    if identities == [ExtensionId::IDENTITY] {
+    if identities.is_empty() {
         return Ok(Some(FileExtensions::FastCdc));
     }
-    if identities == [ZSTD_EXTENSION_ID, ExtensionId::IDENTITY] {
-        let mut input = info.extents[0].configuration.as_slice();
+    if identities == [ZSTD_EXTENSION_ID] {
+        let mut input = info.decodings[0].configuration.as_slice();
         let level = ciborium::from_reader(&mut input).map_err(|_| {
             Error::new(
                 ErrorKind::Corrupt,

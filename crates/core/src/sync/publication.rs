@@ -23,7 +23,10 @@ use std::pin::Pin;
 
 use crate::Error;
 use crate::filesystem::{NamespaceValue, OperationId};
-use crate::managed::{FileDataRef, ManagedObservation, ManagedVolume, NamespaceRevision};
+use crate::managed::extension::{ExtentRef, RecordStreamReader, StreamRef};
+use crate::managed::{
+    FileDataRef, KnownContent, ManagedObservation, ManagedVolume, NamespaceRevision,
+};
 use crate::namespace::Namespace;
 use crate::workset::{self, Spool, SpoolWriter, Workspace};
 use futures::stream::{FuturesUnordered, StreamExt as _};
@@ -68,6 +71,7 @@ impl SyncEngine {
         target: &Namespace<Option<FileDataRef>>,
     ) -> Result<Namespace<FileDataRef>, Error> {
         let workspace = Workspace::create(self.volume.workset_options())?;
+        let known = read_known_content(&self.volume, &workspace, observed).await?;
         let mut completed = workspace.writer("completed-file-publications")?;
         let mut publications = FuturesUnordered::<PublicationFuture>::new();
         let mut pack = None;
@@ -81,22 +85,30 @@ impl SyncEngine {
                 ));
             };
             let NamespaceValue::RegularFile {
-                fingerprint,
-                content: None,
+                content,
+                data: None,
                 ..
             } = &node.value
             else {
                 continue;
             };
             let pending = PendingFile {
-                path: record.path,
-                fingerprint: *fingerprint,
+                path: record.path.clone(),
+                fingerprint: *content,
             };
-            if pack_target.is_some_and(|target| PublicationPlan::accepts(target, *fingerprint)) {
+            if let Some(data) = known.file(*content)? {
+                completed.write(&(pending.path, data))?;
+                continue;
+            }
+            if let Some(extent) = known.extent(*content)? {
+                completed.write(&(pending.path, FileDataRef::single(extent)))?;
+                continue;
+            }
+            if pack_target.is_some_and(|target| PublicationPlan::accepts(target, *content)) {
                 let target = pack_target.expect("Pack placement has a target");
                 if pack
                     .as_ref()
-                    .is_some_and(|plan: &PublicationPlan| plan.would_overflow(target, *fingerprint))
+                    .is_some_and(|plan: &PublicationPlan| plan.would_overflow(target, *content))
                 {
                     schedule_pack(
                         &mut publications,
@@ -118,6 +130,7 @@ impl SyncEngine {
                     self.volume.clone(),
                     root.to_owned(),
                     pending,
+                    known.clone(),
                     observed.gc_epoch(),
                 );
             }
@@ -156,13 +169,13 @@ impl SyncEngine {
                 .value
                 .as_ref()
                 .expect("current namespace was validated before publication");
-            let content = match &node.value {
+            let data = match &node.value {
                 NamespaceValue::Directory { .. } => None,
                 NamespaceValue::RegularFile {
-                    content: Some(reference),
+                    data: Some(reference),
                     ..
-                } => Some(*reference),
-                NamespaceValue::RegularFile { content: None, .. } => {
+                } => Some(reference.clone()),
+                NamespaceValue::RegularFile { data: None, .. } => {
                     let Some((path, reference)) = completed_reader.next()? else {
                         return Err(Error::corrupt(
                             "publish Managed files",
@@ -178,7 +191,8 @@ impl SyncEngine {
                     Some(reference)
                 }
             };
-            output.write(&record.map_content(|_| content.expect("regular file content")))?;
+            let data = data.as_ref();
+            output.write(&record.map_data(|_| data.expect("regular file data").clone()))?;
         }
         if completed_reader.next()?.is_some() {
             return Err(Error::corrupt(
@@ -196,7 +210,7 @@ impl SyncEngine {
 }
 
 enum PublishedFiles {
-    One(String, FileDataRef),
+    One(String, Box<FileDataRef>),
     Pack(Spool<(String, FileDataRef)>),
 }
 
@@ -207,13 +221,111 @@ fn schedule_file(
     volume: ManagedVolume,
     root: PathBuf,
     file: PendingFile,
+    known: KnownContent,
     gc_epoch: crate::managed::GcEpoch,
 ) {
     publications.push(Box::pin(async move {
-        let content =
-            publish_file(&volume, &root.join(&file.path), file.fingerprint, gc_epoch).await?;
-        Ok(PublishedFiles::One(file.path, content))
+        let content = publish_file(
+            &volume,
+            &root.join(&file.path),
+            file.fingerprint,
+            &known,
+            gc_epoch,
+        )
+        .await?;
+        Ok(PublishedFiles::One(file.path, Box::new(content)))
     }));
+}
+
+async fn read_known_content(
+    volume: &ManagedVolume,
+    workspace: &Workspace,
+    observed: &ManagedObservation,
+) -> Result<KnownContent, Error> {
+    let mut records = workspace.writer("authority-content")?;
+    let mut files = workspace.writer("authority-files")?;
+    let mut tails = workspace.writer("authority-file-extent-tails")?;
+    let mut namespace = observed.namespace.reader()?;
+    while let Some(record) = namespace.next()? {
+        let Some(node) = record.value else {
+            continue;
+        };
+        let NamespaceValue::RegularFile { content, data, .. } = node.value else {
+            continue;
+        };
+        if let Some(extent) = data.inline_extent() {
+            records.write(&(extent.content(), extent))?;
+        }
+        if let Some(tail) = data.tail() {
+            files.write(&(content, tail.object.locator, data.clone()))?;
+            tails.write(&tail)?;
+        }
+    }
+    let tails = workset::sort(workspace, &tails.finish()?, |tail| tail.object.locator)?;
+    let mut tails = tails.reader()?;
+    let mut previous: Option<StreamRef> = None;
+    let mut readers = FuturesUnordered::new();
+    while let Some(tail) = tails.next()? {
+        if let Some(previous) =
+            previous.filter(|previous| previous.object.locator == tail.object.locator)
+        {
+            if previous != tail {
+                return Err(Error::corrupt(
+                    "read Managed authority content",
+                    "one extent segment has conflicting stream references",
+                ));
+            }
+            continue;
+        }
+        previous = Some(tail);
+        readers.push(read_extent_tail(volume, workspace, tail));
+        if readers.len() >= volume.stream_concurrency() {
+            let extents = readers
+                .next()
+                .await
+                .expect("an extent tail reader remains")?;
+            append_known_content(&mut records, &extents)?;
+        }
+    }
+    while let Some(extents) = readers.next().await {
+        append_known_content(&mut records, &extents?)?;
+    }
+    let records = workset::sort(workspace, &records.finish()?, |(content, extent)| {
+        (*content, extent.range.segment, extent.range.offset)
+    })?;
+    let files = workset::sort(workspace, &files.finish()?, |(content, locator, _)| {
+        (*content, *locator)
+    })?;
+    let mut known_files = workspace.writer("known-files")?;
+    let mut files = files.reader()?;
+    while let Some((content, _, data)) = files.next()? {
+        known_files.write(&(content, data))?;
+    }
+    KnownContent::build(workspace, &known_files.finish()?, &records)
+}
+
+async fn read_extent_tail(
+    volume: &ManagedVolume,
+    workspace: &Workspace,
+    tail: StreamRef,
+) -> Result<Spool<(crate::filesystem::ContentRef, ExtentRef)>, Error> {
+    let mut output = workspace.writer("authority-file-extents")?;
+    let mut source = RecordStreamReader::<ExtentRef>::open(volume.operator(), tail).await?;
+    while let Some(extent) = source.next().await? {
+        output.write(&(extent.content(), extent))?;
+    }
+    output.finish()
+}
+
+fn append_known_content(
+    output: &mut SpoolWriter<(crate::filesystem::ContentRef, ExtentRef)>,
+    extents: &Spool<(crate::filesystem::ContentRef, ExtentRef)>,
+) -> Result<(), Error> {
+    let mut extents = extents.reader()?;
+    while let Some(extent) = extents.next()? {
+        output.write(&extent)?;
+    }
+    Ok(())
 }
 
 fn schedule_pack(
@@ -238,7 +350,7 @@ fn record_publication(
     publication: PublishedFiles,
 ) -> Result<(), Error> {
     match publication {
-        PublishedFiles::One(path, content) => completed.write(&(path, content)),
+        PublishedFiles::One(path, content) => completed.write(&(path, *content)),
         PublishedFiles::Pack(files) => {
             let mut files = files.reader()?;
             while let Some(file) = files.next()? {

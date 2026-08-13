@@ -15,222 +15,110 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! The one ordered-extent representation used by every file placement.
+
 use crate::Error;
-use crate::filesystem::{Digest, FileFingerprint};
-use serde::de::{Error as _, SeqAccess, Visitor};
-use serde::ser::SerializeTuple as _;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::fmt;
+use crate::filesystem::ContentRef;
 
-use super::extension::ExtensionFileRef;
-use super::object::{GcEpoch, ObjectClass, ObjectId, ObjectLocator, ObjectRef};
-use super::pack::EntryRef as PackEntryRef;
-use super::stream::{STREAM_TAIL_BYTES, StreamKind, StreamRef};
+use super::extension::{ExtentRef, SegmentRangeRef};
+use super::object::ObjectClass;
+use super::stream::{StreamKind, StreamRef};
 
-/// Durable reference to one Whole File byte stream.
+/// Durable reference to one logical file's ordered extent stream.
 ///
-/// Its enclosing namespace record supplies the logical length and payload
-/// digest. The variant fixes the object class and stream kind.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct WholeFileRef {
-    gc_epoch: GcEpoch,
-    object_id: ObjectId,
-    object_digest: Digest,
+/// The first extent is inline so whole files and packed small files do not
+/// require a metadata request per file. Files with more extents continue in a
+/// self-delimiting record stream. Both fields are projections of the same
+/// ordered sequence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileDataRef {
+    pub(super) first: Option<ExtentRef>,
+    pub(super) tail: Option<StreamRef>,
 }
 
-super::wire::tuple_wire!(WholeFileRef {
-    gc_epoch: GcEpoch,
-    object_id: ObjectId,
-    object_digest: Digest,
+super::wire::tuple_wire!(FileDataRef {
+    first: Option<ExtentRef>,
+    tail: Option<StreamRef>,
 });
 
-/// The one durable file-data reference used by namespace records.
-///
-/// Whole files name one byte stream. Packed files name one exact range in an
-/// immutable pack; the enclosing fingerprint supplies range length and digest.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum FileDataRef {
-    Whole(WholeFileRef),
-    Pack(PackEntryRef),
-    Extension(ExtensionFileRef),
-}
-
-const WHOLE_FILE: u8 = 1;
-const PACK_ENTRY: u8 = 2;
-const EXTENSION_FILE: u8 = 3;
-
 impl FileDataRef {
-    pub(super) fn from_stream(
-        reference: StreamRef,
-        fingerprint: FileFingerprint,
-    ) -> Result<Self, Error> {
-        if reference
-            .require(StreamKind::FILE_BYTES, ObjectClass::FileData)
-            .is_err()
-            || reference.payload_length != fingerprint.logical_length()
-            || reference.payload_digest != fingerprint.digest()
-        {
-            return Err(Error::corrupt(
-                "publish Managed file",
-                "file data does not match its fingerprint",
-            ));
+    /// Reference the empty byte sequence without creating a data object.
+    pub const fn empty() -> Self {
+        Self {
+            first: None,
+            tail: None,
         }
-        Ok(Self::Whole(WholeFileRef {
-            gc_epoch: reference.object.locator.gc_epoch,
-            object_id: reference.object.locator.id,
-            object_digest: reference.object.digest,
-        }))
     }
 
-    pub(crate) fn stream_ref(self, fingerprint: FileFingerprint) -> Result<StreamRef, Error> {
-        let Self::Whole(reference) = self else {
-            return Err(Error::corrupt(
-                "read Managed file",
-                "packed data is not a whole-file stream",
-            ));
-        };
-        let payload_length = fingerprint.logical_length();
-        let encoded_length = payload_length
-            .checked_add(STREAM_TAIL_BYTES as u64)
-            .ok_or_else(|| Error::corrupt("read Managed file", "file length overflows"))?;
-        Ok(StreamRef {
-            kind: StreamKind::FILE_BYTES,
-            object: ObjectRef {
-                locator: ObjectLocator {
-                    gc_epoch: reference.gc_epoch,
-                    class: ObjectClass::FileData,
-                    id: reference.object_id,
-                },
-                encoded_length,
-                digest: reference.object_digest,
-            },
-            payload_length,
-            payload_digest: fingerprint.digest(),
+    /// Reference one inline extent.
+    pub const fn single(extent: ExtentRef) -> Self {
+        Self {
+            first: Some(extent),
+            tail: None,
+        }
+    }
+
+    /// Reference an ordered extent sequence with its first item inline.
+    pub fn with_tail(first: ExtentRef, tail: StreamRef) -> Result<Self, Error> {
+        tail.require(StreamKind::FILE_EXTENTS, ObjectClass::FileExtentSegment)?;
+        Ok(Self {
+            first: Some(first),
+            tail: Some(tail),
         })
     }
 
-    pub(crate) const fn from_pack(locator: ObjectLocator, offset: u64) -> Self {
-        Self::Pack(PackEntryRef::new(locator, offset))
-    }
-
-    pub(crate) const fn object_locator(self) -> ObjectLocator {
-        match self {
-            Self::Whole(reference) => ObjectLocator {
-                gc_epoch: reference.gc_epoch,
-                class: ObjectClass::FileData,
-                id: reference.object_id,
-            },
-            Self::Pack(reference) => reference.locator(),
-            Self::Extension(reference) => reference.root.object.locator,
-        }
-    }
-
-    pub(crate) const fn pack_offset(self) -> Option<u64> {
-        match self {
-            Self::Whole(_) => None,
-            Self::Pack(reference) => Some(reference.offset()),
-            Self::Extension(_) => None,
-        }
-    }
-
-    pub(crate) const fn extension(self) -> Option<ExtensionFileRef> {
-        match self {
-            Self::Extension(reference) => Some(reference),
-            Self::Whole(_) | Self::Pack(_) => None,
-        }
-    }
-
-    pub(crate) fn validate(self, fingerprint: FileFingerprint) -> Result<(), Error> {
-        match self {
-            Self::Whole(_) => self.stream_ref(fingerprint).map(drop),
-            Self::Pack(reference) => reference
-                .offset()
-                .checked_add(fingerprint.logical_length())
-                .map(drop)
-                .ok_or_else(|| Error::corrupt("read Managed file", "pack range overflows")),
-            Self::Extension(reference) => {
-                if reference.root.object.locator.class != ObjectClass::Extension {
+    pub(crate) fn validate(&self, content: ContentRef, decoding_count: usize) -> Result<(), Error> {
+        match (&self.first, self.tail) {
+            (None, None) if content.length() == 0 => Ok(()),
+            (Some(first), tail) if content.length() != 0 => {
+                if first.decoded.len() != decoding_count
+                    || first.content().length() == 0
+                    || first.content().length() > content.length()
+                {
                     return Err(Error::corrupt(
                         "read Managed file",
-                        "extension root uses the wrong object class",
+                        "first extent length is invalid",
                     ));
+                }
+                if tail.is_none() && first.content() != content {
+                    return Err(Error::corrupt(
+                        "read Managed file",
+                        "single extent does not match the file content reference",
+                    ));
+                }
+                first
+                    .range
+                    .offset
+                    .checked_add(first.range.stored.length())
+                    .ok_or_else(|| {
+                        Error::corrupt("read Managed file", "stored extent range overflows")
+                    })?;
+                if let Some(tail) = tail {
+                    tail.require(StreamKind::FILE_EXTENTS, ObjectClass::FileExtentSegment)?;
                 }
                 Ok(())
             }
+            _ => Err(Error::corrupt(
+                "read Managed file",
+                "empty and non-empty file references do not match",
+            )),
         }
     }
-}
 
-impl Serialize for FileDataRef {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let mut tuple = serializer.serialize_tuple(2)?;
-        match self {
-            Self::Whole(reference) => {
-                tuple.serialize_element(&WHOLE_FILE)?;
-                tuple.serialize_element(reference)?;
-            }
-            Self::Pack(reference) => {
-                tuple.serialize_element(&PACK_ENTRY)?;
-                tuple.serialize_element(reference)?;
-            }
-            Self::Extension(reference) => {
-                tuple.serialize_element(&EXTENSION_FILE)?;
-                tuple.serialize_element(reference)?;
-            }
-        }
-        tuple.end()
+    pub(crate) const fn tail(&self) -> Option<StreamRef> {
+        self.tail
     }
-}
 
-impl<'de> Deserialize<'de> for FileDataRef {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct FileDataRefVisitor;
+    pub(crate) fn inline_extent(&self) -> Option<ExtentRef> {
+        self.first.clone()
+    }
 
-        impl<'de> Visitor<'de> for FileDataRefVisitor {
-            type Value = FileDataRef;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("a tagged Managed file-data reference")
-            }
-
-            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
-            where
-                A: SeqAccess<'de>,
-            {
-                let kind: u8 = sequence
-                    .next_element()?
-                    .ok_or_else(|| A::Error::custom("file-data reference kind is missing"))?;
-                let value = match kind {
-                    WHOLE_FILE => Self::Value::Whole(
-                        sequence
-                            .next_element()?
-                            .ok_or_else(|| A::Error::custom("whole-file reference is missing"))?,
-                    ),
-                    PACK_ENTRY => Self::Value::Pack(
-                        sequence
-                            .next_element()?
-                            .ok_or_else(|| A::Error::custom("pack-entry reference is missing"))?,
-                    ),
-                    EXTENSION_FILE => {
-                        Self::Value::Extension(sequence.next_element()?.ok_or_else(|| {
-                            A::Error::custom("extension-file reference is missing")
-                        })?)
-                    }
-                    _ => return Err(A::Error::custom("unknown file-data reference kind")),
-                };
-                if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
-                    return Err(A::Error::custom("file-data reference has trailing fields"));
-                }
-                Ok(value)
-            }
-        }
-
-        deserializer.deserialize_tuple(2, FileDataRefVisitor)
+    pub(crate) fn identity_range(&self) -> Option<SegmentRangeRef> {
+        self.tail
+            .is_none()
+            .then_some(self.first.as_ref())
+            .flatten()
+            .filter(|extent| extent.decoded.is_empty())
+            .map(|extent| extent.range)
     }
 }

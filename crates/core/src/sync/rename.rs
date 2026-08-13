@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::Error;
 use crate::filesystem::{
-    FileFingerprint, FileVersionId, NamespaceNode, NamespaceRecord, NamespaceValue, NodeAttributes,
+    ContentRef, FileVersionId, NamespaceNode, NamespaceRecord, NamespaceValue, NodeAttributes,
     NodeId,
 };
 use crate::managed::FileDataRef;
@@ -36,13 +36,13 @@ use super::scan::next_generation;
 struct LocalCandidate {
     path: String,
     executable: bool,
-    fingerprint: FileFingerprint,
+    fingerprint: ContentRef,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct BaseCandidate {
     path: String,
-    fingerprint: FileFingerprint,
+    fingerprint: ContentRef,
     node: NamespaceNode<FileDataRef>,
 }
 
@@ -173,7 +173,7 @@ fn resolve_file_renames(
 }
 
 fn take_local_group(
-    fingerprint: FileFingerprint,
+    fingerprint: ContentRef,
     reader: &mut workset::SpoolReader<LocalCandidate>,
     head: &mut Option<LocalCandidate>,
     output: &mut workset::SpoolWriter<NamespaceRecord<Option<FileDataRef>>>,
@@ -199,7 +199,7 @@ fn take_local_group(
 }
 
 fn take_base_group(
-    fingerprint: FileFingerprint,
+    fingerprint: ContentRef,
     reader: &mut workset::SpoolReader<BaseCandidate>,
     head: &mut Option<BaseCandidate>,
 ) -> Result<Option<BaseCandidate>, Error> {
@@ -234,8 +234,8 @@ fn write_new_file(
             },
             value: NamespaceValue::RegularFile {
                 version: FileVersionId::generate(),
-                fingerprint: local.fingerprint,
-                content: None,
+                content: local.fingerprint,
+                data: None,
             },
         }),
     })
@@ -249,8 +249,8 @@ fn write_renamed_file(
     let BaseCandidate { node, .. } = base;
     let NamespaceValue::RegularFile {
         version,
-        fingerprint,
         content,
+        data,
     } = node.value
     else {
         return Err(Error::corrupt(
@@ -274,8 +274,8 @@ fn write_renamed_file(
             attributes,
             value: NamespaceValue::RegularFile {
                 version,
-                fingerprint,
-                content: Some(content),
+                content,
+                data: Some(data),
             },
         }),
     })

@@ -20,11 +20,11 @@ use opendal::{Buffer, BufferStream, Operator};
 use tokio::io::{AsyncWrite, AsyncWriteExt as _};
 
 use crate::Error;
-use crate::filesystem::{Digest, FileFingerprint};
+use crate::filesystem::{ContentRef, Digest};
 
 use super::super::object::{ObjectClass, ObjectLocator};
 
-/// One bounded range stream from a Pack object.
+/// One bounded range stream from a data segment.
 pub(crate) struct RangeReader {
     stream: BufferStream,
     pending: Buffer,
@@ -37,20 +37,20 @@ impl RangeReader {
         locator: ObjectLocator,
         range: std::ops::Range<u64>,
     ) -> Result<Self, Error> {
-        if locator.class != ObjectClass::FilePack || range.start > range.end {
+        if locator.class != ObjectClass::DataSegment || range.start > range.end {
             return Err(Error::corrupt(
-                "read Managed pack",
-                "pack range reference is invalid",
+                "read Managed data segment",
+                "data segment range reference is invalid",
             ));
         }
         let remaining = range.end - range.start;
         let stream = operator
             .reader(&locator.key())
             .await
-            .map_err(|error| Error::from_storage("open Managed pack", error))?
+            .map_err(|error| Error::from_storage("open Managed data segment", error))?
             .into_stream(range)
             .await
-            .map_err(|error| Error::from_storage("read Managed pack", error))?;
+            .map_err(|error| Error::from_storage("read Managed data segment", error))?;
         Ok(Self {
             stream,
             pending: Buffer::new(),
@@ -60,17 +60,17 @@ impl RangeReader {
 
     pub(crate) async fn copy_file(
         &mut self,
-        fingerprint: FileFingerprint,
-        destination: &mut (impl AsyncWrite + Unpin),
+        content: ContentRef,
+        destination: &mut (impl AsyncWrite + Unpin + ?Sized),
     ) -> Result<(), Error> {
-        let expected = fingerprint.logical_length();
+        let expected = content.length();
         let mut hasher = blake3::Hasher::new();
         self.copy_exact(expected, destination, Some(&mut hasher))
             .await?;
-        if Digest::from_bytes(hasher.finalize().into()) != fingerprint.digest() {
+        if Digest::from_bytes(hasher.finalize().into()) != content.digest() {
             return Err(Error::corrupt(
-                "read Managed pack",
-                "pack entry does not match its fingerprint",
+                "read Managed data segment",
+                "stored range does not match its content reference",
             ));
         }
         Ok(())
@@ -79,7 +79,7 @@ impl RangeReader {
     pub(crate) async fn copy_bytes(
         &mut self,
         length: u64,
-        destination: &mut (impl AsyncWrite + Unpin),
+        destination: &mut (impl AsyncWrite + Unpin + ?Sized),
     ) -> Result<(), Error> {
         self.copy_exact(length, destination, None).await
     }
@@ -87,13 +87,13 @@ impl RangeReader {
     async fn copy_exact(
         &mut self,
         length: u64,
-        destination: &mut (impl AsyncWrite + Unpin),
+        destination: &mut (impl AsyncWrite + Unpin + ?Sized),
         mut hasher: Option<&mut blake3::Hasher>,
     ) -> Result<(), Error> {
         if length > self.remaining {
             return Err(Error::corrupt(
-                "read Managed pack",
-                "pack entry exceeds the requested range",
+                "read Managed data segment",
+                "stored range exceeds the requested range",
             ));
         }
         let mut remaining = length;
@@ -103,8 +103,13 @@ impl RangeReader {
                     .stream
                     .next()
                     .await
-                    .ok_or_else(|| Error::corrupt("read Managed pack", "pack range is truncated"))?
-                    .map_err(|error| Error::from_storage("read Managed pack", error))?;
+                    .ok_or_else(|| {
+                        Error::corrupt(
+                            "read Managed data segment",
+                            "data segment range is truncated",
+                        )
+                    })?
+                    .map_err(|error| Error::from_storage("read Managed data segment", error))?;
             }
             let take = usize::try_from(remaining)
                 .unwrap_or(usize::MAX)
@@ -118,7 +123,7 @@ impl RangeReader {
                 destination
                     .write_all(&chunk)
                     .await
-                    .map_err(|error| Error::io("write Managed pack destination", error))?;
+                    .map_err(|error| Error::io("write Managed data segment destination", error))?;
             }
             remaining -= take as u64;
             self.remaining -= take as u64;

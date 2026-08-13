@@ -103,8 +103,8 @@ async fn apply<C: DeserializeOwned>(
         let destination = root.join(&record.path);
         let NamespaceValue::RegularFile {
             version,
-            fingerprint,
             content,
+            data,
         } = node.value
         else {
             if record.path.is_empty() {
@@ -139,12 +139,18 @@ async fn apply<C: DeserializeOwned>(
             continue;
         }
         let executable = node.attributes.executable;
-        if let Some(offset) = content.pack_offset() {
+        if let Some(range) = data.identity_range() {
+            if range.stored != content {
+                return Err(Error::corrupt(
+                    "install Managed file",
+                    "identity extent does not match its file content",
+                ));
+            }
             packed.write(&PackInstallation::create(
-                content.object_locator(),
-                offset,
+                range.segment,
+                range.offset,
                 &destination,
-                fingerprint,
+                content,
                 executable,
                 authoritative,
             )?)?;
@@ -152,8 +158,8 @@ async fn apply<C: DeserializeOwned>(
             file_installations.push(install_file(
                 volume,
                 destination,
-                fingerprint,
                 content,
+                data.clone(),
                 executable,
                 authoritative,
             ));
@@ -188,7 +194,7 @@ async fn apply<C: DeserializeOwned>(
 async fn install_file(
     volume: &ManagedVolume,
     destination: std::path::PathBuf,
-    fingerprint: crate::filesystem::FileFingerprint,
+    fingerprint: crate::filesystem::ContentRef,
     content: FileDataRef,
     executable: bool,
     authoritative: bool,

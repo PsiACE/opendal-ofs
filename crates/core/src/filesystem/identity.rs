@@ -125,50 +125,46 @@ macro_rules! generated_identity {
 
 generated_identity!(VolumeId, NodeId, FileVersionId, OperationId);
 
-/// Content fingerprint used by Sync to compare a materialized file with a
-/// logical file version. It is not the file version identity or its layout.
+/// Stable identity of one logical byte sequence.
+///
+/// The reference is independent of a file version, path, and physical layout,
+/// so the same content can be compared and reused across namespace entries.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct FileFingerprint {
+pub struct ContentRef {
     digest: Digest,
-    logical_length: u64,
+    length: u64,
 }
 
-impl Serialize for FileFingerprint {
+impl Serialize for ContentRef {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
-        (self.digest, self.logical_length).serialize(serializer)
+        (self.digest, self.length).serialize(serializer)
     }
 }
 
-impl<'de> Deserialize<'de> for FileFingerprint {
+impl<'de> Deserialize<'de> for ContentRef {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        let (digest, logical_length) = Deserialize::deserialize(deserializer)?;
-        Ok(Self {
-            digest,
-            logical_length,
-        })
+        let (digest, length) = Deserialize::deserialize(deserializer)?;
+        Ok(Self { digest, length })
     }
 }
 
-impl FileFingerprint {
-    pub const fn new(digest: Digest, logical_length: u64) -> Self {
-        Self {
-            digest,
-            logical_length,
-        }
+impl ContentRef {
+    pub const fn new(digest: Digest, length: u64) -> Self {
+        Self { digest, length }
     }
 
     pub const fn digest(self) -> Digest {
         self.digest
     }
 
-    pub const fn logical_length(self) -> u64 {
-        self.logical_length
+    pub const fn length(self) -> u64 {
+        self.length
     }
 }
 

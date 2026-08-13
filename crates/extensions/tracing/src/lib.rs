@@ -22,11 +22,11 @@ use std::future::Future;
 use std::ops::Range;
 
 use ofs_core::Error;
-use ofs_core::filesystem::FileFingerprint;
+use ofs_core::filesystem::ContentRef;
 use ofs_core::managed::extension::{
-    AccessContext, ExtendedFileAccess, ExtensionFileRef, FileAccess, FileAccessExtension,
+    AccessContext, ExtendedFileAccess, FileAccess, FileAccessExtension,
 };
-use ofs_core::managed::{GcEpoch, ObjectLocator};
+use ofs_core::managed::{FileDataRef, GcEpoch, KnownContent};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::{Instrument as _, info_span};
 
@@ -74,45 +74,35 @@ impl<A: FileAccess> ExtendedFileAccess for TracingFileAccess<A> {
         &'a self,
         context: &'a AccessContext,
         source: &'a mut (dyn AsyncRead + Send + Unpin),
-        fingerprint: FileFingerprint,
+        content: ContentRef,
+        known: &'a KnownContent,
         gc_epoch: GcEpoch,
-    ) -> impl Future<Output = Result<ExtensionFileRef, Error>> + Send + 'a {
+    ) -> impl Future<Output = Result<FileDataRef, Error>> + Send + 'a {
         self.inner
-            .write(context, source, fingerprint, gc_epoch)
+            .write(context, source, content, known, gc_epoch)
             .instrument(info_span!(
                 "managed.file.write",
-                logical_length = fingerprint.logical_length()
+                logical_length = content.length()
             ))
     }
 
     fn read<'a>(
         &'a self,
         context: &'a AccessContext,
-        reference: ExtensionFileRef,
-        fingerprint: FileFingerprint,
+        reference: FileDataRef,
+        content: ContentRef,
         range: Range<u64>,
         destination: &'a mut (dyn AsyncWrite + Send + Unpin),
     ) -> impl Future<Output = Result<(), Error>> + Send + 'a {
         let range_start = range.start;
         let range_end = range.end;
         self.inner
-            .read(context, reference, fingerprint, range, destination)
+            .read(context, reference, content, range, destination)
             .instrument(info_span!(
                 "managed.file.read",
-                logical_length = fingerprint.logical_length(),
+                logical_length = content.length(),
                 range_start,
                 range_end
             ))
-    }
-
-    fn visit_reachable<'a>(
-        &'a self,
-        context: &'a AccessContext,
-        reference: ExtensionFileRef,
-        visit: &'a mut (dyn FnMut(ObjectLocator) -> Result<(), Error> + Send),
-    ) -> impl Future<Output = Result<(), Error>> + Send + 'a {
-        self.inner
-            .visit_reachable(context, reference, visit)
-            .instrument(info_span!("managed.file.visit_reachable"))
     }
 }

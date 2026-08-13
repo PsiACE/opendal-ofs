@@ -28,7 +28,7 @@ use crate::filesystem::Digest;
 use super::object::{ObjectRef, checksum};
 use super::storage::ImmutableWriter;
 
-pub(crate) use bytes::{copy_byte_stream, write_byte_stream, write_unchecked_byte_stream};
+pub(crate) use bytes::{write_byte_stream, write_unchecked_byte_stream};
 pub(crate) use record::write_records;
 pub use record::{RecordStreamReader, RecordStreamWriter};
 
@@ -44,9 +44,9 @@ pub struct StreamKind(u16);
 impl StreamKind {
     pub(crate) const NAMESPACE_SNAPSHOT: Self = Self(1);
     pub(crate) const OPERATION_RECEIPTS: Self = Self(2);
-    pub(crate) const FILE_BYTES: Self = Self(3);
+    pub(crate) const DATA_SEGMENT: Self = Self(3);
     pub(crate) const NAMESPACE_CHANGES: Self = Self(4);
-    pub(crate) const FILE_PACK: Self = Self(5);
+    pub const FILE_EXTENTS: Self = Self(5);
 
     pub const fn extension(value: u16) -> Option<Self> {
         if value >= 1024 {
@@ -87,7 +87,7 @@ impl StreamRef {
     }
 }
 
-async fn finish_stream(
+pub(crate) async fn finish_stream(
     mut writer: ImmutableWriter,
     kind: StreamKind,
     payload_length: u64,

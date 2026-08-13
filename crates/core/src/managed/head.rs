@@ -149,6 +149,17 @@ impl ManagedVolume {
         })
     }
 
+    pub(crate) const fn stream_concurrency(&self) -> usize {
+        self.stream_concurrency
+    }
+
+    pub(crate) fn file_decoding_count(&self) -> usize {
+        match self.format.file_placement() {
+            super::format::FilePlacement::Extension(info) => info.decodings.len(),
+            super::format::FilePlacement::Whole | super::format::FilePlacement::Pack { .. } => 0,
+        }
+    }
+
     pub(super) async fn initialize(&self) -> Result<(), Error> {
         match self
             .authority_access

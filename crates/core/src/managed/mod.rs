@@ -24,12 +24,13 @@ mod file;
 mod format;
 mod gc;
 mod head;
+mod known_content;
 mod layout;
 mod namespace;
 mod object;
-mod pack;
 mod publication;
 mod record;
+mod segment;
 mod storage;
 mod stream;
 mod wire;
@@ -38,16 +39,15 @@ pub use authority::{
     AuthorityAccess, AuthorityExtension, AuthorityFuture, AuthorityHead, AuthorityId,
     AuthorityObservation, AuthorityRoot, AuthorityRoots, CollectionFence, DefaultAuthorityAccess,
 };
-pub(crate) use data::FileDataRef;
+pub use data::FileDataRef;
+pub use file::FileExtentReader;
 pub(crate) use format::ManagedFormat;
 pub use gc::GcOutcome;
 pub(crate) use head::ManagedObservation;
 pub use head::{ManagedVolume, NamespaceRevision};
+pub use known_content::KnownContent;
 pub use object::{GcEpoch, ObjectClass, ObjectId, ObjectLocator, ObjectRef};
-pub(crate) use pack::{
-    ENTRY_BYTES as PACK_ENTRY_BYTES, RangeReader as PackRangeReader,
-    TRAILER_BYTES as PACK_TRAILER_BYTES, Writer as PackWriter,
-};
+pub(crate) use segment::{RangeReader as SegmentRangeReader, Writer as SegmentWriter};
 
 use std::num::NonZeroU64;
 use std::num::NonZeroUsize;

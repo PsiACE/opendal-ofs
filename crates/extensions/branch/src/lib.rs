@@ -528,8 +528,6 @@ fn validate_name(name: &str) -> Result<(), Error> {
 fn format() -> ExtensionFormat {
     ExtensionFormat {
         id: BRANCH_EXTENSION_ID,
-        name: "branch".to_owned(),
-        revision: 1,
         configuration: Vec::new(),
     }
 }

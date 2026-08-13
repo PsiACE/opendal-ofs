@@ -23,11 +23,11 @@ use std::task::{Context, Poll};
 
 use async_compression::Level;
 use async_compression::tokio::bufread::{ZstdDecoder, ZstdEncoder};
-use ofs_core::filesystem::{Digest, FileFingerprint};
+use ofs_core::filesystem::{ContentRef, Digest};
 use ofs_core::managed::GcEpoch;
 use ofs_core::managed::extension::{
     AccessContext, ExtendedExtentAccess, ExtensionFormat, ExtensionId, ExtentAccess,
-    ExtentEncoding, ExtentExtension, ExtentRef,
+    ExtentExtension, ExtentRef,
 };
 use ofs_core::{Error, ErrorKind};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, BufReader, ReadBuf};
@@ -84,13 +84,11 @@ impl<A: ExtentAccess> ExtendedExtentAccess for ZstdExtentAccess<A> {
         let mut configuration = Vec::new();
         ciborium::into_writer(&self.level, &mut configuration)
             .expect("encoding a Zstandard level into memory cannot fail");
-        let mut extensions = vec![ExtensionFormat {
+        let mut extensions = self.inner.info();
+        extensions.push(ExtensionFormat {
             id: ZSTD_EXTENSION_ID,
-            name: "zstd".to_owned(),
-            revision: 1,
             configuration,
-        }];
-        extensions.extend(self.inner.info());
+        });
         extensions
     }
 
@@ -100,20 +98,14 @@ impl<A: ExtentAccess> ExtendedExtentAccess for ZstdExtentAccess<A> {
         source: &mut (dyn AsyncRead + Send + Unpin),
         gc_epoch: GcEpoch,
     ) -> Result<ExtentRef, Error> {
-        let fingerprinting = FingerprintingReader::new(source);
+        let content_reader = ContentReader::new(source);
         let mut encoded = ZstdEncoder::with_quality(
-            BufReader::with_capacity(STREAM_BUFFER_BYTES, fingerprinting),
+            BufReader::with_capacity(STREAM_BUFFER_BYTES, content_reader),
             Level::Precise(self.level),
         );
         let mut reference = self.inner.write(context, &mut encoded, gc_epoch).await?;
-        let fingerprint = encoded.get_ref().get_ref().fingerprint()?;
-        reference.encodings.insert(
-            0,
-            ExtentEncoding {
-                id: ZSTD_EXTENSION_ID,
-                fingerprint,
-            },
-        );
+        let content = encoded.get_ref().get_ref().content()?;
+        reference.decoded.push(content);
         Ok(reference)
     }
 
@@ -124,36 +116,25 @@ impl<A: ExtentAccess> ExtendedExtentAccess for ZstdExtentAccess<A> {
         range: Range<u64>,
         destination: &mut (dyn AsyncWrite + Send + Unpin),
     ) -> Result<(), Error> {
-        let (fingerprint, inner) = reference.into_inner(ZSTD_EXTENSION_ID)?;
-        if range.start > range.end || range.end > fingerprint.logical_length() {
+        let (content, inner) = reference.into_inner()?;
+        if range.start > range.end || range.end > content.length() {
             return Err(Error::new(
                 ErrorKind::Invalid,
                 "read Zstandard extent",
                 "logical byte range is invalid",
             ));
         }
-        let encoded = inner.fingerprint().ok_or_else(|| {
-            Error::new(
-                ErrorKind::Corrupt,
-                "read Zstandard extent",
-                "inner extent encoding chain is empty",
-            )
-        })?;
+        let encoded = inner.content();
         let (encoded_reader, mut encoded_writer) = tokio::io::duplex(STREAM_BUFFER_BYTES);
         let feed = async {
             let result = self
                 .inner
-                .read(
-                    context,
-                    inner,
-                    0..encoded.logical_length(),
-                    &mut encoded_writer,
-                )
+                .read(context, inner, 0..encoded.length(), &mut encoded_writer)
                 .await;
             drop(encoded_writer);
             result
         };
-        let decode = decode_range(encoded_reader, fingerprint, range, destination);
+        let decode = decode_range(encoded_reader, content, range, destination);
         tokio::try_join!(feed, decode)?;
         Ok(())
     }
@@ -161,7 +142,7 @@ impl<A: ExtentAccess> ExtendedExtentAccess for ZstdExtentAccess<A> {
 
 async fn decode_range(
     encoded: tokio::io::DuplexStream,
-    fingerprint: FileFingerprint,
+    content: ContentRef,
     range: Range<u64>,
     destination: &mut (dyn AsyncWrite + Send + Unpin),
 ) -> Result<(), Error> {
@@ -208,26 +189,26 @@ async fn decode_range(
         }
         offset = end;
     }
-    if offset != fingerprint.logical_length()
-        || Digest::from_bytes(hasher.finalize().into()) != fingerprint.digest()
+    if offset != content.length()
+        || Digest::from_bytes(hasher.finalize().into()) != content.digest()
     {
         return Err(Error::new(
             ErrorKind::Corrupt,
             "read Zstandard extent",
-            "decoded extent does not match its fingerprint",
+            "decoded extent does not match its content",
         ));
     }
     Ok(())
 }
 
-struct FingerprintingReader<'a> {
+struct ContentReader<'a> {
     inner: &'a mut (dyn AsyncRead + Send + Unpin),
     hasher: blake3::Hasher,
     length: u64,
     complete: bool,
 }
 
-impl<'a> FingerprintingReader<'a> {
+impl<'a> ContentReader<'a> {
     fn new(inner: &'a mut (dyn AsyncRead + Send + Unpin)) -> Self {
         Self {
             inner,
@@ -237,7 +218,7 @@ impl<'a> FingerprintingReader<'a> {
         }
     }
 
-    fn fingerprint(&self) -> Result<FileFingerprint, Error> {
+    fn content(&self) -> Result<ContentRef, Error> {
         if !self.complete {
             return Err(Error::new(
                 ErrorKind::Unavailable,
@@ -245,14 +226,14 @@ impl<'a> FingerprintingReader<'a> {
                 "extent source was not consumed completely",
             ));
         }
-        Ok(FileFingerprint::new(
+        Ok(ContentRef::new(
             Digest::from_bytes(self.hasher.finalize().into()),
             self.length,
         ))
     }
 }
 
-impl AsyncRead for FingerprintingReader<'_> {
+impl AsyncRead for ContentReader<'_> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         context: &mut Context<'_>,

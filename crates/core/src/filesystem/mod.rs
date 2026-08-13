@@ -22,7 +22,7 @@ mod namespace;
 mod record;
 
 pub use identity::{
-    ChangeCursor, Checksum, Digest, FileFingerprint, FileVersionId, NodeId, OperationId, VolumeId,
+    ChangeCursor, Checksum, ContentRef, Digest, FileVersionId, NodeId, OperationId, VolumeId,
 };
 pub use namespace::{NodeAttributes, NodeKind};
 pub use record::{NamespaceNode, NamespaceRecord, NamespaceValue, validate_portable_path};

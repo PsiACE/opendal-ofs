@@ -26,7 +26,7 @@ use unicode_casefold::UnicodeCaseFold as _;
 use unicode_normalization::UnicodeNormalization as _;
 
 use crate::Error;
-use crate::filesystem::{FileFingerprint, NodeKind, validate_portable_path};
+use crate::filesystem::{ContentRef, NodeKind, validate_portable_path};
 use crate::workset;
 
 use super::transfer::inspect_file;
@@ -36,7 +36,7 @@ pub(super) struct LocalRecord {
     pub(super) path: String,
     pub(super) kind: NodeKind,
     pub(super) executable: bool,
-    pub(super) fingerprint: Option<FileFingerprint>,
+    pub(super) fingerprint: Option<ContentRef>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

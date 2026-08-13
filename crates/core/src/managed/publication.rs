@@ -20,6 +20,7 @@
 use crate::filesystem::NamespaceValue;
 use crate::filesystem::{ChangeCursor, OperationId};
 use crate::namespace::Namespace;
+use crate::workset::{self, Workspace};
 use crate::{Error, ErrorKind};
 
 use super::authority::AuthorityHead;
@@ -59,8 +60,7 @@ impl ManagedVolume {
         if observed.namespace.cursor == ChangeCursor::GENESIS {
             commit.namespace_snapshot = NamespaceSnapshot {
                 change_cursor: target.cursor,
-                stream: namespace::write_snapshot(self, target, observed.gc_epoch, |_| Ok(()))
-                    .await?,
+                stream: namespace::write_snapshot(self, target, observed.gc_epoch).await?,
             };
             commit.namespace_changes.clear();
         } else if let Some(delta_stream) =
@@ -79,8 +79,7 @@ impl ManagedVolume {
             if accumulated >= commit.namespace_snapshot.stream.payload_length {
                 commit.namespace_snapshot = NamespaceSnapshot {
                     change_cursor: target.cursor,
-                    stream: namespace::write_snapshot(self, target, observed.gc_epoch, |_| Ok(()))
-                        .await?,
+                    stream: namespace::write_snapshot(self, target, observed.gc_epoch).await?,
                 };
                 commit.namespace_changes.clear();
             } else {
@@ -208,30 +207,57 @@ async fn read_operation_receipt(
 impl ManagedVolume {
     pub(super) async fn compact_for_collection(
         &self,
+        workspace: &Workspace,
         reference: NamespaceRevision,
         gc_epoch: GcEpoch,
         mut visit: impl FnMut(ObjectLocator) -> Result<(), Error> + Send,
     ) -> Result<NamespaceRevision, Error> {
         let source = read_commit(self, reference).await?;
         let current = namespace::read(self, &source, source.change_cursor).await?;
+        let mut tails = workspace.writer("gc-file-extent-tails")?;
         let mut records = current.reader()?;
         while let Some(record) = records.next()? {
             let Some(node) = record.value else {
                 continue;
             };
-            let NamespaceValue::RegularFile { content, .. } = node.value else {
+            let NamespaceValue::RegularFile { data, .. } = node.value else {
                 continue;
             };
-            if let Some(reference) = content.extension() {
-                self.file_access()?
-                    .visit_reachable_dyn(&self.access_context, reference, &mut visit)
-                    .await?;
-            } else {
-                visit(content.object_locator())?;
+            if let Some(extent) = data.inline_extent() {
+                visit(extent.range.segment)?;
+            }
+            if let Some(tail) = data.tail() {
+                visit(tail.object.locator)?;
+                tails.write(&tail)?;
             }
         }
-        let namespace_stream =
-            namespace::write_snapshot(self, &current, gc_epoch, |_| Ok(())).await?;
+        let tails = workset::sort(workspace, &tails.finish()?, |tail| tail.object.locator)?;
+        let mut tails = tails.reader()?;
+        let mut previous = None;
+        while let Some(tail) = tails.next()? {
+            if let Some(previous) = previous.filter(|previous: &super::stream::StreamRef| {
+                previous.object.locator == tail.object.locator
+            }) {
+                if previous != tail {
+                    return Err(Error::corrupt(
+                        "collect Managed file extents",
+                        "one extent segment has conflicting stream references",
+                    ));
+                }
+                continue;
+            }
+            previous = Some(tail);
+            let mut extents =
+                super::stream::RecordStreamReader::<super::extension::ExtentRef>::open(
+                    self.operator(),
+                    tail,
+                )
+                .await?;
+            while let Some(extent) = extents.next().await? {
+                visit(extent.range.segment)?;
+            }
+        }
+        let namespace_stream = namespace::write_snapshot(self, &current, gc_epoch).await?;
         visit(namespace_stream.object.locator)?;
         for receipt in &source.operation_receipts {
             visit(receipt.stream.object.locator)?;

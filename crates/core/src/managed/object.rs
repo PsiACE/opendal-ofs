@@ -98,8 +98,8 @@ pub enum ObjectClass {
     NamespaceCommit,
     NamespaceSegment,
     OperationReceiptSegment,
-    FileData,
-    FilePack,
+    DataSegment,
+    FileExtentSegment,
     Extension,
 }
 
@@ -115,8 +115,8 @@ impl<'de> Deserialize<'de> for ObjectClass {
             1 => Ok(Self::NamespaceCommit),
             2 => Ok(Self::NamespaceSegment),
             3 => Ok(Self::OperationReceiptSegment),
-            4 => Ok(Self::FileData),
-            5 => Ok(Self::FilePack),
+            4 => Ok(Self::DataSegment),
+            5 => Ok(Self::FileExtentSegment),
             6 => Ok(Self::Extension),
             value => Err(serde::de::Error::custom(format_args!(
                 "unknown object class {value}"
@@ -130,8 +130,8 @@ impl ObjectClass {
         Self::NamespaceCommit,
         Self::NamespaceSegment,
         Self::OperationReceiptSegment,
-        Self::FileData,
-        Self::FilePack,
+        Self::DataSegment,
+        Self::FileExtentSegment,
         Self::Extension,
     ];
 
@@ -140,8 +140,8 @@ impl ObjectClass {
             Self::NamespaceCommit => 1,
             Self::NamespaceSegment => 2,
             Self::OperationReceiptSegment => 3,
-            Self::FileData => 4,
-            Self::FilePack => 5,
+            Self::DataSegment => 4,
+            Self::FileExtentSegment => 5,
             Self::Extension => 6,
         }
     }
@@ -151,8 +151,8 @@ impl ObjectClass {
             Self::NamespaceCommit => "01-namespace-commit",
             Self::NamespaceSegment => "02-namespace-segment",
             Self::OperationReceiptSegment => "03-operation-receipt-segment",
-            Self::FileData => "04-file-data",
-            Self::FilePack => "05-file-pack",
+            Self::DataSegment => "04-data-segment",
+            Self::FileExtentSegment => "05-file-extent-segment",
             Self::Extension => "06-extension",
         }
     }

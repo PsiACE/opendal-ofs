@@ -21,16 +21,15 @@ use serde::{Deserialize, Serialize};
 use tokio::fs::File;
 
 use crate::Error;
-use crate::filesystem::FileFingerprint;
-use crate::managed::{
-    FileDataRef, GcEpoch, ManagedVolume, PACK_ENTRY_BYTES, PACK_TRAILER_BYTES, PackWriter,
-};
+use crate::filesystem::ContentRef;
+use crate::managed::extension::{ExtentRef, SegmentRangeRef};
+use crate::managed::{FileDataRef, GcEpoch, ManagedVolume, SegmentWriter};
 use crate::workset::{Spool, SpoolWriter, Workspace};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct PendingFile {
     pub(crate) path: String,
-    pub(crate) fingerprint: FileFingerprint,
+    pub(crate) fingerprint: ContentRef,
 }
 
 pub(crate) struct PublicationPlan {
@@ -39,12 +38,8 @@ pub(crate) struct PublicationPlan {
 }
 
 impl PublicationPlan {
-    pub(crate) fn accepts(target: u64, fingerprint: FileFingerprint) -> bool {
-        fingerprint
-            .logical_length()
-            .checked_add(PACK_ENTRY_BYTES)
-            .and_then(|bytes| bytes.checked_add(PACK_TRAILER_BYTES))
-            .is_some_and(|bytes| bytes <= target)
+    pub(crate) fn accepts(target: u64, fingerprint: ContentRef) -> bool {
+        fingerprint.length() != 0 && fingerprint.length() <= target
     }
 
     pub(crate) fn create(workspace: &Workspace) -> Result<Self, Error> {
@@ -54,19 +49,16 @@ impl PublicationPlan {
         })
     }
 
-    pub(crate) fn would_overflow(&self, target: u64, fingerprint: FileFingerprint) -> bool {
+    pub(crate) fn would_overflow(&self, target: u64, fingerprint: ContentRef) -> bool {
         self.body_bytes
-            .checked_add(fingerprint.logical_length())
-            .and_then(|bytes| bytes.checked_add(PACK_ENTRY_BYTES))
-            .and_then(|bytes| bytes.checked_add(PACK_TRAILER_BYTES))
+            .checked_add(fingerprint.length())
             .is_none_or(|bytes| bytes > target)
     }
 
     pub(crate) fn push(&mut self, file: PendingFile) -> Result<(), Error> {
         self.body_bytes = self
             .body_bytes
-            .checked_add(file.fingerprint.logical_length())
-            .and_then(|bytes| bytes.checked_add(PACK_ENTRY_BYTES))
+            .checked_add(file.fingerprint.length())
             .ok_or_else(|| Error::invalid("plan Managed pack", "pack length overflows"))?;
         self.files.write(&file)
     }
@@ -83,7 +75,7 @@ pub(crate) async fn publish(
     files: &Spool<PendingFile>,
     gc_epoch: GcEpoch,
 ) -> Result<Spool<(String, FileDataRef)>, Error> {
-    let mut pack = PackWriter::open(volume.operator(), gc_epoch).await?;
+    let mut pack = SegmentWriter::open(volume.operator(), gc_epoch).await?;
     let result = async {
         let mut source = files.reader()?;
         let mut expected_offset = 0_u64;
@@ -103,15 +95,7 @@ pub(crate) async fn publish(
                 ));
             }
             expected_offset = expected_offset
-                .checked_add(file.fingerprint.logical_length())
-                .ok_or_else(|| Error::invalid("write Managed pack", "payload length overflows"))?;
-        }
-        let mut source = files.reader()?;
-        let mut offset = 0_u64;
-        while let Some(file) = source.next()? {
-            pack.write_entry(offset, file.fingerprint).await?;
-            offset = offset
-                .checked_add(file.fingerprint.logical_length())
+                .checked_add(file.fingerprint.length())
                 .ok_or_else(|| Error::invalid("write Managed pack", "payload length overflows"))?;
         }
         Ok::<_, Error>(())
@@ -121,14 +105,24 @@ pub(crate) async fn publish(
         let _ = pack.abort().await;
         return Err(error);
     }
-    let object = pack.close().await?;
+    let segment = pack.close().await?;
     let mut published = workspace.writer("published-pack-files")?;
     let mut source = files.reader()?;
     let mut offset = 0_u64;
     while let Some(file) = source.next()? {
-        published.write(&(file.path, FileDataRef::from_pack(object.locator, offset)))?;
+        published.write(&(
+            file.path,
+            FileDataRef::single(ExtentRef {
+                range: SegmentRangeRef {
+                    segment: segment.object.locator,
+                    offset,
+                    stored: file.fingerprint,
+                },
+                decoded: Vec::new(),
+            }),
+        ))?;
         offset = offset
-            .checked_add(file.fingerprint.logical_length())
+            .checked_add(file.fingerprint.length())
             .ok_or_else(|| Error::invalid("publish Managed pack", "payload length overflows"))?;
     }
     published.finish()

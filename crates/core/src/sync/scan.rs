@@ -273,13 +273,13 @@ fn reuse_same_path(
         }),
         NamespaceValue::RegularFile {
             version,
-            fingerprint,
             content,
+            data,
         } => {
             let local_fingerprint = local
                 .fingerprint
                 .expect("a local regular file has a fingerprint");
-            let unchanged_content = fingerprint == local_fingerprint;
+            let unchanged_content = content == local_fingerprint;
             Ok(NamespaceNode {
                 node_id: base.node_id,
                 generation: if unchanged_content && base.attributes == attributes {
@@ -291,14 +291,14 @@ fn reuse_same_path(
                 value: if unchanged_content {
                     NamespaceValue::RegularFile {
                         version,
-                        fingerprint,
-                        content: Some(content),
+                        content,
+                        data: Some(data),
                     }
                 } else {
                     NamespaceValue::RegularFile {
                         version: FileVersionId::generate(),
-                        fingerprint: local_fingerprint,
-                        content: None,
+                        content: local_fingerprint,
+                        data: None,
                     }
                 },
             })
@@ -312,8 +312,8 @@ fn same_base_entry(local: &LocalRecord, node: &NamespaceNode<FileDataRef>) -> bo
     }
     match &node.value {
         NamespaceValue::Directory { .. } => local.kind == NodeKind::Directory,
-        NamespaceValue::RegularFile { fingerprint, .. } => {
-            local.kind == NodeKind::RegularFile && local.fingerprint == Some(*fingerprint)
+        NamespaceValue::RegularFile { content, .. } => {
+            local.kind == NodeKind::RegularFile && local.fingerprint == Some(*content)
         }
     }
 }

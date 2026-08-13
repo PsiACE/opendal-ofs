@@ -26,14 +26,14 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::Error;
-use crate::filesystem::FileFingerprint;
+use crate::filesystem::ContentRef;
 use crate::workset::{self, SpoolWriter, Workspace};
 
 use super::transfer::inspect_file;
 
 pub(super) async fn file_matches(
     path: &Path,
-    expected: FileFingerprint,
+    expected: ContentRef,
     executable: bool,
 ) -> Result<bool, Error> {
     let metadata = match std::fs::symlink_metadata(path) {
@@ -44,7 +44,7 @@ pub(super) async fn file_matches(
     if !supported_regular_file(&metadata) || is_executable(&metadata) != executable {
         return Ok(false);
     }
-    if metadata.len() != expected.logical_length() {
+    if metadata.len() != expected.length() {
         return Ok(false);
     }
     Ok(inspect_file(path).await? == expected)

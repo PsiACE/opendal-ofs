@@ -28,9 +28,12 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::Error;
-use crate::filesystem::FileFingerprint;
+use crate::filesystem::ContentRef;
 
+use super::data::FileDataRef;
+use super::known_content::KnownContent;
 use super::object::{GcEpoch, ObjectClass, ObjectLocator};
+use super::segment::RangeReader;
 use super::stream;
 
 /// Stable identity of one persisted extension type.
@@ -38,9 +41,6 @@ use super::stream;
 pub struct ExtensionId([u8; 16]);
 
 impl ExtensionId {
-    /// Identity encoding used by the core extent access.
-    pub const IDENTITY: Self = Self(*b"ofs.identity.v1!");
-
     /// Construct a stable identifier from its 16-byte registered value.
     pub const fn new(value: [u8; 16]) -> Self {
         Self(value)
@@ -111,103 +111,78 @@ impl<'de> Deserialize<'de> for ExtensionId {
 pub struct ExtensionFormat {
     /// Stable wire identity.
     pub id: ExtensionId,
-    /// Domain name intended for diagnostics and format inspection.
-    pub name: String,
-    /// Revision of this extension's own records.
-    pub revision: u16,
     /// Canonical CBOR configuration interpreted by this extension.
     pub configuration: Vec<u8>,
 }
 
 super::wire::tuple_wire!(ExtensionFormat {
     id: ExtensionId,
-    name: String,
-    revision: u16,
     configuration: Vec<u8>,
 });
 
 /// File-layout and extent-encoding description for one volume.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FileAccessInfo {
-    /// Extension that maps logical file offsets to extents.
-    pub layout: ExtensionFormat,
-    /// Ordered encoding extensions applied independently to each extent.
-    pub extents: Vec<ExtensionFormat>,
+    /// Extension that partitions a logical file into ordered extents.
+    pub partitioning: ExtensionFormat,
+    /// Physical-to-logical decoding extensions applied to each extent.
+    pub decodings: Vec<ExtensionFormat>,
 }
 
 super::wire::tuple_wire!(FileAccessInfo {
-    layout: ExtensionFormat,
-    extents: Vec<ExtensionFormat>,
+    partitioning: ExtensionFormat,
+    decodings: Vec<ExtensionFormat>,
 });
 
-/// One step in the ordered decoding chain of an extent.
+/// One independently verifiable range in an immutable data segment.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ExtentEncoding {
-    /// Extension that decodes this step.
-    pub id: ExtensionId,
-    /// Fingerprint after this step is decoded.
-    pub fingerprint: FileFingerprint,
+pub struct SegmentRangeRef {
+    /// Immutable data segment containing the stored bytes.
+    pub segment: ObjectLocator,
+    /// Byte offset within the segment payload.
+    pub offset: u64,
+    /// Identity of the stored range before decoding.
+    pub stored: ContentRef,
 }
 
-super::wire::tuple_wire!(ExtentEncoding {
-    id: ExtensionId,
-    fingerprint: FileFingerprint,
+super::wire::tuple_wire!(SegmentRangeRef {
+    segment: ObjectLocator,
+    offset: u64,
+    stored: ContentRef,
 });
 
 /// Reference to one independently readable logical extent.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExtentRef {
-    /// Decoding steps from the logical representation to the stored stream.
-    pub encodings: Vec<ExtentEncoding>,
-    /// Encoded immutable stream.
-    pub stream: StreamRef,
+    /// Stored range in an immutable data segment.
+    pub range: SegmentRangeRef,
+    /// Content produced by each configured decoding step, in execution order.
+    pub decoded: Vec<ContentRef>,
 }
 
 super::wire::tuple_wire!(ExtentRef {
-    encodings: Vec<ExtentEncoding>,
-    stream: StreamRef,
+    range: SegmentRangeRef,
+    decoded: Vec<ContentRef>,
 });
 
 impl ExtentRef {
-    /// Fingerprint visible to the caller of the outermost encoding.
-    pub fn fingerprint(&self) -> Option<FileFingerprint> {
-        self.encodings.first().map(|encoding| encoding.fingerprint)
+    /// Logical content visible after the configured decoding chain.
+    pub fn content(&self) -> ContentRef {
+        self.decoded.last().copied().unwrap_or(self.range.stored)
     }
 
-    /// Consume one expected outer encoding and return the inner reference.
-    pub fn into_inner(mut self, id: ExtensionId) -> Result<(FileFingerprint, Self), Error> {
-        let Some(encoding) = self.encodings.first().copied() else {
+    /// Consume the outermost configured decoding step.
+    pub fn into_inner(mut self) -> Result<(ContentRef, Self), Error> {
+        let Some(output) = self.decoded.pop() else {
             return Err(Error::new(
                 crate::ErrorKind::Corrupt,
                 "read Managed extent",
-                "extent encoding chain is empty",
+                "extent decoding chain is empty",
             ));
         };
-        if encoding.id != id {
-            return Err(Error::new(
-                crate::ErrorKind::Corrupt,
-                "read Managed extent",
-                "extent encoding does not match the configured extension",
-            ));
-        }
-        self.encodings.remove(0);
-        Ok((encoding.fingerprint, self))
+        Ok((output, self))
     }
 }
-
-/// Root reference emitted by a file-layout extension.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ExtensionFileRef {
-    /// Layout that interprets the root stream.
-    pub layout: ExtensionId,
-    /// Self-delimiting layout stream, normally a manifest.
-    pub root: StreamRef,
-}
-
-super::wire::tuple_wire!(ExtensionFileRef {
-    layout: ExtensionId,
-    root: StreamRef,
-});
 
 /// Storage and concurrency context shared by extension accesses.
 #[derive(Clone, Debug)]
@@ -332,31 +307,24 @@ pub trait FileAccess: Send + Sync + fmt::Debug + Unpin + 'static {
         &'a self,
         context: &'a AccessContext,
         source: &'a mut (dyn AsyncRead + Send + Unpin),
-        fingerprint: FileFingerprint,
+        content: ContentRef,
+        known: &'a KnownContent,
         gc_epoch: GcEpoch,
-    ) -> impl Future<Output = Result<ExtensionFileRef, Error>> + Send + 'a;
+    ) -> impl Future<Output = Result<FileDataRef, Error>> + Send + 'a;
 
     /// Read one logical byte range.
     fn read<'a>(
         &'a self,
         context: &'a AccessContext,
-        reference: ExtensionFileRef,
-        fingerprint: FileFingerprint,
+        reference: FileDataRef,
+        content: ContentRef,
         range: Range<u64>,
         destination: &'a mut (dyn AsyncWrite + Send + Unpin),
-    ) -> impl Future<Output = Result<(), Error>> + Send + 'a;
-
-    /// Stream every immutable object reachable through a file root.
-    fn visit_reachable<'a>(
-        &'a self,
-        context: &'a AccessContext,
-        reference: ExtensionFileRef,
-        visit: &'a mut (dyn FnMut(ObjectLocator) -> Result<(), Error> + Send),
     ) -> impl Future<Output = Result<(), Error>> + Send + 'a;
 }
 
 /// Typed file-layout extension over an extent access.
-pub trait FileLayoutExtension<A: ExtentAccess> {
+pub trait FilePartitionExtension<A: ExtentAccess> {
     /// Resulting statically composed file access.
     type ExtendedAccess: FileAccess;
 
@@ -394,33 +362,25 @@ pub trait ExtendedFileAccess: Send + Sync + fmt::Debug + Unpin + 'static {
         &'a self,
         context: &'a AccessContext,
         source: &'a mut (dyn AsyncRead + Send + Unpin),
-        fingerprint: FileFingerprint,
+        content: ContentRef,
+        known: &'a KnownContent,
         gc_epoch: GcEpoch,
-    ) -> impl Future<Output = Result<ExtensionFileRef, Error>> + Send + 'a {
-        self.inner().write(context, source, fingerprint, gc_epoch)
+    ) -> impl Future<Output = Result<FileDataRef, Error>> + Send + 'a {
+        self.inner()
+            .write(context, source, content, known, gc_epoch)
     }
 
     /// Forward logical range reads by default.
     fn read<'a>(
         &'a self,
         context: &'a AccessContext,
-        reference: ExtensionFileRef,
-        fingerprint: FileFingerprint,
+        reference: FileDataRef,
+        content: ContentRef,
         range: Range<u64>,
         destination: &'a mut (dyn AsyncWrite + Send + Unpin),
     ) -> impl Future<Output = Result<(), Error>> + Send + 'a {
         self.inner()
-            .read(context, reference, fingerprint, range, destination)
-    }
-
-    /// Forward collection reachability traversal by default.
-    fn visit_reachable<'a>(
-        &'a self,
-        context: &'a AccessContext,
-        reference: ExtensionFileRef,
-        visit: &'a mut (dyn FnMut(ObjectLocator) -> Result<(), Error> + Send),
-    ) -> impl Future<Output = Result<(), Error>> + Send + 'a {
-        self.inner().visit_reachable(context, reference, visit)
+            .read(context, reference, content, range, destination)
     }
 }
 
@@ -433,30 +393,22 @@ impl<T: ExtendedFileAccess> FileAccess for T {
         &'a self,
         context: &'a AccessContext,
         source: &'a mut (dyn AsyncRead + Send + Unpin),
-        fingerprint: FileFingerprint,
+        content: ContentRef,
+        known: &'a KnownContent,
         gc_epoch: GcEpoch,
-    ) -> impl Future<Output = Result<ExtensionFileRef, Error>> + Send + 'a {
-        ExtendedFileAccess::write(self, context, source, fingerprint, gc_epoch)
+    ) -> impl Future<Output = Result<FileDataRef, Error>> + Send + 'a {
+        ExtendedFileAccess::write(self, context, source, content, known, gc_epoch)
     }
 
     fn read<'a>(
         &'a self,
         context: &'a AccessContext,
-        reference: ExtensionFileRef,
-        fingerprint: FileFingerprint,
+        reference: FileDataRef,
+        content: ContentRef,
         range: Range<u64>,
         destination: &'a mut (dyn AsyncWrite + Send + Unpin),
     ) -> impl Future<Output = Result<(), Error>> + Send + 'a {
-        ExtendedFileAccess::read(self, context, reference, fingerprint, range, destination)
-    }
-
-    fn visit_reachable<'a>(
-        &'a self,
-        context: &'a AccessContext,
-        reference: ExtensionFileRef,
-        visit: &'a mut (dyn FnMut(ObjectLocator) -> Result<(), Error> + Send),
-    ) -> impl Future<Output = Result<(), Error>> + Send + 'a {
-        ExtendedFileAccess::visit_reachable(self, context, reference, visit)
+        ExtendedFileAccess::read(self, context, reference, content, range, destination)
     }
 }
 
@@ -469,24 +421,18 @@ pub trait FileAccessDyn: Send + Sync + fmt::Debug + Unpin {
         &'a self,
         context: &'a AccessContext,
         source: &'a mut (dyn AsyncRead + Send + Unpin),
-        fingerprint: FileFingerprint,
+        content: ContentRef,
+        known: &'a KnownContent,
         gc_epoch: GcEpoch,
-    ) -> BoxedFuture<'a, Result<ExtensionFileRef, Error>>;
+    ) -> BoxedFuture<'a, Result<FileDataRef, Error>>;
     /// Dyn form of [`FileAccess::read`].
     fn read_dyn<'a>(
         &'a self,
         context: &'a AccessContext,
-        reference: ExtensionFileRef,
-        fingerprint: FileFingerprint,
+        reference: FileDataRef,
+        content: ContentRef,
         range: Range<u64>,
         destination: &'a mut (dyn AsyncWrite + Send + Unpin),
-    ) -> BoxedFuture<'a, Result<(), Error>>;
-    /// Dyn form of [`FileAccess::visit_reachable`].
-    fn visit_reachable_dyn<'a>(
-        &'a self,
-        context: &'a AccessContext,
-        reference: ExtensionFileRef,
-        visit: &'a mut (dyn FnMut(ObjectLocator) -> Result<(), Error> + Send),
     ) -> BoxedFuture<'a, Result<(), Error>>;
 }
 
@@ -499,30 +445,22 @@ impl<A: FileAccess> FileAccessDyn for A {
         &'a self,
         context: &'a AccessContext,
         source: &'a mut (dyn AsyncRead + Send + Unpin),
-        fingerprint: FileFingerprint,
+        content: ContentRef,
+        known: &'a KnownContent,
         gc_epoch: GcEpoch,
-    ) -> BoxedFuture<'a, Result<ExtensionFileRef, Error>> {
-        Box::pin(self.write(context, source, fingerprint, gc_epoch))
+    ) -> BoxedFuture<'a, Result<FileDataRef, Error>> {
+        Box::pin(self.write(context, source, content, known, gc_epoch))
     }
 
     fn read_dyn<'a>(
         &'a self,
         context: &'a AccessContext,
-        reference: ExtensionFileRef,
-        fingerprint: FileFingerprint,
+        reference: FileDataRef,
+        content: ContentRef,
         range: Range<u64>,
         destination: &'a mut (dyn AsyncWrite + Send + Unpin),
     ) -> BoxedFuture<'a, Result<(), Error>> {
-        Box::pin(self.read(context, reference, fingerprint, range, destination))
-    }
-
-    fn visit_reachable_dyn<'a>(
-        &'a self,
-        context: &'a AccessContext,
-        reference: ExtensionFileRef,
-        visit: &'a mut (dyn FnMut(ObjectLocator) -> Result<(), Error> + Send),
-    ) -> BoxedFuture<'a, Result<(), Error>> {
-        Box::pin(self.visit_reachable(context, reference, visit))
+        Box::pin(self.read(context, reference, content, range, destination))
     }
 }
 
@@ -537,12 +475,7 @@ pub struct IdentityExtentAccess;
 
 impl ExtentAccess for IdentityExtentAccess {
     fn info(&self) -> Vec<ExtensionFormat> {
-        vec![ExtensionFormat {
-            id: ExtensionId::IDENTITY,
-            name: "identity".to_owned(),
-            revision: 1,
-            configuration: Vec::new(),
-        }]
+        Vec::new()
     }
 
     async fn write(
@@ -554,17 +487,17 @@ impl ExtentAccess for IdentityExtentAccess {
         let stream = stream::write_unchecked_byte_stream(
             context.operator(),
             gc_epoch,
-            ObjectClass::Extension,
+            ObjectClass::DataSegment,
             source,
         )
         .await?;
-        let fingerprint = FileFingerprint::new(stream.payload_digest, stream.payload_length);
         Ok(ExtentRef {
-            encodings: vec![ExtentEncoding {
-                id: ExtensionId::IDENTITY,
-                fingerprint,
-            }],
-            stream,
+            range: SegmentRangeRef {
+                segment: stream.object.locator,
+                offset: 0,
+                stored: ContentRef::new(stream.payload_digest, stream.payload_length),
+            },
+            decoded: Vec::new(),
         })
     }
 
@@ -575,18 +508,38 @@ impl ExtentAccess for IdentityExtentAccess {
         range: Range<u64>,
         destination: &mut (dyn AsyncWrite + Send + Unpin),
     ) -> Result<(), Error> {
-        let (fingerprint, reference) = reference.into_inner(ExtensionId::IDENTITY)?;
-        if !reference.encodings.is_empty()
-            || reference.stream.object.locator.class != ObjectClass::Extension
-            || reference.stream.payload_length != fingerprint.logical_length()
-            || reference.stream.payload_digest != fingerprint.digest()
+        if !reference.decoded.is_empty()
+            || reference.range.segment.class != ObjectClass::DataSegment
+            || range.start > range.end
+            || range.end > reference.range.stored.length()
         {
             return Err(Error::corrupt(
                 "read Managed extent",
                 "extent reference does not use identity encoding",
             ));
         }
-        stream::copy_byte_stream(context.operator(), reference.stream, range, destination).await
+        if range.is_empty() {
+            return Ok(());
+        }
+        let start = reference
+            .range
+            .offset
+            .checked_add(range.start)
+            .ok_or_else(|| Error::corrupt("read Managed extent", "range start overflows"))?;
+        let end = reference
+            .range
+            .offset
+            .checked_add(range.end)
+            .ok_or_else(|| Error::corrupt("read Managed extent", "range end overflows"))?;
+        let mut reader =
+            RangeReader::open(context.operator(), reference.range.segment, start..end).await?;
+        if range.start == 0 && range.end == reference.range.stored.length() {
+            reader.copy_file(reference.range.stored, destination).await
+        } else {
+            reader
+                .copy_bytes(range.end - range.start, destination)
+                .await
+        }
     }
 }
 

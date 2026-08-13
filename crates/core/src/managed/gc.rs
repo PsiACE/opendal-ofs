@@ -48,9 +48,12 @@ impl ManagedVolume {
         let mut compacted = workspace.writer("gc-authority-roots")?;
         while let Some(root) = roots.next().await? {
             let collection_commit = self
-                .compact_for_collection(root.head.current_commit(), collection_epoch, |reference| {
-                    records.write(&reference)
-                })
+                .compact_for_collection(
+                    &workspace,
+                    root.head.current_commit(),
+                    collection_epoch,
+                    |reference| records.write(&reference),
+                )
                 .await?;
             compacted.write(&AuthorityRoot {
                 id: root.id,

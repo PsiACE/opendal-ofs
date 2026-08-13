@@ -22,12 +22,12 @@ use tokio::fs::File;
 use tokio::io::AsyncReadExt as _;
 
 use crate::Error;
-use crate::filesystem::{Digest, FileFingerprint, OperationId};
-use crate::managed::{FileDataRef, GcEpoch, ManagedVolume};
+use crate::filesystem::{ContentRef, Digest, OperationId};
+use crate::managed::{FileDataRef, GcEpoch, KnownContent, ManagedVolume};
 
 const IO_BUFFER_BYTES: usize = 256 * 1024;
 
-pub(super) async fn inspect_file(path: &Path) -> Result<FileFingerprint, Error> {
+pub(super) async fn inspect_file(path: &Path) -> Result<ContentRef, Error> {
     let mut file = File::open(path)
         .await
         .map_err(|error| Error::from_io("inspect local file", Some(path), error))?;
@@ -47,7 +47,7 @@ pub(super) async fn inspect_file(path: &Path) -> Result<FileFingerprint, Error> 
             .checked_add(read as u64)
             .ok_or_else(|| Error::invalid("inspect local file", "file length overflows"))?;
     }
-    Ok(FileFingerprint::new(
+    Ok(ContentRef::new(
         Digest::from_bytes(hasher.finalize().into()),
         length,
     ))
@@ -56,21 +56,22 @@ pub(super) async fn inspect_file(path: &Path) -> Result<FileFingerprint, Error> 
 pub(super) async fn publish_file(
     volume: &ManagedVolume,
     path: &Path,
-    fingerprint: FileFingerprint,
+    fingerprint: ContentRef,
+    known: &KnownContent,
     gc_epoch: GcEpoch,
 ) -> Result<crate::managed::FileDataRef, Error> {
     let mut file = File::open(path)
         .await
         .map_err(|error| Error::from_io("publish local file", Some(path), error))?;
     volume
-        .publish_data(&mut file, fingerprint, gc_epoch)
+        .publish_data(&mut file, fingerprint, known, gc_epoch)
         .await
         .map_err(|error| error.with_context("path", path.display()))
 }
 
 pub(super) async fn materialize_file(
     volume: &ManagedVolume,
-    content: (FileFingerprint, FileDataRef),
+    content: (ContentRef, FileDataRef),
     destination: &Path,
     executable: bool,
 ) -> Result<(), Error> {

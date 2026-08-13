@@ -393,7 +393,7 @@ fn live_local_record(
 fn live_remote_record(
     record: NamespaceRecord<FileDataRef>,
 ) -> Option<NamespaceRecord<Option<FileDataRef>>> {
-    record.value.is_some().then(|| record.map_content(Some))
+    record.value.is_some().then(|| record.map_data(Some))
 }
 
 fn conflict<L, R>(

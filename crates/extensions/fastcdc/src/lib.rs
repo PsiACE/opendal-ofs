@@ -20,13 +20,12 @@
 use std::ops::Range;
 
 use fastcdc::v2020::AsyncStreamCDC;
-use ofs_core::filesystem::{Digest, FileFingerprint};
+use ofs_core::filesystem::{ContentRef, Digest};
 use ofs_core::managed::extension::{
-    AccessContext, ExtensionFileRef, ExtensionFormat, ExtensionId, ExtentAccess, ExtentRef,
-    FileAccess, FileAccessInfo, FileLayoutExtension, RecordStreamReader, RecordStreamWriter,
-    StreamKind,
+    AccessContext, ExtensionFormat, ExtensionId, ExtentAccess, ExtentRef, FileAccess,
+    FileAccessInfo, FilePartitionExtension, RecordStreamWriter, StreamKind,
 };
-use ofs_core::managed::{GcEpoch, ObjectClass, ObjectLocator};
+use ofs_core::managed::{FileDataRef, GcEpoch, KnownContent, ObjectClass};
 use ofs_core::{Error, ErrorKind};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -34,10 +33,6 @@ use tokio_stream::StreamExt as _;
 
 /// Stable wire identity of the FastCDC layout extension.
 pub const FASTCDC_EXTENSION_ID: ExtensionId = ExtensionId::new(*b"ofs.fastcdc.v1!!");
-const MANIFEST_KIND: StreamKind = match StreamKind::extension(1024) {
-    Some(kind) => kind,
-    None => panic!("FastCDC stream kind must be in the extension range"),
-};
 
 const MINIMUM_CHUNK_BYTES: u32 = 64 * 1024;
 const AVERAGE_CHUNK_BYTES: u32 = 256 * 1024;
@@ -72,7 +67,7 @@ impl FastCdcExtension {
     }
 }
 
-impl<A: ExtentAccess> FileLayoutExtension<A> for FastCdcExtension {
+impl<A: ExtentAccess> FilePartitionExtension<A> for FastCdcExtension {
     type ExtendedAccess = FastCdcAccess<A>;
 
     fn extend(&self, inner: A) -> Self::ExtendedAccess {
@@ -86,19 +81,14 @@ pub struct FastCdcAccess<A> {
     inner: A,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-struct ManifestExtent(u64, ExtentRef);
-
 impl<A: ExtentAccess> FileAccess for FastCdcAccess<A> {
     fn info(&self) -> FileAccessInfo {
         FileAccessInfo {
-            layout: ExtensionFormat {
+            partitioning: ExtensionFormat {
                 id: FASTCDC_EXTENSION_ID,
-                name: "fastcdc-v2020".to_owned(),
-                revision: 1,
                 configuration: Configuration::CURRENT.encode(),
             },
-            extents: self.inner.info(),
+            decodings: self.inner.info(),
         }
     }
 
@@ -106,16 +96,12 @@ impl<A: ExtentAccess> FileAccess for FastCdcAccess<A> {
         &self,
         context: &AccessContext,
         source: &mut (dyn AsyncRead + Send + Unpin),
-        fingerprint: FileFingerprint,
+        content: ContentRef,
+        known: &KnownContent,
         gc_epoch: GcEpoch,
-    ) -> Result<ExtensionFileRef, Error> {
-        let mut manifest = RecordStreamWriter::open(
-            context.operator(),
-            gc_epoch,
-            ObjectClass::Extension,
-            MANIFEST_KIND,
-        )
-        .await?;
+    ) -> Result<FileDataRef, Error> {
+        let mut first = None;
+        let mut tail = None;
         let mut chunker = AsyncStreamCDC::new(
             source,
             MINIMUM_CHUNK_BYTES,
@@ -125,6 +111,7 @@ impl<A: ExtentAccess> FileAccess for FastCdcAccess<A> {
         let mut chunks = std::pin::pin!(chunker.as_stream());
         let mut logical_hasher = blake3::Hasher::new();
         let mut logical_length = 0_u64;
+        let decoding_count = self.inner.info().len();
 
         while let Some(chunk) = chunks.next().await {
             let chunk = chunk.map_err(|error| {
@@ -150,22 +137,43 @@ impl<A: ExtentAccess> FileAccess for FastCdcAccess<A> {
                 )
             })?;
             logical_hasher.update(&chunk.data);
-            let chunk_fingerprint = FileFingerprint::new(
+            let chunk_content = ContentRef::new(
                 Digest::from_bytes(blake3::hash(&chunk.data).into()),
                 chunk_length,
             );
-            let mut bytes = chunk.data.as_slice();
-            let extent = self.inner.write(context, &mut bytes, gc_epoch).await?;
-            if extent.fingerprint() != Some(chunk_fingerprint) {
+            let extent = match known.extent(chunk_content)? {
+                Some(extent) => extent,
+                None => {
+                    let mut bytes = chunk.data.as_slice();
+                    self.inner.write(context, &mut bytes, gc_epoch).await?
+                }
+            };
+            if extent.content() != chunk_content || extent.decoded.len() != decoding_count {
                 return Err(Error::new(
                     ErrorKind::Corrupt,
                     "publish Managed FastCDC extent",
-                    "extent access returned a different fingerprint",
+                    "extent access returned a different content",
                 ));
             }
-            manifest
-                .write(&ManifestExtent(logical_length, extent))
-                .await?;
+            if first.is_none() {
+                first = Some(extent);
+            } else {
+                if tail.is_none() {
+                    tail = Some(
+                        RecordStreamWriter::open(
+                            context.operator(),
+                            gc_epoch,
+                            ObjectClass::FileExtentSegment,
+                            StreamKind::FILE_EXTENTS,
+                        )
+                        .await?,
+                    );
+                }
+                tail.as_mut()
+                    .expect("extent tail is open")
+                    .write(&extent)
+                    .await?;
+            }
             logical_length = logical_length.checked_add(chunk_length).ok_or_else(|| {
                 Error::new(
                     ErrorKind::Invalid,
@@ -175,47 +183,49 @@ impl<A: ExtentAccess> FileAccess for FastCdcAccess<A> {
             })?;
         }
 
-        let observed = FileFingerprint::new(
+        let observed = ContentRef::new(
             Digest::from_bytes(logical_hasher.finalize().into()),
             logical_length,
         );
-        if observed != fingerprint {
+        if observed != content {
             return Err(Error::new(
                 ErrorKind::Conflict,
                 "publish Managed FastCDC file",
                 "source changed while being published",
             ));
         }
-        Ok(ExtensionFileRef {
-            layout: FASTCDC_EXTENSION_ID,
-            root: manifest.close().await?,
-        })
+        match (first, tail) {
+            (None, None) => Ok(FileDataRef::empty()),
+            (Some(first), None) => Ok(FileDataRef::single(first)),
+            (Some(first), Some(tail)) => FileDataRef::with_tail(first, tail.close().await?),
+            (None, Some(_)) => unreachable!("an extent tail requires an inline first extent"),
+        }
     }
 
     async fn read(
         &self,
         context: &AccessContext,
-        reference: ExtensionFileRef,
-        fingerprint: FileFingerprint,
+        reference: FileDataRef,
+        content: ContentRef,
         range: Range<u64>,
         destination: &mut (dyn AsyncWrite + Send + Unpin),
     ) -> Result<(), Error> {
-        require_reference(reference)?;
-        if range.start > range.end || range.end > fingerprint.logical_length() {
+        if range.start > range.end || range.end > content.length() {
             return Err(Error::new(
                 ErrorKind::Invalid,
                 "read Managed FastCDC file",
                 "logical byte range is invalid",
             ));
         }
-        let mut manifest =
-            RecordStreamReader::<ManifestExtent>::open(context.operator(), reference.root).await?;
+        let mut extents = reference.extents(context.operator()).await?;
         let mut expected_offset = 0_u64;
-        while let Some(ManifestExtent(offset, extent)) = manifest.next().await? {
-            validate_extent(offset, expected_offset, &extent)?;
-            let extent_fingerprint = extent_fingerprint(&extent)?;
-            let extent_end = offset
-                .checked_add(extent_fingerprint.logical_length())
+        let decoding_count = self.inner.info().len();
+        while let Some(extent) = extents.next().await? {
+            validate_extent(&extent, decoding_count)?;
+            let extent_content = extent_content(&extent)?;
+            let offset = expected_offset;
+            let extent_end = expected_offset
+                .checked_add(extent_content.length())
                 .ok_or_else(|| {
                     Error::new(
                         ErrorKind::Corrupt,
@@ -231,8 +241,11 @@ impl<A: ExtentAccess> FileAccess for FastCdcAccess<A> {
                     .await?;
             }
             expected_offset = extent_end;
+            if expected_offset >= range.end && range.end < content.length() {
+                return Ok(());
+            }
         }
-        if expected_offset != fingerprint.logical_length() {
+        if expected_offset != content.length() {
             return Err(Error::new(
                 ErrorKind::Corrupt,
                 "read Managed FastCDC file",
@@ -241,53 +254,14 @@ impl<A: ExtentAccess> FileAccess for FastCdcAccess<A> {
         }
         Ok(())
     }
-
-    async fn visit_reachable(
-        &self,
-        context: &AccessContext,
-        reference: ExtensionFileRef,
-        visit: &mut (dyn FnMut(ObjectLocator) -> Result<(), Error> + Send),
-    ) -> Result<(), Error> {
-        require_reference(reference)?;
-        visit(reference.root.object.locator)?;
-        let mut manifest =
-            RecordStreamReader::<ManifestExtent>::open(context.operator(), reference.root).await?;
-        let mut expected_offset = 0_u64;
-        while let Some(ManifestExtent(offset, extent)) = manifest.next().await? {
-            validate_extent(offset, expected_offset, &extent)?;
-            let extent_fingerprint = extent_fingerprint(&extent)?;
-            expected_offset = offset
-                .checked_add(extent_fingerprint.logical_length())
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::Corrupt,
-                        "visit Managed FastCDC file",
-                        "extent range overflows",
-                    )
-                })?;
-            visit(extent.stream.object.locator)?;
-        }
-        Ok(())
-    }
 }
 
-fn require_reference(reference: ExtensionFileRef) -> Result<(), Error> {
-    if reference.layout != FASTCDC_EXTENSION_ID
-        || reference.root.kind != MANIFEST_KIND
-        || reference.root.object.locator.class != ObjectClass::Extension
+fn validate_extent(extent: &ExtentRef, decoding_count: usize) -> Result<(), Error> {
+    let length = extent_content(extent)?.length();
+    if extent.decoded.len() != decoding_count
+        || length == 0
+        || length > u64::from(MAXIMUM_CHUNK_BYTES)
     {
-        return Err(Error::new(
-            ErrorKind::Corrupt,
-            "read Managed FastCDC manifest",
-            "file reference has the wrong extension type",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_extent(offset: u64, expected_offset: u64, extent: &ExtentRef) -> Result<(), Error> {
-    let length = extent_fingerprint(extent)?.logical_length();
-    if offset != expected_offset || length == 0 || length > u64::from(MAXIMUM_CHUNK_BYTES) {
         return Err(Error::new(
             ErrorKind::Corrupt,
             "read Managed FastCDC manifest",
@@ -297,12 +271,6 @@ fn validate_extent(offset: u64, expected_offset: u64, extent: &ExtentRef) -> Res
     Ok(())
 }
 
-fn extent_fingerprint(extent: &ExtentRef) -> Result<FileFingerprint, Error> {
-    extent.fingerprint().ok_or_else(|| {
-        Error::new(
-            ErrorKind::Corrupt,
-            "read Managed FastCDC manifest",
-            "extent encoding chain is empty",
-        )
-    })
+fn extent_content(extent: &ExtentRef) -> Result<ContentRef, Error> {
+    Ok(extent.content())
 }

@@ -81,7 +81,7 @@ impl Workspace {
         })
     }
 
-    pub(super) fn path(&self) -> &std::path::Path {
+    pub(crate) fn path(&self) -> &std::path::Path {
         &self.inner.path
     }
 

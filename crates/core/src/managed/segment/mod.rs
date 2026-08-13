@@ -15,12 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Complete-file Pack placement.
+//! Immutable data segment access.
 
-mod layout;
 mod reader;
 mod writer;
 
-pub(crate) use layout::{ENTRY_BYTES, EntryRef, TRAILER_BYTES};
 pub(crate) use reader::RangeReader;
 pub(crate) use writer::Writer;
