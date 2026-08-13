@@ -35,16 +35,16 @@ pub(crate) fn run(keep: bool, case: Option<&str>, extension: Option<&str>) {
     if let Some(extension) = extension {
         match extension {
             "pack" => lifecycle::smoke(&fixture, ofs),
-            "fastcdc" => lifecycle::file_extension(&fixture, ofs, "fastcdc", false, false),
-            "zstd" => lifecycle::file_extension(&fixture, ofs, "zstd", true, false),
+            "fastcdc" => lifecycle::file_extension(&fixture, ofs, "fastcdc", false, false, true),
+            "zstd" => lifecycle::file_extension(&fixture, ofs, "zstd", true, false, false),
             "branch" => lifecycle::branch(&fixture, ofs),
-            "tracing" => lifecycle::file_extension(&fixture, ofs, "tracing", false, true),
+            "tracing" => lifecycle::file_extension(&fixture, ofs, "tracing", false, true, false),
             "all" => {
                 lifecycle::smoke(&fixture, ofs);
-                lifecycle::file_extension(&fixture, ofs, "fastcdc", false, false);
-                lifecycle::file_extension(&fixture, ofs, "zstd", true, false);
+                lifecycle::file_extension(&fixture, ofs, "fastcdc", false, false, true);
+                lifecycle::file_extension(&fixture, ofs, "zstd", true, false, false);
                 lifecycle::branch(&fixture, ofs);
-                lifecycle::file_extension(&fixture, ofs, "tracing", false, true);
+                lifecycle::file_extension(&fixture, ofs, "tracing", false, true, false);
             }
             _ => unreachable!("clap validates extension IDs"),
         }
@@ -82,9 +82,12 @@ pub(crate) fn run(keep: bool, case: Option<&str>, extension: Option<&str>) {
 }
 
 pub(super) fn deterministic_bytes(length: usize, seed: u8) -> Vec<u8> {
-    (0..length)
-        .map(|offset| seed.wrapping_add((offset.wrapping_mul(31) % 251) as u8))
-        .collect()
+    let mut bytes = vec![0_u8; length];
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"ofs-managed-sync-behavior");
+    hasher.update(&[seed]);
+    hasher.finalize_xof().fill(&mut bytes);
+    bytes
 }
 
 #[cfg(unix)]

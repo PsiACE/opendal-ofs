@@ -78,11 +78,18 @@ pub(super) fn growing(fixture: &Fixture, ofs: Ofs) {
 
 pub(super) fn extensions(fixture: &Fixture, ofs: Ofs) {
     for (name, zstd) in [("fastcdc", false), ("fastcdc-zstd", true)] {
-        file_extension(fixture, ofs, name, zstd, false);
+        file_extension(fixture, ofs, name, zstd, false, !zstd);
     }
 }
 
-pub(super) fn file_extension(fixture: &Fixture, ofs: Ofs, name: &str, zstd: bool, tracing: bool) {
+pub(super) fn file_extension(
+    fixture: &Fixture,
+    ofs: Ofs,
+    name: &str,
+    zstd: bool,
+    tracing: bool,
+    reuse_regression: bool,
+) {
     let root = CaseRoot::new();
     let replica_a = root.path.join("replica-a");
     let replica_b = root.path.join("replica-b");
@@ -96,12 +103,20 @@ pub(super) fn file_extension(fixture: &Fixture, ofs: Ofs, name: &str, zstd: bool
         ofs.volume_create_extensions(&storage, zstd, tracing),
         "create extension volume",
     );
-    let mut contents = deterministic_bytes(3 * 1024 * 1024, 41);
+    let mut contents = deterministic_bytes(if reuse_regression { 64 } else { 3 } * 1024 * 1024, 41);
     fs::write(replica_a.join("stream.bin"), &contents).expect("write extension source file");
     let published = require_success(
         ofs.sync_with_tracing(&replica_a, &state_a, &storage, tracing),
         "publish extension file",
     );
+    let data_segments = format!(
+        "local/managed-sync/extensions/{name}/managed/1/objects/00000000000000000000/04-data-segment"
+    );
+    let initial_encoded_bytes = if reuse_regression {
+        fixture.storage_usage(&data_segments).1
+    } else {
+        0
+    };
     if tracing {
         let trace = output_text(&published.stderr);
         assert!(
@@ -123,12 +138,36 @@ pub(super) fn file_extension(fixture: &Fixture, ofs: Ofs, name: &str, zstd: bool
         "an extension file converges across replicas"
     );
 
+    if reuse_regression {
+        fs::write(replica_b.join("copy.bin"), &contents).expect("write duplicate extension file");
+        require_success(
+            ofs.sync_with_tracing(&replica_b, &state_b, &storage, tracing),
+            "publish duplicate extension file",
+        );
+        let (_, duplicated_encoded_bytes) = fixture.storage_usage(&data_segments);
+        assert_eq!(
+            duplicated_encoded_bytes, initial_encoded_bytes,
+            "content already reachable from the authority is reused across paths"
+        );
+    }
+
     contents[1024 * 1024..1024 * 1024 + 4096].fill(217);
     fs::write(replica_b.join("stream.bin"), &contents).expect("update extension file in replica B");
     require_success(
         ofs.sync_with_tracing(&replica_b, &state_b, &storage, tracing),
         "publish extension update",
     );
+    if reuse_regression {
+        let (_, updated_encoded_bytes) = fixture.storage_usage(&data_segments);
+        let uploaded = updated_encoded_bytes
+            .checked_sub(initial_encoded_bytes)
+            .expect("an extension update does not remove immutable objects");
+        assert!(
+            uploaded < contents.len() as u64 / 8,
+            "a 4 KiB update uploads {uploaded} bytes for a {}-byte FastCDC file",
+            contents.len()
+        );
+    }
     require_success(
         ofs.sync_with_tracing(&replica_a, &state_a, &storage, tracing),
         "install extension update",
@@ -397,13 +436,8 @@ pub(super) fn smoke(fixture: &Fixture, ofs: Ofs) {
         "a changed tree reports remote publication"
     );
     let object_root = "local/managed-sync/smoke/managed/1/objects/00000000000000000000";
-    let (packs, _) = fixture.storage_usage(&format!("{object_root}/05-file-pack"));
-    let (loose_files, _) = fixture.storage_usage(&format!("{object_root}/04-file-data"));
-    assert_eq!(packs, 1, "small files are published as one immutable Pack");
-    assert_eq!(
-        loose_files, 0,
-        "packed files do not retain duplicate loose objects"
-    );
+    let (segments, _) = fixture.storage_usage(&format!("{object_root}/04-data-segment"));
+    assert_eq!(segments, 1, "small files share one immutable data segment");
     require_success(
         ofs.sync(&replica_b, &state_b, &storage),
         "cold restore smoke tree",

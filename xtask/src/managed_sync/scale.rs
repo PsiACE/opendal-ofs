@@ -362,8 +362,9 @@ fn report_inventory(fixture: &Fixture, profile: Profile) {
         "01-namespace-commit",
         "02-namespace-segment",
         "03-operation-receipt-segment",
-        "04-file-data",
-        "05-file-pack",
+        "04-data-segment",
+        "05-file-extent-segment",
+        "06-extension",
     ];
     let mut metadata_objects = 0_u64;
     let mut metadata_bytes = 0_u64;
@@ -378,7 +379,7 @@ fn report_inventory(fixture: &Fixture, profile: Profile) {
         println!(
             "scale inventory: phase=initial class={class} objects={objects} encoded_bytes={bytes}"
         );
-        if matches!(*class, "04-file-data" | "05-file-pack") {
+        if *class == "04-data-segment" {
             payload_objects += objects;
             payload_bytes += bytes;
         } else {
