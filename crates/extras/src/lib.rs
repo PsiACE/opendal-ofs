@@ -20,5 +20,5 @@
 mod compose;
 mod options;
 
-pub use compose::{VolumeComponents, access, compose};
+pub use compose::{ConfiguredVolume, compose, create, open};
 pub use options::CreateOptions;

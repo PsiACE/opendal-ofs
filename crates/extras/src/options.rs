@@ -18,18 +18,24 @@
 //! One-shot create-time choices projected into `VolumeFormat`.
 
 use ofs_core::Error;
-use ofs_core::format::{DEFAULT_DATA_SEGMENT_TARGET_BYTES, FileDataLayout};
+use ofs_core::format::{DEFAULT_DATA_SEGMENT_TARGET_BYTES, ExtensionDescriptor, FileDataLayout};
 
 /// User-facing create options for the shipped Managed product.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CreateOptions {
     data_segment_target_bytes: u64,
+    partitioning: Option<ExtensionDescriptor>,
+    decodings: Vec<ExtensionDescriptor>,
+    authority: Option<ExtensionDescriptor>,
 }
 
 impl Default for CreateOptions {
     fn default() -> Self {
         Self {
             data_segment_target_bytes: DEFAULT_DATA_SEGMENT_TARGET_BYTES,
+            partitioning: None,
+            decodings: Vec::new(),
+            authority: None,
         }
     }
 }
@@ -39,10 +45,36 @@ impl CreateOptions {
         FileDataLayout::whole_identity(data_segment_target_bytes)?;
         Ok(Self {
             data_segment_target_bytes,
+            partitioning: None,
+            decodings: Vec::new(),
+            authority: None,
         })
     }
 
+    pub fn with_partitioning(mut self, partitioning: ExtensionDescriptor) -> Self {
+        self.partitioning = Some(partitioning);
+        self
+    }
+
+    pub fn with_decoding(mut self, decoding: ExtensionDescriptor) -> Self {
+        self.decodings.push(decoding);
+        self
+    }
+
+    pub fn with_authority(mut self, authority: ExtensionDescriptor) -> Self {
+        self.authority = Some(authority);
+        self
+    }
+
+    pub fn authority(&self) -> Option<ExtensionDescriptor> {
+        self.authority.clone()
+    }
+
     pub fn file_data_layout(&self) -> Result<FileDataLayout, Error> {
-        FileDataLayout::whole_identity(self.data_segment_target_bytes)
+        FileDataLayout::new(
+            self.data_segment_target_bytes,
+            self.partitioning.clone(),
+            self.decodings.clone(),
+        )
     }
 }

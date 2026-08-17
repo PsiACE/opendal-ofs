@@ -63,6 +63,14 @@ impl CreateOptions {
         self
     }
 
+    pub fn with_authority_opt(
+        mut self,
+        authority: Option<crate::format::ExtensionDescriptor>,
+    ) -> Self {
+        self.authority = authority;
+        self
+    }
+
     pub const fn file_data_layout(&self) -> &FileDataLayout {
         &self.file_data_layout
     }

@@ -16,21 +16,21 @@
 # under the License.
 
 [package]
-description = "Product composition for Apache OpenDAL File System"
-edition.workspace = true
-license.workspace = true
-name = "ofs-extras"
+description = "FastCDC file-layout extension for Apache OpenDAL File System"
+edition = "2024"
+license = "Apache-2.0"
+name = "ofs-ext-fastcdc"
 publish = false
-repository.workspace = true
-rust-version.workspace = true
+repository = "https://github.com/apache/opendal-ofs"
+rust-version = "1.91.0"
 version = "0.0.24"
 
 [dependencies]
-ofs-core = { path = "../core" }
-ofs-ext-branch = { path = "../extensions/branch" }
-ofs-ext-fastcdc = { path = "../extensions/fastcdc" }
-ofs-ext-zstd = { path = "../extensions/zstd" }
-opendal = "0.57.0"
+blake3 = "1"
+fastcdc = { version = "3.2.1", features = ["tokio"] }
+futures = "0.3"
+ofs-core = { path = "../../core" }
+tokio = { version = "1", features = ["io-util"] }
 
 [lints]
 workspace = true

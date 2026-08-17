@@ -57,6 +57,17 @@ impl ExtentRef {
             .copied()
             .unwrap_or(self.stored_range.stored_content)
     }
+
+    /// Consume the outermost configured decoding step.
+    pub fn into_inner(mut self) -> Result<(ContentRef, Self), Error> {
+        let Some(output) = self.decoding_outputs.pop() else {
+            return Err(Error::corrupt(
+                "read Managed extent",
+                "extent decoding chain is empty",
+            ));
+        };
+        Ok((output, self))
+    }
 }
 
 /// One half-open logical byte range in a file.
