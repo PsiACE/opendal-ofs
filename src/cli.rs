@@ -29,6 +29,8 @@ pub(crate) struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
+    /// Create, list, and delete Managed branches.
+    Branch(BranchArgs),
     /// Collect unreachable Managed objects.
     Gc(GcArgs),
     /// Reconcile a local replica with a Managed volume.
@@ -84,6 +86,28 @@ impl RuntimeArgs {
 }
 
 #[derive(Debug, Args)]
+pub(crate) struct BranchArgs {
+    pub(crate) volume: String,
+    #[command(flatten)]
+    pub(crate) runtime: RuntimeArgs,
+    #[command(subcommand)]
+    pub(crate) command: BranchCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum BranchCommand {
+    Create {
+        name: String,
+        #[arg(long, default_value = "main")]
+        from: String,
+    },
+    Delete {
+        name: String,
+    },
+    List,
+}
+
+#[derive(Debug, Args)]
 pub(crate) struct GcArgs {
     pub(crate) volume: String,
     #[command(flatten)]
@@ -100,6 +124,8 @@ pub(crate) struct SyncArgs {
     pub(crate) resolve: Vec<String>,
     #[arg(long, value_name = "PATH")]
     pub(crate) change_set: Option<PathBuf>,
+    #[arg(long, default_value = "main", value_name = "NAME")]
+    pub(crate) branch: String,
     #[arg(long, value_enum, value_name = "CAPABILITY")]
     pub(crate) require: Vec<Capability>,
     #[command(flatten)]
@@ -181,6 +207,27 @@ pub(crate) struct VolumeCreateArgs {
         value_parser = parse_size
     )]
     pub(crate) data_segment_target_size: u64,
+
+    /// Enable FastCDC partitioning.
+    #[arg(long)]
+    pub(crate) fastcdc: bool,
+
+    #[arg(long, default_value = "65536", value_name = "BYTES")]
+    pub(crate) fastcdc_min_chunk: u32,
+
+    #[arg(long, default_value = "1048576", value_name = "BYTES")]
+    pub(crate) fastcdc_avg_chunk: u32,
+
+    #[arg(long, default_value = "4194304", value_name = "BYTES")]
+    pub(crate) fastcdc_max_chunk: u32,
+
+    /// Enable Zstandard extent encoding.
+    #[arg(long, value_name = "LEVEL")]
+    pub(crate) zstd_level: Option<i32>,
+
+    /// Persist the Branch authority extension.
+    #[arg(long)]
+    pub(crate) authority_branch: bool,
 }
 
 #[derive(Debug, Args)]

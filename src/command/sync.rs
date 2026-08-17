@@ -21,7 +21,7 @@ use std::ops::Range;
 
 use anyhow::{Context, Result, anyhow, bail};
 use ofs_core::filesystem::{ContentRef, Digest};
-use ofs_core::sync::{FileChangeSetEntry, SyncEngine};
+use ofs_core::sync::FileChangeSetEntry;
 
 use crate::cli::SyncArgs;
 
@@ -42,18 +42,17 @@ pub(super) async fn run(args: SyncArgs) -> Result<()> {
         );
     }
 
-    let volume = super::open_named_volume(&args.volume, &args.runtime).await?;
+    let volume = super::open_named_volume(&args.volume, &args.runtime, &args.branch).await?;
     let volume_id = volume.id();
-    let engine = SyncEngine::new(volume);
-    let result = match &args.change_set {
-        Some(path) => {
-            let mutations = read_changes(path)?;
-            engine
-                .sync_with_mutations(&root, &args.state, &args.resolve, &mutations)
-                .await?
-        }
-        None => engine.sync(&root, &args.state, &args.resolve).await?,
-    };
+    let mutations = args
+        .change_set
+        .as_ref()
+        .map(|path| read_changes(path))
+        .transpose()?;
+    let result = volume
+        .sync(&root, &args.state, &args.resolve, mutations.as_deref())
+        .await
+        .map_err(anyhow::Error::msg)?;
     if !result.conflict_paths.is_empty() {
         let paths = result
             .conflict_paths

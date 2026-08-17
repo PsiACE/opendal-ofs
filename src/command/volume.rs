@@ -16,8 +16,11 @@
 // under the License.
 
 use anyhow::Result;
-use ofs_core::{ManagedVolume, VolumeRuntime};
-use ofs_extras::{CreateOptions, access, compose};
+use ofs_core::VolumeRuntime;
+use ofs_core::authority::AuthoritySelector;
+use ofs_core::data::ExtentCodec;
+use ofs_core::data::FilePartitioner;
+use ofs_extras::{CreateOptions, compose, create, open};
 
 use crate::cli::{VolumeArgs, VolumeCommand, VolumeCreateArgs, VolumeInspectArgs};
 use crate::locator::{VolumeLocator, model_name};
@@ -26,29 +29,44 @@ use super::operator::open_storage;
 
 pub(super) async fn run(args: VolumeArgs) -> Result<()> {
     match args.command {
-        VolumeCommand::Create(args) => create(args).await,
+        VolumeCommand::Create(args) => create_volume(args).await,
         VolumeCommand::Inspect(args) => inspect(args).await,
     }
 }
 
-async fn create(args: VolumeCreateArgs) -> Result<()> {
+async fn create_volume(args: VolumeCreateArgs) -> Result<()> {
     let crate::cli::VolumeModel::Managed = args.model;
     let locator = VolumeLocator::from_env()?;
     locator.create(&args.volume, args.model, &args.storage)?;
     let operator = open_storage(&args.storage)?;
-    let options = CreateOptions::new(args.data_segment_target_size).map_err(anyhow::Error::msg)?;
-    let layout = options.file_data_layout().map_err(anyhow::Error::msg)?;
-    let volume = ManagedVolume::create(
-        &operator,
-        ofs_core::CreateOptions::new(layout),
-        access(),
-        VolumeRuntime::standard(),
-        "main",
-    )
-    .await
-    .map_err(anyhow::Error::msg)?;
+    let mut options =
+        CreateOptions::new(args.data_segment_target_size).map_err(anyhow::Error::msg)?;
+    if args.fastcdc {
+        let partitioner = ofs_ext_fastcdc::FastCdcPartitioner::new(
+            args.fastcdc_min_chunk,
+            args.fastcdc_avg_chunk,
+            args.fastcdc_max_chunk,
+        )
+        .map_err(anyhow::Error::msg)?;
+        options = options.with_partitioning(partitioner.descriptor().expect("descriptor").clone());
+    }
+    if let Some(level) = args.zstd_level {
+        let codec = ofs_ext_zstd::ZstdCodec::new(level).map_err(anyhow::Error::msg)?;
+        options = options.with_decoding(codec.descriptor().expect("descriptor").clone());
+    }
+    if args.authority_branch {
+        options = options.with_authority(
+            ofs_ext_branch::BranchSelector::default()
+                .descriptor()
+                .expect("descriptor")
+                .clone(),
+        );
+    }
+    let volume = create(&operator, VolumeRuntime::standard(), "main", options)
+        .await
+        .map_err(anyhow::Error::msg)?;
     compose(volume.format()).map_err(anyhow::Error::msg)?;
-    println!("created managed volume {} ({})", args.volume, volume.id());
+    println!("created managed volume {} {}", args.volume, volume.id());
     Ok(())
 }
 
@@ -56,11 +74,10 @@ async fn inspect(args: VolumeInspectArgs) -> Result<()> {
     let locator = VolumeLocator::from_env()?;
     let record = locator.resolve(&args.volume)?;
     let operator = open_storage(&record.storage)?;
-    let volume = ManagedVolume::open(&operator, access(), VolumeRuntime::standard(), "main")
+    let volume = open(&operator, VolumeRuntime::standard(), "main")
         .await
         .map_err(anyhow::Error::msg)?;
-    let components = compose(volume.format()).map_err(anyhow::Error::msg)?;
-    let format = components.format();
+    let format = volume.format();
     println!("volume {}", args.volume);
     println!("model {}", model_name(record.model));
     println!("layout v0");

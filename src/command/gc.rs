@@ -20,7 +20,7 @@ use anyhow::Result;
 use crate::cli::GcArgs;
 
 pub(super) async fn run(args: GcArgs) -> Result<()> {
-    let volume = super::open_named_volume(&args.volume, &args.runtime).await?;
+    let volume = super::open_named_volume(&args.volume, &args.runtime, "main").await?;
     let outcome = volume.collect().await.map_err(anyhow::Error::msg)?;
     println!(
         "collected managed volume {}: scanned {}, deleted {} object(s), {} byte(s)",

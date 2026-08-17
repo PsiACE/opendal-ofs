@@ -17,14 +17,22 @@
 
 use anyhow::{Result, anyhow};
 use opendal::Operator;
-use opendal::layers::{RetryLayer, TimeoutLayer};
+use opendal::layers::{ChaosLayer, RetryLayer, TimeoutLayer};
 
 pub(super) fn open_storage(storage: &str) -> Result<Operator> {
     Operator::from_uri(fs_uri(storage))
         .map(|operator| {
-            operator
+            let operator = operator
                 .layer(TimeoutLayer::new())
-                .layer(RetryLayer::new().with_jitter())
+                .layer(RetryLayer::new().with_jitter());
+            match std::env::var("OFS_CHAOS_ERROR_RATIO")
+                .ok()
+                .and_then(|value| value.parse::<f64>().ok())
+                .filter(|ratio| *ratio > 0.0)
+            {
+                Some(ratio) => operator.layer(ChaosLayer::new(ratio)),
+                None => operator,
+            }
         })
         .map_err(|error| {
             anyhow!(

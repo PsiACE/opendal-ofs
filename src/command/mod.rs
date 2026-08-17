@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod branch;
 mod gc;
 mod operator;
 mod status;
@@ -22,8 +23,7 @@ mod sync;
 mod volume;
 
 use anyhow::Result;
-use ofs_core::ManagedVolume;
-use ofs_extras::access;
+use ofs_extras::ConfiguredVolume;
 
 use crate::cli::{Cli, Command, RuntimeArgs};
 use crate::locator::VolumeLocator;
@@ -32,6 +32,7 @@ use operator::open_storage;
 
 pub(crate) async fn run(cli: Cli) -> Result<()> {
     match cli.command {
+        Command::Branch(args) => branch::run(args).await,
         Command::Gc(args) => gc::run(args).await,
         Command::Sync(args) => sync::run(args).await,
         Command::Status(args) => status::run(args),
@@ -42,11 +43,12 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
 async fn open_named_volume(
     name: &str,
     runtime: &RuntimeArgs,
-) -> Result<ManagedVolume<ofs_core::data::CoreAccess>> {
+    authority: &str,
+) -> Result<ConfiguredVolume> {
     let record = VolumeLocator::from_env()?.resolve(name)?;
     let operator = open_storage(&record.storage)?;
     let runtime = runtime.volume_runtime().map_err(anyhow::Error::msg)?;
-    ManagedVolume::open(&operator, access(), runtime, "main")
+    ofs_extras::open(&operator, runtime, authority)
         .await
         .map_err(anyhow::Error::msg)
 }
