@@ -45,12 +45,12 @@ impl<A: VolumeAccess> SyncEngine<A> {
         workspace: &crate::work::WorkContext,
         root: &Path,
         base: &Namespace<FileExtentMap>,
-        observed: &ManagedObservation,
+        _observed: &ManagedObservation,
         mutations: Option<&[FileChangeSetEntry]>,
     ) -> Result<ScannedTree, Error> {
         let entries = crate::sync::replica::scan::scan(workspace, root)?;
         let local = self
-            .publish_local_files(workspace, root, observed, base, entries, mutations)
+            .observe_local_files(workspace, root, base, entries, mutations)
             .await?;
         let next_cursor = base
             .cursor

@@ -279,10 +279,16 @@ impl<A: VolumeAccess> SyncEngine<A> {
         plan: ConvergencePlan,
     ) -> Result<SyncOutcome, Error> {
         let published = plan.committed.is_none();
+        let target = if published {
+            self.publish_planned_files(workspace, root, observed, &plan.target)
+                .await?
+        } else {
+            plan.target
+        };
         let revision = match plan.committed {
             Some(revision) => revision,
             None => {
-                self.prepare_and_commit(workspace, state_file, &mut state, observed, &plan.target)
+                self.prepare_and_commit(workspace, state_file, &mut state, observed, &target)
                     .await?
             }
         };
@@ -293,7 +299,7 @@ impl<A: VolumeAccess> SyncEngine<A> {
                     root,
                     state_file,
                     state,
-                    &plan.target,
+                    &target,
                     revision,
                     Some(&current),
                     published,
