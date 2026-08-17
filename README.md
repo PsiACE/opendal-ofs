@@ -14,14 +14,24 @@
 [chat]: https://img.shields.io/discord/1081052318650339399
 [discord]: https://opendal.apache.org/discord
 
-`ofs` is the Apache OpenDAL filesystem project.
+`ofs` is the Apache OpenDAL filesystem project. The current runtime provides
+an experimental Managed volume layout under [RFC-0016].
 
 > [!IMPORTANT]
-> **Status: active redesign**
+> **Status: experimental layout v0**
 >
-> We are actively working on the design of the next `ofs` release under
-> [RFC-0016]. The `main` branch is a buildable project scaffold and does not
-> currently provide a mount command or runtime API.
+> The Managed format is marked v0 so it can keep changing. Storage created by
+> this code should be treated as development data. Sync, mount, and the older
+> Direct Mount runtime are not part of this layout slice.
+
+```shell
+ofs volume create workspace --model managed --storage <storage-url>
+ofs volume inspect workspace
+```
+
+`<workspace>` is a local volume name. Storage credentials stay in the
+environment; `OFS_HOME` (default `~/.ofs`) only remembers the name-to-URL
+mapping created above.
 
 ## Previous releases
 
