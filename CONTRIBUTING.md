@@ -29,6 +29,9 @@ and CI. Run `cargo x --help` to list its commands.
 - `cargo x lint` checks Rust formatting, Clippy, documentation, TOML formatting,
   and spelling.
 - `cargo x licenses` checks source headers and dependency licenses.
+- `cargo x behavior managed-sync` runs the black-box Managed Sync behavior suite.
+- `cargo x scale managed-sync` and `cargo x e2e managed-sync-bub` are scale and
+  Bub acceptance; they are not ordinary PR gates.
 
 Use `cargo x lint --fix` to apply the available formatting and Clippy fixes.
 
