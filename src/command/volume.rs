@@ -16,8 +16,8 @@
 // under the License.
 
 use anyhow::Result;
-use ofs_core::ManagedVolume;
-use ofs_extras::{CreateOptions, compose};
+use ofs_core::{ManagedVolume, VolumeRuntime};
+use ofs_extras::{CreateOptions, access, compose};
 
 use crate::cli::{VolumeArgs, VolumeCommand, VolumeCreateArgs, VolumeInspectArgs};
 use crate::locator::{VolumeLocator, model_name};
@@ -38,9 +38,15 @@ async fn create(args: VolumeCreateArgs) -> Result<()> {
     let operator = open_storage(&args.storage)?;
     let options = CreateOptions::new(args.data_segment_target_size).map_err(anyhow::Error::msg)?;
     let layout = options.file_data_layout().map_err(anyhow::Error::msg)?;
-    let volume = ManagedVolume::create(&operator, ofs_core::CreateOptions::new(layout))
-        .await
-        .map_err(anyhow::Error::msg)?;
+    let volume = ManagedVolume::create(
+        &operator,
+        ofs_core::CreateOptions::new(layout),
+        access(),
+        VolumeRuntime::standard(),
+        "main",
+    )
+    .await
+    .map_err(anyhow::Error::msg)?;
     compose(volume.format()).map_err(anyhow::Error::msg)?;
     println!("created managed volume {} ({})", args.volume, volume.id());
     Ok(())
@@ -50,7 +56,7 @@ async fn inspect(args: VolumeInspectArgs) -> Result<()> {
     let locator = VolumeLocator::from_env()?;
     let record = locator.resolve(&args.volume)?;
     let operator = open_storage(&record.storage)?;
-    let volume = ManagedVolume::open(&operator)
+    let volume = ManagedVolume::open(&operator, access(), VolumeRuntime::standard(), "main")
         .await
         .map_err(anyhow::Error::msg)?;
     let components = compose(volume.format()).map_err(anyhow::Error::msg)?;

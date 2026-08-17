@@ -18,18 +18,29 @@
 //! Unique format-driven composition for this binary.
 
 use ofs_core::Error;
+use ofs_core::data::CoreAccess;
 use ofs_core::format::VolumeFormat;
 
 /// Components admitted by the current product for one `VolumeFormat`.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct VolumeComponents {
     format: VolumeFormat,
+    access: CoreAccess,
 }
 
 impl VolumeComponents {
     pub const fn format(&self) -> &VolumeFormat {
         &self.format
     }
+
+    pub const fn access(&self) -> &CoreAccess {
+        &self.access
+    }
+}
+
+/// Whole/Identity access used by this binary for new volumes.
+pub fn access() -> CoreAccess {
+    CoreAccess::default()
 }
 
 /// Admit a volume format for the shipped product.
@@ -49,5 +60,6 @@ pub fn compose(format: &VolumeFormat) -> Result<VolumeComponents, Error> {
     }
     Ok(VolumeComponents {
         format: format.clone(),
+        access: access(),
     })
 }

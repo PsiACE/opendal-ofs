@@ -15,10 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Format-driven composition of the shipped Managed product.
+use anyhow::Result;
 
-mod compose;
-mod options;
+use crate::cli::GcArgs;
 
-pub use compose::{VolumeComponents, access, compose};
-pub use options::CreateOptions;
+pub(super) async fn run(args: GcArgs) -> Result<()> {
+    let volume = super::open_named_volume(&args.volume, &args.runtime).await?;
+    let outcome = volume.collect().await.map_err(anyhow::Error::msg)?;
+    println!(
+        "collected managed volume {}: scanned {}, deleted {} object(s), {} byte(s)",
+        volume.id(),
+        outcome.scanned,
+        outcome.deleted,
+        outcome.deleted_bytes
+    );
+    Ok(())
+}
