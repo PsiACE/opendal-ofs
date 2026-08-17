@@ -37,13 +37,18 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 clap.workspace = true
+futures.workspace = true
 ofs-core = { path = "crates/core" }
-ofs-extras = { path = "crates/extras" }
 ofs-ext-branch = { path = "crates/extensions/branch" }
 ofs-ext-fastcdc = { path = "crates/extensions/fastcdc" }
 ofs-ext-zstd = { path = "crates/extensions/zstd" }
-opendal = { version = "0.57.0", features = ["layers-chaos", "services-fs", "services-memory", "services-s3"] }
-futures.workspace = true
+ofs-extras = { path = "crates/extras" }
+opendal = { version = "0.57.0", features = [
+  "layers-chaos",
+  "services-fs",
+  "services-memory",
+  "services-s3",
+] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

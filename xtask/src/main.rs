@@ -22,6 +22,8 @@ use std::process::Command as StdCommand;
 use clap::Parser;
 use clap::Subcommand;
 
+mod managed_sync;
+
 fn main() {
     let cmd = Command::parse();
     cmd.run();
@@ -37,9 +39,25 @@ struct Command {
 impl Command {
     fn run(self) {
         match self.sub {
+            SubCommand::Behavior {
+                target: BehaviorTarget::ManagedSync(cmd),
+            } => managed_sync::run_fixture(cmd.keep, cmd.case, cmd.evaluation),
             SubCommand::Check(cmd) => cmd.run(),
+            SubCommand::E2e {
+                target: E2eTarget::ManagedSyncBub(cmd),
+            } => managed_sync::run_bub_e2e(cmd.keep),
             SubCommand::Licenses(cmd) => cmd.run(),
             SubCommand::Lint(cmd) => cmd.run(),
+            SubCommand::Scale {
+                target: ScaleTarget::ManagedSync(cmd),
+            } => managed_sync::run_scale(
+                cmd.scenario,
+                cmd.keep,
+                cmd.duration_seconds,
+                cmd.sync_interval_seconds,
+                cmd.file_size,
+                cmd.evaluation,
+            ),
             SubCommand::Test(cmd) => cmd.run(),
         }
     }
@@ -47,14 +65,125 @@ impl Command {
 
 #[derive(Subcommand)]
 enum SubCommand {
+    #[clap(about = "Run user-visible behavior scenarios.")]
+    Behavior {
+        #[command(subcommand)]
+        target: BehaviorTarget,
+    },
     #[clap(about = "Check all workspace targets.")]
     Check(CommandCheck),
+    #[clap(about = "Run end-to-end scenarios that require external credentials.")]
+    E2e {
+        #[command(subcommand)]
+        target: E2eTarget,
+    },
     #[clap(about = "Check source headers and dependency licenses.")]
     Licenses(CommandLicenses),
     #[clap(about = "Run source and documentation linters.")]
     Lint(CommandLint),
+    #[clap(about = "Run fixed-scale acceptance scenarios.")]
+    Scale {
+        #[command(subcommand)]
+        target: ScaleTarget,
+    },
     #[clap(about = "Run all workspace tests.")]
     Test(CommandTest),
+}
+
+#[derive(Subcommand)]
+enum ScaleTarget {
+    #[clap(about = "Run Managed Sync scale acceptance.")]
+    ManagedSync(CommandManagedSyncScale),
+}
+
+#[derive(Parser)]
+#[clap(name = "managed-sync")]
+struct CommandManagedSyncScale {
+    #[arg(value_enum)]
+    scenario: managed_sync::ScaleScenario,
+
+    #[arg(long, help = "Leave the fixture and generated files after completion.")]
+    keep: bool,
+
+    #[arg(
+        long,
+        default_value_t = 60,
+        help = "Random-write workload duration in seconds."
+    )]
+    duration_seconds: u64,
+
+    #[arg(
+        long,
+        default_value_t = 60,
+        help = "Random-write sync interval in seconds."
+    )]
+    sync_interval_seconds: u64,
+
+    #[arg(
+        long,
+        default_value = "1GiB",
+        value_name = "SIZE",
+        value_parser = parse_size,
+        help = "Random-write file size."
+    )]
+    file_size: u64,
+
+    #[command(flatten)]
+    evaluation: managed_sync::EvaluationOptions,
+}
+
+#[derive(Subcommand)]
+enum E2eTarget {
+    #[clap(about = "Synchronize Bub sessions and skills across isolated containers.")]
+    ManagedSyncBub(CommandManagedSyncBub),
+}
+
+#[derive(Parser)]
+#[clap(name = "managed-sync-bub")]
+struct CommandManagedSyncBub {
+    #[arg(long, help = "Leave the fixture running after the command exits.")]
+    keep: bool,
+}
+
+#[derive(Subcommand)]
+enum BehaviorTarget {
+    #[clap(about = "Run Managed Sync behavior scenarios.")]
+    ManagedSync(CommandManagedSyncBehavior),
+}
+
+#[derive(Parser)]
+#[clap(name = "managed-sync")]
+struct CommandManagedSyncBehavior {
+    #[arg(long, value_enum, value_name = "NAME")]
+    case: Option<managed_sync::BehaviorCase>,
+
+    #[arg(long, help = "Leave the fixture running after the command exits.")]
+    keep: bool,
+
+    #[command(flatten)]
+    evaluation: managed_sync::EvaluationOptions,
+}
+
+fn parse_size(value: &str) -> Result<u64, String> {
+    let value = value.trim();
+    let (digits, multiplier) = if let Some(digits) = value.strip_suffix("GiB") {
+        (digits, 1024 * 1024 * 1024)
+    } else if let Some(digits) = value.strip_suffix("MiB") {
+        (digits, 1024 * 1024)
+    } else if let Some(digits) = value.strip_suffix("KiB") {
+        (digits, 1024)
+    } else if let Some(digits) = value.strip_suffix('B') {
+        (digits, 1)
+    } else {
+        (value, 1)
+    };
+    let count = digits
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| format!("invalid size {value}"))?;
+    count
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("size {value} overflows"))
 }
 
 #[derive(Parser)]
