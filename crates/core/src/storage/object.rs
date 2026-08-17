@@ -76,6 +76,14 @@ impl ImmutableWriter {
         Ok(())
     }
 
+    pub fn locator(&self) -> ObjectLocator {
+        self.locator
+    }
+
+    pub fn digest(&self) -> Digest {
+        Digest::from_bytes(self.hasher.finalize().into())
+    }
+
     pub async fn write_source<R>(&mut self, source: &mut R) -> Result<(u64, Digest), Error>
     where
         R: AsyncRead + Unpin + ?Sized,

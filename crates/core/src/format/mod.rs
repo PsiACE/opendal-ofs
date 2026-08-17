@@ -28,10 +28,14 @@ mod stream;
 mod volume;
 
 pub use codec::RecordCodec;
-pub use commit::{COMMIT_RECORD, NamespaceCommit, NamespaceRevision, OperationReceipt};
+pub use commit::{
+    COMMIT_RECORD, NamespaceCommit, NamespaceRevision, OperationReceipt, take_merge_tail,
+};
 pub use file::{ExtentMapping, ExtentRef, ExtentRunRef, FileExtentMap, FileRange, SegmentRangeRef};
 pub use namespace::{NamespaceChangeSegment, NamespaceSnapshot, OperationReceiptSegment};
-pub use object::{GcEpoch, ObjectClass, ObjectId, ObjectLocator, ObjectRef, checksum};
+pub use object::{
+    GcEpoch, OBJECT_PREFIX, ObjectClass, ObjectId, ObjectLocator, ObjectRef, checksum,
+};
 pub use stream::{
     STREAM_TAIL_BYTES, StreamKind, StreamRef, encode_stream_tail, validate_stream_tail,
 };

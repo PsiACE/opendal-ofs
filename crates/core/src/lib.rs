@@ -17,11 +17,15 @@
 
 //! RFC 0016 Managed filesystem core.
 
+pub mod authority;
+pub mod data;
 mod error;
 pub mod filesystem;
 pub mod format;
 pub mod storage;
+pub mod sync;
 pub mod volume;
+pub(crate) mod work;
 
 pub use error::{Error, ErrorKind, Result};
-pub use volume::{CreateOptions, ManagedVolume};
+pub use volume::{CreateOptions, GcOutcome, ManagedVolume, VolumeRuntime};

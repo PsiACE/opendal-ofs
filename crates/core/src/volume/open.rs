@@ -17,13 +17,29 @@
 
 //! Create and open a Managed volume from its experimental v0 format.
 
+use std::num::NonZeroUsize;
+use std::ops::RangeBounds;
+
 use opendal::Operator;
+use tokio::io::AsyncWrite;
 
 use crate::Error;
 use crate::ErrorKind;
-use crate::filesystem::{NodeId, VolumeId};
-use crate::format::{FORMAT_KEY, FORMAT_RECORD, FileDataLayout, VolumeFormat};
+use crate::authority::{AuthorityObservation, AuthoritySelector, AuthorityStore};
+use crate::data::{
+    ContentReuseLookup, DataSegmentWriter, ExtentCodec, RangeReader, ReusableFile, VolumeAccess,
+    validate_file_map,
+};
+use crate::filesystem::{ChangeCursor, ContentRef, NodeId, VolumeId};
+use crate::format::{
+    FORMAT_KEY, FORMAT_RECORD, FileDataLayout, FileExtentMap, GcEpoch, NamespaceCommit,
+    NamespaceRevision, VolumeFormat,
+};
 use crate::storage::ControlRecord;
+use crate::work::{WorkBudget, WorkContext};
+
+use super::namespace::{self, Namespace};
+use super::publication;
 
 const FORMAT: ControlRecord<VolumeFormat> = ControlRecord::new(FORMAT_KEY, FORMAT_RECORD);
 
@@ -31,25 +47,106 @@ const FORMAT: ControlRecord<VolumeFormat> = ControlRecord::new(FORMAT_KEY, FORMA
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CreateOptions {
     file_data_layout: FileDataLayout,
+    authority: Option<crate::format::ExtensionDescriptor>,
 }
 
 impl CreateOptions {
     pub fn new(file_data_layout: FileDataLayout) -> Self {
-        Self { file_data_layout }
+        Self {
+            file_data_layout,
+            authority: None,
+        }
+    }
+
+    pub fn with_authority(mut self, authority: crate::format::ExtensionDescriptor) -> Self {
+        self.authority = Some(authority);
+        self
     }
 
     pub const fn file_data_layout(&self) -> &FileDataLayout {
         &self.file_data_layout
     }
+
+    pub fn authority(&self) -> Option<&crate::format::ExtensionDescriptor> {
+        self.authority.as_ref()
+    }
 }
 
-/// Opened Managed volume facade for layout v0.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ManagedVolume {
+/// Runtime transfer and work budgets for one opened volume.
+#[derive(Clone, Copy, Debug)]
+pub struct VolumeRuntime {
+    transfer_concurrency: NonZeroUsize,
+    work_memory_bytes: NonZeroUsize,
+    read_gap_bytes: usize,
+    multipart_part_bytes: Option<NonZeroUsize>,
+}
+
+impl VolumeRuntime {
+    pub fn new(
+        transfer_concurrency: NonZeroUsize,
+        work_memory_bytes: NonZeroUsize,
+        read_gap_bytes: usize,
+        multipart_part_bytes: Option<NonZeroUsize>,
+    ) -> Self {
+        Self {
+            transfer_concurrency,
+            work_memory_bytes,
+            read_gap_bytes,
+            multipart_part_bytes,
+        }
+    }
+
+    pub fn standard() -> Self {
+        Self::new(
+            NonZeroUsize::new(4).expect("nonzero"),
+            NonZeroUsize::new(256 * 1024 * 1024).expect("nonzero"),
+            1024 * 1024,
+            None,
+        )
+    }
+}
+
+/// Opened Managed volume facade.
+#[derive(Clone)]
+pub struct ManagedVolume<A: VolumeAccess> {
     format: VolumeFormat,
+    operator: Operator,
+    multipart_part_bytes: NonZeroUsize,
+    work_budget: WorkBudget,
+    stream_concurrency: usize,
+    read_gap_bytes: usize,
+    access: A,
+    authority_name: String,
 }
 
-impl ManagedVolume {
+pub(crate) struct ManagedObservation {
+    pub(crate) namespace: Namespace<FileExtentMap>,
+    pub(crate) authority: AuthorityObservation,
+    pub(crate) commit: NamespaceCommit,
+}
+
+impl ManagedObservation {
+    pub(crate) const fn authority_id(&self) -> crate::authority::AuthorityId {
+        self.authority.id
+    }
+
+    pub(crate) const fn revision(&self) -> NamespaceRevision {
+        self.authority.head.current_commit
+    }
+
+    pub(crate) fn can_read_revision(&self, revision: NamespaceRevision) -> bool {
+        let sequence = revision.change_cursor.sequence();
+        let head = self.authority.head;
+        sequence >= head.minimum_retained_cursor.sequence()
+            && sequence <= head.current_commit.change_cursor.sequence()
+    }
+
+    pub(crate) const fn gc_epoch(&self) -> GcEpoch {
+        self.authority.head.gc_epoch
+    }
+}
+
+impl<A: VolumeAccess> ManagedVolume<A> {
     pub const fn format(&self) -> &VolumeFormat {
         &self.format
     }
@@ -58,19 +155,90 @@ impl ManagedVolume {
         self.format.volume_id()
     }
 
+    pub fn authority_name(&self) -> &str {
+        &self.authority_name
+    }
+
+    pub const fn operator(&self) -> &Operator {
+        &self.operator
+    }
+
+    pub const fn access(&self) -> &A {
+        &self.access
+    }
+
+    pub const fn work_budget(&self) -> WorkBudget {
+        self.work_budget
+    }
+
+    pub const fn stream_concurrency(&self) -> usize {
+        self.stream_concurrency
+    }
+
+    pub const fn multipart_part_bytes(&self) -> NonZeroUsize {
+        self.multipart_part_bytes
+    }
+
+    pub const fn read_gap_bytes(&self) -> usize {
+        self.read_gap_bytes
+    }
+
+    pub(crate) fn file_decoding_count(&self) -> usize {
+        self.access.decoding_count()
+    }
+
+    pub(crate) fn transfer_window_bytes(&self) -> usize {
+        self.work_budget
+            .memory_target_bytes()
+            .saturating_div(self.stream_concurrency)
+            .max(1)
+    }
+
+    pub(crate) fn data_segment_target_bytes(&self) -> u64 {
+        self.format.file_data_layout().data_segment_target_bytes()
+    }
+
+    pub(crate) fn data_placement(
+        &self,
+        gc_epoch: GcEpoch,
+        target_bytes: u64,
+        stored_payload_bound: Option<u64>,
+    ) -> DataSegmentWriter<'_> {
+        crate::data::write::data_placement(
+            self.operator(),
+            gc_epoch,
+            target_bytes,
+            self.multipart_part_bytes,
+            stored_payload_bound,
+        )
+    }
+
+    pub(crate) fn stored_size_bound(&self, logical_bytes: u64) -> Option<u64> {
+        self.access.stored_size_bound(logical_bytes)
+    }
+
     /// Create a volume in empty storage, or reopen it when the same layout exists.
-    pub async fn create(operator: &Operator, options: CreateOptions) -> Result<Self, Error> {
+    pub async fn create(
+        operator: &Operator,
+        options: CreateOptions,
+        access: A,
+        runtime: VolumeRuntime,
+        authority_name: impl Into<String>,
+    ) -> Result<Self, Error> {
         require_control_capabilities(operator)?;
         let format = VolumeFormat::new(
             VolumeId::generate(),
             NodeId::generate(),
             options.file_data_layout,
-            None,
+            options.authority,
         );
         if FORMAT.write(operator, &format, None).await? {
-            return Ok(Self { format });
+            let volume =
+                Self::from_parts(format, operator.clone(), access, runtime, authority_name)?;
+            volume.initialize().await?;
+            return Ok(volume);
         }
-        let existing = Self::open(operator).await?;
+        let existing = Self::open(operator, access, runtime, authority_name).await?;
         if existing.format.file_data_layout() != format.file_data_layout()
             || existing.format.authority() != format.authority()
         {
@@ -82,8 +250,13 @@ impl ManagedVolume {
         Ok(existing)
     }
 
-    /// Read the volume format from storage.
-    pub async fn open(operator: &Operator) -> Result<Self, Error> {
+    /// Read the volume format from storage and attach runtime access.
+    pub async fn open(
+        operator: &Operator,
+        access: A,
+        runtime: VolumeRuntime,
+        authority_name: impl Into<String>,
+    ) -> Result<Self, Error> {
         require_control_capabilities(operator)?;
         let observed = FORMAT.read(operator).await?.ok_or_else(|| {
             Error::new(
@@ -92,9 +265,275 @@ impl ManagedVolume {
                 "volume format is missing",
             )
         })?;
+        let volume = Self::from_parts(
+            observed.value,
+            operator.clone(),
+            access,
+            runtime,
+            authority_name,
+        )?;
+        volume
+            .access
+            .selector()
+            .validate_name(&volume.authority_name)?;
+        Ok(volume)
+    }
+
+    fn from_parts(
+        format: VolumeFormat,
+        operator: Operator,
+        access: A,
+        runtime: VolumeRuntime,
+        authority_name: impl Into<String>,
+    ) -> Result<Self, Error> {
+        let work_budget = WorkBudget::new(runtime.work_memory_bytes, runtime.transfer_concurrency)?;
+        let multipart_part_bytes = runtime.multipart_part_bytes.unwrap_or_else(|| {
+            NonZeroUsize::new(
+                work_budget
+                    .memory_target_bytes()
+                    .saturating_div(runtime.transfer_concurrency.get())
+                    .max(1),
+            )
+            .expect("a positive memory target produces a positive stream window")
+        });
         Ok(Self {
-            format: observed.value,
+            format,
+            operator,
+            multipart_part_bytes,
+            work_budget,
+            stream_concurrency: runtime.transfer_concurrency.get(),
+            read_gap_bytes: runtime.read_gap_bytes,
+            access,
+            authority_name: authority_name.into(),
         })
+    }
+
+    async fn initialize(&self) -> Result<(), Error> {
+        let store = self.access.selector().store();
+        match store.observe(&self.operator, &self.authority_name).await {
+            Ok(_) => return self.observe().await.map(drop),
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+
+        let namespace =
+            namespace::write_genesis(self, self.format.root_node_id(), GcEpoch::ZERO).await?;
+        let commit = NamespaceCommit::genesis(self.id(), namespace);
+        let revision = publication::write_commit(self, GcEpoch::ZERO, &commit).await?;
+        store
+            .initialize(
+                &self.operator,
+                self.multipart_part_bytes,
+                crate::authority::AuthorityHead {
+                    current_commit: revision,
+                    gc_epoch: GcEpoch::ZERO,
+                    minimum_retained_cursor: ChangeCursor::GENESIS,
+                },
+            )
+            .await
+    }
+
+    pub(crate) async fn observe(&self) -> Result<ManagedObservation, Error> {
+        let workspace = WorkContext::create(self.work_budget)?;
+        self.observe_with_base_in(&workspace, None)
+            .await
+            .map(|(observation, _)| observation)
+    }
+
+    pub(crate) async fn read_namespace_in(
+        &self,
+        workspace: &WorkContext,
+        revision: NamespaceRevision,
+    ) -> Result<Namespace<FileExtentMap>, Error> {
+        let commit = publication::read_commit(self, revision).await?;
+        namespace::read_views(self, workspace, &[(&commit, revision.change_cursor)])
+            .await?
+            .pop()
+            .ok_or_else(|| Error::corrupt("read Managed namespace", "namespace view is missing"))
+    }
+
+    pub(crate) async fn observe_with_base_in(
+        &self,
+        workspace: &WorkContext,
+        base: Option<NamespaceRevision>,
+    ) -> Result<(ManagedObservation, Option<Namespace<FileExtentMap>>), Error> {
+        let authority = self.read_authority().await?;
+        let head = authority.head;
+        let commit = publication::read_commit(self, head.current_commit).await?;
+        let readable_base = base.filter(|base| {
+            let sequence = base.change_cursor.sequence();
+            sequence >= head.minimum_retained_cursor.sequence()
+                && sequence < head.current_commit.change_cursor.sequence()
+        });
+        let (namespace, base_namespace) = match readable_base {
+            Some(base) => {
+                let reference = if base.change_cursor == head.minimum_retained_cursor
+                    && base.object.locator.gc_epoch < head.current_commit.object.locator.gc_epoch
+                {
+                    head.current_commit
+                } else {
+                    base
+                };
+                let base_commit = publication::read_commit(self, reference).await?;
+                let mut namespaces = namespace::read_views(
+                    self,
+                    workspace,
+                    &[
+                        (&base_commit, base.change_cursor),
+                        (&commit, commit.change_cursor),
+                    ],
+                )
+                .await?
+                .into_iter();
+                let base_namespace = namespaces
+                    .next()
+                    .expect("two requested namespace views include the base");
+                let namespace = namespaces
+                    .next()
+                    .expect("two requested namespace views include the current view");
+                (namespace, Some(base_namespace))
+            }
+            None => {
+                let namespace =
+                    namespace::read_views(self, workspace, &[(&commit, commit.change_cursor)])
+                        .await?
+                        .pop()
+                        .expect("one requested namespace view is returned");
+                (namespace, None)
+            }
+        };
+        Ok((
+            ManagedObservation {
+                namespace,
+                authority,
+                commit,
+            },
+            base_namespace,
+        ))
+    }
+
+    pub(crate) async fn read_authority(&self) -> Result<AuthorityObservation, Error> {
+        self.access
+            .selector()
+            .store()
+            .observe(&self.operator, &self.authority_name)
+            .await
+    }
+
+    pub(crate) async fn replace_head(
+        &self,
+        observed: &AuthorityObservation,
+        head: crate::authority::AuthorityHead,
+    ) -> Result<bool, Error> {
+        self.access
+            .selector()
+            .store()
+            .compare_exchange(
+                &self.operator,
+                self.multipart_part_bytes,
+                &self.authority_name,
+                observed,
+                head,
+            )
+            .await
+    }
+
+    pub(crate) async fn known_content(
+        &self,
+        workspace: &WorkContext,
+        observed: &ManagedObservation,
+        base: &Namespace<FileExtentMap>,
+    ) -> Result<ContentReuseLookup, Error> {
+        crate::data::reuse::build_known_content(
+            &self.access,
+            &self.operator,
+            workspace,
+            self.stream_concurrency,
+            &observed.namespace,
+            base,
+            self.format.file_data_layout().partitioning().is_some(),
+        )
+        .await
+    }
+
+    pub(crate) async fn publish_data_into(
+        &self,
+        placement: &mut DataSegmentWriter<'_>,
+        source: &mut (impl tokio::io::AsyncRead + Send + Unpin),
+        logical_bytes: u64,
+        known: &ContentReuseLookup,
+    ) -> Result<(ContentRef, FileExtentMap, bool), Error> {
+        crate::data::write::write_file(
+            &self.access,
+            &self.operator,
+            self.multipart_part_bytes,
+            placement,
+            source,
+            logical_bytes,
+            known,
+        )
+        .await
+    }
+
+    pub(crate) async fn publish_patch_into(
+        &self,
+        placement: &mut DataSegmentWriter<'_>,
+        source: &mut (impl tokio::io::AsyncRead + Send + Unpin),
+        file_length: u64,
+        previous: (ContentRef, FileExtentMap),
+        ranges: &[crate::format::FileRange],
+        known: &ContentReuseLookup,
+    ) -> Result<(ContentRef, FileExtentMap, bool), Error> {
+        crate::data::write::write_patch(
+            &self.access,
+            &self.operator,
+            self.multipart_part_bytes,
+            placement,
+            source,
+            file_length,
+            previous,
+            ranges,
+            known,
+        )
+        .await
+    }
+
+    pub(crate) async fn read_extent(
+        &self,
+        reader: &mut RangeReader,
+        reference: crate::format::ExtentRef,
+        range: std::ops::Range<u64>,
+        destination: &mut (impl AsyncWrite + Send + Unpin),
+    ) -> Result<(), Error> {
+        let destination: &mut (dyn AsyncWrite + Send + Unpin) = destination;
+        self.access
+            .codec()
+            .decode(reader, reference, range, destination)
+            .await
+    }
+
+    pub(crate) async fn read_data<'a>(
+        &'a self,
+        content: (ContentRef, FileExtentMap),
+        range: impl RangeBounds<u64>,
+        reusable: Option<ReusableFile<'a>>,
+        destination: &'a mut (impl AsyncWrite + Send + Unpin),
+    ) -> Result<(), Error> {
+        let (content, reference) = content;
+        validate_file_map(&reference, content, self.file_decoding_count())?;
+        let range = crate::data::read::logical_range(content.length(), range)?;
+        crate::data::read::read_file(
+            &self.access,
+            &self.operator,
+            self.read_gap_bytes,
+            self.transfer_window_bytes(),
+            reference,
+            content,
+            range,
+            reusable,
+            destination,
+        )
+        .await
     }
 }
 

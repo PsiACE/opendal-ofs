@@ -1120,6 +1120,8 @@ dependencies = [
  "ofs-core",
  "ofs-extras",
  "opendal",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
 ]
@@ -1130,12 +1132,16 @@ version = "0.0.24"
 dependencies = [
  "blake3",
  "ciborium",
+ "futures",
  "opendal",
  "serde",
+ "tempfile",
  "tokio",
+ "tokio-util",
  "unicode-casefold",
  "unicode-normalization",
  "uuid",
+ "walkdir",
 ]
 
 [[package]]

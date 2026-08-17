@@ -103,6 +103,10 @@ impl Error {
         error
     }
 
+    pub(crate) fn io(operation: &'static str, source: std::io::Error) -> Self {
+        Self::from_io(operation, None, source)
+    }
+
     pub(crate) fn from_storage(operation: &'static str, source: opendal::Error) -> Self {
         let kind = match source.kind() {
             opendal::ErrorKind::ConfigInvalid => ErrorKind::Invalid,

@@ -17,6 +17,12 @@
 
 //! Managed volume use cases.
 
+mod gc;
+mod namespace;
 mod open;
+mod publication;
 
-pub use open::{CreateOptions, ManagedVolume};
+pub use gc::GcOutcome;
+pub use namespace::{Namespace, NamespaceReader};
+pub(crate) use open::ManagedObservation;
+pub use open::{CreateOptions, ManagedVolume, VolumeRuntime};

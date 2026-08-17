@@ -63,6 +63,12 @@ pub struct NamespaceRevision {
     pub change_cursor: ChangeCursor,
 }
 
+impl NamespaceRevision {
+    pub const fn cursor(self) -> ChangeCursor {
+        self.change_cursor
+    }
+}
+
 super::codec::tuple_wire!(NamespaceRevision {
     object: ObjectRef,
     change_cursor: ChangeCursor,
@@ -153,4 +159,26 @@ impl NamespaceCommit {
         }
         previous == Some(self.change_cursor)
     }
+}
+
+/// Absorb older compacted segments whose weight is less than twice the newest.
+pub fn take_merge_tail<T>(
+    segments: &mut Vec<T>,
+    mut compaction_weight_bytes: u64,
+    size: impl Fn(&T) -> u64,
+) -> Result<(Vec<T>, u64), Error> {
+    let mut merged = Vec::new();
+    while segments
+        .last()
+        .is_some_and(|older| size(older) / 2 < compaction_weight_bytes)
+    {
+        let segment = segments.pop().expect("a merge candidate exists");
+        compaction_weight_bytes = compaction_weight_bytes
+            .checked_add(size(&segment))
+            .ok_or_else(|| {
+                Error::corrupt("compact Managed streams", "compaction weight overflows")
+            })?;
+        merged.push(segment);
+    }
+    Ok((merged, compaction_weight_bytes))
 }

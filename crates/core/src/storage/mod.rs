@@ -19,6 +19,9 @@
 
 mod control;
 mod object;
+mod record_stream;
 
 pub use control::{ControlRecord, ObservedControl};
 pub use object::{ImmutableWriter, read_immutable};
+pub(crate) use record_stream::RecordStreamSizer;
+pub use record_stream::{RecordStreamReader, RecordStreamWriter, finish_stream};

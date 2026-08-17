@@ -104,8 +104,48 @@ super::codec::tuple_wire!(ExtentMapping {
 });
 
 impl ExtentMapping {
+    /// Map one complete extent at the given logical file offset.
+    pub fn complete(file_offset: u64, extent: ExtentRef) -> Result<Self, Error> {
+        Ok(Self {
+            logical_range: FileRange::new(file_offset, extent.content().length())?,
+            extent_offset: 0,
+            extent,
+        })
+    }
+
     pub fn end(&self) -> Result<u64, Error> {
         self.logical_range.end()
+    }
+
+    /// Select one subrange without changing the immutable extent reference.
+    pub fn slice(&self, range: FileRange) -> Result<Self, Error> {
+        let end = range.end()?;
+        if range.offset < self.logical_range.offset || end > self.end()? {
+            return Err(Error::corrupt(
+                "slice Managed file extent",
+                "slice falls outside its file extent",
+            ));
+        }
+        let extent_offset = self
+            .extent_offset
+            .checked_add(range.offset - self.logical_range.offset)
+            .ok_or_else(|| {
+                Error::corrupt("slice Managed file extent", "extent offset overflows")
+            })?;
+        if extent_offset
+            .checked_add(range.length)
+            .is_none_or(|end| end > self.extent.content().length())
+        {
+            return Err(Error::corrupt(
+                "slice Managed file extent",
+                "extent slice exceeds its content",
+            ));
+        }
+        Ok(Self {
+            logical_range: range,
+            extent_offset,
+            extent: self.extent.clone(),
+        })
     }
 
     pub fn validate(&self) -> Result<(), Error> {
@@ -178,6 +218,33 @@ impl FileExtentMap {
         Self {
             base_run: None,
             patch_levels: Vec::new(),
+        }
+    }
+
+    /// Reference one canonical base run without patch levels.
+    pub const fn from_base(base_run: ExtentRunRef) -> Self {
+        Self {
+            base_run: Some(base_run),
+            patch_levels: Vec::new(),
+        }
+    }
+
+    pub(crate) fn runs(&self) -> impl Iterator<Item = &ExtentRunRef> {
+        self.patch_levels
+            .iter()
+            .flatten()
+            .chain(self.base_run.iter())
+    }
+
+    pub(crate) fn inline_file_extent(&self) -> Option<ExtentMapping> {
+        if self.patch_levels.is_empty() {
+            self.base_run.as_ref().and_then(|run| {
+                run.continuation
+                    .is_none()
+                    .then(|| run.inline_extent.clone())
+            })
+        } else {
+            None
         }
     }
 

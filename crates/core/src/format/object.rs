@@ -26,7 +26,8 @@ use crate::filesystem::{Checksum, Digest};
 
 use super::fixed::identity;
 
-pub(crate) const OBJECT_PREFIX: &str = "managed/0/objects/";
+/// Prefix of every immutable Managed object key.
+pub const OBJECT_PREFIX: &str = "managed/0/objects/";
 
 identity!(
     /// Stable identity of one immutable Managed object.
