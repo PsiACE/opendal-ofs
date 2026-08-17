@@ -15,21 +15,18 @@
 # specific language governing permissions and limitations
 # under the License.
 
-[licenses]
-allow = [
-  "Apache-2.0",
-  "Apache-2.0 WITH LLVM-exception",
-  "BSD-2-Clause",
-  "BSD-3-Clause",
-  "CC0-1.0",
-  "ISC",
-  "MIT",
-  "OpenSSL",
-  "Unicode-3.0",
-  "Zlib",
-]
-exceptions = [
-  # Root certificate data used by OpenDAL's TLS stack on WASM targets.
-  { crate = "webpki-root-certs", allow = ["CDLA-Permissive-2.0"] },
-]
-unused-allowed-license = "allow"
+[package]
+description = "Product composition for Apache OpenDAL File System"
+edition.workspace = true
+license.workspace = true
+name = "ofs-extras"
+publish = false
+repository.workspace = true
+rust-version.workspace = true
+version = "0.0.24"
+
+[dependencies]
+ofs-core = { path = "../core" }
+
+[lints]
+workspace = true
