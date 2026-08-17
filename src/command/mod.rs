@@ -15,7 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Apache OpenDAL™ File System.
-//!
-//! The filesystem architecture is being redesigned. This crate intentionally
-//! exposes no runtime API until the new contracts are ready for implementation.
+mod operator;
+mod volume;
+
+use anyhow::Result;
+
+use crate::cli::{Cli, Command};
+
+pub(crate) async fn run(cli: Cli) -> Result<()> {
+    match cli.command {
+        Command::Volume(args) => volume::run(args).await,
+    }
+}
