@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::path::Path;
 use std::process::Command;
 
 use tempfile::TempDir;
@@ -23,11 +24,19 @@ fn ofs() -> Command {
     Command::new(env!("CARGO_BIN_EXE_ofs"))
 }
 
+fn fs_storage_url(path: &Path) -> String {
+    let mut path = path.to_string_lossy().replace('\\', "/");
+    if !path.starts_with('/') {
+        path.insert(0, '/');
+    }
+    format!("fs://{path}")
+}
+
 #[test]
 fn create_then_inspect_reports_the_same_volume() {
     let home = TempDir::new().expect("ofs home");
     let storage = TempDir::new().expect("volume storage");
-    let storage_url = format!("fs://{}", storage.path().display());
+    let storage_url = fs_storage_url(storage.path());
 
     let created = ofs()
         .env("OFS_HOME", home.path())
