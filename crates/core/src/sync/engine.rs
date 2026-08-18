@@ -263,8 +263,16 @@ impl<A: VolumeAccess> SyncEngine<A> {
                 Self::retain_conflicts(&mut state_file, state, paths, observed.revision(), false)
             }
             SyncPlan::Converge(plan) => {
-                self.converge(&workspace, &root, &mut state_file, state, &observed, plan)
-                    .await
+                self.converge(
+                    &workspace,
+                    &root,
+                    &mut state_file,
+                    state,
+                    &observed,
+                    plan,
+                    mutation_input,
+                )
+                .await
             }
         }
     }
@@ -277,10 +285,11 @@ impl<A: VolumeAccess> SyncEngine<A> {
         mut state: ReplicaState,
         observed: &crate::volume::ManagedObservation,
         plan: ConvergencePlan,
+        mutations: Option<&[FileChangeSetEntry]>,
     ) -> Result<SyncOutcome, Error> {
         let published = plan.committed.is_none();
         let target = if published {
-            self.publish_planned_files(workspace, root, observed, &plan.target)
+            self.publish_planned_files(workspace, root, observed, &plan.target, mutations)
                 .await?
         } else {
             plan.target

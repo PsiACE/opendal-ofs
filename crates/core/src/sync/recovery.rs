@@ -212,6 +212,7 @@ impl<A: VolumeAccess> SyncEngine<A> {
                 committed: None,
                 install_from: None,
             },
+            None,
         )
         .await
     }

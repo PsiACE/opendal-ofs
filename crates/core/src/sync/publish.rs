@@ -21,7 +21,9 @@ use std::path::{Path, PathBuf};
 
 use crate::Error;
 use crate::data::{ContentHasher, ContentReuseLookup, VolumeAccess};
-use crate::filesystem::{ContentRef, NamespaceRecord, NamespaceValue, NodeKind, OperationId};
+use crate::filesystem::{
+    ContentRef, Digest, NamespaceRecord, NamespaceValue, NodeKind, OperationId,
+};
 use crate::format::{FileExtentMap, NamespaceRevision};
 use crate::volume::{ManagedObservation, ManagedVolume, Namespace};
 use crate::work::JoinItem;
@@ -76,7 +78,9 @@ impl<A: VolumeAccess> SyncEngine<A> {
         mutations: Option<&[FileChangeSetEntry]>,
     ) -> Result<Spool<LocalRecord>, Error> {
         let trusted_mutations = mutations.is_some();
+        let base_has_files = namespace_has_files(base)?;
         let mut completed = workspace.writer("observed-local-files")?;
+        let mut pending = workspace.writer("observed-local-files-pending")?;
         let mut mutation_records = workspace.writer("trusted-file-mutations")?;
         for mutation in mutations.unwrap_or_default() {
             mutation_records.write(mutation)?;
@@ -156,11 +160,12 @@ impl<A: VolumeAccess> SyncEngine<A> {
             } else {
                 None
             };
+            let length = entry.length.expect("a scanned regular file has a length");
             if trusted_mutations
                 && mutation.is_none()
                 && let Some(previous) = previous
             {
-                if entry.length != Some(previous.content.length()) {
+                if length != previous.content.length() {
                     return Err(Error::invalid(
                         "observe local files",
                         "trusted mutations omit a file whose length changed",
@@ -174,26 +179,28 @@ impl<A: VolumeAccess> SyncEngine<A> {
                 })?;
                 continue;
             }
-            let path = local_path(root, &entry.path);
-            let content = hash_local_file(&path).await?;
-            if entry.length != Some(content.length()) {
-                return Err(Error::conflict(
-                    "observe local files",
-                    "local file changed while it was being observed",
-                ));
+            // ContentRef is a function of the publish stream. Hash locally only
+            // when identity is the decision: same-path no-op detection, or a
+            // new path that may be a rename of a known base file.
+            let identity_decides_publication = mutation.is_none()
+                && (previous
+                    .as_ref()
+                    .is_some_and(|previous| previous.content.length() == length)
+                    || (previous.is_none() && (trusted_mutations || base_has_files)));
+            if identity_decides_publication {
+                pending.write(&PendingObserve {
+                    path: entry.path,
+                    executable: entry.executable,
+                    length,
+                    previous,
+                })?;
+                continue;
             }
-            let file = match previous.filter(|previous| previous.content == content) {
-                Some(previous) => previous,
-                None => LocalFile {
-                    content,
-                    data: FileExtentMap::empty(),
-                },
-            };
             completed.write(&LocalRecord {
                 path: entry.path,
                 kind: entry.kind,
                 executable: entry.executable,
-                file: Some(file),
+                file: Some(unpublished_file(length)),
             })?;
         }
         if mutation_head.is_some() {
@@ -202,7 +209,18 @@ impl<A: VolumeAccess> SyncEngine<A> {
                 "trusted mutation path is absent from the local directory",
             ));
         }
-        completed.finish()
+        let hashed = hash_pending_files(
+            workspace,
+            root,
+            pending.finish()?,
+            self.volume.stream_concurrency(),
+        )
+        .await?;
+        crate::work::merge_sorted(
+            workspace,
+            vec![completed.finish()?, hashed],
+            |record: &LocalRecord| record.path.clone(),
+        )
     }
 
     /// Upload only files selected by the plan that still lack durable maps.
@@ -212,6 +230,7 @@ impl<A: VolumeAccess> SyncEngine<A> {
         root: &Path,
         observed: &ManagedObservation,
         target: &Namespace<FileExtentMap>,
+        mutations: Option<&[FileChangeSetEntry]>,
     ) -> Result<Namespace<FileExtentMap>, Error> {
         let mut unpublished = workspace.writer("planned-unpublished-files")?;
         let mut records = target.reader()?;
@@ -240,7 +259,7 @@ impl<A: VolumeAccess> SyncEngine<A> {
                 observed,
                 &observed.namespace,
                 unpublished.finish()?,
-                None,
+                mutations,
             )
             .await?;
         splice_published_maps(workspace, target, &published)
@@ -590,8 +609,119 @@ async fn publish_group_task<A: VolumeAccess>(
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PendingObserve {
+    path: String,
+    executable: bool,
+    length: u64,
+    previous: Option<LocalFile>,
+}
+
+async fn hash_pending_files(
+    workspace: &WorkContext,
+    root: &Path,
+    pending: Spool<PendingObserve>,
+    concurrency: usize,
+) -> Result<Spool<LocalRecord>, Error> {
+    let concurrency = concurrency.max(1);
+    let mut lanes = Vec::new();
+    let mut lane = 0_usize;
+    let mut records = pending.reader()?;
+    while let Some(item) = records.next()? {
+        if lanes.len() < concurrency {
+            lanes.push(workspace.writer("observe-hash-lane")?);
+        }
+        lanes[lane].write(&item)?;
+        lane = (lane + 1) % lanes.len();
+    }
+    if lanes.is_empty() {
+        return workspace.writer("observe-hash-empty")?.finish();
+    }
+    let lanes = lanes
+        .into_iter()
+        .map(SpoolWriter::finish)
+        .collect::<Result<Vec<_>, _>>()?;
+    let hashed = stream::iter(lanes.into_iter().map(Ok)).map_ok({
+        let root = root.to_owned();
+        let workspace = workspace.clone();
+        move |lane| hash_observe_lane(workspace.clone(), root.clone(), lane)
+    });
+    let hashed = hashed.try_buffer_unordered(concurrency);
+    futures::pin_mut!(hashed);
+    let mut finished = Vec::new();
+    while let Some(spool) = hashed.try_next().await? {
+        finished.push(spool);
+    }
+    crate::work::merge_sorted(workspace, finished, |record: &LocalRecord| {
+        record.path.clone()
+    })
+}
+
+async fn hash_observe_lane(
+    workspace: WorkContext,
+    root: PathBuf,
+    pending: Spool<PendingObserve>,
+) -> Result<Spool<LocalRecord>, Error> {
+    let mut output = workspace.writer("observe-hash-results")?;
+    let mut records = pending.reader()?;
+    while let Some(item) = records.next()? {
+        let path = local_path(&root, &item.path);
+        let content = hash_local_file(&path).await?;
+        if item.length != content.length() {
+            return Err(Error::conflict(
+                "observe local files",
+                "local file changed while it was being observed",
+            ));
+        }
+        let file = match item.previous.filter(|previous| previous.content == content) {
+            Some(previous) => previous,
+            None => LocalFile {
+                content,
+                data: FileExtentMap::empty(),
+            },
+        };
+        output.write(&LocalRecord {
+            path: item.path,
+            kind: NodeKind::RegularFile,
+            executable: item.executable,
+            file: Some(file),
+        })?;
+    }
+    output.finish()
+}
+
 fn needs_remote_publication(content: ContentRef, data: &FileExtentMap) -> bool {
     content.length() > 0 && data.base_run.is_none() && data.patch_levels.is_empty()
+}
+
+fn unpublished_file(length: u64) -> LocalFile {
+    LocalFile {
+        content: unpublished_content(length),
+        data: FileExtentMap::empty(),
+    }
+}
+
+fn unpublished_content(length: u64) -> ContentRef {
+    if length == 0 {
+        return ContentRef::new(Digest::from_bytes(*blake3::hash(&[]).as_bytes()), 0);
+    }
+    // Distinct from any hashed payload so rename matching cannot bind an
+    // unpublished path to a known base file.
+    ContentRef::new(Digest::from_bytes([0; 32]), length)
+}
+
+fn namespace_has_files(namespace: &Namespace<FileExtentMap>) -> Result<bool, Error> {
+    let mut records = namespace.reader()?;
+    while let Some(record) = records.next()? {
+        if record
+            .value
+            .as_ref()
+            .is_some_and(|node| node.file().is_some())
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn local_path(root: &Path, relative: &str) -> PathBuf {
