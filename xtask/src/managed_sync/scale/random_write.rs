@@ -21,8 +21,8 @@ use std::fs;
 use std::io::{Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Output;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -60,7 +60,7 @@ pub(super) fn run(
     let storage = fixture.storage_url(SCENARIO);
 
     let mut buffer = vec![0; STREAM_BUFFER_BYTES];
-    write_xof(&file, 0, 0, workload.file_bytes, &mut buffer);
+    let base_digest = write_xof(&file, 0, 0, workload.file_bytes, &mut buffer);
     fixture.observe(SCENARIO, "create volume", LogicalIo::default(), || {
         require_success(ofs.volume_create(&storage), "create random-write volume");
     });
@@ -79,7 +79,8 @@ pub(super) fn run(
         },
     );
 
-    let writer = RandomWriter::start(file);
+    let changes = work.path.join("changes.ndjson");
+    let writer = RandomWriter::start(file.clone(), workload.file_bytes);
     let workload_started = Instant::now();
     let workload_deadline = workload_started
         .checked_add(workload.duration)
@@ -104,8 +105,20 @@ pub(super) fn run(
         let mut sync_elapsed = Duration::ZERO;
         let output = fixture.observe(SCENARIO, &stage, LogicalIo::default(), || {
             let sync_started = Instant::now();
-            let output = run_sync(&ofs, &source, &source_state, &storage);
+            let (output, rejected) = run_change_set_sync(
+                &ofs,
+                &source,
+                &source_state,
+                &storage,
+                &changes,
+                &writer,
+                base_digest,
+                workload.file_bytes,
+            );
             sync_elapsed = sync_started.elapsed();
+            if let Some(dirty) = rejected {
+                writer.restore_dirty(&dirty);
+            }
             output
         });
         let observed_elapsed = started.elapsed();
@@ -141,7 +154,9 @@ pub(super) fn run(
     let writer = writer.stop();
     let tail = writer.difference(previous);
     let final_output = fixture.observe(SCENARIO, "final sync", LogicalIo::default(), || {
-        run_sync(&ofs, &source, &source_state, &storage)
+        ofs.sync(&source, &source_state, &storage)
+            .output()
+            .expect("run final random-write sync")
     });
     assert!(
         final_output.status.success(),
@@ -192,10 +207,56 @@ pub(super) fn run(
     );
 }
 
-fn run_sync(ofs: &Ofs, replica: &Path, state: &Path, storage: &str) -> Output {
-    ofs.sync(replica, state, storage)
+fn run_change_set_sync(
+    ofs: &Ofs,
+    replica: &Path,
+    state: &Path,
+    storage: &str,
+    changes: &Path,
+    writer: &RandomWriter,
+    base_digest: blake3::Hash,
+    file_bytes: u64,
+) -> (Output, Option<Vec<(u64, u64)>>) {
+    let dirty = writer.take_dirty();
+    write_change_set(changes, "random-write.bin", base_digest, file_bytes, &dirty);
+    let output = ofs
+        .sync_changes(replica, state, storage, changes)
         .output()
-        .expect("run periodic random-write sync")
+        .expect("run random-write change-set sync");
+    if output.status.success() {
+        (output, None)
+    } else {
+        (output, Some(dirty))
+    }
+}
+
+fn write_change_set(
+    output: &Path,
+    path: &str,
+    digest: blake3::Hash,
+    length: u64,
+    ranges: &[(u64, u64)],
+) {
+    if ranges.is_empty() {
+        fs::write(output, []).expect("write empty random-write change set");
+        return;
+    }
+    let ranges = ranges
+        .iter()
+        .map(|(offset, length)| serde_json::json!({ "offset": offset, "length": length }))
+        .collect::<Vec<_>>();
+    fs::write(
+        output,
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "path": path,
+                "base": { "digest": digest.to_hex().to_string(), "length": length },
+                "ranges": ranges,
+            })
+        ),
+    )
+    .expect("write random-write change set");
 }
 
 fn wait_until(deadline: Instant) {
@@ -254,24 +315,44 @@ impl WriterSnapshot {
 
 struct RandomWriter {
     stop: Arc<AtomicBool>,
+    dirty: Arc<Mutex<DirtyBlocks>>,
     operations: Arc<AtomicU64>,
     handle: thread::JoinHandle<()>,
 }
 
 impl RandomWriter {
-    fn start(path: PathBuf) -> Self {
+    fn start(path: PathBuf, file_bytes: u64) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
+        let dirty = Arc::new(Mutex::new(DirtyBlocks::new(
+            file_bytes / WRITE_BYTES as u64,
+        )));
         let operations = Arc::new(AtomicU64::new(0));
         let thread_stop = Arc::clone(&stop);
+        let thread_dirty = Arc::clone(&dirty);
         let thread_operations = Arc::clone(&operations);
         let handle = thread::spawn(move || {
-            write_randomly(&path, &thread_stop, &thread_operations);
+            write_randomly(&path, &thread_stop, &thread_dirty, &thread_operations);
         });
         Self {
             stop,
+            dirty,
             operations,
             handle,
         }
+    }
+
+    fn take_dirty(&self) -> Vec<(u64, u64)> {
+        self.dirty
+            .lock()
+            .expect("take random-write dirty ranges")
+            .take()
+    }
+
+    fn restore_dirty(&self, ranges: &[(u64, u64)]) {
+        self.dirty
+            .lock()
+            .expect("restore random-write dirty ranges")
+            .mark_ranges(ranges);
     }
 
     fn snapshot(&self) -> WriterSnapshot {
@@ -287,6 +368,7 @@ impl RandomWriter {
             stop,
             operations,
             handle,
+            dirty: _,
         } = self;
         stop.store(true, Ordering::Relaxed);
         handle.join().expect("random-write worker did not panic");
@@ -298,7 +380,12 @@ impl RandomWriter {
     }
 }
 
-fn write_randomly(path: &Path, stop: &AtomicBool, operations: &AtomicU64) {
+fn write_randomly(
+    path: &Path,
+    stop: &AtomicBool,
+    dirty: &Mutex<DirtyBlocks>,
+    operations: &AtomicU64,
+) {
     let file_bytes = fs::metadata(path)
         .expect("read random-write file metadata")
         .len();
@@ -319,7 +406,74 @@ fn write_randomly(path: &Path, stop: &AtomicBool, operations: &AtomicU64) {
         file.seek(SeekFrom::Start(block * WRITE_BYTES as u64))
             .expect("seek random-write file");
         file.write_all(&payload).expect("update random-write file");
+        dirty
+            .lock()
+            .expect("record random-write dirty block")
+            .mark(block);
         operations.fetch_add(1, Ordering::Relaxed);
     }
     file.sync_all().expect("persist random-write file");
+}
+
+struct DirtyBlocks {
+    bits: Vec<u64>,
+    block_count: u64,
+}
+
+impl DirtyBlocks {
+    fn new(block_count: u64) -> Self {
+        let words = usize::try_from(block_count.div_ceil(64)).expect("dirty bitmap fits");
+        Self {
+            bits: vec![0; words],
+            block_count,
+        }
+    }
+
+    fn mark(&mut self, block: u64) {
+        let index = usize::try_from(block).expect("dirty block fits");
+        self.bits[index / 64] |= 1_u64 << (index % 64);
+    }
+
+    fn mark_ranges(&mut self, ranges: &[(u64, u64)]) {
+        for &(offset, length) in ranges {
+            let start = offset / WRITE_BYTES as u64;
+            let end = (offset + length).div_ceil(WRITE_BYTES as u64);
+            for block in start..end.min(self.block_count) {
+                self.mark(block);
+            }
+        }
+    }
+
+    fn take(&mut self) -> Vec<(u64, u64)> {
+        let ranges = self.ranges();
+        self.bits.fill(0);
+        ranges
+    }
+
+    fn ranges(&self) -> Vec<(u64, u64)> {
+        let mut ranges = Vec::new();
+        let mut start = None;
+        for block in 0..self.block_count {
+            let index = usize::try_from(block).expect("dirty block fits");
+            let dirty = self.bits[index / 64] & (1_u64 << (index % 64)) != 0;
+            match (dirty, start) {
+                (true, None) => start = Some(block),
+                (false, Some(first)) => {
+                    ranges.push((
+                        first * WRITE_BYTES as u64,
+                        (block - first) * WRITE_BYTES as u64,
+                    ));
+                    start = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(first) = start {
+            ranges.push((
+                first * WRITE_BYTES as u64,
+                (self.block_count - first) * WRITE_BYTES as u64,
+            ));
+        }
+        ranges
+    }
 }
