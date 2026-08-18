@@ -20,7 +20,7 @@ use opendal::Operator;
 use opendal::layers::{RetryLayer, TimeoutLayer};
 
 pub(super) fn open_storage(storage: &str) -> Result<Operator> {
-    Operator::from_uri(storage)
+    Operator::from_uri(fs_uri(storage))
         .map(|operator| {
             operator
                 .layer(TimeoutLayer::new())
@@ -32,4 +32,30 @@ pub(super) fn open_storage(storage: &str) -> Result<Operator> {
                 error.kind()
             )
         })
+}
+
+/// OpenDAL's `fs` URI parser prefixes the path with `/`.
+///
+/// `fs:///C:/Users/...` therefore becomes `/C:/Users/...`, which Windows cannot
+/// canonicalize. Pass the drive path as `?root=` instead.
+fn fs_uri(storage: &str) -> String {
+    let Some(rest) = storage
+        .strip_prefix("fs://")
+        .or_else(|| storage.strip_prefix("file://"))
+    else {
+        return storage.to_owned();
+    };
+    if rest.contains("root=") {
+        return storage.to_owned();
+    }
+    let path = rest
+        .split_once('?')
+        .map(|(path, _)| path)
+        .unwrap_or(rest)
+        .replace('\\', "/");
+    let path = path.trim_start_matches('/');
+    if path.len() >= 2 && path.as_bytes()[0].is_ascii_alphabetic() && path.as_bytes()[1] == b':' {
+        return format!("fs:///?root={path}");
+    }
+    storage.to_owned()
 }

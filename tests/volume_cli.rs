@@ -25,11 +25,8 @@ fn ofs() -> Command {
 }
 
 fn fs_storage_url(path: &Path) -> String {
-    let mut path = path.to_string_lossy().replace('\\', "/");
-    if !path.starts_with('/') {
-        path.insert(0, '/');
-    }
-    format!("fs://{path}")
+    let path = path.to_string_lossy().replace('\\', "/");
+    format!("fs:///?root={path}")
 }
 
 #[test]
